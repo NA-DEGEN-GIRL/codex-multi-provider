@@ -1,0 +1,672 @@
+{
+  "verified_at": "2026-09-12T08:28:35.840433+00:00",
+  "source_commit": "e13fcc1a0cceb3f428599bd5c514b5c104f3c6bc",
+  "source_base": "3d2ee51ca2d5db578f328aa75e20aa22c0197c9a",
+  "upstream_provider_patch": "af3072ebbcde8d47bb8592a6a3226ef1b83b560a",
+  "exported_patch_sha256": "b579d449f02cf7752617b39f95d8d1ec38e8855ed8fb329dc0ea12f3f01871d2",
+  "exported_patch_applies_to_base": true,
+  "live_runtime_binary_sha256": "72e361578b4a736f67b11bfd62ea65f2807bef200e1e7a32d111020d1998a6e0",
+  "rust_regression": {
+    "initial_selected_cases": 657,
+    "initial_passed": 655,
+    "initial_failed": 2,
+    "core_followup_passed": 4,
+    "provider_endpoint_followup_passed": 1,
+    "cross_provider_integration_passed": 6,
+    "clippy": "PASS",
+    "config_schema": "PASS",
+    "format": "PASS",
+    "full_workspace_suite_run": false
+  },
+  "notes": [
+    "Earlier mock run 20260912-032117-5ea6b7 failed due to fixture/detector defects; see implementation-status.md.",
+    "Custom COMPLETED reports indicate turn completion, not automatic product validation.",
+    "Installed app unchanged. Separate desktop launcher and a user desktop mixed task are verified from process, session, tool, and file evidence. Comprehensive visual UI checks and restart/resume with real DeepSeek remain unvalidated.",
+    "The user desktop task at 17:06 preceded the Flash max policy and recorded low. The later real mixed desktop-host run 20260912-172645-45e0bf verified max on the initial and same-child follow-up turns. Historical session values are preserved.",
+    "Documentation review reused existing evidence; no additional model calls or execution tests were performed."
+  ],
+  "runs": [
+    {
+      "run": "20260912-030739-548336",
+      "mode": "installed",
+      "scenario": "baseline",
+      "status": "PASS",
+      "parent": {
+        "id": "00000000-0000-7000-8000-000000000007",
+        "model": "gpt-6-astra",
+        "provider": "openai"
+      },
+      "routes": null
+    },
+    {
+      "run": "20260912-031002-6863ac",
+      "mode": "upstream",
+      "scenario": "baseline",
+      "status": "PASS",
+      "parent": {
+        "id": "00000000-0000-7000-8000-000000000008",
+        "model": "gpt-6-astra",
+        "provider": "openai"
+      },
+      "routes": [
+        {
+          "id": "00000000-0000-7000-8000-000000000008",
+          "provider": "openai",
+          "source": "vscode",
+          "models": [
+            "gpt-6-astra"
+          ],
+          "turn_count": 1
+        }
+      ]
+    },
+    {
+      "run": "20260912-031526-ef61b9",
+      "mode": "upstream",
+      "scenario": "deepseek",
+      "status": "PASS",
+      "parent": {
+        "id": "00000000-0000-7000-8000-000000000009",
+        "model": "deepseek-flash",
+        "provider": "deepseek_external"
+      },
+      "routes": [
+        {
+          "id": "00000000-0000-7000-8000-000000000009",
+          "provider": "deepseek_external",
+          "source": "vscode",
+          "models": [
+            "deepseek-flash"
+          ],
+          "turn_count": 1
+        }
+      ]
+    },
+    {
+      "run": "20260912-031808-154235",
+      "mode": "runtime",
+      "scenario": "mixed",
+      "status": "PASS",
+      "parent": {
+        "id": "00000000-0000-7000-8000-000000000010",
+        "model": "gpt-6-astra",
+        "provider": "openai"
+      },
+      "routes": [
+        {
+          "id": "00000000-0000-7000-8000-000000000010",
+          "provider": "openai",
+          "source": "vscode",
+          "models": [
+            "gpt-6-astra"
+          ],
+          "turn_count": 2
+        },
+        {
+          "id": "00000000-0000-7000-8000-000000000011",
+          "provider": "deepseek_external",
+          "source": {
+            "subagent": {
+              "thread_spawn": {
+                "parent_thread_id": "00000000-0000-7000-8000-000000000010",
+                "depth": 1,
+                "agent_path": "/root/external_worker",
+                "agent_nickname": "Copernicus",
+                "agent_role": "deepseek"
+              }
+            }
+          },
+          "models": [
+            "deepseek-flash"
+          ],
+          "turn_count": 2
+        },
+        {
+          "id": "00000000-0000-7000-8000-000000000012",
+          "provider": "openai",
+          "source": {
+            "subagent": {
+              "thread_spawn": {
+                "parent_thread_id": "00000000-0000-7000-8000-000000000010",
+                "depth": 1,
+                "agent_path": "/root/gpt_worker",
+                "agent_nickname": "Turing",
+                "agent_role": null
+              }
+            }
+          },
+          "models": [
+            "gpt-5.6-sol"
+          ],
+          "turn_count": 1
+        }
+      ]
+    },
+    {
+      "run": "20260912-031930-bdf11d",
+      "mode": "runtime",
+      "scenario": "selection",
+      "status": "PASS",
+      "parent": {
+        "id": "00000000-0000-7000-8000-000000000013",
+        "model": "gpt-6-astra",
+        "provider": "openai"
+      },
+      "routes": [
+        {
+          "id": "00000000-0000-7000-8000-000000000013",
+          "provider": "openai",
+          "source": "vscode",
+          "models": [
+            "gpt-6-astra"
+          ],
+          "turn_count": 1
+        },
+        {
+          "id": "00000000-0000-7000-8000-000000000014",
+          "provider": "deepseek_external",
+          "source": {
+            "subagent": {
+              "thread_spawn": {
+                "parent_thread_id": "00000000-0000-7000-8000-000000000013",
+                "depth": 1,
+                "agent_path": "/root/copy_file",
+                "agent_nickname": "Einstein",
+                "agent_role": "deepseek"
+              }
+            }
+          },
+          "models": [
+            "deepseek-flash"
+          ],
+          "turn_count": 1
+        },
+        {
+          "id": "00000000-0000-7000-8000-000000000015",
+          "provider": "deepseek_external",
+          "source": {
+            "subagent": {
+              "thread_spawn": {
+                "parent_thread_id": "00000000-0000-7000-8000-000000000013",
+                "depth": 1,
+                "agent_path": "/root/verify_product",
+                "agent_nickname": "Jason",
+                "agent_role": "deepseek"
+              }
+            }
+          },
+          "models": [
+            "deepseek-flash"
+          ],
+          "turn_count": 1
+        }
+      ]
+    },
+    {
+      "run": "20260912-032017-327eee",
+      "mode": "runtime",
+      "scenario": "baseline",
+      "status": "PASS",
+      "parent": {
+        "id": "00000000-0000-7000-8000-000000000016",
+        "model": "gpt-6-astra",
+        "provider": "openai"
+      },
+      "routes": [
+        {
+          "id": "00000000-0000-7000-8000-000000000016",
+          "provider": "openai",
+          "source": "vscode",
+          "models": [
+            "gpt-6-astra"
+          ],
+          "turn_count": 1
+        }
+      ]
+    },
+    {
+      "run": "20260912-032117-5ea6b7",
+      "mode": "runtime",
+      "scenario": "mock-mixed",
+      "status": "FAIL",
+      "parent": {
+        "id": "00000000-0000-7000-8000-000000000017",
+        "model": "gpt-6-astra",
+        "provider": "openai"
+      },
+      "routes": [
+        {
+          "id": "00000000-0000-7000-8000-000000000017",
+          "provider": "openai",
+          "source": "vscode",
+          "models": [
+            "gpt-6-astra"
+          ],
+          "turn_count": 1
+        },
+        {
+          "id": "00000000-0000-7000-8000-000000000018",
+          "provider": "deepseek_external",
+          "source": {
+            "subagent": {
+              "thread_spawn": {
+                "parent_thread_id": "00000000-0000-7000-8000-000000000017",
+                "depth": 1,
+                "agent_path": "/root/external_worker",
+                "agent_nickname": "Peirce",
+                "agent_role": "deepseek"
+              }
+            }
+          },
+          "models": [
+            "mock-external"
+          ],
+          "turn_count": 2
+        },
+        {
+          "id": "00000000-0000-7000-8000-000000000019",
+          "provider": "openai",
+          "source": {
+            "subagent": {
+              "thread_spawn": {
+                "parent_thread_id": "00000000-0000-7000-8000-000000000017",
+                "depth": 1,
+                "agent_path": "/root/gpt_worker",
+                "agent_nickname": "Poincare",
+                "agent_role": null
+              }
+            }
+          },
+          "models": [
+            "gpt-5.6-sol"
+          ],
+          "turn_count": 1
+        }
+      ]
+    },
+    {
+      "run": "20260912-032230-8c03cd",
+      "mode": "runtime",
+      "scenario": "mock-mixed",
+      "status": "PASS",
+      "parent": {
+        "id": "00000000-0000-7000-8000-000000000020",
+        "model": "gpt-6-astra",
+        "provider": "openai"
+      },
+      "routes": [
+        {
+          "id": "00000000-0000-7000-8000-000000000020",
+          "provider": "openai",
+          "source": "vscode",
+          "models": [
+            "gpt-6-astra"
+          ],
+          "turn_count": 2
+        },
+        {
+          "id": "00000000-0000-7000-8000-000000000021",
+          "provider": "deepseek_external",
+          "source": {
+            "subagent": {
+              "thread_spawn": {
+                "parent_thread_id": "00000000-0000-7000-8000-000000000020",
+                "depth": 1,
+                "agent_path": "/root/external_worker",
+                "agent_nickname": "Harvey",
+                "agent_role": "deepseek"
+              }
+            }
+          },
+          "models": [
+            "mock-external"
+          ],
+          "turn_count": 2
+        },
+        {
+          "id": "00000000-0000-7000-8000-000000000022",
+          "provider": "openai",
+          "source": {
+            "subagent": {
+              "thread_spawn": {
+                "parent_thread_id": "00000000-0000-7000-8000-000000000020",
+                "depth": 1,
+                "agent_path": "/root/gpt_worker",
+                "agent_nickname": "Russell",
+                "agent_role": null
+              }
+            }
+          },
+          "models": [
+            "gpt-5.6-sol"
+          ],
+          "turn_count": 1
+        }
+      ]
+    },
+    {
+      "run": "20260912-033220-c74ae8",
+      "mode": "runtime",
+      "scenario": "custom",
+      "status": "COMPLETED",
+      "parent": {
+        "id": "00000000-0000-7000-8000-000000000023",
+        "model": "gpt-6-astra",
+        "provider": "openai"
+      },
+      "routes": [
+        {
+          "id": "00000000-0000-7000-8000-000000000023",
+          "provider": "openai",
+          "source": "vscode",
+          "models": [
+            "gpt-6-astra"
+          ],
+          "turn_count": 1
+        },
+        {
+          "id": "00000000-0000-7000-8000-000000000024",
+          "provider": "openai",
+          "source": {
+            "subagent": {
+              "thread_spawn": {
+                "parent_thread_id": "00000000-0000-7000-8000-000000000023",
+                "depth": 1,
+                "agent_path": "/root/arithmetic",
+                "agent_nickname": "Locke",
+                "agent_role": "luna"
+              }
+            }
+          },
+          "models": [
+            "gpt-5.6-luna"
+          ],
+          "turn_count": 1
+        }
+      ]
+    },
+    {
+      "run": "20260912-163948-ab13aa",
+      "mode": "runtime",
+      "scenario": "custom",
+      "desktop_host": null,
+      "status": "COMPLETED",
+      "parent": {
+        "id": "00000000-0000-7000-8000-000000000025",
+        "model": "gpt-6-astra",
+        "provider": "openai"
+      },
+      "routes": [
+        {
+          "id": "00000000-0000-7000-8000-000000000025",
+          "provider": "openai",
+          "source": "vscode",
+          "models": [
+            "gpt-6-astra"
+          ],
+          "turn_count": 1
+        },
+        {
+          "id": "00000000-0000-7000-8000-000000000026",
+          "provider": "deepseek_external",
+          "source": {
+            "subagent": {
+              "thread_spawn": {
+                "parent_thread_id": "00000000-0000-7000-8000-000000000025",
+                "depth": 1,
+                "agent_path": "/root/implement",
+                "agent_nickname": "Pascal",
+                "agent_role": "deepseek"
+              }
+            }
+          },
+          "models": [
+            "deepseek-flash"
+          ],
+          "turn_count": 1
+        },
+        {
+          "id": "00000000-0000-7000-8000-000000000027",
+          "provider": "openai",
+          "source": {
+            "subagent": {
+              "thread_spawn": {
+                "parent_thread_id": "00000000-0000-7000-8000-000000000025",
+                "depth": 1,
+                "agent_path": "/root/review",
+                "agent_nickname": "Bacon",
+                "agent_role": "luna"
+              }
+            }
+          },
+          "models": [
+            "gpt-5.6-luna"
+          ],
+          "turn_count": 2
+        }
+      ]
+    },
+    {
+      "run": "20260912-164856-4943b0",
+      "mode": "runtime",
+      "scenario": "baseline",
+      "desktop_host": false,
+      "status": "PASS",
+      "parent": {
+        "id": "00000000-0000-7000-8000-000000000028",
+        "model": "gpt-6-astra",
+        "provider": "openai"
+      },
+      "routes": [
+        {
+          "id": "00000000-0000-7000-8000-000000000028",
+          "provider": "openai",
+          "source": "vscode",
+          "models": [
+            "gpt-6-astra"
+          ],
+          "turn_count": 1
+        }
+      ]
+    },
+    {
+      "run": "20260912-164923-bfd201",
+      "mode": "runtime",
+      "scenario": "mixed",
+      "desktop_host": true,
+      "status": "PASS",
+      "parent": {
+        "id": "00000000-0000-7000-8000-000000000029",
+        "model": "gpt-6-astra",
+        "provider": "openai"
+      },
+      "routes": [
+        {
+          "id": "00000000-0000-7000-8000-000000000029",
+          "provider": "openai",
+          "source": "vscode",
+          "models": [
+            "gpt-6-astra"
+          ],
+          "turn_count": 2
+        },
+        {
+          "id": "00000000-0000-7000-8000-000000000030",
+          "provider": "deepseek_external",
+          "source": {
+            "subagent": {
+              "thread_spawn": {
+                "parent_thread_id": "00000000-0000-7000-8000-000000000029",
+                "depth": 1,
+                "agent_path": "/root/external_worker",
+                "agent_nickname": "Ptolemy",
+                "agent_role": "deepseek"
+              }
+            }
+          },
+          "models": [
+            "deepseek-flash"
+          ],
+          "turn_count": 2
+        },
+        {
+          "id": "00000000-0000-7000-8000-000000000031",
+          "provider": "openai",
+          "source": {
+            "subagent": {
+              "thread_spawn": {
+                "parent_thread_id": "00000000-0000-7000-8000-000000000029",
+                "depth": 1,
+                "agent_path": "/root/gpt_worker",
+                "agent_nickname": "Arendt",
+                "agent_role": null
+              }
+            }
+          },
+          "models": [
+            "gpt-5.6-sol"
+          ],
+          "turn_count": 1
+        }
+      ]
+    },
+    {
+      "run": "20260912-172645-45e0bf",
+      "mode": "runtime",
+      "scenario": "mixed",
+      "desktop_host": true,
+      "status": "PASS",
+      "parent": {
+        "id": "00000000-0000-7000-8000-000000000032",
+        "model": "gpt-6-astra",
+        "provider": "openai"
+      },
+      "routes": [
+        {
+          "id": "00000000-0000-7000-8000-000000000032",
+          "provider": "openai",
+          "source": "vscode",
+          "models": [
+            "gpt-6-astra"
+          ],
+          "turn_count": 2,
+          "reasoning_efforts": [
+            "low"
+          ]
+        },
+        {
+          "id": "00000000-0000-7000-8000-000000000033",
+          "provider": "deepseek_external",
+          "source": {
+            "subagent": {
+              "thread_spawn": {
+                "parent_thread_id": "00000000-0000-7000-8000-000000000032",
+                "depth": 1,
+                "agent_path": "/root/external_worker",
+                "agent_nickname": "Maxwell",
+                "agent_role": "deepseek"
+              }
+            }
+          },
+          "models": [
+            "deepseek-flash"
+          ],
+          "turn_count": 2,
+          "reasoning_efforts": [
+            "max"
+          ]
+        },
+        {
+          "id": "00000000-0000-7000-8000-000000000034",
+          "provider": "openai",
+          "source": {
+            "subagent": {
+              "thread_spawn": {
+                "parent_thread_id": "00000000-0000-7000-8000-000000000032",
+                "depth": 1,
+                "agent_path": "/root/gpt_worker",
+                "agent_nickname": "Mendel",
+                "agent_role": null
+              }
+            }
+          },
+          "models": [
+            "gpt-5.6-sol"
+          ],
+          "turn_count": 1,
+          "reasoning_efforts": [
+            "low"
+          ]
+        }
+      ]
+    }
+  ],
+  "live_progress": {
+    "gui_stream_fixture": {
+      "child_alive": true,
+      "observed_before_exit": true,
+      "elapsed_ms": 160.1247
+    },
+    "python_regression_cases_passed": 4,
+    "real_gui_baseline": "20260912-164856-4943b0",
+    "desktop_host_mixed": "20260912-164923-bfd201"
+  },
+  "desktop_startup": {
+    "app_version": "26.903.9818.0",
+    "isolated_app_pid_observed": 30152,
+    "patched_app_server_pid_observed": 118512,
+    "patched_app_server_parent_pid": 30152,
+    "original_app_pid_preserved": 82332,
+    "original_app_server_pid_preserved": 81488,
+    "native_user_data_dir_argument_required": true,
+    "gui_task_end_to_end_validated": true,
+    "restart_resume_validated": false,
+    "gui_task_validation_method": "User desktop task audited through session logs, successful tool calls, actual files and recorded parent test execution.",
+    "gui_presentation_visually_validated": false
+  },
+  "explorer_launcher": {
+    "regression_tests_passed": 2,
+    "test_path": "System32 only; no agent-only PATH entries",
+    "entry_points": [
+      "Open-Lab.cmd",
+      "Open-Experimental-Codex.cmd"
+    ],
+    "live_gui_streaming_verified": true,
+    "desktop_read_only_check_passed": true,
+    "normal_gui_pid_observed": 119200,
+    "api_calls_required": false
+  },
+  "flash_reasoning_policy": {
+    "model": "deepseek-flash",
+    "required_effort": "max",
+    "regression_tests_passed": 2,
+    "initial_and_same_child_followup_max_verified": true,
+    "run": "20260912-172645-45e0bf"
+  },
+  "documentation_reviewed_on": "2026-09-12",
+  "desktop_user_task": {
+    "parent_session_id": "00000000-0000-7000-8000-000000000004",
+    "implementation_session_id": "00000000-0000-7000-8000-000000000005",
+    "review_session_id": "00000000-0000-7000-8000-000000000006",
+    "originator": "CodexDesktop",
+    "workspace": "C:\\dev\\example-workspace",
+    "started_at": "2026-09-12T17:06:42+09:00",
+    "finished_at": "2026-09-12T17:08:04+09:00",
+    "models": {
+      "parent": "gpt-6-astra",
+      "implementation": "deepseek-flash",
+      "review": "gpt-6-astra"
+    },
+    "flash_reasoning_effort_at_run_time": "low",
+    "precedes_flash_max_policy": true,
+    "tests_passed": 9,
+    "test_command": "python -m unittest discover -v",
+    "test_exit_code": 0,
+    "files": [
+      "text_utils.py",
+      "test_text_utils.py"
+    ],
+    "report": "docs/test-results-20260912-1706.md",
+    "restart_resume_validated": false
+  }
+}

@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../Shell/DiagnosticLog.cs" Link="DiagnosticLog.cs" />
+    <Compile Include="../Shell/ClipboardTextCopy.cs" Link="ClipboardTextCopy.cs" />
+    <ProjectReference Include="../Shared/Codex.ControlCenter.Shared.csproj" />
+  </ItemGroup>
+  <Target Name="CopyFixtureService" AfterTargets="Build">
+    <ItemGroup><SupervisorFiles Include="../service/target/release/codex-workspace-service.exe" /></ItemGroup>
+    <Copy SourceFiles="@(SupervisorFiles)" DestinationFolder="$(OutDir)" />
+  </Target>
+</Project>

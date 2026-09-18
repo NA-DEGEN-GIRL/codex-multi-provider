@@ -1,0 +1,115 @@
+// The renderer owns the visible transcript. The main-process catalog is a
+// separate store: refreshing it alone never invalidates this store's readers.
+(() => {
+  const managers = new Set(), local = new WeakMap(), refreshing = new WeakMap();
+  const pending = new Map(), uuid = /^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i;
+  const deletedKeys=new Set();
+  const archivedKeys=new Set();
+  const counters = {refreshes:0, failures:0, unavailable:0, deferred:0, draftDeferred:0};
+  const signals=new Set(['thread/started','thread/name/updated','thread/settings/updated','thread/project/updated','thread/archived','thread/unarchived','thread/deleted','turn/started','turn/completed','item/started','item/completed','item/agentMessage/delta']);
+  let running = false;
+  let composing = false;
+  const liveManagers = () => {
+    for(const m of managers)if(m.disposed)managers.delete(m);
+    return managers;
+  };
+  const hasDraft = id => {
+    // Native transcript hydration can recreate the composer when its latest
+    // turn changes. Defer that task's merge while the user owns an unsent draft;
+    // do not copy/restore DOM text, which loses mentions, selections and IME.
+    const editor=document.querySelector('[data-codex-composer]');
+    return composing || !!editor?.textContent?.trim();
+  };
+  const active = (m,id) => local.get(m)?.turns.has(id) || local.get(m)?.requests.has(id) || m.hasInFlightConversationResume(id);
+  async function tick() {
+    liveManagers();
+    // Hidden profiles keep invalidations, not repeated transcript hydration.
+    // One visibility transition drains the latest state without dropping tasks.
+    if(running || !pending.size || document.visibilityState==='hidden') return;
+    running = true;
+    try {
+      for(const [key,state] of [...pending].filter(([,s])=>s.due<=Date.now()).slice(0,8)) {
+        const {id,host,deleted}=state;
+        if(deleted){for(const m of liveManagers())if(m.hostId===host)m.handleThreadDeletion([id]);pending.delete(key);continue;}
+        let deferred=false, failed=false, applied=false;
+        if(hasDraft(id)){state.due=Date.now()+400;counters.draftDeferred++;continue;}
+        for(const m of liveManagers()) {
+          if(m.disposed || m.hostId!==host || !m.threadStore) continue;
+          if(active(m,id)){deferred=true;counters.deferred++;continue;}
+          const store=m.threadStore;
+          refreshing.set(store,{m,id});
+          try {
+            store.backgroundThreadLookups?.delete(id);
+            store.threadReadStates?.delete(id);
+            await store.hydrateThreads([id],{addToRecentConversations:true,includeTurns:true,maxTurns:8,
+              retainHistoryPagination:true,notifyAnyCallbacks:true,throwOnReadError:true});
+            if(active(m,id)||hasDraft(id)){deferred=true;continue;}
+            applied=true;counters.refreshes++;
+          } catch(error) { failed=true;if(/thread not loaded|thread.*not found/i.test(String(error?.message||error)))counters.unavailable++;else counters.failures++; }
+          finally {refreshing.delete(store);}
+        }
+        if(pending.get(key)!==state)continue;
+        state.due=Date.now()+(failed?2500:700);
+        if(failed){if(++state.failures>=3)pending.delete(key);}
+        else if(applied&&!deferred)pending.delete(key);
+      }
+    } finally {running=false;}
+  }
+  globalThis.__codexRendererRecordSync = {
+    register(m) {
+      liveManagers();
+      if(m.disposed||managers.has(m))return;
+      managers.add(m);local.set(m,{turns:new Map(),requests:new Map()});
+      const client=m.requestClient,send=client.sendRequest;
+      client.sendRequest=async function(method,params,...rest){
+        if(globalThis.__codexProfileResume)params=await globalThis.__codexProfileResume(m,send,this,method,params);
+        const id=params?.threadId,track=uuid.test(id||'')&&(method==='turn/start'||method==='turn/steer');
+        const state=local.get(m);
+        if(track)state.requests.set(id,(state.requests.get(id)||0)+1);
+        try{return await Reflect.apply(send,this,[method,params,...rest]);}
+        finally{if(track){const count=state.requests.get(id)-1;if(count)state.requests.set(id,count);else state.requests.delete(id);}}
+      };
+    },
+    observe(m,method,params) {
+      const state=local.get(m),id=params?.thread?.id||params?.threadId,turn=params?.turn?.id||params?.turnId;
+      if(!state||!uuid.test(id||''))return;
+      if(method==='thread/deleted'){deletedKeys.add(m.hostId+'\0'+id);pending.delete(m.hostId+'\0'+id);}
+      if(method==='thread/archived'){archivedKeys.add(m.hostId+'\0'+id);pending.delete(m.hostId+'\0'+id);}
+      if(method==='thread/unarchived')archivedKeys.delete(m.hostId+'\0'+id);
+      if(signals.has(method))window.electronBridge?.sendMessageFromView?.({type:'manager-record-changed',threadId:id,hostId:m.hostId,kind:({'thread/deleted':'deleted','thread/archived':'archived','thread/unarchived':'unarchived'})[method]||'changed'});
+      if(['turn/started','item/started','item/agentMessage/delta'].includes(method))state.turns.set(id,turn||null);
+      if(method==='turn/completed'&&(!turn||state.turns.get(id)===turn))state.turns.delete(id);
+      if(['thread/closed','thread/deleted'].includes(method)||(method==='thread/status/changed'&&params?.status?.type==='idle'))state.turns.delete(id);
+    },
+    canApply(store){const r=refreshing.get(store);return !r||(!deletedKeys.has(r.m.hostId+'\0'+r.id)&&!archivedKeys.has(r.m.hostId+'\0'+r.id)&&!active(r.m,r.id)&&!hasDraft(r.id));},
+    status(){return {...counters,managers:liveManagers().size,pending:pending.size,archived:archivedKeys.size,deleted:deletedKeys.size};},
+    tick
+  };
+  window.addEventListener('compositionstart',event=>{if(event.target?.closest?.('[data-codex-composer]'))composing=true;});
+  window.addEventListener('compositionend',()=>{composing=false;});
+  document.addEventListener?.('visibilitychange',()=>{if(document.visibilityState!=='hidden')void tick();});
+  window.addEventListener('message',event=>{
+    const data=event.data;
+    if(data?.type!=='manager-record-invalidated'||!Array.isArray(data.threadIds))return;
+    // The main-process adapter already retries durable reads three times. Each
+    // successful delivery needs one renderer merge, not another three reads.
+    // A new state object preserves invalidations arriving during an in-flight read.
+    const host=data.hostId||'local';
+    if(typeof host!=='string'||host.length>256)return;
+    for(const id of (data.archivedThreadIds||[]).slice(0,256))if(uuid.test(id)){
+      archivedKeys.add(host+'\0'+id);pending.delete(host+'\0'+id);
+      for(const m of liveManagers())if(m.hostId===host)m.handleThreadArchived(id);
+    }
+    for(const id of (data.unarchivedThreadIds||[]).slice(0,256))if(uuid.test(id)&&!deletedKeys.has(host+'\0'+id)){
+      archivedKeys.delete(host+'\0'+id);
+      for(const m of liveManagers())if(m.hostId===host)m.handleThreadUnarchived(id);
+    }
+    for(const id of data.threadIds.slice(0,32))if(uuid.test(id)&&!deletedKeys.has(host+'\0'+id)&&!archivedKeys.has(host+'\0'+id))pending.set(host+'\0'+id,{id,host,failures:0,due:Date.now()});
+    for(const id of (data.deletedThreadIds||[]).slice(0,256))if(uuid.test(id)){deletedKeys.add(host+'\0'+id);pending.set(host+'\0'+id,{id,host,deleted:true,due:Date.now()});}
+    while(deletedKeys.size>4096)deletedKeys.delete(deletedKeys.values().next().value);
+    while(archivedKeys.size>4096)archivedKeys.delete(archivedKeys.values().next().value);
+    while(pending.size>1024)pending.delete(pending.keys().next().value);
+    void tick();
+  });
+  setInterval(tick,400);
+})();

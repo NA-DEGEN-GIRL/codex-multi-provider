@@ -1,0 +1,26 @@
+[package]
+name = "codex-workspace-service"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+process-fixture = []
+
+[[bin]]
+name = "process-fixture"
+path = "fixtures/process.rs"
+required-features = ["process-fixture"]
+
+[dependencies]
+tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "net", "io-util", "process", "sync", "time", "fs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4", "serde"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Pipes", "Win32_Storage_FileSystem", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+strip = true

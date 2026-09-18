@@ -1,0 +1,7 @@
+<Solution>
+  <Project Path="Shared/Codex.ControlCenter.Shared.csproj" />
+  <Project Path="Supervisor/Codex.ControlCenter.Supervisor.csproj" />
+  <Project Path="RuntimeProxy/Codex.ControlCenter.RuntimeProxy.csproj" />
+  <Project Path="SshProxy/Codex.ControlCenter.SshProxy.csproj" />
+  <Project Path="Shell/Codex.ControlCenter.Shell.csproj" />
+</Solution>

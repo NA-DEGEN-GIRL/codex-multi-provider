@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- Execute the production lifecycle, replacing only WPF and OS boundaries.
+         This test never references WPF or calls a Windows window API. -->
+    <Compile Include="../Shell/NativeWindowHost.cs" Link="NativeWindowHost.cs" />
+    <Compile Include="../Shell/EmbeddedMouseActivation.cs" Link="EmbeddedMouseActivation.cs" />
+    <Compile Include="../Shell/NativeWindowLease.cs" Link="NativeWindowLease.cs" />
+    <Compile Include="../Shell/NativeResizePolicy.cs" Link="NativeResizePolicy.cs" />
+    <Compile Include="../Shell/ProfileActionGate.cs" Link="ProfileActionGate.cs" />
+    <Compile Include="../Shell/AutomaticProfileUpdate.cs" Link="AutomaticProfileUpdate.cs" />
+    <Compile Include="../Shell/InstalledManagerRelease.cs" Link="InstalledManagerRelease.cs" />
+    <Compile Include="../Shell/WindowAttachmentAttempts.cs" Link="WindowAttachmentAttempts.cs" />
+    <Compile Include="../Shell/UpdatePresentation.cs" Link="UpdatePresentation.cs" />
+    <Compile Include="../Shell/ProfileLoginPresentation.cs" Link="ProfileLoginPresentation.cs" />
+    <Compile Include="../Shell/ConversationReadyWait.cs" Link="ConversationReadyWait.cs" />
+    <Compile Include="../Shell/NativeHostDeck.cs" Link="NativeHostDeck.cs" />
+    <Compile Include="../Shell/WindowLaunchIdentity.cs" Link="WindowLaunchIdentity.cs" />
+    <Compile Include="../Shell/JsonValues.cs" Link="JsonValues.cs" />
+    <Compile Include="../Shell/RpcLogFilter.cs" Link="RpcLogFilter.cs" />
+  </ItemGroup>
+</Project>

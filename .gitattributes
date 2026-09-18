@@ -1,0 +1,4 @@
+* text=auto
+*.cmd text eol=crlf
+# Unified diff context lines contain required whitespace; preserve patch bytes.
+patches/*.patch -text -whitespace
