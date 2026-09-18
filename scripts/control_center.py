@@ -121,6 +121,13 @@ class ControlCenter:
             def register(data):
                 Store._source(data,Path.home()/'.codex','original:local','기존 Codex')
             self.store.mutate(register);state=self.store.read()
+        # Forked tasks share their source memo until the user splits it; the
+        # note service reads this mapping instead of opening state databases.
+        try:
+            from manager_core.note_forks import refresh as refresh_note_forks
+            refresh_note_forks(self.root,state)
+        except (ValueError,RuntimeError,OSError):
+            pass
         state['profile_restarts']=self.restarts.status()
         state['startup_updates']=self.startup_updates.status()
         registry=self.providers.list()

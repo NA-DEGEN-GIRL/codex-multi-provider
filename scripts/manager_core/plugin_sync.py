@@ -69,6 +69,27 @@ def _read(path):
     return path.read_text(encoding='utf-8-sig') if path.exists() else ''
 
 
+def _long(path):
+    """Return an extended-length path so deep mirror trees stay reachable.
+
+    A manager-managed plugin mirror repeats a long profile home, the
+    marketplace name, the plugin name and a staging directory before the
+    plugin's own nested files. That alone can exceed the classic Windows
+    MAX_PATH limit, which used to abort the whole home's synchronization.
+    Only the concrete file operations use this form; confinement checks keep
+    the ordinary path so two spellings never compare as different roots.
+    """
+    path = Path(path)
+    if os.name != 'nt':
+        return path
+    value = os.path.abspath(str(path))
+    if value.startswith('\\\\?\\'):
+        return Path(value)
+    if value.startswith('\\\\'):
+        return Path('\\\\?\\UNC\\' + value[2:])
+    return Path('\\\\?\\' + value)
+
+
 def _key(path):
     return os.path.normcase(str(Path(path).resolve()))
 
@@ -353,14 +374,14 @@ def _copy_bundle(source, destination, base, *, attempts=2):
     last = None
 
     def copy(source_path, destination_path, budget):
-        destination_path.mkdir(parents=True, exist_ok=True)
-        for item in sorted(Path(source_path).iterdir(), key=lambda value: value.name.casefold()):
+        Path(_long(destination_path)).mkdir(parents=True, exist_ok=True)
+        for item in sorted(Path(_long(source_path)).iterdir(), key=lambda value: value.name.casefold()):
             if _linked(item) or item.name in blocked:
                 continue
             budget['entries'] += 1
             if budget['entries'] > _MAX_BUNDLE_ENTRIES:
                 raise ValueError('Plugin bundle exceeds the entry budget.')
-            target = Path(destination_path) / item.name
+            target = Path(_long(Path(destination_path) / item.name))
             if item.is_dir():
                 copy(item, target, budget)
             elif item.is_file():
@@ -389,28 +410,28 @@ def _publish_directory(base, staging, target, label):
     """Atomically publish ``staging`` as ``target`` inside ``base``."""
     _confined(base, staging, label)
     _confined(base, target, label)
-    target.parent.mkdir(parents=True, exist_ok=True)
+    Path(_long(target).parent).mkdir(parents=True, exist_ok=True)
     trash = None
     if os.path.lexists(target):
         trash = target.with_name(target.name + '.manager-old-' + uuid4().hex[:8])
         _confined(base, trash, label)
-        os.replace(target, trash)
+        os.replace(_long(target), _long(trash))
     try:
-        os.replace(staging, target)
+        os.replace(_long(staging), _long(target))
     except OSError:
         if trash is not None and not os.path.lexists(target):
-            os.replace(trash, target)
+            os.replace(_long(trash), _long(target))
         raise
     finally:
         if trash is not None and os.path.lexists(trash):
-            shutil.rmtree(trash, ignore_errors=True)
+            shutil.rmtree(_long(trash), ignore_errors=True)
 
 
 def _remove_directory(base, target, label):
     """Recursively delete ``target`` after confinement checks."""
     _confined(base, target, label)
     if os.path.lexists(target):
-        shutil.rmtree(target, ignore_errors=True)
+        shutil.rmtree(_long(target), ignore_errors=True)
 
 
 class PluginSync:

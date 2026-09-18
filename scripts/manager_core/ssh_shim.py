@@ -236,7 +236,12 @@ def route_arguments(arguments: list[str], manifest: dict) -> tuple[list[str], di
     matching = [item for item in bindings if item['alias'] == invocation.destination]
     if len(matching) != 1:
         if invocation.destination in manifest.get('pending_policy_hosts', []):
-            raise ShimError('ssh_policy_pending', 'This host must apply the selected profile model settings before SSH reconnects.')
+            # A host whose saved settings predate the current policy is repaired
+            # through the same scoped auto-prepare path as an unprepared host.
+            # Only hosts without a saved alias stay blocked, because their remote
+            # launcher arguments cannot be reconstructed automatically.
+            if invocation.destination not in manifest.get('auto_prepare_aliases', []):
+                raise ShimError('ssh_policy_pending', 'This host must apply the selected profile model settings before SSH reconnects.')
         raise ShimError('host_binding_required', 'Prepare this SSH host for the selected profile in Control Center first.')
     binding = matching[0]
     operation, marker, outer = decode_native(tail[0], manifest.get('native_cli', 'codex'))

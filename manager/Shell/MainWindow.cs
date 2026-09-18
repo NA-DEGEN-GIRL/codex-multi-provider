@@ -730,7 +730,15 @@ public sealed class MainWindow : Window
             age >= 86400 ? $" · {age / 86400}일 전 값" : age >= 3600 ? $" · {age / 3600}시간 전 값" :
             age >= 120 ? $" · {age / 60}분 전 값" : "";
         if (stamp == "" && (usage.S("freshness") == "stale" || usage.Get("error").ValueKind is not (JsonValueKind.Null or JsonValueKind.Undefined))) stamp = " · 이전 값";
-        return string.Join(" / ", text) + stamp;
+        // Weekly reset time and any redeemable reset credits stay on the card so
+        // the profile list answers "when does it come back" without a dialog.
+        var reset = windows.FirstOrDefault(w => w.S("label", w.S("name")) == "주간");
+        var resetText = reset.ValueKind == JsonValueKind.Object && reset.Get("resets_at").ValueKind == JsonValueKind.Number
+            ? $" · {DateTimeOffset.FromUnixTimeSeconds(reset.Get("resets_at").GetInt64()).ToLocalTime():M/d HH:mm} 초기화" : "";
+        var credits = usage.Get("reset_credits");
+        var creditText = credits.ValueKind == JsonValueKind.Object && credits.N("available") > 0
+            ? $" · 초기화권 {credits.N("available")}회" : "";
+        return string.Join(" / ", text) + resetText + creditText + stamp;
     }
     private async Task ShowProfileAsync(string id, string command = "profile.show")
     {

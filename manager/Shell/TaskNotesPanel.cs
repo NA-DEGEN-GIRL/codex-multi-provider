@@ -24,6 +24,8 @@ internal sealed class TaskNotesPanel : Border
     private readonly WrapPanel tabs = new();
     private readonly Button add = new() { Name = "AddNote", Content = "+ 새 메모", Height = 32, Padding = new Thickness(10, 0, 10, 0), Margin = new Thickness(0), HorizontalContentAlignment = HorizontalAlignment.Center, ToolTip = "이 작업에 새 메모 추가" };
     private readonly Button options = new() { Content = "⋯", Width = 32, Height = 32, Margin = new Thickness(6, 0, 0, 0), Padding = new Thickness(0), HorizontalContentAlignment = HorizontalAlignment.Center, ToolTip = "메모 이름 변경 · 삭제 · 복구" };
+    private readonly Button fork = new() { Name = "ForkNote", Content = "?? fork", Height = 32, Padding = new Thickness(10, 0, 10, 0), Margin = new Thickness(6, 0, 0, 0), HorizontalContentAlignment = HorizontalAlignment.Center, Visibility = Visibility.Collapsed, ToolTip = "????? ??? ??? ? ???? ??? ?????. ???? ??? ????? ????." };
+    private bool shared;
     private readonly Button retry = new() { Content = "다시 저장", Visibility = Visibility.Collapsed };
     private readonly TextBox editor = new() { Name = "NoteBody", AcceptsReturn = true, AcceptsTab = true, TextWrapping = TextWrapping.Wrap,
         Background = Brushes.Transparent, Foreground = Brush(233, 236, 242), BorderThickness = new Thickness(0), Padding = new Thickness(0, 6, 0, 6), Margin = new Thickness(0), FontSize = 14, MaxLength = 65000, MinHeight = 52 };
@@ -48,6 +50,7 @@ internal sealed class TaskNotesPanel : Border
         var top = new StackPanel(); top.Children.Add(heading); top.Children.Add(taskTitle);
         var toolbar = new DockPanel { Margin = new Thickness(0, 0, 0, 10) };
         DockPanel.SetDock(options, Dock.Right); toolbar.Children.Add(options);
+        DockPanel.SetDock(fork, Dock.Right); toolbar.Children.Add(fork);
         add.HorizontalAlignment = HorizontalAlignment.Left; toolbar.Children.Add(add); top.Children.Add(toolbar);
         tabs.Margin = new Thickness(0, 0, 0, 10); top.Children.Add(tabs);
         retry.Click += async (_, _) => { if (loadFailed) await SelectTaskAsync(selected, reload: true); else if (editing is { } draft) await SaveAsync(draft); };
@@ -73,6 +76,7 @@ internal sealed class TaskNotesPanel : Border
         body.Children.Add(noteScroll); body.Children.Add(empty);
         layout.Children.Add(new Border { Background = Brush(18, 21, 27), BorderBrush = Brush(48, 54, 65), BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(8), Child = body }); Child = layout;
         add.Click += (_, _) => Add();
+        fork.Click += async (_, _) => await ForkAsync();
         editor.TextChanged += (_, _) =>
         {
             placeholder.Visibility = editor.Text.Length == 0 ? Visibility.Visible : Visibility.Collapsed;
@@ -97,6 +101,7 @@ internal sealed class TaskNotesPanel : Border
             var value = await request("notes.list", new { task = task.Task.Wire });
             if (selection != ticket) return;
             notes.AddRange(value.GetProperty("notes").Deserialize<List<TaskNote>>(NoteDrafts.Json) ?? []);
+            shared = value.TryGetProperty("shared", out var sharedFlag) && sharedFlag.ValueKind == JsonValueKind.True;
             foreach (var recovered in recovery.Recover(task.Task))
             {
                 var existing = notes.FindIndex(n => n.Id == recovered.Id);
@@ -110,8 +115,21 @@ internal sealed class TaskNotesPanel : Border
             var first = notes.FirstOrDefault(n => !n.Deleted);
             if (first is not null) Edit(first); else { RenderTabs(); RenderEditor(); status.Text = "아직 메모가 없습니다"; }
             foreach (var draft in drafts.Values.Where(d => d.Task == task.Task && d.Changed != d.Saved).ToArray()) _ = SaveAsync(draft);
+            fork.Visibility = shared && notes.Any(n => !n.Deleted) ? Visibility.Visible : Visibility.Collapsed;
         }
         catch (Exception error) { if (selection == ticket) { loadFailed = true; status.Text = "불러오기 실패 · " + error.Message; add.IsEnabled = false; retry.Content = "다시 불러오기"; retry.Visibility = Visibility.Visible; } }
+    }
+    private async Task ForkAsync()
+    {
+        if (selected is null || loadFailed || !shared) return;
+        if (editing is { } draft) await SaveAsync(draft);
+        try
+        {
+            await request("notes.fork", new { task = selected.Task.Wire });
+            status.Text = "??? ??????. ?? ? ??? ?? ?????.";
+            await SelectTaskAsync(selected, reload: true);
+        }
+        catch (Exception error) { status.Text = "?? fork ?? ? " + error.Message; }
     }
     internal void Add()
     {

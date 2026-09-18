@@ -52,45 +52,211 @@ pub struct Note {
 struct Document {
     version: u32,
     task: TaskKey,
+    #[serde(default)]
+    group_id: Option<String>,
+    #[serde(default)]
     notes: Vec<Note>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Group {
+    version: u32,
+    group_id: String,
+    notes: Vec<Note>,
+}
+
+fn group_path(root: &Path, group_id: &str) -> PathBuf {
+    root.join("work/control-center/note-groups")
+        .join(format!("{group_id}.json"))
+}
+
+/// Forked conversations inherit one shared note document until the user splits it.
+fn fork_parent(root: &Path, task: &TaskKey) -> Option<String> {
+    let path = root.join("work/control-center/note-forks.json");
+    let metadata = std::fs::metadata(&path).ok()?;
+    if metadata.len() > 4 * 1024 * 1024 {
+        return None;
+    }
+    let value: Value = serde_json::from_str(&std::fs::read_to_string(&path).ok()?).ok()?;
+    let entry = value.get(&task.thread_id)?;
+    let parent = entry.as_str().map(str::to_string).or_else(|| {
+        entry
+            .get("parent_thread_id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    })?;
+    (parent != task.thread_id).then_some(parent)
+}
+
+fn read_document(path: &Path, task: &TaskKey) -> Result<Option<Document>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    if std::fs::metadata(path)
+        .map_err(|_| "메모 파일을 확인하지 못했습니다.")?
+        .len()
+        > 4 * 1024 * 1024
+    {
+        return Err("메모 파일 크기를 확인해 주세요.".into());
+    }
+    let bytes = std::fs::read(path).map_err(|_| "메모 파일을 읽지 못했습니다.")?;
+    let value: Document = serde_json::from_slice(&bytes)
+        .map_err(|_| "메모 파일이 손상되었습니다. 원본은 보존되었습니다.")?;
+    if value.version != 1 && value.version != 2 {
+        return Err("메모 형식을 확인할 수 없습니다. 원본은 보존되었습니다.".into());
+    }
+    if &value.task != task {
+        return Err("메모 작업 정보가 다릅니다. 원본은 보존되었습니다.".into());
+    }
+    Ok(Some(value))
+}
+
+fn read_group(root: &Path, group_id: &str) -> Result<Group, String> {
+    let path = group_path(root, group_id);
+    if std::fs::metadata(&path)
+        .map_err(|_| "메모 그룹을 확인하지 못했습니다.")?
+        .len()
+        > 4 * 1024 * 1024
+    {
+        return Err("메모 그룹 크기를 확인해 주세요.".into());
+    }
+    let bytes = std::fs::read(&path).map_err(|_| "메모 그룹을 읽지 못했습니다.")?;
+    let value: Group = serde_json::from_slice(&bytes)
+        .map_err(|_| "메모 그룹이 손상되었습니다. 원본은 보존되었습니다.")?;
+    if value.version != 1 || value.group_id != group_id {
+        return Err("메모 그룹 형식이 다릅니다. 원본은 보존되었습니다.".into());
+    }
+    Ok(value)
+}
+
+fn write_group(root: &Path, group: &Group) -> Result<(), String> {
+    let bytes = serde_json::to_vec_pretty(group).map_err(|_| "메모를 저장하지 못했습니다.")?;
+    if bytes.len() > 4 * 1024 * 1024 {
+        return Err("작업 메모 용량을 초과했습니다.".into());
+    }
+    windows::atomic(&group_path(root, &group.group_id), &bytes)
+        .map_err(|_| "메모 저장에 실패했습니다. 편집 내용은 유지됩니다.".into())
+}
+
+fn write_document(root: &Path, document: &Document) -> Result<(), String> {
+    let bytes = serde_json::to_vec_pretty(document).map_err(|_| "메모를 저장하지 못했습니다.")?;
+    if bytes.len() > 4 * 1024 * 1024 {
+        return Err("작업 메모 용량을 초과했습니다.".into());
+    }
+    windows::atomic(&document.task.path(root), &bytes)
+        .map_err(|_| "메모 저장에 실패했습니다. 편집 내용은 유지됩니다.".into())
+}
+
+/// Start sharing: turn a task's own notes into the first document of a group.
+fn migrate_to_group(root: &Path, document: &mut Document) -> Result<String, String> {
+    let group_id = uuid::Uuid::new_v4().to_string();
+    write_group(
+        root,
+        &Group {
+            version: 1,
+            group_id: group_id.clone(),
+            notes: document.notes.clone(),
+        },
+    )?;
+    document.version = 2;
+    document.group_id = Some(group_id.clone());
+    document.notes = vec![];
+    write_document(root, document)?;
+    Ok(group_id)
+}
+
+fn clone_notes(notes: &[Note]) -> Vec<Note> {
+    notes
+        .iter()
+        .map(|note| Note {
+            id: uuid::Uuid::new_v4().to_string(),
+            title: note.title.clone(),
+            kind: note.kind.clone(),
+            body: note.body.clone(),
+            items: note
+                .items
+                .iter()
+                .map(|item| Item {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    text: item.text.clone(),
+                    done: item.done,
+                })
+                .collect(),
+            revision: 0,
+            deleted: note.deleted,
+            updated_at: note.updated_at,
+        })
+        .collect()
 }
 
 pub fn execute(root: &Path, command: &str, args: &Value) -> Result<Value, String> {
     let task = TaskKey::parse(args)?;
     let path = task.path(root);
-    let mut doc = if path.exists() {
-        if std::fs::metadata(&path)
-            .map_err(|_| "메모 파일을 확인하지 못했습니다.")?
-            .len()
-            > 4 * 1024 * 1024
-        {
-            return Err("메모 파일 크기를 확인해 주세요.".into());
+    let existed = path.exists();
+    let mut document = read_document(&path, &task)?.unwrap_or(Document {
+        version: 1,
+        task: task.clone(),
+        group_id: None,
+        notes: vec![],
+    });
+
+    // A forked conversation starts on the same note group as its source, so
+    // both tasks keep editing one document until the user splits it.
+    if !existed {
+        if let Some(parent) = fork_parent(root, &task) {
+            let source_task = TaskKey {
+                host_id: task.host_id.clone(),
+                thread_id: parent,
+            };
+            if let Ok(Some(mut source)) = read_document(&source_task.path(root), &source_task) {
+                let group = match source.group_id.clone() {
+                    Some(id) => Some(id),
+                    None if !source.notes.is_empty() => Some(migrate_to_group(root, &mut source)?),
+                    None => None,
+                };
+                if let Some(group_id) = group {
+                    document.version = 2;
+                    document.group_id = Some(group_id);
+                    document.notes = vec![];
+                    write_document(root, &document)?;
+                }
+            }
         }
-        let bytes = std::fs::read(&path).map_err(|_| "메모 파일을 읽지 못했습니다.")?;
-        let value: Document = serde_json::from_slice(&bytes)
-            .map_err(|_| "메모 파일이 손상되었습니다. 원본을 보존했습니다.")?;
-        if value.version != 1 || value.task != task {
-            return Err("메모 작업 정보가 다릅니다. 원본을 보존했습니다.".into());
-        }
-        value
-    } else {
-        Document {
-            version: 1,
-            task,
-            notes: vec![],
-        }
-    };
+    }
+
+    if command == "notes.fork" {
+        let current = resolved_notes(root, &document)?;
+        let group_id = uuid::Uuid::new_v4().to_string();
+        let split = clone_notes(&current);
+        write_group(
+            root,
+            &Group {
+                version: 1,
+                group_id: group_id.clone(),
+                notes: split.clone(),
+            },
+        )?;
+        document.version = 2;
+        document.group_id = Some(group_id);
+        document.notes = vec![];
+        write_document(root, &document)?;
+        return Ok(json!({"state": "forked", "task": document.task, "notes": split}));
+    }
     if command == "notes.list" {
-        return Ok(json!({"task":doc.task,"notes":doc.notes}));
+        return Ok(
+            json!({"task": document.task, "notes": resolved_notes(root, &document)?,
+                         "shared": document.group_id.is_some()}),
+        );
     }
     let id = protocol::uuid(args, "note_id")?;
-    let expected = args["revision"].as_u64().ok_or("메모 버전이 없습니다.")?;
-    let index = doc.notes.iter().position(|n| n.id == id);
-    let current = index.map(|i| doc.notes[i].revision).unwrap_or(0);
+    let expected = args["revision"].as_u64().ok_or("?? ??? ????.")?;
+    let mut notes = resolved_notes(root, &document)?;
+    let index = notes.iter().position(|n| n.id == id);
+    let current = index.map(|i| notes[i].revision).unwrap_or(0);
     if current != expected {
-        return Ok(json!({"state":"conflict","current":index.map(|i| doc.notes[i].clone())}));
+        return Ok(json!({"state": "conflict", "current": index.map(|i| notes[i].clone())}));
     }
-    let mut note = index.map(|i| doc.notes[i].clone()).unwrap_or(Note {
+    let mut note = index.map(|i| notes[i].clone()).unwrap_or(Note {
         id,
         title: String::new(),
         kind: "text".into(),
@@ -103,24 +269,24 @@ pub fn execute(root: &Path, command: &str, args: &Value) -> Result<Value, String
     match command {
         "notes.save" => {
             if note.deleted {
-                return Err("삭제된 메모입니다. 복구 후 편집해 주세요.".into());
+                return Err("??? ?????. ?? ? ??? ???.".into());
             }
             note.title = args["title"].as_str().unwrap_or("").trim().into();
             if note.title.is_empty()
                 || note.title.chars().count() > 80
                 || note.title.chars().any(char::is_control)
             {
-                return Err("메모 이름은 1~80자로 입력해 주세요.".into());
+                return Err("?? ??? 1~80?? ??? ???.".into());
             }
             note.kind = args["kind"].as_str().unwrap_or("text").into();
             if !["text", "checklist"].contains(&note.kind.as_str()) {
-                return Err("지원하지 않는 메모 종류입니다.".into());
+                return Err("???? ?? ?? ?????.".into());
             }
             note.body = args["body"].as_str().unwrap_or("").into();
             note.items = serde_json::from_value(args.get("items").cloned().unwrap_or(json!([])))
-                .map_err(|_| "체크리스트 형식이 잘못되었습니다.")?;
+                .map_err(|_| "????? ??? ???? ????.".to_string())?;
             if note.body.len() > 128 * 1024 || note.items.len() > 500 {
-                return Err("메모가 너무 큽니다. 새 탭으로 나눠 주세요.".into());
+                return Err("??? ?? ???. ??? ?? ???.".into());
             }
             let mut ids = HashSet::new();
             for item in &note.items {
@@ -128,13 +294,13 @@ pub fn execute(root: &Path, command: &str, args: &Value) -> Result<Value, String
                     || !ids.insert(&item.id)
                     || item.text.len() > 8192
                 {
-                    return Err("체크리스트 항목을 확인해 주세요.".into());
+                    return Err("????? ??? ??? ???.".into());
                 }
             }
         }
         "notes.delete" if index.is_some() => note.deleted = true,
         "notes.restore" if index.is_some() => note.deleted = false,
-        _ => return Err("지원하지 않는 메모 요청입니다.".into()),
+        _ => return Err("???? ?? ?? ?????.".into()),
     }
     note.revision += 1;
     note.updated_at = std::time::SystemTime::now()
@@ -142,15 +308,34 @@ pub fn execute(root: &Path, command: &str, args: &Value) -> Result<Value, String
         .unwrap_or_default()
         .as_millis() as u64;
     match index {
-        Some(i) => doc.notes[i] = note.clone(),
-        None if doc.notes.len() < 128 => doc.notes.push(note.clone()),
-        _ => return Err("메모 탭이 너무 많습니다.".into()),
+        Some(i) => notes[i] = note.clone(),
+        None if notes.len() < 128 => notes.push(note.clone()),
+        _ => return Err("?? ?? ?? ????.".into()),
     }
-    let bytes = serde_json::to_vec_pretty(&doc).map_err(|_| "메모를 저장하지 못했습니다.")?;
-    if bytes.len() > 4 * 1024 * 1024 {
-        return Err("작업 메모 용량을 초과했습니다.".into());
+    store_notes(root, &mut document, notes)?;
+    Ok(json!({"state": "saved", "note": note}))
+}
+
+fn resolved_notes(root: &Path, document: &Document) -> Result<Vec<Note>, String> {
+    match document.group_id.as_deref() {
+        Some(group_id) => Ok(read_group(root, group_id)?.notes),
+        None => Ok(document.notes.clone()),
     }
-    windows::atomic(&path, &bytes)
-        .map_err(|_| "메모 저장에 실패했습니다. 편집 내용은 유지됩니다.")?;
-    Ok(json!({"state":"saved","note":note}))
+}
+
+fn store_notes(root: &Path, document: &mut Document, notes: Vec<Note>) -> Result<(), String> {
+    match document.group_id.clone() {
+        Some(group_id) => write_group(
+            root,
+            &Group {
+                version: 1,
+                group_id,
+                notes,
+            },
+        ),
+        None => {
+            document.notes = notes;
+            write_document(root, document)
+        }
+    }
 }

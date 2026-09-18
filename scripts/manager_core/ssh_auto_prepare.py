@@ -86,6 +86,8 @@ def ensure_binding(arguments, manifest, path, *, remote=None):
                 if current.get('generation') != generation:
                     raise ShimError('ssh_generation_changed', 'SSH 프로필 실행이 변경되었습니다.')
                 current['bindings'] = [b for b in current.get('bindings', []) if b.get('alias') != alias] + [binding]
+                if 'pending_policy_hosts' in current:
+                    current['pending_policy_hosts'] = [a for a in current['pending_policy_hosts'] if a != alias]
                 atomic_json(expected, current)
             finally:
                 _unlock_file(write_lock)

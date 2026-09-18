@@ -31,6 +31,60 @@ fn retirement_requires_known_idle_management_state_not_closed_apps() {
 }
 
 #[test]
+fn forked_conversations_share_notes_until_the_user_splits_them() {
+    let root = tempdir().unwrap();
+    let parent = uuid::Uuid::new_v4().to_string();
+    let child = uuid::Uuid::new_v4().to_string();
+    let task = |thread: &str| json!({"task":{"host_id":"local","thread_id":thread}});
+    let mut args = note_args();
+    args["task"]["thread_id"] = json!(parent);
+    args["title"] = json!("?? ??");
+    args["kind"] = json!("text");
+    args["items"] = json!([]);
+    notes::execute(root.path(), "notes.save", &args).unwrap();
+
+    let forks = root.path().join("work/control-center/note-forks.json");
+    std::fs::create_dir_all(forks.parent().unwrap()).unwrap();
+    let mut mapping = serde_json::Map::new();
+    mapping.insert(child.clone(), json!(parent));
+    std::fs::write(&forks, Value::Object(mapping).to_string()).unwrap();
+
+    let child_list = notes::execute(root.path(), "notes.list", &task(&child)).unwrap();
+    assert_eq!(child_list["notes"][0]["title"], "?? ??");
+    assert_eq!(child_list["shared"], true);
+
+    // Until the split both tasks edit one shared document.
+    let mut edit = task(&child);
+    edit["note_id"] = child_list["notes"][0]["id"].clone();
+    edit["revision"] = child_list["notes"][0]["revision"].clone();
+    edit["title"] = json!("?? ?? ??");
+    edit["kind"] = json!("text");
+    edit["body"] = json!("child edit");
+    edit["items"] = json!([]);
+    notes::execute(root.path(), "notes.save", &edit).unwrap();
+    let parent_list = notes::execute(root.path(), "notes.list", &task(&parent)).unwrap();
+    assert_eq!(parent_list["notes"][0]["body"], "child edit");
+
+    // ?? fork copies the notes and stops the synchronization from then on.
+    let split = notes::execute(root.path(), "notes.fork", &task(&child)).unwrap();
+    assert_eq!(split["state"], "forked");
+    assert_ne!(split["notes"][0]["id"], parent_list["notes"][0]["id"]);
+    let mut after = task(&child);
+    after["note_id"] = split["notes"][0]["id"].clone();
+    after["revision"] = split["notes"][0]["revision"].clone();
+    after["title"] = json!("?? ??");
+    after["kind"] = json!("text");
+    after["body"] = json!("child only");
+    after["items"] = json!([]);
+    notes::execute(root.path(), "notes.save", &after).unwrap();
+    let parent_after = notes::execute(root.path(), "notes.list", &task(&parent)).unwrap();
+    assert_eq!(parent_after["notes"][0]["body"], "child edit");
+    assert_eq!(parent_after["notes"].as_array().unwrap().len(), 1);
+    let child_after = notes::execute(root.path(), "notes.list", &task(&child)).unwrap();
+    assert_eq!(child_after["notes"][0]["body"], "child only");
+}
+
+#[test]
 fn checklist_persists_edits_completion_and_conflicts() {
     let root = tempdir().unwrap();
     let mut args = note_args();

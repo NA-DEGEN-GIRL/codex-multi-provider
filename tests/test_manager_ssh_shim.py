@@ -242,6 +242,31 @@ class ManifestTests(unittest.TestCase):
                 route_arguments(['remote-dev',command],manifest)
             self.assertEqual(raised.exception.code,'ssh_policy_pending')
 
+    def test_stale_policy_host_with_saved_alias_is_repaired_instead_of_blocked(self):
+        # A reboot or a policy change can leave every prepared host pending.
+        # Hosts with a saved alias must reach the scoped auto-prepare path
+        # instead of failing forever with the pending-policy error.
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            proxy=root/'ssh.exe';real=root/'original.exe'
+            proxy.touch();real.touch()
+            profile=root/'work/control-center/profiles'/PROFILE
+            (profile/'codex').mkdir(parents=True)
+            (profile/'codex/.codex-global-state.json').write_text(json.dumps({
+                'codex-managed-remote-connections': [
+                    {'alias': 'remote-dev', 'hostId': 'remote-ssh-discovered:remote-dev'}]}),encoding='utf-8')
+            old={**binding(),'model_ids':[PROFILE]}
+            scoped=prepare_environment(root,PROFILE,[old],{},app_version='26.908.4834.0',
+                                       ssh_proxy=proxy,real_ssh=real,selected_model_ids=[])
+            saved=json.loads(Path(scoped['CODEX_MANAGER_SSH_BINDINGS']).read_text())
+            self.assertEqual(saved['bindings'],[])
+            self.assertEqual(saved['pending_policy_hosts'],['remote-dev'])
+            self.assertEqual(saved['auto_prepare_aliases'],['remote-dev'])
+            command=native_command(native_bodies()['native-proxy'],bytes(range(8)))
+            with self.assertRaises(ShimError) as raised:
+                route_arguments(['remote-dev',command],saved)
+            self.assertEqual(raised.exception.code,'host_binding_required')
+
     def test_opening_task_preserves_live_binding_until_new_generation(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
