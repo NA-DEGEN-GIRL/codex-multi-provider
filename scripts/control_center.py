@@ -68,6 +68,8 @@ class ControlCenter:
         self._request_gate_lock=threading.Lock()
         from manager_core.personal_skills import PersonalSkills
         self.personal_skills=PersonalSkills(self.store)
+        from manager_core.plugin_sync import PluginSync
+        self.shared_plugins=PluginSync(self.store)
 
     def catalog_sources(self):
         capabilities=runtime_build(self.root).get('capabilities',{})
@@ -468,6 +470,7 @@ def main():
     center=ControlCenter(args.root,supervisor_protocol=int(protocol) if protocol.isdecimal() else 0)
     if args.serve:
         center.personal_skills.start()
+        center.shared_plugins.start()
         center.catalog_refresh.start(center.catalog_sources)
         center.source_catalog_refresh.start(center.native_catalog_sources)
         center.remote_catalog.start()
@@ -499,6 +502,7 @@ def main():
         center.update_jobs.shutdown()
         center.restarts.shutdown()
         if args.serve:
+            center.shared_plugins.shutdown()
             center.personal_skills.shutdown()
             center.catalog_refresh.stop()
             center.source_catalog_refresh.stop()

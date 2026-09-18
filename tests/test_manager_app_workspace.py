@@ -8,7 +8,9 @@ import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
+from manager_core import membership_proofs
 from manager_core.app_preferences import prepare
+from manager_core.app_workspace import current_workspace
 from manager_core.source_catalog import projection_id
 
 
@@ -227,6 +229,85 @@ class WorkspaceTests(unittest.TestCase):
             state = json.loads((target / path.name).read_text())
             self.assertNotIn(thread,state['thread-project-assignments'])
             self.assertIn(thread,state['projectless-thread-ids'])
+
+    def membership_fixture(self, source, thread, *, native, extra_projects=(), mapping=None, **migration):
+        """Source snapshot whose native membership for one task is ambiguous."""
+        mapping = {'audio': 'native-audio'} if mapping is None else dict(mapping)
+        projects = [('native-audio', 'audio'), *((name, name) for name in extra_projects)]
+        self.database(source, projects, [(thread, str(source), native, 'Task')])
+        host = 'local:' + str(source)
+        return {
+            'local-projects': {'audio': dict(id='audio', name='audio', rootPaths=[str(source)])},
+            'app-server-project-id-by-legacy-project-id-by-host': {host: mapping},
+            'app-server-projects-migration-by-host': {host: dict(projectsMigrated=True, **migration)},
+            'thread-project-assignments': {thread: dict(projectKind='local', projectId='audio')},
+        }
+
+    def test_pending_assignment_survives_recorded_legacy_migration(self):
+        # threadAssignmentsMigrated was recorded true regardless of completion,
+        # so it must not let a NULL erase a task the desktop still imports.
+        with tempfile.TemporaryDirectory() as temp:
+            source, target = (Path(temp) / name for name in ('source', 'target'))
+            thread = '00000000-0000-4000-9000-000000000006'
+            donor = self.membership_fixture(source, thread, native=None,
+                threadAssignmentsMigrated=True, pendingThreadAssignmentIds=[thread])
+            (source / '.codex-global-state.json').write_text(json.dumps(donor))
+            prepare(target, source)
+            state = json.loads((target / '.codex-global-state.json').read_text())
+            projected = projection_id('legacy:' + hashlib.sha256(str(source).encode()).hexdigest(), thread)
+            self.assertEqual(state['thread-project-assignments'].get(projected),
+                             {'projectKind': 'local', 'projectId': 'audio'})
+            self.assertNotIn(thread, state.get('projectless-thread-ids', []))
+            aliases = json.loads((target / '.manager-project-aliases.json').read_text())
+            self.assertEqual(aliases['threadAssignments'], {thread: 'audio'})
+
+    def test_pending_assignment_survives_even_with_confirmed_read_migration(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / 'source'
+            thread = '00000000-0000-4000-9000-000000000007'
+            original = self.membership_fixture(source, thread, native=None,
+                threadAssignmentsMigrated=True, threadAssignmentsReadMigrated=True,
+                pendingThreadAssignmentIds=[thread])
+            result = current_workspace(source, original)
+            self.assertEqual(result['thread-project-assignments'][thread]['projectId'], 'audio')
+            self.assertNotIn(thread, result['projectless-thread-ids'])
+
+    def test_unconfirmed_null_keeps_assignment_until_read_migration_or_proof(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / 'source'
+            thread = '00000000-0000-4000-9000-000000000008'
+            original = self.membership_fixture(source, thread, native=None,
+                threadAssignmentsMigrated=True)
+            preserved = current_workspace(source, original)
+            self.assertEqual(preserved['thread-project-assignments'][thread]['projectId'], 'audio')
+            self.assertNotIn(thread, preserved['projectless-thread-ids'])
+            # A confirmed read migration turns the same NULL into a real removal.
+            migration = original['app-server-projects-migration-by-host']['local:' + str(source)]
+            migration['threadAssignmentsReadMigrated'] = True
+            cleared = current_workspace(source, original)
+            self.assertNotIn(thread, cleared['thread-project-assignments'])
+            self.assertIn(thread, cleared['projectless-thread-ids'])
+            # A per-task proof is the other accepted confirmation.
+            migration.pop('threadAssignmentsReadMigrated')
+            signals = Path(temp) / 'record-signals'
+            membership_proofs.remember(signals, [thread])
+            proven = current_workspace(source, original, signals=signals)
+            self.assertNotIn(thread, proven['thread-project-assignments'])
+            self.assertIn(thread, proven['projectless-thread-ids'])
+            # Without a signals path no proof is read, so an unknown NULL stays safe.
+            self.assertIn(thread, current_workspace(source, original)['thread-project-assignments'])
+
+    def test_unknown_native_project_does_not_clear_legacy_assignment(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / 'source'
+            thread = '00000000-0000-4000-9000-000000000009'
+            # The native row names a project this store no longer describes:
+            # not the retained legacy membership's removal evidence.
+            original = self.membership_fixture(source, thread, native='native-gone',
+                threadAssignmentsMigrated=True, threadAssignmentsReadMigrated=True)
+            result = current_workspace(source, original)
+            self.assertEqual(result['thread-project-assignments'][thread]['projectId'], 'audio')
+            self.assertNotIn(thread, result['projectless-thread-ids'])
 
 
 if __name__ == '__main__':

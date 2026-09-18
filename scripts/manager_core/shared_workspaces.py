@@ -151,6 +151,6 @@ def prepare_home(root, home):
     order = [key for key in state.get('project-order', []) if key not in removed]
     state['project-order'] = list(dict.fromkeys(order + list(projects) + list(remotes)))
     from .project_membership import project_memberships
-    project_memberships(state, home)
+    project_memberships(state, home, signals=directory)
     if json.dumps(state) != before:
         atomic_json(home / '.codex-global-state.json', state)

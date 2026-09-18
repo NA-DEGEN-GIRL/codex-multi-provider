@@ -3,17 +3,81 @@
 // explicit local moves through the common runtime, and project peer metadata
 // back through the native assignment store without navigating any window.
 (() => {
-  if(!(process.env.CODEX_RECORD_SIGNALS||process.env.CODEX_MANAGER_RECORD_SIGNALS))return;
+  const root=process.env.CODEX_RECORD_SIGNALS||process.env.CODEX_MANAGER_RECORD_SIGNALS;
+  if(!root)return;
+  const fs=require('node:fs').promises,path=require('node:path');
+  const writer=process.env.CODEX_MANAGER_PROFILE_ID||'00000000-0000-4000-8000-000000000001';
+  const directory=path.join(root,'project-membership-proofs'),file=path.join(directory,writer+'.json');
+  const proven=new Set(),owned=new Set(),stamps=new Map(),wakeups=new Set(),connections=new WeakSet();
+  let proofDirty=false,proofRunning=false;
   const registered=new WeakSet(),drainers=new WeakMap(),uuid=/^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i;
   const assignmentKey='thread-project-assignments',migrationKey='app-server-projects-migration-by-host';
-  globalThis.__codexProjectMembership={refresh:backend=>drainers.get(backend)?.(),register(backend){
+  function confirm(id){
+    if(typeof id!=='string'||!uuid.test(id))return;
+    proven.add(id);
+    if(!owned.has(id)){owned.add(id);proofDirty=true;}
+  }
+  async function proofTick(){
+    if(proofRunning)return;proofRunning=true;
+    try{
+      await fs.mkdir(directory,{recursive:true});
+      for(const name of (await fs.readdir(directory)).filter(n=>n.endsWith('.json')&&uuid.test(n.slice(0,-5))).slice(0,256)){
+        try{
+          const full=path.join(directory,name),stat=await fs.stat(full),stamp=stat.mtimeMs+':'+stat.size;
+          if(!stat.isFile()||stat.size>8*1024*1024||stamps.get(name)===stamp)continue;
+          const data=JSON.parse(await fs.readFile(full,'utf8'));
+          if(data.version!==1||!Array.isArray(data.thread_ids)||data.thread_ids.length>131072||data.thread_ids.some(id=>typeof id!=='string'||!uuid.test(id)))continue;
+          for(const id of data.thread_ids){proven.add(id);if(name===writer+'.json')owned.add(id);}
+          stamps.set(name,stamp);
+        }catch{/* One damaged writer cannot turn unknown membership into a removal. */}
+      }
+      if(proofDirty&&owned.size<=131072){
+        const size=owned.size,temp=file+'.'+process.pid+'.tmp';
+        await fs.writeFile(temp,JSON.stringify({version:1,thread_ids:[...owned].sort()}),'utf8');
+        await fs.rename(temp,file);if(owned.size===size)proofDirty=false;
+      }
+      for(const wake of wakeups)if(!wake())wakeups.delete(wake);
+    }catch{/* Keep legacy membership while storage is unavailable; retry later. */}
+    finally{proofRunning=false;}
+  }
+  globalThis.__codexProjectMembership={refresh:backend=>drainers.get(backend)?.(),tick:proofTick,register(backend){
     if(registered.has(backend)||backend.cache.hostId!=='local'||!backend.threadAssignments)return;
     registered.add(backend);
     const nativeWrite=backend.writeThreadAssignment,nativeObserve=backend.observeThreads;
     if(typeof nativeWrite!=='function'||typeof nativeObserve!=='function')return;
-    const writing=new Map(),versions=new Map(),pending=new Map(),reading=new Set();
+    const writing=new Map(),versions=new Map(),pending=new Map(),reading=new Set(),unimported=new Set();
     let draining=false;
     const local=a=>a?.projectKind==='local'&&backend.cache.getProjects()?.[a.projectId]!=null;
+    function preserveUnknownNull(id){
+      const state=backend.globalState,current=state.getStored(assignmentKey)?.[id];
+      const migration=state.getStored(migrationKey)?.[backend.migrationIdentity];
+      const legacy=current?.projectKind==='local'&&(current.projectOrigin!=='chatgpt'||local(current));
+      // Read migration can finish while individual legacy writes remain pending.
+      return legacy&&(migration?.pendingThreadAssignmentIds?.includes(id)||
+        (!proven.has(id)&&migration?.threadAssignmentsReadMigrated!==true));
+    }
+    const nativeAdopt=backend.threadAssignments.adopt;
+    backend.threadAssignments.adopt=function(id,projectId){
+      if(projectId!=null)confirm(id);
+      // A mode switch can observe a NULL before legacy membership has ever
+      // reached native storage. It is not evidence of a user removing a task.
+      if(projectId===null&&preserveUnknownNull(id)){
+        unimported.add(id);return;
+      }
+      unimported.delete(id);
+      return Reflect.apply(nativeAdopt,this,arguments);
+    };
+    const connection=backend.connection;
+    if(!connections.has(connection)){
+      connections.add(connection);const request=connection.sendAppServerRequest;
+      connection.sendAppServerRequest=async function(method,params){
+        const result=await Reflect.apply(request,this,arguments);
+        // Success, including an explicit empty projectId, proves a native write.
+        // Observations, mode changes and failed RPCs never prove a removal.
+        if(method==='thread/metadata/update'&&typeof params?.projectId==='string')confirm(params.threadId);
+        return result;
+      };
+    }
     function committed(id){
       const state=backend.globalState,host=backend.migrationIdentity,migrations=state.getStored(migrationKey)||{};
       const previous=migrations[host];
@@ -60,7 +124,8 @@
               if(thread.projectId!=null&&!backend.legacyProjectIdsByServerId.has(thread.projectId)){
                 if(failures<3)pending.set(id,failures+1);continue;
               }
-              backend.threadAssignments.adopt(id,thread.projectId);committed(id);
+              backend.threadAssignments.adopt(id,thread.projectId);
+              if(!unimported.has(id))committed(id);
             }
           }catch{if(failures<2)pending.set(id,failures+1);}
           finally{reading.delete(id);}
@@ -69,10 +134,12 @@
       finally{draining=false;}
     }
     backend.observeThreads=function(threads){
+      for(const thread of threads)if(thread.projectId!=null)confirm(thread.id);
       const result=Reflect.apply(nativeObserve,this,arguments);
       if(backend.threadAssignmentsEnabled||backend.disposed)return result;
       for(const thread of threads){
         if(!uuid.test(thread.id)||thread.projectId===undefined||writing.has(thread.id)||reading.has(thread.id))continue;
+        if(thread.projectId===null&&unimported.has(thread.id)&&preserveUnknownNull(thread.id))continue;
         if(backend.threadAssignments.matches(thread.id,thread.projectId))continue;
         pending.set(thread.id,0);
       }
@@ -81,5 +148,13 @@
       return result;
     };
     drainers.set(backend,drain);
+    wakeups.add(()=>{
+      if(backend.disposed)return false;
+      for(const id of unimported)if(!preserveUnknownNull(id)){unimported.delete(id);pending.set(id,0);}
+      if(pending.size)void drain();
+      return true;
+    });
+    void proofTick();
   }};
+  setInterval(proofTick,700).unref();
 })();

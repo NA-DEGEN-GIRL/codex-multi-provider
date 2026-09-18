@@ -2,6 +2,7 @@
 import hashlib
 import json
 from pathlib import Path
+import re
 import shutil
 import struct
 from uuid import uuid4
@@ -30,10 +31,36 @@ RENDERER_PATCHES = {
     b'onNotification(e,t,n=null,r){if(this.assertActive(),':
         b'onNotification(e,t,n=null,r){globalThis.__codexRendererRecordSync?.observe(this,e,t);if(this.assertActive(),',
     b'this.requestClient=n;let y=this.settings.restricted;':
-        b'this.requestClient=n;globalThis.__codexRendererRecordSync?.register(this);let y=this.settings.restricted;',
+        b'this.requestClient=n;globalThis.__codexRendererRecordSync?.register(this);globalThis.__codexPluginRendererSync?.register(this);let y=this.settings.restricted;',
     b'shouldApplyHydratedThread:()=>c===this.hydrationGeneration&&(n?.isCurrent()??!0)':
         b'shouldApplyHydratedThread:()=>c===this.hydrationGeneration&&(n?.isCurrent()??!0)&&(globalThis.__codexRendererRecordSync?.canApply(this)??true)',
 }
+
+# The native renderer notification case for `skills/changed` invalidates only
+# the skills query. Plugin/skill membership changed, so the verified case also
+# invalidates the `plugins` prefix (Fw=[`plugins`]) and exposes a bounded
+# counter for the live fixture. A missing case only skips this extra
+# invalidation; the main adapter still reloads through the native app-server.
+_PLUGIN_RENDERER_MARK = b'globalThis.__codexPluginInvalidations'
+_PLUGIN_RENDERER_CASE = re.compile(
+    rb'case`skills/changed`:([A-Za-z_$][A-Za-z0-9_$]*)\.queryClient'
+    rb'\.invalidateQueries\(\{queryKey:\[`skills`\]\}\);break;')
+
+
+def renderer_plugin_patches(data):
+    matches = list(_PLUGIN_RENDERER_CASE.finditer(data))
+    if len(matches) > 1:
+        raise ValueError('Ambiguous desktop plugin refresh case.')
+    if not matches:
+        # Already patched (isolated fixture) or a version without the verified
+        # case: the reload still runs, only this extra invalidation is skipped.
+        return {}
+    receiver = matches[0].group(1)
+    replacement = (b'case`skills/changed`:' + _PLUGIN_RENDERER_MARK + b'=(' + _PLUGIN_RENDERER_MARK +
+        b'||0)+1;' + receiver + b'.queryClient.invalidateQueries({queryKey:[`skills`]});' +
+        receiver + b'.queryClient.invalidateQueries({queryKey:[`plugins`]});break;')
+    return {matches[0].group(0): replacement}
+
 
 def renderer_patches_for(data):
     return RENDERER_PATCHES if all(data.count(key)==1 for key in RENDERER_PATCHES) else None
@@ -78,12 +105,18 @@ def patch_archive(source, destination):
             updated = data
             for pattern, replacement in replacements.items():
                 updated = updated.replace(pattern, replacement)
+            if module.startswith('webview/'):
+                for pattern, replacement in renderer_plugin_patches(data).items():
+                    updated = updated.replace(pattern, replacement)
             helper = 'desktop_renderer_record_sync.cjs' if module.startswith('webview/') else 'desktop_record_sync.cjs'
             updated = Path(__file__).with_name(helper).read_bytes() + b'\n' + updated
+            if module.startswith('webview/'):
+                updated = Path(__file__).with_name('desktop_plugin_renderer_sync.cjs').read_bytes() + b'\n' + updated
             updated = Path(__file__).with_name('desktop_profile_resume.cjs').read_bytes() + b'\n' + updated
             if not module.startswith('webview/'):
                 updated = b'\n'.join(Path(__file__).with_name(name).read_bytes() for name in (
-                    'desktop_workspace_sync.cjs', 'desktop_project_membership.cjs', 'desktop_local_workspace_sync.cjs')) + b'\n' + updated
+                    'desktop_workspace_sync.cjs', 'desktop_project_membership.cjs', 'desktop_local_workspace_sync.cjs',
+                    'desktop_plugin_sync.cjs')) + b'\n' + updated
             if module == name:
                 updated = Path(__file__).with_name('desktop_network_policy.cjs').read_bytes() + b'\n' + updated
                 after = updated
@@ -125,6 +158,8 @@ def prepare(root, app):
         adapter=hashlib.sha256(adapter.read_bytes()).hexdigest(),
         workspace=hashlib.sha256(Path(__file__).with_name('desktop_workspace_sync.cjs').read_bytes()).hexdigest(),
         local_workspace=hashlib.sha256(Path(__file__).with_name('desktop_local_workspace_sync.cjs').read_bytes()).hexdigest(),
+        plugin=hashlib.sha256(Path(__file__).with_name('desktop_plugin_sync.cjs').read_bytes()).hexdigest(),
+        plugin_renderer=hashlib.sha256(Path(__file__).with_name('desktop_plugin_renderer_sync.cjs').read_bytes()).hexdigest(),
         membership=hashlib.sha256(Path(__file__).with_name('desktop_project_membership.cjs').read_bytes()).hexdigest(),
         profile_resume=hashlib.sha256(Path(__file__).with_name('desktop_profile_resume.cjs').read_bytes()).hexdigest(),
         renderer=hashlib.sha256(Path(__file__).with_name('desktop_renderer_record_sync.cjs').read_bytes()).hexdigest(),

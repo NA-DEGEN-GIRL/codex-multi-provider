@@ -58,7 +58,7 @@ def merge_desktop(text, values):
     return updated
 
 
-def prepare(home, source, *, account_id=None, ssh_ready_aliases=None, canonical=False):
+def prepare(home, source, *, account_id=None, ssh_ready_aliases=None, canonical=False, signals=None):
     home, source = Path(home).resolve(), Path(source).resolve()
     if home == source:
         raise ValueError('원본 앱의 설정은 덮어쓰지 않습니다.')
@@ -89,12 +89,13 @@ def prepare(home, source, *, account_id=None, ssh_ready_aliases=None, canonical=
     original = json.loads(donor_state.read_text(encoding='utf-8-sig')) if donor_state.is_file() else {}
     current = json.loads(state.read_text(encoding='utf-8-sig')) if state.exists() else {}
     from .app_workspace import merge_workspace, remove_imported_projects
-    project_aliases, result['workspace'] = merge_workspace(current, original, owned, source, ssh_ready_aliases=ssh_ready_aliases)
+    project_aliases, result['workspace'] = merge_workspace(current, original, owned, source,
+        ssh_ready_aliases=ssh_ready_aliases, signals=signals)
     if canonical:
         # Project IDs now belong to the shared store. Never run each profile's
         # legacy importer against it or resurrect removed project declarations.
         from .app_workspace import current_workspace
-        workspace = current_workspace(source, original)
+        workspace = current_workspace(source, original, signals=signals)
         host = 'local:' + str(home)
         donor_host = 'local:' + str(source)
         current.setdefault('app-server-project-id-by-legacy-project-id-by-host', {})[host] = deepcopy(

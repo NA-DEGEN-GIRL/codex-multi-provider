@@ -216,6 +216,9 @@
       localManagers();
       if (manager.disposed || managers.has(manager)) return;
       managers.add(manager);
+      // Shared plugin/skill revisions refresh through this manager's own
+      // app-server request client; optional so isolated adapters still load.
+      globalThis.__codexPluginSync?.register(manager);
       const local = { turns:new Map(), requests:new Map() };
       activity.set(manager, local);
       const client = manager.requestClient, send = client?.sendRequest;

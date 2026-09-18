@@ -86,6 +86,15 @@ def launch(root, *, check=False, prepare_only=False):
     seed_ssh_projects(root)
     from manager_core.shared_workspaces import prepare_home
     prepare_home(root, original_home)
+    # The manager backend is not required for shared plugins: reconcile them
+    # here so the original app also sees installs made by managed profiles
+    # while the control center is closed.
+    try:
+        from manager_core.plugin_sync import PluginSync
+        from manager_core.store import Store
+        result['shared_plugins'] = PluginSync(Store(root), source=original_home).reconcile(force=True)
+    except (OSError, ValueError) as error:
+        result['shared_plugins'] = dict(applied=0, errors=[str(error)])
     env['CODEX_CLI_PATH'] = runtime['runtime']
     env['CODEX_RECORD_SHARED_APPEND'] = '1'
     # Original login/settings stay in place. Both writers now allocate record

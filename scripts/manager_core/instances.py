@@ -168,6 +168,12 @@ class Instances:
             from .personal_skills import PersonalSkills
             common['personal_skills'] = PersonalSkills(self.store).reconcile(force=True)
         if not profile.get('view_only'):
+            from .plugin_sync import PluginSync
+            try:
+                common['shared_plugins'] = PluginSync(self.store).reconcile(force=True)
+            except (OSError, ValueError) as error:
+                common['shared_plugins'] = dict(applied=0, shared=0, removed=0, errors=[str(error)])
+        if not profile.get('view_only'):
             from .app_preferences import prepare as prepare_app
             from .proxy_auth import read_existing_tokens, LoginNeededError
             account_id = None
@@ -179,7 +185,8 @@ class Instances:
             ready_aliases = None if profile.get('runtime_channel') == 'packaged' else {
                 binding['alias'] for binding in profile.get('remote_bindings', []) if binding.get('prepared') is True}
             common['app'] = prepare_app(home, Path.home()/'.codex', account_id=account_id,
-                                        ssh_ready_aliases=ready_aliases, canonical=canonical)
+                                        ssh_ready_aliases=ready_aliases, canonical=canonical,
+                                        signals=self.store.directory / 'record-signals')
             if canonical:
                 from .workspace_seed import ensure as seed_ssh_projects
                 from .shared_workspaces import prepare_home

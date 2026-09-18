@@ -9,6 +9,17 @@ import sqlite3
 from .source_catalog import projection_id
 
 
+def _confirmed_threads(signals):
+    """Per-task native membership proofs; no path means no evidence."""
+    if signals is None:
+        return set()
+    from . import membership_proofs
+    try:
+        return membership_proofs.read(signals)
+    except (OSError, TypeError, ValueError):
+        return set()
+
+
 def workspace_path(value):
     path = os.path.normcase(str(Path(value).resolve()))
     if path.startswith('\\\\?\\unc\\'):
@@ -62,15 +73,21 @@ def merge_entries(current, donor, previous):
     return result
 
 
-def current_workspace(source, original):
+def current_workspace(source, original, *, signals=None):
     """After native migration, SQLite is newer than retained legacy JSON.
 
-    Read a single source snapshot. Legacy assignments are needed only while
-    migration is pending; a native assignment wins unless the source desktop
-    explicitly lists that task as a pending membership write.
+    Read a single source snapshot. A native NULL and an unimported legacy
+    assignment are indistinguishable, so a retained legacy assignment is only
+    cleared by a native NULL when the desktop confirmed its native read
+    migration or a per-task proof recorded a successful native membership.
+    Assignments the desktop still lists as pending survive either signal.
     """
     host = 'local:' + str(source)
     migration = original.get('app-server-projects-migration-by-host', {}).get(host, {})
+    pending_ids = migration.get('pendingThreadAssignmentIds')
+    pending_ids = set(pending_ids) if isinstance(pending_ids, list) else set()
+    read_migrated = migration.get('threadAssignmentsReadMigrated') is True
+    confirmed = _confirmed_threads(signals)
     database = source / 'state_5.sqlite'
     if not migration.get('projectsMigrated') or not database.is_file():
         return original
@@ -101,26 +118,29 @@ def current_workspace(source, original):
         columns = {row[1] for row in connection.execute('PRAGMA table_info(threads)')}
         if 'project_id' in columns:
             for thread, project in connection.execute('SELECT id,project_id FROM threads'):
-                pending = (not migration.get('threadAssignmentsMigrated') and
-                           thread in migration.get('pendingThreadAssignmentIds', []))
-                if pending and (thread in assignments or thread in projectless):
+                if thread in pending_ids and (thread in assignments or thread in projectless):
                     # The desktop intentionally retains this explicit move
                     # until the native metadata write succeeds. Folder/SQLite
-                    # fallback must not undo the user's pending assignment.
+                    # fallback must not undo the user's pending assignment, and
+                    # a recorded migration flag (true regardless of completion)
+                    # must not either.
                     continue
                 if project in inverse:
                     assignments[thread] = dict(projectKind='local', projectId=inverse[project])
                     projectless.discard(thread)
-                elif migration.get('threadAssignmentsMigrated'):
+                elif project is None and (read_migrated or thread in confirmed):
+                    # Only a confirmed native removal clears retained legacy
+                    # membership. A project id this home cannot map is another
+                    # store's membership, not evidence to drop the assignment.
                     assignments.pop(thread, None)
                     projectless.add(thread)
         result['projectless-thread-ids'] = list(projectless)
         return result
 
 
-def merge_workspace(current, original, owned, source, *, ssh_ready_aliases=None):
+def merge_workspace(current, original, owned, source, *, ssh_ready_aliases=None, signals=None):
     source = Path(source).resolve()
-    original = current_workspace(source, original)
+    original = current_workspace(source, original, signals=signals)
     projects = {}
     for key, value in original.get('local-projects', {}).items():
         if (isinstance(value, dict) and value.get('id') == key

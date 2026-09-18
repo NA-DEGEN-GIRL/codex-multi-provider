@@ -17,7 +17,7 @@ from uuid import UUID, uuid4
 
 from .store import atomic_json
 
-REVISION = 19
+REVISION = 20
 _LOCK = threading.Lock()
 _ORIGINAL = b'if(process.platform===`win32`)return i.join(`\\\\\\\\.\\\\pipe`,`codex-ipc`);'
 _REPLACEMENT = (b'if(process.platform===`win32`){let p=process.env.CODEX_MANAGER_DESKTOP_PIPE;'
@@ -103,7 +103,7 @@ def read_header(stream):
 
 def patch_archive(source, destination):
     """Patch exact native entry points and preserve unrelated archive assets."""
-    from .original_sync_bundle import patches_for, renderer_patches_for
+    from .original_sync_bundle import patches_for, renderer_patches_for, renderer_plugin_patches
     with Path(source).open('rb') as src:
         header, base = read_header(src)
         entries = list(_entries(header))
@@ -170,7 +170,10 @@ def patch_archive(source, destination):
             changed[context_name] = (context_target, context_adapter + b'\n' + context_data.replace(context_pattern, _CONTEXT_VARIANTS[context_pattern]))
         for renderer_name, renderer_target, renderer_data, renderer_pattern in renderers:
             renderer_data = changed.get(renderer_name, (None, renderer_data))[1]
-            changed[renderer_name] = (renderer_target, renderer_data.replace(renderer_pattern, _RENDERER_VARIANTS[renderer_pattern]))
+            renderer_data = renderer_data.replace(renderer_pattern, _RENDERER_VARIANTS[renderer_pattern])
+            for before, after in renderer_plugin_patches(renderer_data).items():
+                renderer_data = renderer_data.replace(before, after)
+            changed[renderer_name] = (renderer_target, renderer_data)
         if len(sync_modules) != 1:
             # A previously sync-patched archive is used by the isolated desktop
             # integration fixture. Production always starts from installed assets.
@@ -185,7 +188,7 @@ def patch_archive(source, destination):
             signal = b'globalThis.__codexRecordSync?.observe(this,e,t);'
             sync_data = sync_data.replace(signal, signal + b'globalThis.__codexManagerNotificationActivity?.(this.hostId,e,t);')
             sync_adapter = b'\n'.join(Path(__file__).with_name(name).read_bytes() for name in
-                ('desktop_profile_resume.cjs', 'desktop_workspace_sync.cjs', 'desktop_project_membership.cjs', 'desktop_local_workspace_sync.cjs', 'desktop_record_sync.cjs'))
+                ('desktop_profile_resume.cjs', 'desktop_workspace_sync.cjs', 'desktop_project_membership.cjs', 'desktop_local_workspace_sync.cjs', 'desktop_plugin_sync.cjs', 'desktop_record_sync.cjs'))
             changed[sync_name] = (sync_target, sync_adapter + b'\n' + sync_data)
         if len(sync_renderers) != 1:
             if not any(b'globalThis.__codexRendererRecordSync?.register(this)' in row[2] for row in renderers):
@@ -196,7 +199,7 @@ def patch_archive(source, destination):
             for before,after in sync_patches.items():sync_data=sync_data.replace(before,after)
             from .desktop_reasoning_ui import patch as patch_reasoning
             sync_data=patch_reasoning(sync_data)
-            changed[sync_name]=(sync_target,Path(__file__).with_name('desktop_profile_resume.cjs').read_bytes()+b'\n'+Path(__file__).with_name('desktop_renderer_record_sync.cjs').read_bytes()+b'\n'+sync_data)
+            changed[sync_name]=(sync_target,Path(__file__).with_name('desktop_profile_resume.cjs').read_bytes()+b'\n'+Path(__file__).with_name('desktop_renderer_record_sync.cjs').read_bytes()+b'\n'+Path(__file__).with_name('desktop_plugin_renderer_sync.cjs').read_bytes()+b'\n'+sync_data)
         segments = []
         for item, updated in changed.values():
             offset, old_size = int(item['offset']), item['size']
@@ -243,8 +246,8 @@ def prepare(root, app):
         raise ValueError('Invalid desktop version.')
     stat = archive.stat()
     adapters = ['desktop_network_policy.cjs', 'desktop_window_host.cjs', 'desktop_window_health.cjs', 'desktop_notification_activation.cjs', 'desktop_task_context.cjs',
-        'desktop_record_sync.cjs', 'desktop_renderer_record_sync.cjs', 'desktop_profile_resume.cjs',
-        'desktop_workspace_sync.cjs', 'desktop_project_membership.cjs', 'desktop_local_workspace_sync.cjs', 'desktop_reasoning_ui.py', 'original_sync_bundle.py',
+        'desktop_record_sync.cjs', 'desktop_renderer_record_sync.cjs', 'desktop_plugin_renderer_sync.cjs', 'desktop_profile_resume.cjs',
+        'desktop_workspace_sync.cjs', 'desktop_project_membership.cjs', 'desktop_local_workspace_sync.cjs', 'desktop_plugin_sync.cjs', 'desktop_reasoning_ui.py', 'original_sync_bundle.py',
         'desktop_publication.py']
     identity = dict(version=version, source=str(source), size=stat.st_size, modified=stat.st_mtime_ns, revision=REVISION,
         patch=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),

@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 from manager_core import shared_workspaces as workspaces
 from manager_core.store import Store, atomic_json
 from manager_core.app_workspace import merge_workspace
+from manager_core import membership_proofs
 
 ID = '11111111-1111-4111-8111-111111111111'
 SERVER = '22222222-2222-4222-8222-222222222222'
@@ -19,6 +20,13 @@ WRITER = '44444444-4444-4444-8444-444444444444'
 
 
 class SharedWorkspaceTests(unittest.TestCase):
+    def test_unwritable_membership_evidence_does_not_block_launch(self):
+        with patch.object(membership_proofs, 'atomic_json', side_effect=PermissionError('busy')):
+            membership_proofs.remember(self.root / 'signals', [ID])
+        with patch.object(Path, 'mkdir', side_effect=PermissionError('busy')):
+            membership_proofs.remember(self.root / 'signals', [ID])
+        self.assertEqual(membership_proofs.read(self.root / 'signals'), set())
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -107,6 +115,40 @@ class SharedWorkspaceTests(unittest.TestCase):
         workspaces.prepare_home(self.root, home)
         self.assertNotIn(tid, workspaces.read_state(home)['thread-project-assignments'])
         self.assertIn(tid, workspaces.read_state(home)['projectless-thread-ids'])
+
+    def test_unknown_native_null_keeps_unimported_legacy_membership(self):
+        tid = '66666666-6666-4666-8666-666666666666'
+        with closing(sqlite3.connect(self.original / 'state_5.sqlite')) as db:
+            db.execute('INSERT INTO threads VALUES(?,?,?)', (tid, 'C:/old/project', None));db.commit()
+        home = Path(self.api['home'])
+        value = workspaces.read_state(home)
+        value['thread-project-assignments'] = {tid: dict(projectKind='local', projectId=ID)}
+        value['projectless-thread-ids'] = []
+        value['selected-project'] = 'keep'
+        atomic_json(home / '.codex-global-state.json', value)
+        workspaces.prepare_home(self.root, home)
+        result = workspaces.read_state(home)
+        self.assertEqual(result['thread-project-assignments'][tid]['projectId'], ID)
+        self.assertNotIn(tid, result['projectless-thread-ids'])
+        self.assertEqual(result['selected-project'], 'keep')
+        with closing(sqlite3.connect(self.original / 'state_5.sqlite')) as db:
+            self.assertIsNone(db.execute('SELECT project_id FROM threads WHERE id=?', (tid,)).fetchone()[0])
+
+    def test_membership_proof_survives_new_profile_and_canonical_removal(self):
+        tid = '77777777-7777-4777-8777-777777777777'
+        with closing(sqlite3.connect(self.original / 'state_5.sqlite')) as db:
+            db.execute('INSERT INTO threads VALUES(?,?,?)', (tid, 'C:/old/project', SERVER));db.commit()
+        workspaces.prepare_home(self.root, Path(self.api['home']))
+        with closing(sqlite3.connect(self.original / 'state_5.sqlite')) as db:
+            db.execute('UPDATE threads SET project_id=NULL WHERE id=?', (tid,));db.commit()
+        home = Path(self.store.add_profile('new')['home']);home.mkdir(parents=True)
+        atomic_json(home / '.codex-global-state.json', {'local-projects': {ID: self.project},
+            workspaces.MAP: {'local:' + str(home): {ID: SERVER}},
+            'thread-project-assignments': {tid: dict(projectKind='local', projectId=ID)}})
+        workspaces.prepare_home(self.root, home)
+        result = workspaces.read_state(home)
+        self.assertNotIn(tid, result['thread-project-assignments'])
+        self.assertIn(tid, result['projectless-thread-ids'])
 
 
 if __name__ == '__main__':
