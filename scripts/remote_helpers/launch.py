@@ -15,6 +15,13 @@ import sys
 import tempfile
 
 
+ROLE_NAME = re.compile(r"agents/cc_(?:gpt_(?:astra|luna|sol|terra)|external_[0-9a-f]{32}_r[0-9]+_[0-9a-f]{12})\.toml")
+
+
+class ConfigurationConflict(ValueError):
+    code = 'remote_configuration_changed'
+
+
 def _read(path):
     if path.is_symlink():
         raise ValueError("symlink")
@@ -170,12 +177,57 @@ def clear_stale_record(profile):
         path.unlink(missing_ok=True)
 
 
+def recover_role_ownership(profile, home, previous):
+    """Recover lost ownership only from exact bytes in validated old definitions.
+
+    Older launches forgot removed files in generated-files.json while leaving
+    them in agents/. When the role is selected again it must not look like a new
+    user file. Unknown or edited files remain unowned and are never overwritten.
+    """
+    recovered = {}
+    roles = home / 'agents'
+    if not roles.exists() or roles.is_symlink():
+        return recovered
+    candidates = {}
+    for path in roles.glob('cc_*.toml'):
+        name = 'agents/' + path.name
+        if (name in previous or not ROLE_NAME.fullmatch(name) or path.is_symlink()
+                or not path.is_file() or path.stat().st_size > 1024 * 1024):
+            continue
+        candidates[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    definitions = profile / 'definitions'
+    if not candidates or definitions.is_symlink():
+        return recovered
+    for index, descriptor_path in enumerate(sorted(definitions.glob('*.json'))):
+        if index >= 512 or not candidates:
+            break
+        revision = descriptor_path.stem
+        if (not re.fullmatch(r'[0-9a-f]{64}', revision) or descriptor_path.is_symlink()
+                or descriptor_path.stat().st_size > 65536):
+            continue
+        try:
+            descriptor = _read(descriptor_path)
+            definition = definitions / revision
+            if (descriptor.get('profile_id') != profile.name or descriptor.get('revision') != revision
+                    or descriptor.get('definition') != str(definition) or definition.is_symlink()
+                    or (definition / 'agents').is_symlink()):
+                continue
+            for name, digest in list(candidates.items()):
+                source = definition / name
+                if (not source.is_symlink() and source.is_file() and source.stat().st_size <= 1024 * 1024
+                        and hashlib.sha256(source.read_bytes()).hexdigest() == digest):
+                    recovered[name] = digest
+                    del candidates[name]
+        except (OSError, ValueError, TypeError):
+            continue
+    return recovered
+
+
 def obsolete_role_plan(home, previous, generated):
     """Validate obsolete manager roles before changing any generated config."""
     plan = []
     for name, digest in previous.items():
-        if (name in generated or not re.fullmatch(
-                r"agents/cc_(?:gpt_(?:astra|luna|sol|terra)|external_[0-9a-f]{32}_r[0-9]+_[0-9a-f]{12})\.toml", name)):
+        if name in generated or not ROLE_NAME.fullmatch(name):
             continue
         target = home / name
         if target.is_symlink() or any(parent.is_symlink() for parent in target.parents):
@@ -184,7 +236,7 @@ def obsolete_role_plan(home, previous, generated):
             continue
         content = target.read_bytes()
         if hashlib.sha256(content).hexdigest() != digest:
-            raise ValueError("obsolete managed role was edited; preserve it before applying settings")
+            raise ConfigurationConflict("obsolete managed role was edited; preserve it before applying settings")
         archive = home / "manager-retired-agents" / (target.stem + "." + digest[:16] + ".toml")
         if archive.is_symlink() or any(parent.is_symlink() for parent in archive.parents):
             raise ValueError("symlink obsolete role archive")
@@ -265,6 +317,8 @@ def run(profile, revision, argv, *, managed_socket=None):
         codex_home.mkdir(mode=0o700, exist_ok=True)
         generated_path = profile / "generated-files.json"
         prior = _read(generated_path) if generated_path.exists() else {}
+        recovered = recover_role_ownership(profile, codex_home, prior)
+        prior = {**prior, **recovered}
         files = {}
         common_plan = None
         for source in definition.rglob("*"):
@@ -284,11 +338,18 @@ def run(profile, revision, argv, *, managed_socket=None):
                 if target.exists() and name != "config.toml":
                     current = hashlib.sha256(target.read_bytes()).hexdigest()
                     if current != new_digest and current != prior.get(name):
-                        raise ValueError("user configuration changed")
+                        raise ConfigurationConflict("user configuration changed")
                 files[name] = (content, new_digest)
         retired_roles = obsolete_role_plan(codex_home, prior, files)
+        repaired_roles = obsolete_role_plan(codex_home, {
+            name: digest for name, digest in recovered.items()
+            if name in files and files[name][1] != digest}, {})
         if common_plan is not None:
             common.stage(codex_home, common_plan)
+        # Preserve recovered historical bytes before replacing the selected role.
+        for target, archive in repaired_roles:
+            archive.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.replace(target, archive)
         # Validate every destination before updating any file; never overwrite auth.
         for name, (content, digest) in files.items():
             if name in ("auth.json", "credentials.json"):
@@ -356,6 +417,8 @@ if __name__ == "__main__":
                 sys.exit(main(profile, sys.argv[1], sys.argv[2]))
             sys.exit(run(profile, sys.argv[1], sys.argv[2:]))
     except Exception as error:
+        if isinstance(error, ConfigurationConflict):
+            print('Codex manager remote launcher error: remote_configuration_changed', file=sys.stderr)
         detail = str(error) or error.__class__.__name__
         print(f"Codex manager remote launcher failed: {detail}", file=sys.stderr)
         print("Codex manager remote launcher failed; inspect the profile binding.", file=sys.stderr)

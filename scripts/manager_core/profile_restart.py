@@ -111,6 +111,48 @@ class ProfileRestarts:
                 raise
             return deepcopy(job)
 
+    def open_local(self, profile_id):
+        """Return the local window first; reconcile its SSH hosts independently."""
+        profile_id = identifier(profile_id)
+        with _claim(self.store.directory / 'restarts' / (profile_id + '.lock')):
+            if self.stopping.is_set():
+                raise RuntimeError('관리 앱이 종료 중입니다. 다시 연 뒤 적용하세요.')
+            old = self.store.read().get('profile_restarts', {}).get(profile_id)
+            with self.lock:
+                worker_active = profile_id in self.workers
+            active = old and (worker_active or (
+                old.get('phase') not in TERMINAL and self.owner_alive(old)))
+            if active:
+                if old.get('remote_background'):
+                    profile = self.store.profile(profile_id)
+                    observed = self.instances.observe(profile)
+                    return dict(state='existing' if observed.get('status') == 'running' else 'updating',
+                                profile_id=profile_id, profile={**profile, **observed},
+                                ssh_pending=True, restart=deepcopy(old))
+                profile = self.store.profile(profile_id)
+                return dict(state='updating', profile_id=profile_id,
+                            profile={**profile, **self.instances.observe(profile)}, restart=deepcopy(old))
+            shown, transaction_id = self.hooks.open_local_for_remote_reconcile(profile_id)
+            profile = self.store.profile(profile_id)
+            job = dict(id=str(uuid4()), profile_id=profile_id, phase='waiting', remote_background=True,
+                       generation=profile.get('generation'), transaction_id=transaction_id,
+                       requested_revision=profile['policy']['desired_revision'],
+                       message='로컬 창을 열었습니다. SSH 연결은 별도로 준비하고 있습니다.',
+                       created_at=now(), updated_at=now(), worker_pid=os.getpid(),
+                       worker_created=(process_identity(os.getpid()) or {}).get('process_created'))
+            self.store.mutate(lambda data: data.setdefault('profile_restarts', {}).update({profile_id: job}))
+            with self.lock:
+                self.workers.add(profile_id)
+            try:
+                self.spawn(lambda: self._run(profile_id, job['id']))
+            except Exception:
+                with self.lock:
+                    self.workers.discard(profile_id)
+                self.hooks.remote_open_failed(profile_id, transaction_id, 'worker_start_failed')
+                self._write(profile_id, job['id'], phase='attention', code='worker_start_failed',
+                            message='로컬 창은 열었습니다. SSH 준비를 다시 시도해 주세요.')
+            return {**shown, 'ssh_pending': True, 'restart': deepcopy(job)}
+
     def status(self):
         jobs = self.store.read().get('profile_restarts', {})
         with self.lock:
@@ -129,6 +171,9 @@ class ProfileRestarts:
                 if self.step(profile_id, job_id):
                     return
                 self.stopping.wait(self.interval)
+            job = self.store.read().get('profile_restarts', {}).get(profile_id, {})
+            if job.get('id') == job_id and job.get('remote_background'):
+                self.hooks.remote_open_failed(profile_id, job['transaction_id'], 'service_stopped')
             self._write(profile_id, job_id, phase='attention',
                         code='service_stopped',
                         message='관리 서비스 종료로 적용을 대기합니다. 다음 시작 시 자동 확인합니다.')
@@ -146,6 +191,20 @@ class ProfileRestarts:
                 raise UpdateError('profile_removed', '제거된 계정의 재시작을 중지했습니다.')
             job = self.store.read()['profile_restarts'][profile_id]
             if job['id'] != job_id:
+                return True
+            if job.get('remote_background'):
+                try:
+                    if not self.hooks.reconcile_opened_remotes(profile_id, job['transaction_id']):
+                        self._write(profile_id, job_id, phase='waiting',
+                                    message='로컬 창은 사용할 수 있습니다. 진행 중인 SSH 작업이 끝나기를 기다립니다.')
+                        return False
+                    self._write(profile_id, job_id, phase='complete',
+                                message='로컬 창과 SSH 연결 준비를 완료했습니다.')
+                except (RuntimeError, ValueError, OSError, KeyError) as error:
+                    code = getattr(error, 'code', 'remote_prepare_failed')
+                    self.hooks.remote_open_failed(profile_id, job['transaction_id'], code)
+                    self._write(profile_id, job_id, phase='attention', code=code,
+                                message='로컬 창은 사용할 수 있습니다. SSH 연결 준비 상태를 확인해 주세요.')
                 return True
             if (job.get('automatic_key') and not job.get('transaction_id')
                     and profile.get('generation') != job.get('generation')):

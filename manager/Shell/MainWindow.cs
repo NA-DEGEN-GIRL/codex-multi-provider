@@ -461,12 +461,12 @@ public sealed class MainWindow : Window
         => Menu(actions.Select(action => (action.Label, (Func<Task>)(() => action.Action(RequireContextProfile())))).ToArray());
     private async Task InitializeAsync()
     {
-        Log($"관리 앱 시작 · SSH·포크 메모·요청 형식 수정 55 · IPC {ManagerProtocol.Version} · 로그: {_diagnostics.Path}");
+        Log($"관리 앱 시작 · 로컬 우선 실행·백그라운드 프로필 준비 56 · IPC {ManagerProtocol.Version} · 로그: {_diagnostics.Path}");
         if (_responsiveness is not null) Log("응답 지연 상세 로그 · " + _responsiveness.Path);
         SetStatus("관리 서비스를 연결하고 있습니다…");
         _client = await ManagerClient.ConnectAsync(_root);
         await CheckStartupUpdatesAsync();
-        await RefreshAsync(); _timer.Start(); SetStatus("준비되었습니다. 업데이트는 자동 확인하며, 프로필을 선택하면 Codex가 열립니다.");
+        await RefreshAsync(); _timer.Start(); SetStatus("프로필을 백그라운드에서 미리 열고 있습니다. 준비된 프로필은 선택하면 바로 표시됩니다.");
     }
     private async Task ReconnectAsync()
     {
@@ -563,12 +563,19 @@ public sealed class MainWindow : Window
         {
             var startup = _state.Get("startup_updates");
             _profileUpdateStatus.Text = startup.Message("전체 프로필 업데이트 확인 중");
+            var warmup = _state.Get("profile_warmup");
             if (!_profileOrdering.IsInteracting) Fill(_profiles, _state.Arr("profiles").Select(p =>
             {
                 var update = startup.Arr("profiles").FirstOrDefault(item => item.S("profile_id") == p.S("id"));
                 var suffix = update.ValueKind == JsonValueKind.Object && update.S("state") is not ("current" or "latest_on_open" or "complete")
                     ? "\n" + UpdatePresentation.ProfileState(update) : "";
                 if (ProfileLoginPresentation.NeedsLogin(p)) suffix = "\n로그인 확인 필요";
+                var prepared = warmup.Arr("profiles").FirstOrDefault(item => item.S("profile_id") == p.S("id"));
+                if (p.S("status") != "running" && !ProfileLoginPresentation.NeedsLogin(p))
+                {
+                    if (prepared.S("state") is "checking" or "opening") suffix = "\n백그라운드에서 여는 중";
+                    else if (prepared.S("state") == "queued") suffix = "\n미리 열기 대기";
+                }
                 var label = p.S("auth_mode") == "external" ? "[API] " + p.S("alias") : p.S("alias", "이름 없는 프로필");
                 var usage = p.S("auth_mode") == "external" ? p.S("external_model_name", "외부 API") : Usage(p.Get("usage"));
                 return new Choice(p.S("id"), $"{label}\n{usage} · {Status(p.S("status"))}" + suffix, p);
@@ -659,7 +666,10 @@ public sealed class MainWindow : Window
                 if (restart.S("id") != "" && _restartNotices.GetValueOrDefault(observed.S("id")) != stamp)
                 {
                     _restartNotices[observed.S("id")] = stamp;
-                    Log($"{observed.S("alias")} · 다시 열기 · {restart.S("phase")} · {restart.S("message")}");
+                    var activity = restart.B("remote_background") ? "SSH 준비" : "다시 열기";
+                    var errorCode = restart.S("code");
+                    Log($"{observed.S("alias")} · {activity} · {restart.S("phase")} · {restart.S("message")}" +
+                        (errorCode == "" ? "" : " · " + errorCode));
                 }
                 var runtime = observed.Get("runtime_state");
                 var generation = observed.S("id") + ":" + runtime.S("generation");
@@ -768,7 +778,8 @@ public sealed class MainWindow : Window
             return;
         }
         if (command == "profile.show" && _attached is { } cached && cached.MatchesLifetime &&
-            _host.IsAttached && _windowLaunches.TryGetValue(_host, out var launch) && launch.Matches(Profile()))
+            _host.IsAttached && _windowLaunches.TryGetValue(_host, out var launch) && launch.Matches(Profile()) &&
+            !(Profile().Get("restart").B("remote_background") && Profile().Get("restart").S("phase") == "attention"))
         {
             _profileRequestTicket = null;
             TryAttach(Profile());
@@ -792,17 +803,16 @@ public sealed class MainWindow : Window
             if (returnedProfile.S("desktop_compatibility_notice") != "") Log(returnedProfile.S("desktop_compatibility_notice"));
             if (returnedProfile.S("id") != id || (result.S("profile_id") != "" && result.S("profile_id") != id))
                 throw new InvalidOperationException("요청한 프로필과 반환된 창 정보가 일치하지 않습니다.");
-            if (result.S("state") == "updating")
+            if (result.S("state") is "updating" or "opening")
             {
-                // A stopped profile can require SSH maintenance before launch.
-                // Its response still describes the old generation; do not pin
-                // window discovery to that generation or require a second click.
+                // Queued background startup still describes the old generation.
+                // Let subsequent state polls attach its new window.
                 _expectedWindowLaunch = null;
                 _attachDeadline = DateTime.UtcNow.AddSeconds(25);
                 ++_stateRevision;
                 await RefreshAsync();
                 if (ticket == _navigation && !_closing)
-                    SetStatus("SSH 설정을 적용한 뒤 이 프로필의 창을 표시합니다…");
+                    SetStatus("백그라운드에서 이 프로필을 여는 중입니다. 준비되면 바로 표시합니다…");
                 return;
             }
             Log($"{returnedProfile.S("alias")} · {(result.S("state") == "launched" ? "새 프로세스 시작" : "기존 프로세스 사용")} · PID {returnedProfile.N("process_id")} · 실행 {returnedProfile.S("generation")}");
@@ -1224,6 +1234,42 @@ public sealed class MainWindow : Window
         await Task.Yield();
         try
         {
+            if (_client is not null && !_client.IsConnected)
+            {
+                // Reconnect only for shutdown; startup hooks would enqueue new
+                // background windows while we are trying to drain them.
+                using var reconnect = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+                await _client.DisposeAsync();
+                _client = await ManagerClient.ConnectAsync(_root, reconnect.Token);
+            }
+            if (_client?.IsConnected == true)
+            {
+                // Stop the queue before taking the shutdown snapshot. Otherwise
+                // a warmup could create another hidden app after its peers exit.
+                using var stopWarmup = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+                await _client.RequestAsync("manager.stop_warmup", cancellationToken: stopWarmup.Token);
+                do
+                {
+                    _state = await _client.RequestAsync("state", cancellationToken: stopWarmup.Token);
+                    if (!_state.Get("profile_warmup").B("worker_active") &&
+                        _state.Get("local_launches").N("active") == 0) break;
+                    await Task.Delay(100, stopWarmup.Token);
+                } while (true);
+                // State reads profile identities before the launch counter. A
+                // launch may finish between those reads; take a post-drain
+                // snapshot while the admission barrier is still armed.
+                _state = await _client.RequestAsync("state", cancellationToken: stopWarmup.Token);
+                // Preloaded windows have never been attached or parked. Include
+                // their verified process/window identities in normal shutdown.
+                var hidden = _state.Arr("profiles").Where(p => p.S("status") == "running" &&
+                    p.N("window_handle") != 0 && !_parked.ContainsKey((nint)p.N("window_handle"))).ToArray();
+                await Task.WhenAll(hidden.Select(async profile =>
+                {
+                    if (!await NativeWindowShutdown.RequestAsync(_root, (int)profile.N("process_id"),
+                        (nint)profile.N("window_handle"), profile.S("executable_path"), profile.N("process_created")))
+                        throw new InvalidOperationException("백그라운드 프로필의 정상 종료 확인이 필요합니다.");
+                }));
+            }
             await Task.WhenAll(_parked.Values.ToArray().Select(async window =>
             {
                 if (!window.MatchesLifetime) { _parked.Remove(window.Handle); return; }
@@ -1249,7 +1295,7 @@ public sealed class MainWindow : Window
                     try
                     {
                         using var stopDeadline = new CancellationTokenSource(TimeSpan.FromSeconds(6));
-                        await _client.RequestAsync("process.stop",
+                        await _client.RequestAsync("profile.cleanup",
                             new { profile_id = id, generation = profile.S("generation") },
                             cancellationToken: stopDeadline.Token);
                         Log($"남은 Codex 프로세스 정리 · {profile.S("alias", id)}");
@@ -1272,6 +1318,15 @@ public sealed class MainWindow : Window
         }
         catch (Exception error)
         {
+            if (_client?.IsConnected == true)
+            {
+                try
+                {
+                    using var resume = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+                    await _client.RequestAsync("manager.resume_launches", cancellationToken: resume.Token);
+                }
+                catch (Exception resumeError) { Log("프로필 실행 재개 확인 · " + resumeError.Message); }
+            }
             _closing = false; _shutdownInProgress = false;
             IsEnabled = true;
             _timer.Start(); _activityTimer.Start();

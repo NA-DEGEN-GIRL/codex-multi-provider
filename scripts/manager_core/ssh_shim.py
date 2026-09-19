@@ -643,6 +643,14 @@ def main(arguments: list[str] | None = None) -> int:
     stage = 'load_manifest'
     try:
         manifest, path = _load_manifest(os.environ)
+        if manifest.get('generation'):
+            from manager_core.ssh_connection_wait import wait_for_settings
+            generation = manifest['generation']
+            stage = 'wait_for_settings'
+            wait_for_settings(args, manifest)
+            manifest, path = _load_manifest(os.environ)
+            if manifest.get('generation') != generation:
+                raise ShimError('ssh_generation_changed', 'SSH 프로필 실행이 변경되었습니다.')
         executable = Path(manifest.get('real_ssh', ''))
         if not executable.is_absolute() or not executable.is_file():
             raise ShimError('real_ssh_missing', 'The original OpenSSH executable is unavailable.')

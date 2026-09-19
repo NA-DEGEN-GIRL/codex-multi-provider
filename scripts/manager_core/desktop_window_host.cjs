@@ -9,6 +9,13 @@
   const { app, Menu, screen } = require('electron');
   const marker = path.join(root, 'work', 'control-center', 'window-hosts', `${process.pid}.json`);
   const checks = new Set(), presentations = new Set();
+  // STARTUPINFO only hides the initial native show. The app's ready callbacks
+  // and startup fallback can still call show/focus before the shell attaches.
+  // Hand back startup control permanently at the first valid lease, so later
+  // auxiliary windows and explicit detached windows retain native behavior.
+  let preloadHidden = process.env.CODEX_MANAGER_PRELOAD_HIDDEN === '1';
+  const startupPresentation = new Set(['show', 'showInactive', 'focus', 'moveTop',
+    'maximize', 'minimize', 'restore', 'unmaximize', 'setFullScreen']);
   let pendingMenu, hasPendingMenu = false, quitting = false;
   const setApplicationMenu = Menu?.setApplicationMenu;
   if (typeof setApplicationMenu === 'function') {
@@ -52,6 +59,7 @@
             !Number.isSafeInteger(state.shellPid) || state.shellPid <= 0) return false;
         if (state.mode === 'viewport') lastHostState = state;
         if (state.mode !== 'released') process.kill(state.shellPid, 0); // Existence only; no signal.
+        if (['viewport', 'released', 'shutdown'].includes(state.mode)) preloadHidden = false;
         return state;
       } catch { return false; }
     };
@@ -210,11 +218,12 @@
       'setMenu', 'setMenuBarVisibility', 'setAutoHideMenuBar', 'center', 'setResizable', 'setMaximizable',
       'setMinimizable', 'setFullScreenable', 'setMovable', 'setClosable', 'setHasShadow',
       'setAlwaysOnTop', 'setSkipTaskbar', 'setOpacity', 'setBackgroundColor', 'setTitle',
-      'show', 'showInactive', 'hide', 'maximize', 'minimize', 'restore', 'unmaximize', 'setFullScreen', 'focus', 'blur']) {
+      'show', 'showInactive', 'hide', 'maximize', 'minimize', 'restore', 'unmaximize', 'setFullScreen', 'focus', 'blur', 'moveTop']) {
       const original = win[name];
       if (typeof original !== 'function') continue;
       win[name] = function (...args) {
         const state = hostState();
+        if (preloadHidden && (startupPresentation.has(name) || (name === 'setAlwaysOnTop' && args[0]))) return;
         if (!state || state.mode === 'released') {
           // The native startup fade may still be at zero when hosting starts.
           // Managed windows start opaque; the shell controls when they appear.

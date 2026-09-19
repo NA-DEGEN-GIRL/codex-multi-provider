@@ -20,6 +20,27 @@ import time
 from ws_client import WebSocketPipe
 
 
+class RemoteStartError(RuntimeError):
+    def __init__(self, code):
+        self.code = code
+        super().__init__('Remote listener startup failed (' + code + ').')
+
+
+def _start_failure(logfile, offset):
+    """Classify only this launch's bounded output; never return arbitrary logs."""
+    try:
+        with logfile.open('rb') as stream:
+            stream.seek(0, os.SEEK_END)
+            end = stream.tell()
+            stream.seek(max(offset, end - 16384))
+            lines = stream.read(16384).splitlines()
+        if b'Codex manager remote launcher error: remote_configuration_changed' in lines:
+            return 'remote_configuration_changed'
+    except OSError:
+        pass
+    return 'remote_runtime_exited'
+
+
 def socket_path(profile):
     # Linux's sockaddr_un path is limited to 108 bytes. CODEX_HOME itself can be
     # long, so use an explicit private socket and `proxy --sock` on both sides.
@@ -121,6 +142,7 @@ def start(profile, revision):
         fcntl.flock(lock, fcntl.LOCK_EX)
         path = socket_path(profile)
         existing = _running(profile, revision)
+        process = None
         if existing is None:
             # Do not create another listener if a stdio runtime owns this profile.
             instance_lock = profile / "instance.lock"
@@ -135,6 +157,7 @@ def start(profile, revision):
             environment["SSH_AUTH_SOCK"] = _forward_agent(profile)
             with logfile.open("ab", buffering=0) as output:
                 os.chmod(logfile, 0o600)
+                log_offset = output.tell()
                 process = subprocess.Popen([sys.executable, str(profile / "launch.py"), revision, "native-serve"],
                     stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT,
                     env=environment, start_new_session=True)
@@ -142,8 +165,10 @@ def start(profile, revision):
         while time.monotonic() < deadline:
             if _ready(profile, revision, path):
                 return 0
+            if process is not None and process.poll() is not None:
+                raise RemoteStartError(_start_failure(logfile, log_offset))
             time.sleep(0.1)
-        raise RuntimeError("Remote private listener did not become ready.")
+        raise RemoteStartError('remote_start_timeout')
 
 
 def _control_request(pipe, request_id, method, params, deadline):

@@ -18,8 +18,11 @@ try:
   exec(compile(p['modules'][name],'<managed-'+name+'>','exec'),m.__dict__)
  result=sys.modules['maintenance'].dispatch(p['request'])
  print(json.dumps({'ok':True,'result':result}))
-except Exception:
- print(json.dumps({'ok':False}))
+except Exception as error:
+ code=getattr(error,'code',None)
+ if code not in ('remote_configuration_changed','remote_runtime_exited','remote_start_timeout'):
+  code='remote_maintenance_unverified'
+ print(json.dumps({'ok':False,'code':code}))
  sys.exit(2)
 '''
 
@@ -109,6 +112,15 @@ class RemoteMaintenance:
             if len(result.stdout) > 131072:
                 raise ValueError()
             response = json.loads(result.stdout)
+            if response.get('ok') is False:
+                code = response.get('code')
+                messages = {
+                    'remote_configuration_changed': 'SSH 생성 설정 파일이 변경되어 시작하지 못했습니다. 프로필의 원격 설정 충돌을 확인하세요.',
+                    'remote_runtime_exited': 'SSH 런타임이 준비되기 전에 종료되었습니다. 원격 프로필 실행 로그를 확인하세요.',
+                    'remote_start_timeout': 'SSH 런타임이 제한 시간 안에 준비되지 않았습니다.',
+                }
+                if code in messages:
+                    raise UpdateError(code, binding['alias'] + ' · ' + operation + ': ' + messages[code])
             value = response['result']
             if (result.returncode or response.get('ok') is not True or not isinstance(value, dict)
                     or type(value.get('idle')) is not bool or type(value.get('exited')) is not bool):
@@ -151,24 +163,33 @@ class RemoteMaintenance:
             if proof['process'] is not None:
                 entry.update(state='started', started=proof)
 
-    def prepare_and_start(self, profile, entries, save_journal):
+    def prepare_and_start(self, profile, entries, save_journal, *, lifecycle_guard=None):
         """Prepare the whole cohort first; resume starts only from saved evidence."""
+        check_current = lifecycle_guard or (lambda: None)
+        check_current()
         if any(entry.get('state') not in ('closed', 'prepared', 'start_requested', 'started') for entry in entries):
             raise UpdateError('remote_exit_unverified', 'SSH 서버 종료 확인 뒤 새 설정을 적용할 수 있습니다.')
         model_ids = profile['policy']['model_ids'] if profile['policy']['enabled'] else []
         revision = profile['policy']['desired_revision']
+        from .model_settings import render_options
+        options = render_options(profile)
         for entry in entries:
+            check_current()
             if entry.get('state') != 'closed':
                 if entry.get('target_policy_revision') != revision:
                     raise UpdateError('policy_changed', '이전 SSH 설정 적용 결과를 확인한 뒤 최신 설정을 적용해야 합니다.')
                 continue
             alias = entry['binding']['alias']
-            from .model_settings import render_options
-            binding = self.remote.prepare(alias, profile['id'], profile['home'], model_ids, **render_options(profile))
+            binding = self.remote.prepare(alias, profile['id'], profile['home'], model_ids, **options)
+            check_current()
             if binding.get('prepared') is not True:
                 raise UpdateError('remote_preparation_pending', 'SSH 서버에 새 설정을 준비하지 못했습니다.')
             def save(data):
                 current = self.store.profile(profile['id'], data)
+                if current.get('generation') != profile.get('generation'):
+                    raise UpdateError('remote_generation_changed', 'SSH 준비 중 프로필 실행이 변경되어 이전 결과를 적용하지 않습니다.')
+                if render_options(current) != options:
+                    raise UpdateError('policy_changed', 'SSH 준비 중 모델 설정이 변경되어 이전 결과를 적용하지 않습니다.')
                 if current['policy']['desired_revision'] != profile['policy']['desired_revision']:
                     raise UpdateError('policy_changed', '설정이 다시 변경되었습니다. 최신 설정 적용이 필요합니다.')
                 current['remote_bindings'] = [b for b in current.get('remote_bindings', []) if b.get('alias') != alias] + [deepcopy(binding)]
@@ -176,16 +197,20 @@ class RemoteMaintenance:
             entry.update(state='prepared', next_binding=validate_binding(binding, profile['id']),
                          target_policy_revision=revision)
             save_journal()
+            check_current()
 
         for entry in entries:
+            check_current()
             binding = entry['next_binding']
             if entry['state'] == 'start_requested':
                 self.reconcile(entry)
                 save_journal()
+                check_current()
                 if entry['state'] != 'started':
                     raise UpdateError('remote_start_pending', '이전 SSH 시작 요청의 결과 확인이 필요합니다.')
             if entry['state'] == 'started':
                 observed = self.request(binding, 'inspect')
+                check_current()
                 if observed['process'] is None or observed['process'] != entry['started']['process']:
                     raise UpdateError('remote_process_changed', '시작한 SSH 서버의 실행 상태가 변경되었습니다.')
                 continue
@@ -193,11 +218,15 @@ class RemoteMaintenance:
             # stay start_requested and are inspected, never blindly resubmitted.
             entry['state'] = 'start_requested'
             save_journal()
+            check_current()
             started = self.request(binding, 'start')
             if started['process'] is None:
                 raise UpdateError('remote_start_pending', 'SSH 서버가 실행 중인지 확인해야 합니다.')
             entry.update(state='started', started=started)
             save_journal()
+            # A completed request must remain recoverable even if a concurrent
+            # edit or new launch invalidated this worker while SSH was pending.
+            check_current()
 
     def retry_pending_starts(self, profile, entries, save_journal):
         """An explicit retry may ensure the SAME immutable revision is running.
@@ -248,15 +277,19 @@ class RemoteMaintenance:
             applied = set()
             for entry in started:
                 old = validate_binding(entry['binding'], profile['id'])
+                publication = validate_binding(entry.get('publication_binding', entry['binding']), profile['id'])
                 new = validate_binding(entry['next_binding'], profile['id'])
                 proof = entry.get('started', {})
-                if (old['alias'] != new['alias'] or not proof.get('process')
+                if (old['alias'] != new['alias'] or publication['alias'] != old['alias'] or not proof.get('process')
                         or proof['process'].get('revision') != new['revision'] or proof.get('exited') is not False):
                     raise UpdateError('remote_start_unverified', '실제 적용된 SSH 설정을 확인해야 합니다.')
                 matches = [i for i, binding in enumerate(bindings) if binding['alias'] == old['alias']]
+                if (entry.get('target_policy_revision') != current['policy']['desired_revision']
+                        and not (len(matches) == 1 and bindings[matches[0]] == new)):
+                    raise UpdateError('policy_changed', 'SSH 연결 설정 반영 전에 모델 정책이 변경되었습니다.')
                 if not matches and old['alias'] in manifest.get('pending_policy_hosts', []):
                     bindings.append(new)
-                elif len(matches) == 1 and bindings[matches[0]] in (old, new):
+                elif len(matches) == 1 and bindings[matches[0]] in (publication, new):
                     bindings[matches[0]] = new
                 else:
                     raise UpdateError('remote_binding_changed', 'SSH 연결 설정이 별도로 변경되어 덮어쓰지 않았습니다.')

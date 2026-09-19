@@ -71,6 +71,21 @@ class ControlCenter:
         self.personal_skills=PersonalSkills(self.store)
         from manager_core.plugin_sync import PluginSync
         self.shared_plugins=PluginSync(self.store)
+        from manager_core.profile_warmup import ProfileWarmup
+        self.profile_warmup=ProfileWarmup(self.store,self.instances,self._open_profile_locally)
+
+    def _open_profile_locally(self, profile_id):
+        profile=self.store.profile(profile_id)
+        observed=self.instances.observe(profile)
+        ssh_gate=self.store.read().get('ssh_maintenance',{}).get(profile_id,{})
+        if ssh_gate.get('state') not in (None,'released') or (
+                observed.get('status')!='running' and self.remote_maintenance.pending_on_open(profile)):
+            return self.restarts.open_local(profile_id)
+        if observed.get('status')=='running':
+            # A warmed window needs only native attachment. Re-running Electron
+            # here adds a second-instance round trip and can steal foreground.
+            return dict(profile_id=profile_id,profile={**profile,**observed},state='existing')
+        return self.instances.show(profile_id,reopen_existing=False)
 
     def catalog_sources(self):
         capabilities=runtime_build(self.root).get('capabilities',{})
@@ -188,6 +203,8 @@ class ControlCenter:
             pass
         state['profile_restarts']=self.restarts.status()
         state['startup_updates']=self.startup_updates.status()
+        state['profile_warmup']=self.profile_warmup.status()
+        state['local_launches']=self.instances.launch_status()
         registry=self.providers.list()
         from manager_core.runtime_selection import describe as describe_runtime
         from manager_core.instances import process_identity
@@ -265,7 +282,26 @@ class ControlCenter:
         if command=='skills.personal.set':return self.personal_skills.set(args['skill_id'],args['enabled'])
         if command=='skills.personal.delete':return self.personal_skills.delete(args['skill_id'])
         if command=='skills.personal.restore':return self.personal_skills.restore(args['deleted_id'])
-        if command=='manager.startup':return self.startup_updates.start(retry_failed=args.get('retry_failed') is True)
+        if command=='manager.startup':
+            result=self.startup_updates.start(retry_failed=args.get('retry_failed') is True)
+            if getattr(self.instances,'embed_windows',False):
+                self.profile_warmup.start()
+            return result
+        if command=='manager.stop_warmup':
+            self.instances.stop_launches()
+            self.profile_warmup.shutdown()
+            return self.profile_warmup.status()
+        if command=='manager.resume_launches':
+            self.instances.resume_launches()
+            return self.instances.launch_status()
+        if command=='profile.cleanup':
+            from manager_core import rust_service
+            profile=self.store.profile(identifier(args['profile_id']))
+            if profile.get('generation')!=identifier(args['generation']):
+                raise ValueError('프로필 실행이 변경되어 이전 종료 요청을 취소했습니다.')
+            if not rust_service.enabled():
+                raise RuntimeError('프로세스 정리를 위한 관리 서비스가 연결되지 않았습니다.')
+            return rust_service.request('process.stop',profile_id=profile['id'],generation=profile['generation'])
         if command=='manager.recover_legacy':return self.startup_updates.recover_legacy(
             args.get('profiles'), interrupt_running_work=args.get('interrupt_running_work') is True)
         if command=='accounts.refresh':
@@ -339,11 +375,14 @@ class ControlCenter:
         if command=='profile.show':
             profile=self.store.profile(args['profile_id'])
             observed=self.instances.observe(profile)
-            if observed.get('status')!='running' and self.remote_maintenance.pending_on_open(profile):
-                job=self.restarts.schedule(profile['id'])
+            warmup=self.profile_warmup.status()
+            pending=next((p for p in warmup['profiles'] if p['profile_id']==profile['id']),None)
+            if observed.get('status')!='running' and warmup['worker_active'] and (
+                    not warmup['profiles'] or pending and pending['state'] in ('queued','checking','opening')):
+                self.profile_warmup.prioritize(profile['id'])
                 return dict(profile_id=profile['id'], profile={**profile,**observed},
-                            state='updating', restart=job)
-            return self.instances.show(args['profile_id'])
+                            state='opening')
+            return self._open_profile_locally(profile['id'])
         if command=='shortcut.add':
             host=args.get('host_id','local');source_id=args['source_store_id']
             discovered=self.remote_catalog.shortcut_source(host,source_id,identifier(args['thread_id'])) if host.startswith('ssh:') and source_id.startswith('legacy:') else None
@@ -573,6 +612,7 @@ def main():
             else:respond(raw)
             if args.once:break
     finally:
+        center.profile_warmup.shutdown()
         if executor is not None:executor.shutdown(wait=True)
         center.startup_updates.shutdown()
         center.update_jobs.shutdown()

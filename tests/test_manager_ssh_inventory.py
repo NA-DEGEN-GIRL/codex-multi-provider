@@ -69,6 +69,20 @@ class InventoryTests(unittest.TestCase):
             self.assertFalse(self.inventory.coverage(peer)['complete'])
         self.assertTrue(self.inventory.coverage(peer)['complete'])
 
+    def test_ssh_only_gate_blocks_a_late_native_start_without_blocking_local_launch(self):
+        hooks=UpdateHooks(self.root,self.store,None)
+        for state in ('held','attention'):
+            with self.subTest(state=state):
+                self.store.mutate(lambda data:data.setdefault('ssh_maintenance',{}).update({
+                    self.profile['id']:{'state':state,'generation':self.profile['generation']}}))
+                hooks.guard_launch(self.profile['id'])
+                with self.assertRaises(UpdateError):
+                    with self.execute('native-start'):
+                        self.fail('A connection checked before the SSH gate must still be fenced at enrollment')
+        self.store.mutate(lambda data:data['ssh_maintenance'][self.profile['id']].update(state='released'))
+        with self.execute('native-start'):
+            pass
+
     def test_unclassified_commands_never_disappear_from_coverage_on_local_exit(self):
         with self.execute('passthrough'):
             pass

@@ -95,6 +95,26 @@ class NativeMaintenanceTests(unittest.TestCase):
         mocks[3].assert_not_called()
         mocks[5].assert_not_called()
 
+    def test_failed_child_reports_safe_config_conflict_without_waiting_twenty_seconds(self):
+        mocks = self.start_patches(None)
+        mocks[6].return_value = False
+        mocks[5].return_value.poll.return_value = 1
+        def spawn(*args, **kwargs):
+            kwargs['stdout'].write(b'Codex manager remote launcher error: remote_configuration_changed\n')
+            return mocks[5].return_value
+        mocks[5].side_effect = spawn
+        with patch.object(NATIVE.time, 'sleep') as sleep:
+            with self.assertRaises(NATIVE.RemoteStartError) as raised:
+                NATIVE.start(self.profile, self.revision)
+        self.assertEqual(raised.exception.code, 'remote_configuration_changed')
+        sleep.assert_not_called()
+
+    def test_child_diagnostics_ignore_old_log_errors_and_arbitrary_private_output(self):
+        logfile = self.profile / 'native-runtime.log'
+        old = b'Codex manager remote launcher error: remote_configuration_changed\n'
+        logfile.write_bytes(old + b'private arbitrary output must not escape\n')
+        self.assertEqual(NATIVE._start_failure(logfile, len(old)), 'remote_runtime_exited')
+
     def test_expected_process_is_checked_inside_the_start_lock_before_any_rpc(self):
         mocks = self.stop_patches()
         stale = dict(self.record, process_start='previous-process')

@@ -116,3 +116,95 @@ exists=true;timer();timer();assert.equal(quits,1,'normal application quit exactl
 assert.deepEqual(calls,[],'shutdown must not present or recover a hidden window');
 closed();
 console.log('PASS: scoped application shutdown before renderer readiness, no duplicate quit');
+
+// Preloaded windows have no native lease until the user selects their profile.
+// These fixtures execute startup callbacks without creating any native window.
+function preloadFixture() {
+  const fixture = {marker:null, ownerAlive:true, calls:[], report:null};
+  vm.runInNewContext(source, {
+    process:{platform:'win32', pid:42,
+      env:{CODEX_MANAGER_ROOT:'fixture', CODEX_MANAGER_PRELOAD_HIDDEN:'1'},
+      kill(pid,signal){assert.equal(signal,0);if(!fixture.ownerAlive)throw Object.assign(Error('gone'),{code:'ESRCH'})}},
+    setInterval(fn){fixture.tick=fn;return {unref(){}}},
+    require(name){
+      if(name==='electron') return {app:{on(_,fn){fixture.created=fn},quit(){fixture.quit=true}}};
+      if(name==='node:fs') return {
+        mkdirSync(){},watch(){},
+        statSync(){if(!fixture.marker)throw Error('missing');return {size:100}},
+        readFileSync(){return JSON.stringify(fixture.marker)},
+        writeFileSync(_,data){fixture.report=JSON.parse(data)},
+        unlinkSync(file){if(!file.endsWith('.render.json'))fixture.marker=null},
+      };
+      return require(name);
+    },
+  });
+  fixture.window = hwnd => {
+    const events={}, viewEvents={};
+    const window={visible:false, once(event,fn){events[event]=fn},
+      webContents:{once(event,fn){viewEvents[event]=fn}},
+      isVisible(){return this.visible},isDestroyed(){return false},
+      getNativeWindowHandle(){const b=Buffer.alloc(8);b.writeBigUInt64LE(BigInt(hwnd));return b}};
+    for(const name of ['show','showInactive','focus','moveTop','hide','maximize','minimize','restore',
+      'unmaximize','setFullScreen','setAlwaysOnTop','setOpacity','setBounds']) {
+      window[name]=(...args)=>{
+        fixture.calls.push([hwnd,name,...args]);
+        if(name==='show'||name==='showInactive')window.visible=true;
+        if(name==='hide')window.visible=false;
+      };
+    }
+    fixture.created(null,window);
+    window.ready=()=>{events['ready-to-show']();viewEvents['did-finish-load']()};
+    return window;
+  };
+  fixture.lease = (changes={}) => fixture.marker = {
+    version:1,appPid:42,hwnd:'123',shellPid:99,token:'warmup',mode:'viewport',visible:false,...changes,
+  };
+  return fixture;
+}
+{
+  const fixture=preloadFixture(), main=fixture.window(123), auxiliary=fixture.window(124);
+  const startup=['show','showInactive','focus','moveTop','maximize','minimize','restore','unmaximize','setFullScreen','setAlwaysOnTop'];
+  for(const name of startup)main[name](true);
+  main.ready();auxiliary.ready();fixture.tick();fixture.tick();
+  assert.deepEqual(fixture.calls,[],'ready callbacks and startup fallback must not display or activate preloads');
+  main.setBounds({x:1});main.hide();main.setAlwaysOnTop(false);
+  assert.deepEqual(fixture.calls.map(call=>call[1]),['setBounds','hide','setAlwaysOnTop'],
+    'preloading permits native initialization and hide operations');
+  fixture.calls=[];
+  for(const invalid of [{appPid:43},{hwnd:'125'},{version:2},{shellPid:0}]){
+    fixture.lease(invalid);main.show();main.focus();fixture.tick();
+    assert.deepEqual(fixture.calls,[],'invalid lease cannot release startup visibility guard');
+  }
+  fixture.lease();fixture.ownerAlive=false;main.show();main.focus();fixture.tick();
+  assert.deepEqual(fixture.calls,[],'dead lease owner cannot release startup visibility guard');
+  fixture.ownerAlive=true;fixture.tick();
+  assert.deepEqual(fixture.calls,[[123,'hide']],'valid hidden lease keeps main window hidden');
+  main.show();main.focus();
+  assert.equal(fixture.calls.length,1,'viewport lease owns main visibility after startup handoff');
+  auxiliary.show();auxiliary.focus();
+  const later=fixture.window(125);later.show();later.focus();
+  assert.deepEqual(fixture.calls.slice(1),[[124,'show'],[124,'focus'],[125,'show'],[125,'focus']],
+    'auxiliary windows are native after main attach, including ones created during preload');
+  fixture.calls=[];fixture.marker.visible=true;fixture.tick();
+  assert.deepEqual(fixture.calls,[[123,'setOpacity',1],[123,'showInactive']]);
+  assert.equal(fixture.report.rendererReady,true,'renderer readiness proceeds during hidden startup');
+  assert.equal(fixture.report.shown,true);fixture.tick();assert.equal(fixture.calls.length,2);
+  fixture.marker.mode='released';fixture.tick();
+  assert.equal(fixture.marker,null);main.show();main.focus();
+  assert.deepEqual(fixture.calls.slice(-2),[[123,'show'],[123,'focus']],
+    'explicit detach permanently restores display and activation');
+}
+{
+  const fixture=preloadFixture(), main=fixture.window(123);
+  fixture.lease({mode:'released',visible:false});main.ready();
+  assert.equal(fixture.marker,null);main.show();main.focus();
+  assert.deepEqual(fixture.calls,[[123,'hide'],[123,'show'],[123,'focus']],
+    'release before the first viewport attachment restores normal behavior');
+}
+{
+  const fixture=preloadFixture();fixture.window(123);
+  fixture.lease({mode:'shutdown'});fixture.tick();
+  assert.equal(fixture.quit,true);assert.deepEqual(fixture.calls,[],
+    'shutdown does not need renderer readiness or a preceding viewport attach');
+}
+console.log('PASS: hidden preload before lease, startup no-focus, renderer ready, auxiliary windows and explicit detach');

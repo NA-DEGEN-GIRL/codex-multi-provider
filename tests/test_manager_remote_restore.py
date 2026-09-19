@@ -108,6 +108,77 @@ class RemoteRestoreTests(unittest.TestCase):
         self.assertEqual(self.fleet.calls.count(('prepare', 'fixture-a')), 1)
         self.hooks.release_maintenance(lease)
 
+    def test_late_preparation_for_old_generation_does_not_publish_or_start(self):
+        lease = self.close()
+        prepare = self.fleet.prepare
+        def changed(*args, **kwargs):
+            result = prepare(*args, **kwargs)
+            self.store.mutate(lambda data: self.store.profile(self.profile['id'], data).update(generation=str(uuid4())))
+            return result
+        self.fleet.prepare = changed
+        before = self.store.profile(self.profile['id']).get('remote_bindings')
+        with self.assertRaises(UpdateError) as raised:
+            self.restore()
+        self.assertEqual(raised.exception.code, 'remote_generation_changed')
+        self.assertEqual(self.store.profile(self.profile['id']).get('remote_bindings'), before)
+        self.assertFalse(any(call[0] == 'start' for call in self.fleet.calls))
+
+    def test_policy_edit_after_start_blocks_manifest_publication(self):
+        lease = self.close()
+        before = self.manifest.read_bytes()
+        self.assertTrue(self.restore()['verified'])
+        self.manifest.write_bytes(before)  # Simulate a result before publication.
+        self.store.mutate(lambda data: self.store.profile(self.profile['id'], data)['policy'].update(desired_revision=1))
+        with self.assertRaises(UpdateError) as raised:
+            self.fleet.publish_started(self.store.profile(self.profile['id']), self.records(lease))
+        self.assertEqual(raised.exception.code, 'policy_changed')
+        self.assertEqual(self.manifest.read_bytes(), before)
+
+    def test_generation_change_during_first_start_keeps_proof_and_cancels_remaining_starts(self):
+        lease = self.close()
+        entries = self.records(lease)
+        journals = []
+        request = self.fleet.request
+        def changed(binding, operation, **params):
+            result = request(binding, operation, **params)
+            if operation == 'start':
+                self.store.mutate(lambda data: self.store.profile(self.profile['id'], data).update(generation=str(uuid4())))
+            return result
+        self.fleet.request = changed
+        def current():
+            if self.store.profile(self.profile['id'])['generation'] != self.profile['generation']:
+                raise UpdateError('ssh_generation_changed', 'The selected launch changed.')
+        with self.assertRaises(UpdateError) as raised:
+            self.fleet.prepare_and_start(self.profile, entries,
+                lambda: journals.append(deepcopy(entries)), lifecycle_guard=current)
+        self.assertEqual(raised.exception.code, 'ssh_generation_changed')
+        self.assertEqual([entry['state'] for entry in journals[-1]], ['started', 'prepared'])
+        self.assertEqual(journals[-1][0]['started']['process'], self.fleet.running['fixture-a'])
+        self.assertEqual([call for call in self.fleet.calls if call[0] == 'start'], [('start', 'fixture-a')])
+        self.assertIsNone(self.fleet.running['fixture-b'])
+
+    def test_gate_change_during_prepare_cannot_publish_or_start_old_worker_result(self):
+        lease = self.close()
+        entries = self.records(lease)
+        admitted = True
+        prepare = self.fleet.prepare
+        def changed(*args, **kwargs):
+            nonlocal admitted
+            result = prepare(*args, **kwargs)
+            admitted = False
+            return result
+        self.fleet.prepare = changed
+        def current():
+            if not admitted:
+                raise UpdateError('ssh_generation_changed', 'The transaction changed.')
+        before = self.store.profile(self.profile['id']).get('remote_bindings')
+        with self.assertRaises(UpdateError):
+            self.fleet.prepare_and_start(self.profile, entries, lambda: None, lifecycle_guard=current)
+        self.assertEqual(self.store.profile(self.profile['id']).get('remote_bindings'), before)
+        self.assertEqual([entry['state'] for entry in entries], ['closed', 'closed'])
+        self.assertEqual([call for call in self.fleet.calls if call[0] == 'prepare'], [('prepare', 'fixture-a')])
+        self.assertFalse(any(call[0] == 'start' for call in self.fleet.calls))
+
     def test_closed_local_profile_with_older_listeners_can_complete_normal_restart(self):
         for process in self.fleet.running.values():
             process['revision'] = '0' * 64

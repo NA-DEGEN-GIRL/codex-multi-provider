@@ -41,7 +41,7 @@ import os
 from pathlib import Path
 import threading
 import time
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from .store import atomic_json, identifier, now
 from .updates import UpdateError, version_tuple, _lock_file, _unlock_file
@@ -174,6 +174,14 @@ class UpdateHooks:
         return profile_id
 
     def authorize_restoration_generation(self, profile):
+        ssh_owner = getattr(self._restoration, 'ssh_transaction_id', None)
+        if ssh_owner is not None:
+            def authorize_ssh(data):
+                gate = data.get('ssh_maintenance', {}).get(profile['id'])
+                if not gate or gate.get('transaction_id') != ssh_owner or gate.get('state') != 'held':
+                    raise UpdateError('restoration_changed', 'SSH 준비 중 프로필 실행 권한이 변경되었습니다.')
+                gate['generation'] = profile['generation']
+            self.store.mutate(authorize_ssh)
         owner = getattr(self._restoration, 'transaction_id', None)
         if owner is None:
             return
@@ -191,6 +199,190 @@ class UpdateHooks:
         scoped = data.get("profile_maintenance", {}).get(profile_id)
         return (scoped if scoped and scoped.get("state") != "released"
                 else data.get("update_maintenance"))
+
+    def open_local_for_remote_reconcile(self, profile_id):
+        """Open the desktop without network I/O, fencing only its SSH cohort."""
+        profile_id = identifier(profile_id)
+        lock = _lock_file(self.directory / 'launch-admission.lock')
+        self._admission.depth = 1
+        try:
+            profile = self._profile(profile_id)
+            data = self.store.read()
+            global_gate = data.get('update_maintenance')
+            if global_gate and global_gate.get('state') != 'released':
+                raise UpdateError('update_maintenance', '전체 업데이트가 끝나면 프로필을 열 수 있습니다.')
+            prior = data.get('profile_maintenance', {}).get(profile_id)
+            old_lease = None
+            if prior and prior.get('state') != 'released':
+                old_lease = _read_json(self._lease_path(prior['transaction_id']))
+                entries = old_lease.get('profiles', [])
+                if (old_lease.get('profile_scope') != [profile_id] or len(entries) != 1
+                        or entries[0].get('profile_id') != profile_id):
+                    raise UpdateError('restart_scope_changed', '이전 설정 적용의 계정 범위를 확인해야 합니다.')
+                previous = entries[0]
+                identities = list(previous.get('identities', {}).values())
+                if previous.get('process'):
+                    identities.append({'pid': previous['process']['process_id'],
+                                       'created': previous['process']['process_created']})
+                if (self._live(profile) is not None
+                        or (not previous.get('remote_only') and not identities)
+                        or any(self._endpoint_alive(item) for item in identities
+                               if isinstance(item, dict) and 'pid' in item)):
+                    raise UpdateError('previous_runtime_alive', '이전 로컬 실행의 종료를 먼저 확인해야 합니다.')
+            existing = data.get('ssh_maintenance', {}).get(profile_id)
+            if existing and existing.get('state') != 'released':
+                transaction_id = identifier(existing['transaction_id'])
+                lease = _read_json(self._lease_path(transaction_id))
+                if not lease.get('ssh_only') or lease.get('profile_scope') != [profile_id]:
+                    raise UpdateError('restart_scope_changed', 'SSH 준비 기록의 계정 범위가 다릅니다.')
+            else:
+                transaction_id = str(uuid4())
+                records = copy.deepcopy(old_lease['profiles'][0].get('remotes', [])) if old_lease else []
+                for record in records:
+                    record['reinspect'] = True
+                if not records:
+                    from .ssh_shim import validate_binding
+                    bindings = {b['alias']: validate_binding(b, profile_id)
+                                for b in profile.get('remote_bindings', []) if b.get('prepared') is True}
+                    path = self.store.directory / 'profiles' / profile_id / 'ssh-bindings.json'
+                    if path.is_file():
+                        manifest = _read_json(path, 256000)
+                        if manifest.get('profile_id') == profile_id:
+                            bindings.update({b['alias']: validate_binding(b, profile_id)
+                                             for b in manifest.get('bindings', [])})
+                    hosts = data.get('ssh_inventory', {}).get(profile_id, {}).get('hosts', [])
+                    records = [dict(binding=bindings.get(alias), alias=alias, state='unobserved')
+                               for alias in sorted(set(hosts))]
+                lease = dict(transaction_id=transaction_id, ssh_only=True, state='held',
+                             profile_scope=[profile_id], target_revision=profile['policy']['desired_revision'],
+                             profiles=[dict(profile_id=profile_id, generation=profile.get('generation'),
+                                            remote_only=True, state='held', remotes=records)])
+            # Retry remote evidence with the current helper, never an old saved
+            # next_binding start. A fresh inspect proves exit or the actual PID.
+            for record in lease['profiles'][0].get('remotes', []):
+                if record.get('state') in ('prepared', 'start_requested', 'stop_requested', 'started'):
+                    record['reinspect'] = True
+            lease['target_revision'] = profile['policy']['desired_revision']
+            self._save_lease(lease)
+            def hold(current):
+                current.setdefault('ssh_maintenance', {})[profile_id] = dict(
+                    state='held', transaction_id=transaction_id, generation=profile.get('generation'),
+                    target_revision=profile['policy']['desired_revision'], updated_at=now())
+                if old_lease:
+                    gate = current.get('profile_maintenance', {}).get(profile_id)
+                    if not gate or gate.get('transaction_id') != prior['transaction_id']:
+                        raise UpdateError('restoration_changed', '이전 설정 적용 기록이 변경되었습니다.')
+                    gate.update(state='released', adopted_by=transaction_id, updated_at=now())
+            self.store.mutate(hold)
+            self._restoration.ssh_transaction_id = transaction_id
+            shown = self.instances.show(profile_id, reopen_existing=False)
+            current = self._profile(profile_id)
+            def launched(state):
+                gate = state['ssh_maintenance'][profile_id]
+                if gate['transaction_id'] != transaction_id:
+                    raise UpdateError('restoration_changed', 'SSH 준비 요청이 변경되었습니다.')
+                gate['generation'] = current.get('generation')
+            self.store.mutate(launched)
+            lease['profiles'][0]['generation'] = current.get('generation')
+            if lease['profiles'][0].get('remotes'):
+                from .ssh_shim import validate_binding
+                manifest = _read_json(self.store.directory / 'profiles' / profile_id / 'ssh-bindings.json', 256000)
+                if (manifest.get('profile_id') != profile_id
+                        or manifest.get('generation') != current.get('generation')):
+                    raise UpdateError('remote_generation_changed', '로컬 창의 SSH 연결 설정을 확인해야 합니다.')
+                published = {b['alias']: validate_binding(b, profile_id) for b in manifest.get('bindings', [])}
+                # Environment creation may have installed a previously prepared
+                # binding. Pin that publication baseline independently of the
+                # original runtime identity retained in binding/active_binding.
+                for record in lease['profiles'][0]['remotes']:
+                    record.pop('publication_binding', None)
+                    alias = (record.get('binding') or {}).get('alias', record.get('alias'))
+                    if alias in published:
+                        record['publication_binding'] = published[alias]
+            self._save_lease(lease)
+            return shown, transaction_id
+        except (RuntimeError, ValueError, OSError, KeyError):
+            if getattr(self._restoration, 'ssh_transaction_id', None):
+                self.remote_open_failed(profile_id, transaction_id, 'local_launch_failed')
+            raise
+        finally:
+            self._restoration.ssh_transaction_id = None
+            self._admission.depth = 0
+            _unlock_file(lock)
+
+    def reconcile_opened_remotes(self, profile_id, transaction_id):
+        """Advance only SSH; the newly opened local process is never closed."""
+        lease = _read_json(self._lease_path(transaction_id))
+        if not lease.get('ssh_only') or lease.get('profile_scope') != [profile_id]:
+            raise UpdateError('restart_scope_changed', 'SSH 준비 범위가 다릅니다.')
+        entry = lease['profiles'][0]
+        def current():
+            profile = self._profile(profile_id)
+            gate = self.store.read().get('ssh_maintenance', {}).get(profile_id, {})
+            if (gate.get('transaction_id') != transaction_id or gate.get('state') != 'held'
+                    or profile.get('generation') != entry['generation']
+                    or gate.get('generation') != entry['generation']
+                    or profile['policy']['desired_revision'] != lease['target_revision']):
+                raise UpdateError('ssh_generation_changed', '프로필 실행 또는 설정이 변경되어 SSH 적용을 중지했습니다.')
+            self.guard_launch(profile_id)
+            return profile
+        current()
+        if self.remote_maintenance is None:
+            raise UpdateError('remote_binding_unknown', 'SSH 준비 구성요소를 확인해야 합니다.')
+        records = entry.get('remotes', [])
+        for record in records:
+            current()
+            if record.get('state') == 'unobserved' or record.get('reinspect'):
+                binding = record.get('next_binding') or record.get('active_binding') or record.get('binding')
+                if not binding:
+                    raise UpdateError('remote_binding_unknown', '저장된 SSH 연결 설정을 확인해야 합니다.')
+                observed = self.remote_maintenance.request(binding, 'inspect', discover_active=True)
+                record.update(process=observed['process'], idle=observed['idle'], exited=observed['exited'],
+                              active_binding=observed.get('active_binding', binding),
+                              state='observed' if observed['process'] is not None else 'closed')
+                record.pop('reinspect', None)
+                record.pop('next_binding', None)
+                record.pop('target_policy_revision', None)
+                self._save_lease(lease)
+                current()
+            if record.get('state') == 'observed':
+                observed = self.remote_maintenance.request(record.get('active_binding', record['binding']), 'inspect')
+                if observed['process'] != record['process']:
+                    raise UpdateError('remote_process_changed', 'SSH 실행 식별자가 변경되어 종료하지 않았습니다.')
+                if not observed['idle']:
+                    return False
+            elif record.get('state') in ('stop_requested', 'start_requested'):
+                self.remote_maintenance.reconcile(record)
+                self._save_lease(lease)
+                if record['state'] in ('stop_requested', 'start_requested'):
+                    return False
+        current()
+        self._close_remotes(lease, entry, lifecycle_guard=current)
+        profile = current()
+        self.remote_maintenance.prepare_and_start(profile, records, lambda: self._save_lease(lease),
+                                                  lifecycle_guard=current)
+        profile = current()
+        self.remote_maintenance.publish_started(profile, records)
+        def release(data):
+            gate = data['ssh_maintenance'][profile_id]
+            profile = self.store.profile(profile_id, data)
+            if (gate.get('transaction_id') != transaction_id or gate.get('generation') != entry['generation']
+                    or profile.get('generation') != entry['generation']
+                    or profile['policy']['desired_revision'] != lease['target_revision']):
+                raise UpdateError('ssh_generation_changed', 'SSH 준비 중 프로필 설정이 변경되었습니다.')
+            gate.update(state='released', updated_at=now())
+        self.store.mutate(release)
+        lease['state'] = 'released'
+        self._save_lease(lease)
+        return True
+
+    def remote_open_failed(self, profile_id, transaction_id, code):
+        def attention(data):
+            gate = data.get('ssh_maintenance', {}).get(profile_id)
+            if gate and gate.get('transaction_id') == transaction_id:
+                gate.update(state='attention', code=code,
+                            message='로컬 창은 사용할 수 있습니다. SSH 연결 준비 상태를 확인해 주세요.', updated_at=now())
+        self.store.mutate(attention)
 
     @contextmanager
     def launch_admission(self, profile_id):
@@ -451,6 +643,10 @@ class UpdateHooks:
 
     def _begin_global(self, transaction_id, profile_scope=None):
         def begin(data):
+            ssh_gates = data.get('ssh_maintenance', {})
+            candidates = ssh_gates.values() if profile_scope is None else (ssh_gates.get(key) for key in profile_scope)
+            if any(gate and gate.get('state') != 'released' for gate in candidates):
+                raise UpdateError('profile_maintenance', 'SSH 연결 준비가 끝난 뒤 전체 설정을 적용할 수 있습니다.')
             previous = data.get("update_maintenance")
             if previous and previous.get("state") != "released" and previous.get("transaction_id") != transaction_id:
                 raise UpdateError("update_in_progress", "다른 업데이트가 프로필 시작을 관리하고 있습니다.")
@@ -670,8 +866,10 @@ class UpdateHooks:
         # Ordinary manual update callers retain their existing close semantics.
         return False
 
-    def _close_remotes(self, lease, entry):
+    def _close_remotes(self, lease, entry, *, lifecycle_guard=None):
         for remote in entry.get('remotes', []):
+            if lifecycle_guard is not None:
+                lifecycle_guard()
             if remote.get('state') == 'closed':
                 continue
             if remote.get('state') != 'observed':
@@ -686,6 +884,8 @@ class UpdateHooks:
                     raise UpdateError('remote_shutdown_pending', 'SSH 서버의 종료를 확인하지 못했습니다.')
                 remote.update(state='closed', exit_proof=proof)
             self._save_lease(lease)
+            if lifecycle_guard is not None:
+                lifecycle_guard()
 
     def _endpoint_alive(self, value):
         return self.liveness(value) not in ("exited", "reused")

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import nullcontext
 import os
 from pathlib import Path
 import shlex
@@ -42,6 +43,25 @@ def unwrap(command):
 
 
 class NativeFixtureTests(unittest.TestCase):
+    def test_waiting_connection_routes_the_new_published_binding(self):
+        with tempfile.TemporaryDirectory() as directory:
+            executable=Path(directory)/'ssh.exe'
+            executable.write_bytes(b'fixture')
+            old=manifest()
+            old.update(generation=OTHER,inventory_root=directory,real_ssh=str(executable))
+            new=json.loads(json.dumps(old))
+            new['bindings'][0]['revision']='b'*64
+            path=Path(directory)/'ssh-bindings.json'
+            with patch('manager_core.ssh_shim._load_manifest',side_effect=[(old,path),(new,path)]), \
+                 patch('manager_core.ssh_connection_wait.wait_for_settings') as wait, \
+                 patch('manager_core.ssh_shim._audit'), \
+                 patch('manager_core.ssh_inventory.SshInventory.execution',return_value=nullcontext()), \
+                 patch('manager_core.ssh_shim._execute',return_value=0) as execute:
+                self.assertEqual(main(['remote-dev',FIXTURE['wrapped']['app_server_bootstrap']]),0)
+            wait.assert_called_once()
+            self.assertEqual(execute.call_args.args[-1]['revision'],'b'*64)
+            self.assertNotIn('a'*64,execute.call_args.args[1][-1])
+
     def test_updated_installed_app_routes_exact_captured_start_and_proxy(self):
         for version in ('26_908_4834', '26_911_7940'):
             fixture=json.loads((Path(__file__).parent/f'fixtures/native_ssh_{version}.json').read_text(encoding='utf-8-sig'))

@@ -9,6 +9,10 @@ fn note_args() -> Value {
 fn retirement_requires_known_idle_management_state_not_closed_apps() {
     let mut response = json!({"ok":true,"result":{"profiles":[{"status":"running"}]}});
     assert!(can_stop(&response));
+    response["result"]["local_launches"] = json!({"active":1});
+    assert!(!can_stop(&response));
+    response["result"]["local_launches"] = json!({"active":0});
+    assert!(can_stop(&response));
     for phase in ["opening", "waiting", ""] {
         response["result"]["profile_restarts"] = json!({"p":{"phase":phase}});
         assert!(!can_stop(&response));
@@ -20,7 +24,7 @@ fn retirement_requires_known_idle_management_state_not_closed_apps() {
     response["result"]["profile_restarts"] = json!([]);
     assert!(!can_stop(&response));
     response["result"]["profile_restarts"] = json!({});
-    for key in ["updates", "startup_updates"] {
+    for key in ["updates", "startup_updates", "profile_warmup"] {
         for active in [json!(true), json!(null), json!("false")] {
             response["result"][key] = json!({"worker_active":active});
             assert!(!can_stop(&response));

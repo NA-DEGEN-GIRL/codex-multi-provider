@@ -8,7 +8,7 @@ internal static class NativeWindowShutdown
 {
     // Called only for a shell-owned, lifetime-verified HWND. Hold the process
     // handle across the await so PID reuse cannot turn success into a new target.
-    internal static async Task<bool> RequestAsync(string root, int pid, nint hwnd, string executable)
+    internal static async Task<bool> RequestAsync(string root, int pid, nint hwnd, string executable, long expectedCreated = 0)
     {
         Process process;
         try { process = Process.GetProcessById(pid); }
@@ -17,8 +17,13 @@ internal static class NativeWindowShutdown
         {
             _ = process.Handle;
             if (process.HasExited) return true;
+            if (expectedCreated != 0 && process.StartTime.ToUniversalTime().ToFileTimeUtc() != expectedCreated)
+                throw new InvalidOperationException("Codex process lifetime changed before shutdown.");
             if (!string.Equals(process.MainModule?.FileName, executable, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidOperationException("Codex process identity changed before shutdown.");
+            NativeWindowInterop.GetWindowThreadProcessId(hwnd, out var ownerPid);
+            if (ownerPid != (uint)pid)
+                throw new InvalidOperationException("Codex window owner changed before shutdown.");
             var directory = Path.Combine(root, "work", "control-center", "window-hosts");
             Directory.CreateDirectory(directory);
             var path = Path.Combine(directory, $"{pid}.json");

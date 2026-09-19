@@ -105,6 +105,9 @@ class SshInventory:
         if observed.get('process_id') != pid or type(created) is not int or created <= 0:
             created = None
         def enroll(data):
+            ssh_gate = data.get('ssh_maintenance', {}).get(profile_id)
+            if ssh_gate and ssh_gate.get('state') != 'released':
+                raise UpdateError('ssh_settings_pending', 'SSH settings are being prepared; local work remains available.')
             for gate in (data.get('update_maintenance'), data.get('profile_maintenance', {}).get(profile_id)):
                 if gate and gate.get('state') != 'released':
                     restored = gate.get('restoring_generations', {}).get(profile_id) == generation

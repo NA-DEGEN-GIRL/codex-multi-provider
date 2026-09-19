@@ -107,6 +107,20 @@ class RemoteMaintenanceTests(unittest.TestCase):
                     stdout=json.dumps(dict(ok=True, result={**base, **change})).encode())
                 self.service.snapshot(self.profile, self.coverage)
 
+    def test_start_failure_surfaces_only_allowlisted_diagnostic_code(self):
+        self.service.root = ROOT
+        self.service.remote = MagicMock()
+        for code, expected in [('remote_configuration_changed', 'remote_configuration_changed'),
+                               ('remote_runtime_exited', 'remote_runtime_exited'),
+                               ('private text from remote', 'remote_maintenance_unverified')]:
+            self.service.remote._run.return_value = types.SimpleNamespace(returncode=2,
+                stdout=json.dumps(dict(ok=False, code=code, detail='secret-value')).encode())
+            with self.subTest(code=code), self.assertRaises(UpdateError) as raised:
+                self.service.request(self.binding, 'start')
+            self.assertEqual(raised.exception.code, expected)
+            self.assertNotIn('secret-value', str(raised.exception))
+            self.assertNotIn('private text', str(raised.exception))
+
     def test_read_only_reconciliation_never_replays_a_lost_mutation(self):
         self.service.request = MagicMock(return_value={'exited': False, 'idle': True, 'process': {'pid': 12}})
         entry = dict(state='stop_requested', binding=self.binding)

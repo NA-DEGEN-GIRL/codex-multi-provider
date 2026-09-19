@@ -7,6 +7,7 @@ from uuid import uuid4
 import test_manager_update_hooks as fixtures
 from test_manager_remote_restore import Fleet
 from manager_core.profile_restart import ProfileRestarts
+from manager_core.profile_warmup import ProfileWarmup
 from manager_core.store import atomic_json
 from manager_core.updates import UpdateError
 from control_center import ControlCenter
@@ -32,7 +33,7 @@ class ProfileRemoteRetryTests(unittest.TestCase):
         self.show_count = 0
         original_show = self.fixture.instances.show
 
-        def show(profile_id):
+        def show(profile_id, **kwargs):
             before = self.store.profile(profile_id)['generation']
             value = original_show(profile_id)
             current = self.store.profile(profile_id)
@@ -47,7 +48,7 @@ class ProfileRemoteRetryTests(unittest.TestCase):
                 manifest = json.loads(self.manifest.read_text())
                 manifest['generation'] = current['generation']
                 atomic_json(self.manifest, manifest)
-            return value
+            return {**value, 'state': 'launched' if before != current['generation'] else 'existing'}
         self.fixture.instances.show = show
 
     def apply(self):
@@ -90,8 +91,10 @@ class ProfileRemoteRetryTests(unittest.TestCase):
         center = ControlCenter.__new__(ControlCenter)
         center.store, center.instances = self.store, self.fixture.instances
         center.restarts, center.remote_maintenance = self.restarts, self.fleet
+        center.profile_warmup = ProfileWarmup(self.store,self.fixture.instances,lambda _: None)
         result = center.dispatch('profile.show', {'profile_id': self.profile['id']})
-        self.assertEqual(result['state'], 'updating')
+        self.assertEqual(result['state'], 'launched')
+        self.assertEqual(self.show_count, 1, 'Local window must open before any SSH request')
         self.assertFalse(self.fleet.calls, 'Selection must not perform synchronous SSH work')
         self.pending.pop()()
         job = self.restarts.status()[self.profile['id']]

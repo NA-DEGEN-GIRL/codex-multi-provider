@@ -217,6 +217,9 @@ impl Service {
 fn allowed(command: &str) -> bool {
     [
         "manager.startup",
+        "manager.stop_warmup",
+        "manager.resume_launches",
+        "profile.cleanup",
         "manager.recover_legacy",
         "state",
         "accounts.refresh",
@@ -268,7 +271,8 @@ fn can_stop(response: &Value) -> bool {
     let state = &response["result"];
     response["ok"] == true
         && state["profiles"].is_array()
-        && ["updates", "startup_updates"].iter().all(|key| {
+        && state.get("local_launches").is_none_or(|launches| launches["active"] == 0)
+        && ["updates", "startup_updates", "profile_warmup"].iter().all(|key| {
             state[key]
                 .get("worker_active")
                 .is_none_or(|active| active == false)

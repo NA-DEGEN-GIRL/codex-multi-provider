@@ -1,8 +1,11 @@
 import sys
 import hashlib
+import json
 import tempfile
+import types
 import unittest
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 from remote_helpers import launch
@@ -70,6 +73,58 @@ class ObsoleteRoleTests(unittest.TestCase):
             launch.obsolete_role_plan(self.home, self.previous, {})
         self.assertTrue(self.role.exists())
         self.assertFalse((self.home / 'manager-retired-agents').exists())
+
+    def historical_definition(self, profile, content, *, revision='a' * 64, profile_id=None):
+        definition = profile / 'definitions' / revision
+        (definition / 'agents').mkdir(parents=True)
+        (definition / 'agents/cc_gpt_astra.toml').write_bytes(content)
+        descriptor = dict(profile_id=profile_id or profile.name, revision=revision, definition=str(definition))
+        (definition.parent / (revision + '.json')).write_text(json.dumps(descriptor), encoding='utf-8')
+        return definition
+
+    def test_historical_manager_bytes_recover_lost_ownership_but_personal_edits_do_not(self):
+        profile = self.home / 'profile'
+        self.historical_definition(profile, self.content)
+        self.assertEqual(launch.recover_role_ownership(profile, self.home, {}), self.previous)
+        self.role.write_bytes(self.content + b'# personal edit\n')
+        self.assertEqual(launch.recover_role_ownership(profile, self.home, {}), {})
+
+    def test_foreign_descriptor_cannot_claim_historical_role_ownership(self):
+        profile = self.home / 'profile'
+        self.historical_definition(profile, self.content, profile_id='someone-else')
+        self.assertEqual(launch.recover_role_ownership(profile, self.home, {}), {})
+
+    def test_launch_repairs_orphaned_selected_role_and_keeps_exact_backup(self):
+        profile = self.home / 'profiles' / 'fixture-profile'
+        home = profile / 'codex'
+        old = b'model = "gpt-fixture"\n'
+        new = b'name = "fixture"\ndescription = "Fixture role"\nmodel = "gpt-fixture"\ndeveloper_instructions = "Fixture"\n'
+        self.historical_definition(profile, old)
+        revision = 'b' * 64
+        definition = self.historical_definition(profile, new, revision=revision)
+        runtime = self.home / 'runtime' / 'fixture'
+        runtime.mkdir(parents=True)
+        descriptor_path = profile / 'definitions' / (revision + '.json')
+        descriptor = json.loads(descriptor_path.read_text())
+        descriptor['runtime'] = str(runtime)
+        descriptor_path.write_text(json.dumps(descriptor))
+        (home / 'agents').mkdir(parents=True)
+        target = home / 'agents/cc_gpt_astra.toml'
+        target.write_bytes(old)
+        (profile / 'generated-files.json').write_text('{}')
+        (profile / 'credentials').mkdir()
+        (profile / 'credentials' / (revision + '.json')).write_text('{}')
+        common = types.SimpleNamespace(reconcile_skills=MagicMock())
+        fcntl = types.SimpleNamespace(LOCK_EX=2, LOCK_NB=4, flock=MagicMock())
+        with patch.dict(sys.modules, {'common': common, 'fcntl': fcntl}), \
+             patch.object(launch.os, 'execve', side_effect=RuntimeError('fixture runtime reached')):
+            with self.assertRaisesRegex(RuntimeError, 'fixture runtime reached'):
+                launch.run(profile, revision, ['--version'])
+        self.assertEqual(target.read_bytes(), new)
+        backups = list((home / 'manager-retired-agents').glob('*.toml'))
+        self.assertEqual([path.read_bytes() for path in backups], [old])
+        self.assertEqual(json.loads((profile / 'generated-files.json').read_text()),
+                         {'agents/cc_gpt_astra.toml': hashlib.sha256(new).hexdigest()})
 
 
 if __name__ == '__main__':

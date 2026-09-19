@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import threading
 import time
 from uuid import uuid4
 
@@ -113,6 +114,9 @@ class Instances:
         self.processes={};self.handles={}
         self.embed_windows=embed_windows
         self.launch_admission=None
+        self._launch_lock=threading.Lock()
+        self._launch_count=0
+        self._launch_stopping=False
         from .catalog_refresh import CatalogRefresh
         self.catalog_refresh=CatalogRefresh(self.root)
         from .source_catalog import build as source_catalog_build
@@ -207,6 +211,8 @@ class Instances:
         from .desktop_bundle import pipe_name
         env['CODEX_MANAGER_DESKTOP_PIPE'] = pipe_name(profile['id'])
         env['CODEX_MANAGER_ROOT'] = str(self.root)
+        if self.embed_windows:
+            env['CODEX_MANAGER_PRELOAD_HIDDEN'] = '1'
         if profile.get('auth_mode') in ('native', 'source', 'external'):
             env={name:value for name,value in env.items() if not name.upper().startswith(('OPENAI_','AZURE_OPENAI_','CHATGPT_'))}
         if profile.get('runtime_channel')=='packaged':
@@ -308,8 +314,34 @@ class Instances:
         return env
 
     def show(self, profile_id, *, reopen_existing=True):
-        with self.launch_admission(profile_id) if self.launch_admission else nullcontext():
-            return self._show(profile_id, reopen_existing=reopen_existing)
+        with self._launch_lock:
+            if self._launch_stopping:
+                raise RuntimeError('관리창을 닫는 중이므로 새 프로필 실행을 중지했습니다.')
+            self._launch_count+=1
+        try:
+            with self.launch_admission(profile_id) if self.launch_admission else nullcontext():
+                return self._show(profile_id, reopen_existing=reopen_existing)
+        finally:
+            with self._launch_lock:
+                self._launch_count-=1
+
+    def launch_status(self):
+        with self._launch_lock:
+            return dict(stopping=self._launch_stopping,active=self._launch_count)
+
+    def stop_launches(self):
+        with self._launch_lock:
+            self._launch_stopping=True
+            return dict(stopping=True,active=self._launch_count)
+
+    def resume_launches(self):
+        with self._launch_lock:
+            self._launch_stopping=False
+
+    def _require_launch_open(self):
+        with self._launch_lock:
+            if self._launch_stopping:
+                raise RuntimeError('관리창을 닫는 중이므로 새 프로필 실행을 중지했습니다.')
 
     def _show(self, profile_id, *, reopen_existing=True):
         profile=self.store.profile(profile_id)
@@ -327,6 +359,7 @@ class Instances:
             # state. No deep link is sent, so its current conversation stays put.
             environment=self.environment(profile)
             try:
+                self._require_launch_open()
                 from . import rust_service
                 request=rust_service.launch(profile,active['executable_path'],environment,embed=self.embed_windows,reopen=True) if rust_service.enabled() else subprocess.Popen([active['executable_path'],f'--user-data-dir={profile["ui_home"]}'],
                     cwd=self.root,env=environment,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,
@@ -376,6 +409,7 @@ class Instances:
             # The combined desktop also offers ChatGPT/Work. Its native deep link
             # selects the Codex composer without creating or submitting a task.
             from . import rust_service
+            self._require_launch_open()
             process=rust_service.launch(profile,app['executable'],env,embed=self.embed_windows) if rust_service.enabled() else subprocess.Popen([app['executable'],f'--user-data-dir={profile["ui_home"]}',
                                       'codex://threads/new?mode=codex'],cwd=self.root,
                                      env=env,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
