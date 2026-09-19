@@ -117,6 +117,9 @@ class Instances:
         self._launch_lock=threading.Lock()
         self._launch_count=0
         self._launch_stopping=False
+        self._app_lock=threading.Lock()
+        self._app_cache=None
+        self._app_checked=0.0
         from .launch_metrics import LaunchMetrics
         self.metrics = LaunchMetrics(store.directory)
         from .personal_skills import PersonalSkills
@@ -127,6 +130,19 @@ class Instances:
         self.catalog_refresh=CatalogRefresh(self.root)
         from .source_catalog import build as source_catalog_build
         self.source_catalog_refresh=CatalogRefresh(self.root,builder=source_catalog_build)
+
+    def installed_app(self):
+        # Package discovery starts PowerShell. Share it briefly across launch
+        # preparation and SSH environment construction, never across services.
+        from desktop_launch import find_app
+        with self._app_lock:
+            if (self._app_cache and time.monotonic()-self._app_checked < 5
+                    and Path(self._app_cache.get('executable', '')).is_file()):
+                return dict(self._app_cache)
+            app = find_app()
+            self._app_cache = dict(app)
+            self._app_checked = time.monotonic()
+            return dict(app)
 
     def paths(self, profile):
         pid=identifier(profile['id'])
@@ -307,8 +323,7 @@ class Instances:
             release=json.loads(manifest.read_text(encoding='utf-8-sig'))
             from .ssh_shim import prepare_environment
             from .ssh_compatibility import fingerprint
-            from desktop_launch import find_app
-            installed_app = find_app()
+            installed_app = self.installed_app()
             env=prepare_environment(self.root,profile['id'],profile.get('remote_bindings',[]),env,
                                     app_version=installed_app['Version'],ssh_proxy=release.get('ssh_proxy'),
                                     app_source_sha256=fingerprint(installed_app['executable']),
@@ -403,10 +418,9 @@ class Instances:
                 raise RuntimeError('이 프로필의 로그인 계정을 먼저 확인하세요. 다른 계정으로 작업을 시작하지 않았습니다.')
         with self.metrics.phase(profile_id, 'profile_configuration'):
             preparation = self.prepare(profile)
-        from desktop_launch import find_app
         from .desktop_bundle import prepare as prepare_desktop
         with self.metrics.phase(profile_id, 'desktop_bundle'):
-            app=prepare_desktop(self.root, find_app())
+            app=prepare_desktop(self.root, self.installed_app())
         profile['generation']=str(uuid4())
         profile['shared_catalog_path']=None
         if profile.get('view_only'):

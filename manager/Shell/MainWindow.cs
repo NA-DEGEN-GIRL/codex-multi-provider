@@ -668,6 +668,7 @@ public sealed class MainWindow : Window
             _profileUpdateStatus.Text = startup.Message("전체 프로필 업데이트 확인 중");
             var warmup = _state.Get("profile_warmup");
             _profileCount.Text = _state.Arr("profiles").Count().ToString();
+            using (_responsiveness?.Stage("shell.profile_list", 25))
             if (!_profileOrdering.IsInteracting) Fill(_profiles, _state.Arr("profiles").Select(p =>
             {
                 var update = startup.Arr("profiles").FirstOrDefault(item => item.S("profile_id") == p.S("id"));
@@ -685,6 +686,7 @@ public sealed class MainWindow : Window
                 return new Choice(p.S("id"), $"{label}\n{usage} · {Status(p.S("status"))}" + suffix, p) { ProfileNotice = suffix };
             }), _selectedProfile);
             var shortcuts = _state.Arr("shortcuts");
+            using (_responsiveness?.Stage("shell.shortcut_list", 25))
             Fill(_shortcuts, shortcuts.Select(s => new Choice(s.S("id"), s.S("alias", "이름 없는 작업") + "\n" +
                 _state.Arr("profiles").FirstOrDefault(p => p.S("id") == s.S("profile_id")).S("alias", "계정 지정 필요") +
                 " 계정에서 열기 · " + (s.S("host_id", "local") == "local" ? "Windows" : s.S("host_id")), s)), (_shortcuts.SelectedItem as Choice)?.Id);
@@ -701,7 +703,7 @@ public sealed class MainWindow : Window
             _taskIdentity.Text = openedTask.S("thread_id") == "" ? "작업 · 아직 열지 않음" : "최근 연 작업 · " + openedTask.S("title", openedTask.S("thread_id"));
             if (openedTask.S("thread_id") != "" && openedTask.S("title") == "") _taskIdentity.Text = "최근 연 작업 · " + openedTask.S("thread_id");
             _taskIdentity.ToolTip = "이 프로필에서 마지막으로 열기 완료한 작업입니다.\n" + openedTask.S("title") + "\n" + openedTask.S("thread_id");
-            _taskContext?.Select(p);
+            using (_responsiveness?.Stage("shell.task_context", 25)) _taskContext?.Select(p);
             if (_selectedTask is { } selectedTask) { _taskIdentity.Text = "작업 · " + selectedTask.Title; _taskIdentity.ToolTip = selectedTask.Title + "\n" + selectedTask.Task.Key; }
             var policy = p.Get("policy");
             var mode = p.S("auth_mode") == "external" ? p.S("external_model_name", "외부 API 모델") : "GPT 사용";
@@ -757,6 +759,7 @@ public sealed class MainWindow : Window
                 _lastUpdateNotice = updateNotice;
                 Log("전체 Codex 앱 업데이트 · " + _updateStatus.Text.Replace('\n', ' '));
             }
+            using (_responsiveness?.Stage("shell.diagnostics", 25))
             foreach (var observed in _state.Arr("profiles").Concat(_state.Arr("view_instances")))
             {
                 var loginProblem = observed.Get("login_health");
@@ -805,13 +808,14 @@ public sealed class MainWindow : Window
                     _observedDiagnostics[generation] = entry.N("sequence");
                 }
             }
+            using (_responsiveness?.Stage("shell.selected_window", 25))
             if (_embedRequested && _profileRequestTicket is null && _selectedProfile is not null)
             {
                 if (p.Get("restart").S("phase") is "acquiring" or "closing" or "opening" or "releasing" or "waiting" or "recovering" or "connecting")
                     _attachDeadline = DateTime.UtcNow.AddSeconds(25);
                 TryAttach(p);
             }
-            ReconcileBackgroundWindows();
+            using (_responsiveness?.Stage("shell.background_windows", 25)) ReconcileBackgroundWindows();
         }
         finally { _rendering = false; }
     }

@@ -378,6 +378,7 @@ class ControlCenter:
             if observed.get('status')!='running' and warmup['worker_active'] and (
                     not warmup['profiles'] or pending and pending['state'] in ('queued','checking','opening')):
                 self.profile_warmup.prioritize(profile['id'])
+                self.update_hooks.prioritize_launch(profile['id'])
                 return dict(profile_id=profile['id'], profile={**profile,**observed},
                             state='opening')
             return self._open_profile_locally(profile['id'])

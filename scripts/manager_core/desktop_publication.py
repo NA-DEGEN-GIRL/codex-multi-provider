@@ -1,10 +1,14 @@
 """Crash-safe publication of program-only desktop copies and verified fallback."""
 from contextlib import contextmanager
+from collections import OrderedDict
+import ctypes
 import hashlib
 import json
 import os
 from pathlib import Path
 import shutil
+import stat
+import threading
 import time
 from uuid import uuid4
 
@@ -44,9 +48,50 @@ def publication_lock(parent):
                 fcntl.flock(stream, fcntl.LOCK_UN)
 
 
+_hashes = OrderedDict()
+_hash_lock = threading.Lock()
+
+
+def _content_stamp(stream):
+    info = os.fstat(stream.fileno())
+    changed = info.st_ctime_ns
+    if os.name == 'nt':
+        # Python's Windows ctime is creation time, not last metadata/content
+        # change. NTFS ChangeTime also detects writes with a restored mtime.
+        import msvcrt
+        from ctypes import wintypes
+        class BasicInfo(ctypes.Structure):
+            _fields_ = [(name, ctypes.c_longlong) for name in
+                        ('created', 'accessed', 'written', 'changed')] + [('attributes', wintypes.DWORD)]
+        query = ctypes.WinDLL('kernel32', use_last_error=True).GetFileInformationByHandleEx
+        query.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+        query.restype = wintypes.BOOL
+        basic = BasicInfo()
+        if not query(msvcrt.get_osfhandle(stream.fileno()), 0, ctypes.byref(basic), ctypes.sizeof(basic)):
+            return None  # An unavailable change stamp must never permit reuse.
+        changed = basic.changed
+    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, changed
+
+
 def _hash(path):
     with path.open('rb') as stream:
-        return hashlib.file_digest(stream, 'sha256').hexdigest()
+        before = _content_stamp(stream)
+        key = str(path.absolute()), before
+        with _hash_lock:
+            cached = _hashes.get(key) if before is not None else None
+            if cached is not None:
+                _hashes.move_to_end(key)
+                return cached
+        digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+        after = _content_stamp(stream)
+        if before != after:
+            raise OSError('Desktop program changed while checking its content.')
+        if before is not None:
+            with _hash_lock:
+                _hashes[key] = digest
+                while len(_hashes) > 64:
+                    _hashes.popitem(last=False)
+        return digest
 
 
 def _inventory(directory):
@@ -56,19 +101,29 @@ def _inventory(directory):
 
 def validated(directory, marker_name, identity=None):
     try:
+        directory = Path(directory)
+        resolved = directory.resolve()
         value = json.loads((directory / marker_name).read_text(encoding='utf8'))
         if identity is not None and value.get('source') != identity:
             return None
         if not value.get('files') or not value.get('hashes'):
             return None
+        parents = {}
         for name, expected in value['files'].items():
             path = directory / name
-            if not path.resolve().is_relative_to(directory.resolve()) or path.is_symlink():
+            parent = parents.get(path.parent)
+            if parent is None:
+                parent = parents[path.parent] = path.parent.resolve()
+            if not parent.is_relative_to(resolved):
                 return None
-            info = path.stat()
+            info = path.lstat()
+            if not stat.S_ISREG(info.st_mode) or getattr(info, 'st_file_attributes', 0) & 0x400:
+                return None  # No symlink/reparse-point file may escape validation.
             if expected != dict(size=info.st_size, modified=info.st_mtime_ns):
                 return None
         for name, digest in value['hashes'].items():
+            if name not in value['files']:
+                return None
             if _hash(directory / name) != digest:
                 return None
         return value

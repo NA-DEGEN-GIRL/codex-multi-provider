@@ -146,7 +146,8 @@ class UpdateHooks:
         self.remote_maintenance = remote_maintenance
         self.clock, self.sleep, self.timeout = clock or time.monotonic, sleep or time.sleep, timeout
         self._mutex = threading.RLock()
-        self._launch_queue = threading.RLock()
+        from .launch_queue import LaunchQueue
+        self._launch_queue = LaunchQueue()
         self._restoration = threading.local()
         self._admission = threading.local()
 
@@ -204,11 +205,14 @@ class UpdateHooks:
         return (scoped if scoped and scoped.get("state") != "released"
                 else data.get("update_maintenance"))
 
-    def _acquire_launch_admission_lock(self):
+    def prioritize_launch(self, profile_id):
+        self._launch_queue.prefer(identifier(profile_id))
+
+    def _acquire_launch_admission_lock(self, profile_id=None):
         # Queue this service's parallel preparations before starting the OS-lock
         # timeout. A cold desktop bundle can take longer than ten seconds; it
         # must not turn the other warmup workers into spurious launch failures.
-        self._launch_queue.acquire()
+        self._launch_queue.acquire(profile_id)
         try:
             return self._acquire_external_launch_lock()
         except BaseException:
@@ -243,7 +247,7 @@ class UpdateHooks:
         profile_id = identifier(profile_id)
         from .launch_metrics import LaunchMetrics
         with LaunchMetrics(self.store.directory).phase(profile_id, 'ssh_launch_admission_wait'):
-            lock = self._acquire_launch_admission_lock()
+            lock = self._acquire_launch_admission_lock(profile_id)
         self._admission.depth = 1
         try:
             observed_profile = self._profile(profile_id)
@@ -466,7 +470,7 @@ class UpdateHooks:
             self.guard_launch(profile_id)
             yield
             return
-        lock = self._acquire_launch_admission_lock()
+        lock = self._acquire_launch_admission_lock(profile_id)
         try:
             self.guard_launch(profile_id)
             self._admission.depth = 1

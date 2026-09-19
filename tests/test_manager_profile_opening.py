@@ -15,6 +15,7 @@ class ProfileOpeningTests(unittest.TestCase):
         self.center.store.profile.return_value=self.profile
         self.center.store.read.return_value={}
         self.center.instances=Mock()
+        self.center.update_hooks=Mock()
         self.center.instances.observe.return_value={'status':'not_started'}
         self.center.profile_warmup=Mock()
         self.center.profile_warmup.status.return_value={'worker_active':False,'profiles':[]}
@@ -41,6 +42,7 @@ class ProfileOpeningTests(unittest.TestCase):
                     'profiles':[{'profile_id':'selected','state':state}]}
                 self.assertEqual(self.open()['state'],'opening')
                 self.center.profile_warmup.prioritize.assert_called_with('selected')
+                self.center.update_hooks.prioritize_launch.assert_called_with('selected')
         self.center.instances.show.assert_not_called()
 
     def test_pending_ssh_uses_local_first_path_instead_of_whole_profile_restart(self):

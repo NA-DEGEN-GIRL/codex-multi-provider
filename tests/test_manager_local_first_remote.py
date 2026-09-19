@@ -96,9 +96,9 @@ class LocalFirstRemoteTests(unittest.TestCase):
         clock = [0]
         self.hooks.clock = lambda: clock[0]
         acquire = self.hooks._acquire_launch_admission_lock
-        def queued():
+        def queued(*args):
             waiting.set()
-            return acquire()
+            return acquire(*args)
         def second():
             try:
                 with self.hooks.launch_admission(self.profile['id']):

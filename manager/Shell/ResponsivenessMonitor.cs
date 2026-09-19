@@ -35,14 +35,14 @@ internal sealed class ResponsivenessMonitor : IDisposable
         sampler = new System.Threading.Timer(_ => Sample(), null, 250, 250);
     }
 
-    internal IDisposable Stage(string name)
+    internal IDisposable Stage(string name, int threshold = 100)
     {
         var current = new Phase(name, Environment.TickCount64, phase);
         phase = current;
         return new Completion(() => {
             if (ReferenceEquals(phase, current)) phase = current.Previous;
             long elapsed = Environment.TickCount64 - current.At;
-            if (elapsed >= 100) Record("ui_operation", new { name, elapsed_ms = elapsed });
+            if (elapsed >= threshold) Record("ui_operation", new { name, elapsed_ms = elapsed });
         });
     }
 
