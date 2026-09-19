@@ -39,6 +39,7 @@ internal static class ManagerTitleBar
                 Name = name, Content = glyph, Width = 46, Height = 36,
                 Margin = new Thickness(0), Padding = new Thickness(0), BorderThickness = new Thickness(0),
                 HorizontalContentAlignment = HorizontalAlignment.Center, VerticalContentAlignment = VerticalAlignment.Center,
+                Style = (Style)Application.Current.FindResource("WorkspaceToolButton"), Background = Brushes.Transparent,
                 FontFamily = new FontFamily("Segoe MDL2 Assets"), FontSize = 11,
                 Focusable = false, IsTabStop = false
             };

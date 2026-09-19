@@ -23,12 +23,13 @@ internal sealed class TaskNotesPanel : Border
     private int pendingMutations;
     private long contentVersion;
     private readonly DispatcherTimer refresh = new() { Interval = TimeSpan.FromSeconds(2) };
-    private readonly TextBlock sharing = new() { Name = "NoteSharing", Foreground = Brush(153, 174, 206), FontSize = 12, Margin = new Thickness(0, 0, 0, 10), TextWrapping = TextWrapping.Wrap };
-    private readonly TextBlock taskTitle = new() { Text = "작업을 열어 주세요", TextTrimming = TextTrimming.CharacterEllipsis, Foreground = Brush(169, 177, 194), Margin = new Thickness(0, 6, 0, 16) };
-    private readonly TextBlock status = new() { Text = "작업별로 자동 저장됩니다", Foreground = Brush(153, 164, 184), FontSize = 12, Margin = new Thickness(0, 10, 0, 0), TextWrapping = TextWrapping.Wrap };
-    private readonly WrapPanel tabs = new();
+    private readonly TextBlock sharing = new() { Name = "NoteSharing", Foreground = WorkspaceAppearance.Accent, FontSize = 11, VerticalAlignment = VerticalAlignment.Center };
+    private readonly Border sharingBadge = new() { Background = WorkspaceAppearance.Selected, CornerRadius = new CornerRadius(5), Padding = new Thickness(8, 5, 8, 5), VerticalAlignment = VerticalAlignment.Center };
+    private readonly TextBlock taskTitle = new() { Text = "작업을 열어 주세요", FontSize = 12, TextTrimming = TextTrimming.CharacterEllipsis, Foreground = WorkspaceAppearance.Muted, Margin = new Thickness(0, 5, 0, 12) };
+    private readonly TextBlock status = new() { Text = "작업별로 자동 저장됩니다", Foreground = WorkspaceAppearance.Muted, FontSize = 11, Margin = new Thickness(0, 10, 0, 0), TextWrapping = TextWrapping.Wrap };
+    private readonly StackPanel tabs = new() { Orientation = Orientation.Horizontal };
     private readonly Button add = new() { Name = "AddNote", Content = "+ 새 메모", Height = 32, Padding = new Thickness(10, 0, 10, 0), Margin = new Thickness(0), HorizontalContentAlignment = HorizontalAlignment.Center, ToolTip = "이 작업에 새 메모 추가" };
-    private readonly Button options = new() { Content = "⋯", Width = 32, Height = 32, Margin = new Thickness(6, 0, 0, 0), Padding = new Thickness(0), HorizontalContentAlignment = HorizontalAlignment.Center, ToolTip = "메모 이름 변경 · 삭제 · 복구" };
+    private readonly Button options = new() { Content = "⋯", ToolTip = "메모 이름 변경 · 삭제 · 복구" };
     private readonly Button fork = new() { Name = "ForkNote", Content = "메모 분리", Height = 32, Padding = new Thickness(10, 0, 10, 0), Margin = new Thickness(6, 0, 0, 0), HorizontalContentAlignment = HorizontalAlignment.Center, Visibility = Visibility.Collapsed, ToolTip = "현재 메모와 체크 항목을 모두 복사해 이 작업만 독립적으로 편집합니다. 다른 작업의 메모는 그대로 유지됩니다." };
     private bool shared;
     private readonly Button retry = new() { Content = "다시 저장", Visibility = Visibility.Collapsed };
@@ -38,26 +39,33 @@ internal sealed class TaskNotesPanel : Border
     private readonly StackPanel checklist = new();
     private readonly ScrollViewer noteScroll;
     private readonly Grid body = new();
-    private readonly TextBlock empty = new() { Text = "이 작업의 메모를 남겨 보세요.\n+ 버튼으로 메모를 만들고, 메모 안에 체크 항목을 추가할 수 있습니다.", TextWrapping = TextWrapping.Wrap, Margin = new Thickness(12, 28, 12, 12), Foreground = Brush(153,164,184) };
+    private readonly StackPanel empty = new() { VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(18) };
     private readonly DispatcherTimer autosave = new() { Interval = TimeSpan.FromMilliseconds(500) };
     internal event Action? CollapseRequested;
 
     internal TaskNotesPanel(string root, Func<string, object, Task<JsonElement>> request)
     {
         this.request = request; recovery = new(root);
-        Background = Brush(24, 27, 33); BorderBrush = Brush(54, 60, 70); BorderThickness = new Thickness(1, 0, 0, 0); Padding = new Thickness(16);
+        Background = WorkspaceAppearance.Surface; BorderBrush = WorkspaceAppearance.Line; BorderThickness = new Thickness(1, 0, 0, 0); Padding = new Thickness(16, 16, 16, 12);
         UseLayoutRounding = true; SnapsToDevicePixels = true;
         var layout = new DockPanel();
         var heading = new DockPanel();
-        var close = new Button { Content = "›", ToolTip = "메모 패널 접기", Width = 32, Height = 32, Margin = new Thickness(0), Padding = new Thickness(0), Background = Brushes.Transparent, BorderThickness = new Thickness(0), HorizontalContentAlignment = HorizontalAlignment.Center, HorizontalAlignment = HorizontalAlignment.Right };
-        close.Click += (_, _) => CollapseRequested?.Invoke(); DockPanel.SetDock(close, Dock.Right); heading.Children.Add(close);
-        heading.Children.Add(new TextBlock { Text = "작업 메모", FontSize = 18, FontWeight = FontWeights.SemiBold, VerticalAlignment = VerticalAlignment.Center });
-        var top = new StackPanel(); top.Children.Add(heading); top.Children.Add(taskTitle); top.Children.Add(sharing);
-        var toolbar = new DockPanel { Margin = new Thickness(0, 0, 0, 10) };
-        DockPanel.SetDock(options, Dock.Right); toolbar.Children.Add(options);
-        DockPanel.SetDock(fork, Dock.Right); toolbar.Children.Add(fork);
-        add.HorizontalAlignment = HorizontalAlignment.Left; toolbar.Children.Add(add); top.Children.Add(toolbar);
-        tabs.Margin = new Thickness(0, 0, 0, 10); top.Children.Add(tabs);
+        var close = WorkspaceAppearance.Icon(new Button { Content = "›", ToolTip = "메모 패널 접기" }, "CloseTaskNotes");
+        close.Click += (_, _) => CollapseRequested?.Invoke();
+        add.Content = "+"; WorkspaceAppearance.Icon(add, "AddNote"); WorkspaceAppearance.Icon(options, "NoteOptions");
+        var headingActions = new StackPanel { Orientation = Orientation.Horizontal };
+        headingActions.Children.Add(add); headingActions.Children.Add(options); headingActions.Children.Add(close);
+        DockPanel.SetDock(headingActions, Dock.Right); heading.Children.Add(headingActions);
+        heading.Children.Add(new TextBlock { Text = "작업 메모", FontSize = 16, FontWeight = FontWeights.SemiBold, VerticalAlignment = VerticalAlignment.Center });
+        var top = new StackPanel(); top.Children.Add(heading); top.Children.Add(taskTitle);
+        var sharingRow = new DockPanel { Margin = new Thickness(0, 0, 0, 12) };
+        WorkspaceAppearance.Tool(fork, quiet: true); DockPanel.SetDock(fork, Dock.Right); sharingRow.Children.Add(fork);
+        sharingBadge.Child = sharing; sharingBadge.HorizontalAlignment = HorizontalAlignment.Left; sharingRow.Children.Add(sharingBadge); top.Children.Add(sharingRow);
+        WorkspaceAppearance.Tool(retry);
+        // A single scrollable tab strip keeps many notes from pushing the editor
+        // out of view. Tab names remain available through keyboard focus/tooltips.
+        top.Children.Add(new ScrollViewer { Name = "NoteTabs", Content = tabs, HorizontalScrollBarVisibility = ScrollBarVisibility.Auto,
+            VerticalScrollBarVisibility = ScrollBarVisibility.Disabled, Margin = new Thickness(0, 0, 0, 10), MaxHeight = 46 });
         retry.Click += async (_, _) => { if (loadFailed) await SelectTaskAsync(selected, reload: true); else if (editing is { } draft) await SaveAsync(draft); };
         options.Click += (_, _) =>
         {
@@ -73,13 +81,16 @@ internal sealed class TaskNotesPanel : Border
         };
         DockPanel.SetDock(top, Dock.Top); layout.Children.Add(top);
         var footer = new StackPanel(); footer.Children.Add(status); footer.Children.Add(retry);
+        retry.Margin = new Thickness(0, 8, 0, 0); retry.HorizontalAlignment = HorizontalAlignment.Left;
         DockPanel.SetDock(footer, Dock.Bottom); layout.Children.Add(footer);
         var textArea = new Grid(); textArea.Children.Add(editor); textArea.Children.Add(placeholder);
-        var document = new StackPanel { Margin = new Thickness(12, 8, 12, 12) }; document.Children.Add(textArea); document.Children.Add(checklist);
+        var document = new StackPanel { Margin = new Thickness(14, 10, 14, 14) }; document.Children.Add(textArea); document.Children.Add(checklist);
         noteScroll = new ScrollViewer { Content = document, VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
             HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled, Background = Brushes.Transparent, Visibility = Visibility.Collapsed };
+        empty.Children.Add(new TextBlock { Text = "생각과 할 일을 한곳에", TextAlignment = TextAlignment.Center, FontSize = 14, FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 0, 0, 8) });
+        empty.Children.Add(new TextBlock { Text = "+ 버튼으로 새 메모를 만들고\n글과 체크 항목을 함께 남겨 보세요.", TextAlignment = TextAlignment.Center, TextWrapping = TextWrapping.Wrap, FontSize = 12, LineHeight = 20, Foreground = WorkspaceAppearance.Muted });
         body.Children.Add(noteScroll); body.Children.Add(empty);
-        layout.Children.Add(new Border { Background = Brush(18, 21, 27), BorderBrush = Brush(48, 54, 65), BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(8), Child = body }); Child = layout;
+        layout.Children.Add(new Border { Background = Brush(23, 25, 30), BorderBrush = WorkspaceAppearance.Line, BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(8), Child = body }); Child = layout;
         add.Click += (_, _) => Add();
         fork.Click += async (_, _) => await ForkAsync();
         editor.TextChanged += (_, _) =>
@@ -91,13 +102,13 @@ internal sealed class TaskNotesPanel : Border
         refresh.Tick += async (_, _) => await RefreshSharedAsync();
         Loaded += (_, _) => refresh.Start();
         Unloaded += (_, _) => refresh.Stop();
-        RenderTabs(); RenderEditor();
+        UpdateSharing(); RenderTabs(); RenderEditor();
     }
     private static SolidColorBrush Brush(byte r, byte g, byte b) => new(Color.FromRgb(r,g,b));
     private string DraftKey(NoteTask task, string note) => task.Key + "/" + note;
     internal async Task SelectTaskAsync(SelectedTask? task, bool reload = false)
     {
-        if (!reload && selected?.Task == task?.Task) { if (task is not null) taskTitle.Text = task.Title; return; }
+        if (!reload && selected?.Task == task?.Task) { if (task is not null) { taskTitle.Text = task.Title; taskTitle.ToolTip = task.Title; } return; }
         var ticket = ++selection; selected = task; editing = null; notes.Clear(); loadFailed = false; loading = true; shared = false;
         UpdateSharing();
         taskTitle.Text = task?.Title ?? "작업을 열어 주세요"; taskTitle.ToolTip = task?.Title;
@@ -134,7 +145,9 @@ internal sealed class TaskNotesPanel : Border
     }
     private void UpdateSharing()
     {
-        sharing.Text = selected is null || loading || loadFailed ? "" : shared ? "공유 메모 · 연결된 작업에 함께 반영됩니다" : "독립 메모 · 이 작업에 저장됩니다";
+        sharing.Text = selected is null || loading || loadFailed ? "" : shared ? "공유 메모" : "독립 메모";
+        sharingBadge.Visibility = sharing.Text.Length == 0 ? Visibility.Collapsed : Visibility.Visible;
+        sharingBadge.ToolTip = shared ? "연결된 작업과 같은 메모를 사용합니다. 수정 내용도 함께 반영됩니다." : "이 작업에만 저장되는 메모입니다.";
         fork.Visibility = selected is not null && shared && !loading && !loadFailed ? Visibility.Visible : Visibility.Collapsed;
         fork.IsEnabled = !splitting && pendingMutations == 0;
     }
@@ -200,9 +213,17 @@ internal sealed class TaskNotesPanel : Border
         tabs.Children.Clear(); add.IsEnabled = selected is not null && !loadFailed; options.IsEnabled = selected is not null && !loadFailed;
         foreach (var note in notes.Where(n => !n.Deleted))
         {
-            var button = new Button { Content = note.Title, MaxWidth = 150, Height = 32, Padding = new Thickness(10,0,10,0), Margin = new Thickness(0,0,6,6), Background = editing?.Note.Id == note.Id ? Brush(43, 53, 74) : Brushes.Transparent,
-                BorderThickness = new Thickness(1), BorderBrush = editing?.Note.Id == note.Id ? Brush(91, 121, 172) : Brushes.Transparent,
-                Foreground = editing?.Note.Id == note.Id ? Brush(162,193,255) : Brush(187,193,205), ToolTip = note.Title + " · 오른쪽 클릭으로 이름 변경 / 삭제" };
+            var button = WorkspaceAppearance.Tool(new Button { Content = new TextBlock { Text = note.Title, TextTrimming = TextTrimming.CharacterEllipsis, MaxWidth = 124 },
+                ToolTip = note.Title + " · 오른쪽 클릭으로 이름 변경 / 삭제" }, quiet: true);
+            bool active = editing?.Note.Id == note.Id;
+            button.Margin = new Thickness(0, 0, 6, 2); button.Height = 30;
+            button.Background = active ? WorkspaceAppearance.Selected : Brushes.Transparent;
+            button.Foreground = active ? WorkspaceAppearance.Accent : WorkspaceAppearance.Muted;
+            ((TextBlock)button.Content).Foreground = button.Foreground;
+            button.BorderBrush = active ? WorkspaceAppearance.Color("#687CA6") : Brushes.Transparent;
+            System.Windows.Automation.AutomationProperties.SetItemStatus(button, active ? "선택됨" : "");
+            button.GotKeyboardFocus += (_, _) => button.BringIntoView();
+            if (active) button.Loaded += (_, _) => button.BringIntoView();
             button.Click += (_, _) => Edit(note);
             var menu = new ContextMenu();
             var rename = new MenuItem { Header = "이름 변경" }; rename.Click += (_, _) => Rename(note);
@@ -238,8 +259,8 @@ internal sealed class TaskNotesPanel : Border
             var check = new CheckBox { IsChecked = item.Done, VerticalAlignment = VerticalAlignment.Top, Margin = new Thickness(0, 8, 0, 0), Width = 18, Height = 18,
                 HorizontalAlignment = HorizontalAlignment.Left, ToolTip = "완료 표시", Style = (Style)FindResource("NoteCheckBox") };
             row.Children.Add(check);
-            var remove = new Button { Content = "×", Width = 28, Height = 28, Margin = new Thickness(0, 3, 0, 0), Padding = new Thickness(0), HorizontalContentAlignment = HorizontalAlignment.Center,
-                Background = Brushes.Transparent, BorderThickness = new Thickness(0), Foreground = Brush(153,164,184), ToolTip = "항목 삭제", VerticalAlignment = VerticalAlignment.Top };
+            var remove = WorkspaceAppearance.Icon(new Button { Content = "×", ToolTip = "항목 삭제", Foreground = WorkspaceAppearance.Muted, VerticalAlignment = VerticalAlignment.Top }, "");
+            remove.Width = remove.Height = 28; remove.Margin = new Thickness(0, 3, 0, 0);
             remove.Click += (_, _) =>
             {
                 var index = draft.Note.Items.IndexOf(item);
@@ -253,8 +274,9 @@ internal sealed class TaskNotesPanel : Border
             check.Click += (_, _) => { item.Done = check.IsChecked == true; text.Foreground = item.Done ? Brush(139,150,168) : Brush(233,236,242); Dirty(draft); };
             text.TextChanged += (_, _) => { item.Text = text.Text; Dirty(draft); }; Grid.SetColumn(text, 1); row.Children.Add(text); checklist.Children.Add(row);
         }
-        var append = new Button { Name = "AddNoteCheck", Content = "+ 체크 항목 추가", ToolTip = "이 메모에 체크 항목 추가", Height = 32, Margin = new Thickness(0,8,0,0), Padding = new Thickness(8,0,8,0),
-            Background = Brushes.Transparent, BorderThickness = new Thickness(0), Foreground = Brush(163,193,255), HorizontalAlignment = HorizontalAlignment.Left, IsEnabled = draft.Note.Items.Count < 500 };
+        var append = WorkspaceAppearance.Tool(new Button { Name = "AddNoteCheck", Content = "+ 체크 항목 추가", ToolTip = "이 메모에 체크 항목 추가",
+            Foreground = WorkspaceAppearance.Accent, HorizontalAlignment = HorizontalAlignment.Left, IsEnabled = draft.Note.Items.Count < 500 }, quiet: true);
+        append.Margin = new Thickness(0, 8, 0, 0); append.Padding = new Thickness(6, 0, 6, 0);
         append.Click += (_, _) => { draft.Note.Items.Add(new()); Dirty(draft); RenderChecklist();
             if (checklist.Children.OfType<Grid>().LastOrDefault()?.Children.OfType<TextBox>().FirstOrDefault() is { } input) { input.Focus(); input.BringIntoView(); } };
         checklist.Children.Add(append);

@@ -33,14 +33,14 @@ public sealed class MainWindow : Window
     private readonly ProfileOrdering _profileOrdering;
     private readonly ListBox _shortcuts = new();
     private readonly TextBlock _status = new() { TextWrapping = TextWrapping.Wrap, TextTrimming = TextTrimming.CharacterEllipsis, FontSize = 11, LineHeight = 16, Foreground = Muted, MaxHeight = 32 };
-    private readonly TextBlock _identity = new() { FontSize = 16, FontWeight = FontWeights.SemiBold, Foreground = new SolidColorBrush(Color.FromRgb(163, 193, 255)) };
-    private readonly TextBlock _taskIdentity = new() { FontSize = 19, FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 4, 0, 2), TextTrimming = TextTrimming.CharacterEllipsis };
+    private readonly TextBlock _identity = new() { FontSize = 12, FontWeight = FontWeights.SemiBold, Foreground = WorkspaceAppearance.Accent, TextTrimming = TextTrimming.CharacterEllipsis };
+    private readonly TextBlock _taskIdentity = new() { FontSize = 18, FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 5, 0, 0), TextTrimming = TextTrimming.CharacterEllipsis };
     private readonly TextBlock _attention = new() { Foreground = Brushes.Orange, FontSize = 12, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 4, 0, 0), Visibility = Visibility.Collapsed };
     private readonly TextBlock _mode = new() { Foreground = Muted, Margin = new Thickness(0, 5, 0, 0), FontSize = 12, TextWrapping = TextWrapping.Wrap };
     private readonly TextBlock _accountState = new() { Foreground = Muted, Margin = new Thickness(0, 5, 0, 0), FontSize = 12, TextWrapping = TextWrapping.Wrap };
     private readonly TextBlock _runtimeVersion = new() { Foreground = Muted, Margin = new Thickness(0, 5, 0, 0), FontSize = 12, TextWrapping = TextWrapping.Wrap };
-    private readonly TextBlock _operation = new() { Foreground = Muted, Margin = new Thickness(0, 4, 0, 0), FontSize = 12, Visibility = Visibility.Collapsed };
-    private readonly TextBlock _empty = new() { Text = "왼쪽에서 사용할 프로필을 선택하세요.\n\n오른쪽에는 해당 계정의 실제 Codex 앱이 표시됩니다.", TextWrapping = TextWrapping.Wrap, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center, Foreground = Muted, FontSize = 18, Margin = new Thickness(50) };
+    private readonly TextBlock _operation = new() { Foreground = Muted, Margin = new Thickness(0, 6, 0, 0), FontSize = 12, TextWrapping = TextWrapping.Wrap, Visibility = Visibility.Collapsed };
+    private readonly TextBlock _empty = new() { Text = "왼쪽에서 프로필을 선택하세요.\n선택한 계정의 Codex가 여기에 열립니다.", TextWrapping = TextWrapping.Wrap, TextAlignment = TextAlignment.Center, LineHeight = 24, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center, Foreground = Muted, FontSize = 14, Margin = new Thickness(28) };
     private readonly Grid _clientSurface = new() { Background = new SolidColorBrush(Color.FromRgb(22, 24, 29)) };
     private readonly NativeHostDeck _hostDeck;
     private NativeWindowHost _host => _hostDeck.Current;
@@ -63,8 +63,8 @@ public sealed class MainWindow : Window
     private readonly List<string> _events = [];
     private readonly DiagnosticLog _diagnostics;
     private readonly ResponsivenessMonitor? _responsiveness;
-    private readonly TextBlock _logFeedback = new() { Foreground = Muted, VerticalAlignment = VerticalAlignment.Center, TextWrapping = TextWrapping.Wrap };
-    private readonly TextBox _logText = new() { IsReadOnly = true, AcceptsReturn = true,
+    private readonly TextBlock _logFeedback = new() { Foreground = Muted, FontSize = 11, Margin = new Thickness(12, 0, 0, 0), VerticalAlignment = VerticalAlignment.Center, TextTrimming = TextTrimming.CharacterEllipsis };
+    private readonly TextBox _logText = new() { Name = "WorkspaceLogOutput", IsReadOnly = true, AcceptsReturn = true,
         FontFamily = new FontFamily("Consolas, Malgun Gothic"), FontSize = 12,
         VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Auto };
     private readonly Dictionary<string, long> _observedDiagnostics = [];
@@ -108,6 +108,7 @@ public sealed class MainWindow : Window
         _root = Path.GetFullPath(root);
         _notes = new TaskNotesPanel(_root, async (command, args) =>
         {
+            if (_fixtureRequest is not null) return await _fixtureRequest(command, args);
             if (_client is null) throw new InvalidOperationException("관리 서비스 연결을 기다려 주세요.");
             using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
             return await _client.RequestAsync(command, args, timeout.Token);
@@ -269,17 +270,25 @@ public sealed class MainWindow : Window
             HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled });
         Grid.SetRow(footer, 1); sidebarFrame.Children.Add(footer);
         layout.Children.Add(sidebarFrame);
-        var right = new Grid { Background = new SolidColorBrush(Color.FromRgb(23, 25, 30)) };
+        var right = new Grid { Background = WorkspaceAppearance.Canvas };
         right.ColumnDefinitions.Add(new ColumnDefinition());
         var dividerColumn = new ColumnDefinition { Width = new GridLength(5) };
         right.ColumnDefinitions.Add(dividerColumn);
         right.ColumnDefinitions.Add(_notesColumn);
-        var divider = new GridSplitter { Width = 5, HorizontalAlignment = HorizontalAlignment.Stretch,
+        var divider = new GridSplitter { Name = "NotesDivider", Width = 5, HorizontalAlignment = HorizontalAlignment.Stretch,
             VerticalAlignment = VerticalAlignment.Stretch, ResizeDirection = GridResizeDirection.Columns,
-            ResizeBehavior = GridResizeBehavior.PreviousAndNext, Background = new SolidColorBrush(Color.FromRgb(42, 46, 55)) };
+            ResizeBehavior = GridResizeBehavior.PreviousAndNext, Background = WorkspaceAppearance.Canvas };
         Grid.SetColumn(divider, 1); Grid.SetRowSpan(divider, 3); right.Children.Add(divider);
         Grid.SetColumn(_notes, 2); Grid.SetRowSpan(_notes, 3); right.Children.Add(_notes);
         double notesWidth = 340;
+        Button? notesToggle = null;
+        void LimitNotesWidth()
+        {
+            if (_notes.Visibility != Visibility.Visible || right.ActualWidth <= 0) return;
+            // Leave room for the task controls and native viewport even after a
+            // wide notes panel is dragged open, then the manager is made smaller.
+            _notesColumn.MaxWidth = Math.Max(280, Math.Min(620, right.ActualWidth - 420 - 5));
+        }
         void SetNotesVisible(bool visible)
         {
             if (!visible && _notesColumn.ActualWidth > 0) notesWidth = _notesColumn.ActualWidth;
@@ -287,55 +296,90 @@ public sealed class MainWindow : Window
             _notesColumn.Width = new GridLength(visible ? notesWidth : 0);
             dividerColumn.Width = new GridLength(visible ? 5 : 0);
             _notes.Visibility = divider.Visibility = visible ? Visibility.Visible : Visibility.Collapsed;
+            LimitNotesWidth();
+            if (notesToggle is not null) WorkspaceAppearance.Active(notesToggle, visible);
         }
+        right.SizeChanged += (_, _) => LimitNotesWidth();
         _notes.CollapseRequested += () => SetNotesVisible(false);
         SetNotesVisible(false);
         right.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         right.RowDefinitions.Add(new RowDefinition());
         right.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-        var header = new StackPanel { Margin = new Thickness(20, 12, 18, 10) };
+        var header = new StackPanel { Margin = new Thickness(20, 16, 20, 10) };
+        var headingRow = new Grid { Name = "WorkspaceHeading" };
+        headingRow.ColumnDefinitions.Add(new ColumnDefinition());
+        headingRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        headingRow.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        headingRow.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         var identity = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
-        identity.Children.Add(_identity); identity.Children.Add(_taskIdentity); identity.Children.Add(_attention); identity.Children.Add(_operation); header.Children.Add(identity);
-        // Keep controls in their own wrapping row. Long account/runtime labels
-        // must never push the escape controls beyond the right screen edge.
-        var controls = new WrapPanel { Margin = new Thickness(0, 5, 0, 0) };
-        controls.Children.Add(Action("작업 메모", () => { SetNotesVisible(_notes.Visibility != Visibility.Visible); return Task.CompletedTask; }, "이 작업의 메모와 체크리스트"));
-        controls.Children.Add(Action("관리창 안에 표시", AttachSelectedAsync));
-        controls.Children.Add(MenuButton("창 및 연결", ("원래 창으로 보기", DetachAsync), ("연결 확인", VerifyConversationAsync),
-            ("입력 상태 확인", CheckInputAsync), ("로그인 상태 새로 확인", RefreshLoginStatusAsync)));
-        _loginRepair = Action("이 프로필에 로그인", LoginProfileAsync);
+        identity.Children.Add(_identity); identity.Children.Add(_taskIdentity); headingRow.Children.Add(identity);
+        var controls = new WrapPanel { Name = "WorkspaceTools", VerticalAlignment = VerticalAlignment.Center };
+        notesToggle = WorkspaceAppearance.Tool(Action("작업 메모", () => { SetNotesVisible(_notes.Visibility != Visibility.Visible); return Task.CompletedTask; }, "이 작업의 메모와 체크리스트 열기 / 접기"), "ToggleTaskNotes");
+        controls.Children.Add(notesToggle);
+        controls.Children.Add(WorkspaceAppearance.Tool(Action("관리창 안에 표시", AttachSelectedAsync), "RestoreWorkspaceView"));
+        controls.Children.Add(WorkspaceAppearance.Tool(MenuButton("창 및 연결", ("원래 창으로 보기", DetachAsync), ("연결 확인", VerifyConversationAsync),
+            ("입력 상태 확인", CheckInputAsync), ("로그인 상태 새로 확인", RefreshLoginStatusAsync)), "WorkspaceConnections", quiet: true));
+        _loginRepair = WorkspaceAppearance.Tool(Action("이 프로필에 로그인", LoginProfileAsync));
         _loginRepair.Visibility = Visibility.Collapsed;
         controls.Children.Add(_loginRepair);
-        header.Children.Add(controls);
+        foreach (Button button in controls.Children) button.Margin = new Thickness(0, 3, 6, 3);
+        headingRow.Children.Add(controls);
+        void ArrangeHeading()
+        {
+            bool wide = headingRow.ActualWidth >= 760 && _loginRepair.Visibility != Visibility.Visible;
+            Grid.SetColumn(controls, wide ? 1 : 0); Grid.SetRow(controls, wide ? 0 : 1);
+            Grid.SetColumnSpan(controls, wide ? 1 : 2);
+            Grid.SetColumnSpan(identity, wide ? 1 : 2);
+            identity.Margin = new Thickness(0, 0, wide ? 18 : 0, 0);
+            controls.Margin = new Thickness(0, wide ? 0 : 8, 0, 0);
+        }
+        headingRow.SizeChanged += (_, _) => ArrangeHeading();
+        _loginRepair.IsVisibleChanged += (_, _) => ArrangeHeading();
+        ArrangeHeading();
+        header.Children.Add(headingRow); header.Children.Add(_attention); header.Children.Add(_operation);
         var details = new StackPanel();
         details.Children.Add(_mode); details.Children.Add(_accountState); details.Children.Add(_runtimeVersion);
-        header.Children.Add(new Expander { Header = "연결 상세", FontSize = 12, Foreground = Muted, Content = details, Margin = new Thickness(0, 2, 0, 0) });
-        right.Children.Add(header);
+        header.Children.Add(new Expander { Header = "연결 상세", FontSize = 11, Foreground = Muted,
+            Content = new Border { Background = WorkspaceAppearance.Surface, CornerRadius = new CornerRadius(6), Padding = new Thickness(12, 6, 12, 12), Child = details }, Margin = new Thickness(0, 3, 0, 0) });
+        right.Children.Add(new Border { BorderBrush = WorkspaceAppearance.Line, BorderThickness = new Thickness(0, 0, 0, 1), Child = header });
         var client = _clientSurface;
         client.Children.Add(_empty);
         Grid.SetRow(client, 1); right.Children.Add(client);
-        var logPanel = new DockPanel { Margin = new Thickness(14, 4, 14, 6) };
-        var logTools = new WrapPanel();
+        var logPanel = new DockPanel { Margin = new Thickness(12, 6, 12, 6) };
+        var logTools = new DockPanel();
+        var logActions = new StackPanel { Orientation = Orientation.Horizontal };
         _logText.Height = 140; _logText.Visibility = Visibility.Collapsed;
-        logTools.Children.Add(Action("진행 기록", () => { _logText.Visibility = _logText.Visibility == Visibility.Visible ? Visibility.Collapsed : Visibility.Visible; return Task.CompletedTask; }, "상세 로그 펼치기 / 접기"));
-        logTools.Children.Add(Action("로그 복사", CopyLogsAsync));
-        logTools.Children.Add(MenuButton("로그 관리", ("진행 내역", () => { Dialogs.ShowEvents(this, _events); return Task.CompletedTask; }), ("로그 파일 열기", () =>
+        _logText.Margin = new Thickness(0, 6, 0, 0); _logText.Padding = new Thickness(12, 10, 12, 10);
+        _logText.Background = WorkspaceAppearance.Color("#12151B"); _logText.BorderBrush = WorkspaceAppearance.Line;
+        Button? logToggle = null;
+        logToggle = WorkspaceAppearance.Tool(Action("진행 기록", () => {
+            bool visible = _logText.Visibility != Visibility.Visible;
+            _logText.Visibility = visible ? Visibility.Visible : Visibility.Collapsed;
+            WorkspaceAppearance.Active(logToggle!, visible); return Task.CompletedTask;
+        }, "상세 로그 펼치기 / 접기"), "ToggleWorkspaceLog", quiet: true);
+        logActions.Children.Add(logToggle);
+        logActions.Children.Add(WorkspaceAppearance.Tool(Action("로그 복사", CopyLogsAsync), quiet: true));
+        logActions.Children.Add(WorkspaceAppearance.Tool(MenuButton("로그 관리", ("진행 내역", () => { Dialogs.ShowEvents(this, _events); return Task.CompletedTask; }), ("로그 파일 열기", () =>
         {
             var path = _diagnostics.Export();
             System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(path) { UseShellExecute = true });
             _logFeedback.Text = "저장한 로그 파일을 열었습니다.";
             return Task.CompletedTask;
-        }), ("화면 로그 비우기 · 파일 유지", () => { _logText.Clear(); return Task.CompletedTask; })));
+        }), ("화면 로그 비우기 · 파일 유지", () => { _logText.Clear(); return Task.CompletedTask; })), quiet: true));
+        foreach (Button button in logActions.Children) button.Margin = new Thickness(0, 0, 4, 0);
+        DockPanel.SetDock(logActions, Dock.Left); logTools.Children.Add(logActions);
+        _logFeedback.SetBinding(ToolTipProperty, new System.Windows.Data.Binding(nameof(TextBlock.Text)) { Source = _logFeedback });
         logTools.Children.Add(_logFeedback);
         DockPanel.SetDock(logTools, Dock.Top); logPanel.Children.Add(logTools); logPanel.Children.Add(_logText);
-        Grid.SetRow(logPanel, 2); right.Children.Add(logPanel);
+        var logFrame = new Border { Background = WorkspaceAppearance.Canvas, BorderBrush = WorkspaceAppearance.Line, BorderThickness = new Thickness(0, 1, 0, 0), Child = logPanel };
+        Grid.SetRow(logFrame, 2); right.Children.Add(logFrame);
         Grid.SetColumn(right, 1); layout.Children.Add(right);
         Content = ManagerTitleBar.Wrap(this, layout, Log);
         if (!fixture) _taskContext = new TaskContextWatcher(_root, Dispatcher, task =>
         {
             _selectedTask = task;
             _taskIdentity.Text = task is null ? "작업 · 아직 열지 않음" : "작업 · " + task.Title;
-            _taskIdentity.ToolTip = task?.Task.Key;
+            _taskIdentity.ToolTip = task is null ? null : task.Title + "\n" + task.Task.Key;
             if (_selectedProfile is { } profile && !_viewingCatalog) _workspaceNotifications?.Remember(profile, task);
             _ = _notes.SelectTaskAsync(task);
         });
@@ -652,12 +696,13 @@ public sealed class MainWindow : Window
                 p = _viewerProfile;
             }
             _identity.Text = _selectedProfile is null ? "사용할 프로필을 선택하세요" : (p.S("auth_mode") == "external" ? "외부 API 프로필 " : "Codex 프로필 ") + p.S("alias", "연결된 프로필 없음");
+            _identity.ToolTip = _identity.Text;
             var openedTask = p.Get("runtime_state").Get("opened_task");
             _taskIdentity.Text = openedTask.S("thread_id") == "" ? "작업 · 아직 열지 않음" : "최근 연 작업 · " + openedTask.S("title", openedTask.S("thread_id"));
             if (openedTask.S("thread_id") != "" && openedTask.S("title") == "") _taskIdentity.Text = "최근 연 작업 · " + openedTask.S("thread_id");
-            _taskIdentity.ToolTip = "이 프로필에서 마지막으로 열기 완료한 작업입니다.\n" + openedTask.S("thread_id");
+            _taskIdentity.ToolTip = "이 프로필에서 마지막으로 열기 완료한 작업입니다.\n" + openedTask.S("title") + "\n" + openedTask.S("thread_id");
             _taskContext?.Select(p);
-            if (_selectedTask is { } selectedTask) { _taskIdentity.Text = "작업 · " + selectedTask.Title; _taskIdentity.ToolTip = selectedTask.Task.Key; }
+            if (_selectedTask is { } selectedTask) { _taskIdentity.Text = "작업 · " + selectedTask.Title; _taskIdentity.ToolTip = selectedTask.Title + "\n" + selectedTask.Task.Key; }
             var policy = p.Get("policy");
             var mode = p.S("auth_mode") == "external" ? p.S("external_model_name", "외부 API 모델") : "GPT 사용";
             var agentBadge = ProfileAgentPresentation.Badge(p);

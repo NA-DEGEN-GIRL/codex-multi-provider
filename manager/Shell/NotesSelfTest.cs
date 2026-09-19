@@ -77,7 +77,7 @@ internal static class NotesSelfTest
             await panel.SelectTaskAsync(other); await panel.FlushAsync();
             Require((await client.RequestAsync("notes.list", new { task = other.Task.Wire })).GetProperty("notes").GetArrayLength() == 0, "notes do not leak to another task");
             await panel.SelectTaskAsync(new(task.Task, "이름이 변경된 작업")); window.UpdateLayout();
-            Click(Descendants(panel).OfType<Button>().Single(b => Equals(b.Content, "메모 2"))); window.UpdateLayout();
+            Click(Descendants(panel).OfType<Button>().Single(b => b.Content is TextBlock title && title.Text == "메모 2")); window.UpdateLayout();
             Require(NoteBody(panel).Text == memoText && ItemInputs(panel).Single().Text == item.Text && Descendants(panel).OfType<CheckBox>().Single().IsChecked == true,
                 "returning restores mixed note and completion");
             value = await client.RequestAsync("notes.list", new { task = task.Task.Wire });
@@ -95,7 +95,7 @@ internal static class NotesSelfTest
             Require(value.GetProperty("notes")[1].GetProperty("body").GetString() == draftNote.Body, "draft recovers after reopening");
             Require(value.GetProperty("notes")[1].GetProperty("items")[0].GetProperty("done").GetBoolean(), "mixed checklist survives draft recovery");
             // Test optimistic conflict with an independent edit while this panel is open.
-            Click(Descendants(panel).OfType<Button>().Single(b => Equals(b.Content, "메모 2"))); window.UpdateLayout();
+            Click(Descendants(panel).OfType<Button>().Single(b => b.Content is TextBlock title && title.Text == "메모 2")); window.UpdateLayout();
             mixed = value.GetProperty("notes")[1];
             await client.RequestAsync("notes.save", new { task = task.Task.Wire, note_id = mixed.S("id"), revision = mixed.GetProperty("revision").GetInt64(), title = "다른 창의 변경", kind = "text", body = "다른 창에서 적은 내용", items = mixed.GetProperty("items") });
             NoteBody(panel).Text = memoText;

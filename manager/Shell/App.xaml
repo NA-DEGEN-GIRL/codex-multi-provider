@@ -2,6 +2,22 @@
  <Application.Resources>
   <SolidColorBrush x:Key="Surface" Color="#202228" />
   <SolidColorBrush x:Key="Text" Color="#E9ECF2" />
+  <Style x:Key="WorkspaceToolButton" TargetType="Button">
+   <Setter Property="Background" Value="#252A33"/><Setter Property="Foreground" Value="#E9ECF2"/>
+   <Setter Property="BorderBrush" Value="#353C48"/><Setter Property="BorderThickness" Value="1"/>
+   <Setter Property="Cursor" Value="Hand"/>
+   <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button">
+    <Border x:Name="Chrome" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="6" Padding="{TemplateBinding Padding}">
+     <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}" VerticalAlignment="Center"/>
+    </Border>
+    <ControlTemplate.Triggers>
+     <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Chrome" Property="Background" Value="#303744"/></Trigger>
+     <Trigger Property="IsPressed" Value="True"><Setter TargetName="Chrome" Property="Background" Value="#394255"/></Trigger>
+     <Trigger Property="IsKeyboardFocused" Value="True"><Setter TargetName="Chrome" Property="BorderBrush" Value="#CFE0FF"/></Trigger>
+     <Trigger Property="IsEnabled" Value="False"><Setter Property="Opacity" Value="0.48"/></Trigger>
+    </ControlTemplate.Triggers>
+   </ControlTemplate></Setter.Value></Setter>
+  </Style>
   <Style TargetType="Expander">
    <Setter Property="Foreground" Value="{StaticResource Text}"/>
    <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Expander">
@@ -38,8 +54,9 @@
   </Style>
   <Style TargetType="Window"><Setter Property="Background" Value="#17191E"/><Setter Property="Foreground" Value="{StaticResource Text}"/><Setter Property="FontFamily" Value="Segoe UI, Malgun Gothic"/><Setter Property="FontSize" Value="14"/></Style>
   <Style TargetType="TextBlock"><Setter Property="Foreground" Value="{StaticResource Text}"/></Style>
-  <Style TargetType="Button"><Setter Property="Background" Value="#30343D"/><Setter Property="Foreground" Value="{StaticResource Text}"/><Setter Property="BorderBrush" Value="#444955"/><Setter Property="Padding" Value="12,8"/><Setter Property="Margin" Value="0,3,0,3"/><Setter Property="Cursor" Value="Hand"/><Setter Property="HorizontalContentAlignment" Value="Left"/>
-   <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button"><Border x:Name="Chrome" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="5" Padding="{TemplateBinding Padding}"><ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}" VerticalAlignment="Center"/></Border><ControlTemplate.Triggers><Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Chrome" Property="Background" Value="#424957"/></Trigger><Trigger Property="IsKeyboardFocused" Value="True"><Setter TargetName="Chrome" Property="BorderBrush" Value="#9DAAFE"/></Trigger><Trigger Property="IsEnabled" Value="False"><Setter Property="Opacity" Value="0.48"/></Trigger></ControlTemplate.Triggers></ControlTemplate></Setter.Value></Setter>
+  <Style TargetType="Button" BasedOn="{StaticResource WorkspaceToolButton}">
+   <Setter Property="Padding" Value="12,8"/><Setter Property="Margin" Value="0,3,0,3"/>
+   <Setter Property="FontSize" Value="13"/><Setter Property="HorizontalContentAlignment" Value="Left"/>
   </Style>
   <Style TargetType="TextBox"><Setter Property="Background" Value="#111318"/><Setter Property="Foreground" Value="{StaticResource Text}"/><Setter Property="CaretBrush" Value="White"/><Setter Property="BorderBrush" Value="#48505E"/><Setter Property="Padding" Value="8"/><Setter Property="Margin" Value="0,4,0,10"/></Style>
   <Style TargetType="PasswordBox"><Setter Property="Background" Value="#111318"/><Setter Property="Foreground" Value="{StaticResource Text}"/><Setter Property="BorderBrush" Value="#48505E"/><Setter Property="Padding" Value="8"/><Setter Property="Margin" Value="0,4,0,10"/></Style>

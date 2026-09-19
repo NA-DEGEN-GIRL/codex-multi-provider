@@ -100,6 +100,11 @@ if ($SelfTest) {
     if (-not $notesTest.WaitForExit(45000)) { throw 'Notes/checklist self-test timed out. Current release is unchanged.' }
     if ($notesTest.ExitCode -ne 0) { throw "Notes/checklist self-test failed. Review $notesReport" }
     Get-Content -LiteralPath $notesReport
+    $layoutReport = Join-Path $repoRoot 'work\control-center-layout-test.json'
+    $layoutTest = Start-Process -FilePath (Join-Path $outputPath 'Codex.ControlCenter.exe') -ArgumentList ('--layout-self-test --root "' + $repoRoot + '" --report "' + $layoutReport + '"') -WindowStyle Hidden -PassThru
+    if (-not $layoutTest.WaitForExit(20000)) { throw 'Workspace layout self-test timed out. Current release is unchanged.' }
+    if ($layoutTest.ExitCode -ne 0) { throw "Workspace layout self-test failed. Review $layoutReport" }
+    Get-Content -LiteralPath $layoutReport
     $orderReport = Join-Path $repoRoot 'work\control-center-profile-order-test.json'
     $orderTest = Start-Process -FilePath (Join-Path $outputPath 'Codex.ControlCenter.exe') -ArgumentList ('--profile-order-self-test --report "' + $orderReport + '"') -WindowStyle Hidden -PassThru
     if (-not $orderTest.WaitForExit(15000)) { throw 'Profile order self-test timed out. Current release is unchanged.' }
