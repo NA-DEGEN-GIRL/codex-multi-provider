@@ -116,9 +116,102 @@ def protected_bwrap_directory(runtime):
     return binary.parent
 
 
+def _proc_cmdline(pid):
+    try:
+        raw = (Path("/proc") / str(pid) / "cmdline").read_bytes()
+    except OSError:
+        return ""
+    return raw.replace(b"\0", b" ").decode("utf-8", "replace")
+
+
+def managed_instances(profile_id):
+    """Managed app-server processes for one profile as ``(pid, executable)``."""
+    found = []
+    root = Path("/proc")
+    try:
+        entries = list(root.iterdir())
+    except OSError:
+        return found
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        command = _proc_cmdline(entry.name)
+        if ("codex-control-center/runtime/" not in command or profile_id not in command
+                or "app-server" not in command):
+            continue
+        try:
+            executable = os.readlink(entry / "exe")
+        except OSError:
+            executable = ""
+        found.append((int(entry.name), executable))
+    return found
+
+
+def stale_instances(instances, runtime):
+    """Entries whose executable does not belong to the current runtime bundle."""
+    # The launcher only ever runs on Linux. Using the raw string keeps the
+    # comparison free of whatever separator the local platform would apply.
+    prefix = str(runtime).rstrip("/") + "/"
+    return [(pid, executable) for pid, executable in instances
+            if not executable.startswith(prefix)]
+
+
+def clear_stale_record(profile):
+    """Drop an instance record whose process no longer exists."""
+    path = profile / "native-instance.json"
+    if not path.exists() or path.is_symlink():
+        return
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    pid = record.get("pid")
+    if isinstance(pid, int) and pid > 0 and not (Path("/proc") / str(pid)).exists():
+        path.unlink(missing_ok=True)
+
+
+def acquire_instance_lock(profile, lock, fcntl, runtime):
+    """Take the single-writer lock, reaping instances left by an older bundle.
+
+    A runtime update leaves the previous remote app-server running while the
+    descriptor already points at the new bundle. Without this the next
+    connection fails with a bare lock error and the profile looks broken.
+    """
+    import signal
+    import time
+
+    for _ in range(2):
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            pass
+        stale = stale_instances(managed_instances(profile.name), runtime)
+        if not stale:
+            raise ValueError("another Codex instance is already running for this profile")
+        for pid, _ in stale:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                continue
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if not any((Path("/proc") / str(pid)).exists() for pid, _ in stale):
+                break
+            time.sleep(0.2)
+        for pid, _ in stale:
+            if (Path("/proc") / str(pid)).exists():
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+    raise ValueError("a previous Codex instance still holds this profile")
+
+
 def run(profile, revision, argv, *, managed_socket=None):
     import fcntl
     import common
+    clear_stale_record(profile)
     if not re.fullmatch(r"[0-9a-f]{64}", revision):
         raise ValueError("revision")
     if managed_socket is None:
@@ -141,7 +234,7 @@ def run(profile, revision, argv, *, managed_socket=None):
     if lock_path.is_symlink():
         raise ValueError("symlink lock")
     with lock_path.open("a+b") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        acquire_instance_lock(profile, lock, fcntl, runtime)
         codex_home = profile / "codex"
         if codex_home.is_symlink():
             raise ValueError("symlink home")
@@ -232,6 +325,8 @@ if __name__ == "__main__":
                 from native_controller import main
                 sys.exit(main(profile, sys.argv[1], sys.argv[2]))
             sys.exit(run(profile, sys.argv[1], sys.argv[2:]))
-    except Exception:
+    except Exception as error:
+        detail = str(error) or error.__class__.__name__
+        print(f"Codex manager remote launcher failed: {detail}", file=sys.stderr)
         print("Codex manager remote launcher failed; inspect the profile binding.", file=sys.stderr)
         sys.exit(1)
