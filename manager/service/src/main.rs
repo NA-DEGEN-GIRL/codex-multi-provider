@@ -133,7 +133,7 @@ impl Service {
         }
         if command.starts_with("notes.") {
             // A native fork may be opened before the next manager state poll.
-            // Resolve only this task's metadata before creating its snapshot.
+            // Resolve only this task's metadata before joining its note group.
             if notes::needs_fork_refresh(&self.root, &request.args) {
                 let refreshed = self
                     .backend

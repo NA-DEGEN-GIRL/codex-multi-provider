@@ -34,174 +34,33 @@ fn retirement_requires_known_idle_management_state_not_closed_apps() {
     }
 }
 
-#[test]
-fn forked_conversations_copy_notes_once_and_edit_independently() {
-    let root = tempdir().unwrap();
-    let parent = uuid::Uuid::new_v4().to_string();
-    let child = uuid::Uuid::new_v4().to_string();
-    let task = |thread: &str| json!({"task":{"host_id":"local","thread_id":thread}});
-    let mut args = note_args();
-    args["task"]["thread_id"] = json!(parent);
-    args["body"] = json!("parent body");
-    args["items"][0]["done"] = json!(true);
-    notes::execute(root.path(), "notes.save", &args).unwrap();
-    let parent_list = notes::execute(root.path(), "notes.list", &task(&parent)).unwrap();
-
-    let forks = root.path().join("work/control-center/note-forks.json");
-    std::fs::create_dir_all(forks.parent().unwrap()).unwrap();
-    let mut mapping = serde_json::Map::new();
-    mapping.insert(child.clone(), json!(parent));
-    std::fs::write(&forks, Value::Object(mapping).to_string()).unwrap();
-
-    let child_list = notes::execute(root.path(), "notes.list", &task(&child)).unwrap();
-    assert_eq!(child_list["notes"][0]["title"], args["title"]);
-    assert_eq!(child_list["notes"][0]["body"], "parent body");
-    assert_eq!(child_list["notes"][0]["items"][0]["done"], true);
-    assert_ne!(child_list["notes"][0]["id"], parent_list["notes"][0]["id"]);
-    assert_ne!(
-        child_list["notes"][0]["items"][0]["id"],
-        parent_list["notes"][0]["items"][0]["id"]
-    );
-    assert_eq!(child_list["notes"][0]["revision"], 0);
-    assert_eq!(child_list["shared"], false);
-    assert_eq!(
-        notes::execute(root.path(), "notes.list", &task(&child)).unwrap(),
-        child_list
-    );
-    assert_eq!(
-        notes::execute(root.path(), "notes.list", &task(&parent)).unwrap(),
-        parent_list
-    );
-
-    // The child has its own document immediately, without a separate split.
-    let mut edit = task(&child);
-    edit["note_id"] = child_list["notes"][0]["id"].clone();
-    edit["revision"] = child_list["notes"][0]["revision"].clone();
-    edit["title"] = json!("child title");
-    edit["kind"] = json!("text");
-    edit["body"] = json!("child edit");
-    edit["items"] = json!([]);
-    notes::execute(root.path(), "notes.save", &edit).unwrap();
-    assert_eq!(
-        notes::execute(root.path(), "notes.list", &task(&parent)).unwrap(),
-        parent_list
-    );
-    args["revision"] = json!(1);
-    args["body"] = json!("parent changed");
-    notes::execute(root.path(), "notes.save", &args).unwrap();
-    let child_after = notes::execute(root.path(), "notes.list", &task(&child)).unwrap();
-    assert_eq!(child_after["notes"][0]["body"], "child edit");
-}
-
 fn note_fork_map(root: &std::path::Path, mapping: Value) {
     let path = root.join("work/control-center/note-forks.json");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, mapping.to_string()).unwrap();
 }
 
-#[test]
-fn nested_forks_materialize_immediate_parent_and_preserve_existing_child() {
-    let root = tempdir().unwrap();
-    let mut parent = note_args();
-    parent["body"] = json!("original");
-    let child = note_args();
-    let grandchild = note_args();
-    let parent_id = parent["task"]["thread_id"].as_str().unwrap().to_string();
-    let child_id = child["task"]["thread_id"].as_str().unwrap();
-    let grandchild_id = grandchild["task"]["thread_id"].as_str().unwrap();
-    note_fork_map(
-        root.path(),
-        json!({child_id: parent_id, grandchild_id: child_id}),
-    );
-    notes::execute(root.path(), "notes.save", &parent).unwrap();
-    let leaf = notes::execute(root.path(), "notes.list", &grandchild).unwrap();
-    let middle = notes::execute(root.path(), "notes.list", &child).unwrap();
-    assert_eq!(leaf["notes"][0]["body"], "original");
-    assert_eq!(middle["notes"][0]["body"], "original");
-    assert_ne!(leaf["notes"][0]["id"], middle["notes"][0]["id"]);
-    parent["revision"] = json!(1);
-    parent["body"] = json!("later parent edit");
-    notes::execute(root.path(), "notes.save", &parent).unwrap();
-    assert_eq!(
-        notes::execute(root.path(), "notes.list", &grandchild).unwrap(),
-        leaf
-    );
-    assert_eq!(
-        notes::execute(root.path(), "notes.list", &child).unwrap(),
-        middle
-    );
-
-    let existing = note_args();
-    notes::execute(root.path(), "notes.save", &existing).unwrap();
-    let before = notes::execute(root.path(), "notes.list", &existing).unwrap();
-    note_fork_map(
-        root.path(),
-        json!({existing["task"]["thread_id"].as_str().unwrap(): parent_id}),
-    );
-    assert_eq!(
-        notes::execute(root.path(), "notes.list", &existing).unwrap(),
-        before
-    );
+fn note_list(root: &std::path::Path, args: &Value) -> Value {
+    notes::execute(root, "notes.list", args).unwrap()
 }
 
-#[test]
-fn empty_fork_snapshot_stays_empty_and_other_hosts_do_not_inherit() {
-    let root = tempdir().unwrap();
-    let parent = note_args();
-    let child = note_args();
-    let parent_id = parent["task"]["thread_id"].as_str().unwrap();
-    let child_id = child["task"]["thread_id"].as_str().unwrap();
-    note_fork_map(root.path(), json!({child_id: parent_id}));
-    assert_eq!(
-        notes::execute(root.path(), "notes.list", &child).unwrap()["notes"],
-        json!([])
-    );
-    notes::execute(root.path(), "notes.save", &parent).unwrap();
-    assert_eq!(
-        notes::execute(root.path(), "notes.list", &child).unwrap()["notes"],
-        json!([])
-    );
-
-    let mut remote_parent = parent.clone();
-    remote_parent["task"]["host_id"] = json!("ssh:other-host");
-    notes::execute(root.path(), "notes.save", &remote_parent).unwrap();
-    let mut remote_child = child.clone();
-    remote_child["task"]["host_id"] = json!("ssh:other-host");
-    assert_eq!(
-        notes::execute(root.path(), "notes.list", &remote_child).unwrap()["notes"],
-        json!([])
-    );
+fn note_document_path(root: &std::path::Path, args: &Value) -> PathBuf {
+    std::fs::read_dir(root.join("work/control-center/notes"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            let document: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            document["task"] == args["task"]
+        })
+        .unwrap()
 }
 
-#[test]
-fn fork_cycles_fail_without_creating_empty_snapshots() {
-    let root = tempdir().unwrap();
-    let a = note_args();
-    let b = note_args();
-    note_fork_map(
-        root.path(),
-        json!({a["task"]["thread_id"].as_str().unwrap(): b["task"]["thread_id"],
-                                   b["task"]["thread_id"].as_str().unwrap(): a["task"]["thread_id"]}),
-    );
-    assert!(notes::execute(root.path(), "notes.list", &a).is_err());
-    assert!(!root.path().join("work/control-center/notes").exists());
-}
-
-#[test]
-fn legacy_shared_group_can_be_copied_and_split_without_changing_source() {
-    let root = tempdir().unwrap();
-    let parent = note_args();
-    notes::execute(root.path(), "notes.save", &parent).unwrap();
-    let directory = root.path().join("work/control-center/notes");
-    let path = std::fs::read_dir(&directory)
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
+fn legacy_note_group(root: &std::path::Path, args: &Value) -> (PathBuf, PathBuf) {
+    notes::execute(root, "notes.save", args).unwrap();
+    let path = note_document_path(root, args);
     let mut document: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     let group = uuid::Uuid::new_v4().to_string();
-    let group_directory = root.path().join("work/control-center/note-groups");
+    let group_directory = root.join("work/control-center/note-groups");
     std::fs::create_dir_all(&group_directory).unwrap();
     let group_path = group_directory.join(format!("{group}.json"));
     let data = json!({"version":1,"group_id":group,"notes":document["notes"]});
@@ -210,28 +69,485 @@ fn legacy_shared_group_can_be_copied_and_split_without_changing_source() {
     document["group_id"] = json!(group);
     document["notes"] = json!([]);
     std::fs::write(&path, document.to_string()).unwrap();
-    let parent_bytes = std::fs::read(&path).unwrap();
-    let group_bytes = std::fs::read(&group_path).unwrap();
+    (path, group_path)
+}
 
+#[test]
+fn forked_conversations_share_edits_additions_deletions_and_revisions() {
+    let root = tempdir().unwrap();
+    let mut parent = note_args();
+    let mut child = note_args();
+    parent["body"] = json!("parent body");
+    parent["items"][0]["done"] = json!(true);
+    notes::execute(root.path(), "notes.save", &parent).unwrap();
+    let original = note_list(root.path(), &parent);
+    note_fork_map(
+        root.path(),
+        json!({child["task"]["thread_id"].as_str().unwrap(): parent["task"]["thread_id"]}),
+    );
+    let inherited = note_list(root.path(), &child);
+    assert_eq!(inherited["notes"], original["notes"]);
+    assert_eq!(inherited["shared"], true);
+    assert_eq!(note_list(root.path(), &parent)["shared"], true);
+
+    child["note_id"] = parent["note_id"].clone();
+    child["revision"] = json!(1);
+    child["body"] = json!("child edit");
+    child["items"] = parent["items"].clone();
+    child["items"][0]["text"] = json!("edited in child");
+    child["items"][0]["done"] = json!(false);
+    let edited = notes::execute(root.path(), "notes.save", &child).unwrap();
+    assert_eq!(note_list(root.path(), &parent)["notes"][0], edited["note"]);
+    assert_eq!(edited["note"]["revision"], 2);
+    assert_eq!(edited["note"]["items"][0]["id"], parent["items"][0]["id"]);
+
+    parent["revision"] = json!(1);
+    let conflict = notes::execute(root.path(), "notes.save", &parent).unwrap();
+    assert_eq!(conflict["state"], "conflict");
+    assert_eq!(conflict["current"], edited["note"]);
+    parent["revision"] = json!(2);
+    parent["body"] = json!("parent changed");
+    let edited = notes::execute(root.path(), "notes.save", &parent).unwrap();
+    assert_eq!(note_list(root.path(), &child)["notes"][0], edited["note"]);
+    let conflict = notes::execute(root.path(), "notes.save", &child).unwrap();
+    assert_eq!(conflict["state"], "conflict");
+    assert_eq!(conflict["current"], edited["note"]);
+
+    // New notes from either member are immediately visible to the other.
+    for source in [&child, &parent] {
+        let mut added = note_args();
+        added["task"] = source["task"].clone();
+        notes::execute(root.path(), "notes.save", &added).unwrap();
+        assert_eq!(
+            note_list(root.path(), &parent)["notes"],
+            note_list(root.path(), &child)["notes"]
+        );
+    }
+    assert_eq!(
+        note_list(root.path(), &parent)["notes"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+
+    // Both directions of delete and restore share one revision history.
+    for (source, other, revision) in [(&child, &parent, 3), (&parent, &child, 5)] {
+        let mut mutation = source.clone();
+        mutation["revision"] = json!(revision);
+        let deleted = notes::execute(root.path(), "notes.delete", &mutation).unwrap();
+        assert_eq!(deleted["note"]["deleted"], true);
+        assert_eq!(note_list(root.path(), other)["notes"][0], deleted["note"]);
+        mutation["task"] = other["task"].clone();
+        mutation["revision"] = json!(revision + 1);
+        let restored = notes::execute(root.path(), "notes.restore", &mutation).unwrap();
+        assert_eq!(restored["note"]["deleted"], false);
+        assert_eq!(restored["note"]["body"], "parent changed");
+        assert_eq!(note_list(root.path(), source)["notes"][0], restored["note"]);
+    }
+}
+
+#[test]
+fn explicit_note_fork_detaches_current_task_with_fresh_ids_and_is_idempotent() {
+    let root = tempdir().unwrap();
+    let mut parent = note_args();
+    parent["body"] = json!("keep this body");
+    parent["items"][0]["done"] = json!(true);
+    notes::execute(root.path(), "notes.save", &parent).unwrap();
+    let mut deleted = note_args();
+    deleted["task"] = parent["task"].clone();
+    notes::execute(root.path(), "notes.save", &deleted).unwrap();
+    deleted["revision"] = json!(1);
+    notes::execute(root.path(), "notes.delete", &deleted).unwrap();
     let child = note_args();
     note_fork_map(
         root.path(),
         json!({child["task"]["thread_id"].as_str().unwrap(): parent["task"]["thread_id"]}),
     );
-    let cloned = notes::execute(root.path(), "notes.list", &child).unwrap();
-    assert_eq!(cloned["notes"][0]["title"], parent["title"]);
-    assert_eq!(cloned["shared"], false);
+    let before = note_list(root.path(), &child);
+    let parent_before = note_list(root.path(), &parent);
+    let split = notes::execute(root.path(), "notes.fork", &child).unwrap();
+    assert_eq!(split["state"], "forked");
+    assert_eq!(split["shared"], false);
+    assert_eq!(split["task"], child["task"]);
+    assert_eq!(split["notes"].as_array().unwrap().len(), 2);
+    for (copy, original) in split["notes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(before["notes"].as_array().unwrap())
+    {
+        assert_ne!(copy["id"], original["id"]);
+        assert!(uuid::Uuid::parse_str(copy["id"].as_str().unwrap()).is_ok());
+        assert_eq!(copy["revision"], 0);
+        for key in ["title", "kind", "body", "deleted", "updated_at"] {
+            assert_eq!(copy[key], original[key]);
+        }
+        for (item, old_item) in copy["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(original["items"].as_array().unwrap())
+        {
+            assert_ne!(item["id"], old_item["id"]);
+            assert!(uuid::Uuid::parse_str(item["id"].as_str().unwrap()).is_ok());
+            assert_eq!(item["text"], old_item["text"]);
+            assert_eq!(item["done"], old_item["done"]);
+        }
+    }
+    assert_eq!(note_list(root.path(), &parent), parent_before);
+    assert_eq!(note_list(root.path(), &child)["notes"], split["notes"]);
+    assert_eq!(note_list(root.path(), &child)["shared"], false);
+    let repeated = notes::execute(root.path(), "notes.fork", &child).unwrap();
+    assert_eq!(repeated["notes"], split["notes"]);
+    assert_eq!(repeated["shared"], false);
+
+    let mut edit = child.clone();
+    edit["note_id"] = split["notes"][0]["id"].clone();
+    edit["body"] = json!("detached edit");
+    notes::execute(root.path(), "notes.save", &edit).unwrap();
+    assert_eq!(note_list(root.path(), &parent), parent_before);
+    let detached = note_list(root.path(), &child);
+    parent["revision"] = json!(1);
+    parent["body"] = json!("source edit");
+    notes::execute(root.path(), "notes.save", &parent).unwrap();
+    assert_eq!(note_list(root.path(), &child), detached);
+}
+
+#[test]
+fn splitting_a_standalone_document_retains_note_and_checklist_ids() {
+    let root = tempdir().unwrap();
+    let args = note_args();
+    notes::execute(root.path(), "notes.save", &args).unwrap();
+    let before = note_list(root.path(), &args);
+    for _ in 0..2 {
+        let split = notes::execute(root.path(), "notes.fork", &args).unwrap();
+        assert_eq!(split["shared"], false);
+        assert_eq!(split["notes"], before["notes"]);
+        assert_eq!(note_list(root.path(), &args), before);
+    }
+}
+
+#[test]
+fn nested_forks_share_groups_and_new_descendants_follow_detached_parent() {
+    let root = tempdir().unwrap();
+    let mut parent = note_args();
+    parent["body"] = json!("original");
+    let child = note_args();
+    let grandchild = note_args();
+    let sibling = note_args();
+    let later_child = note_args();
+    let later_grandchild = note_args();
+    let parent_id = parent["task"]["thread_id"].as_str().unwrap();
+    let child_id = child["task"]["thread_id"].as_str().unwrap();
+    let grandchild_id = grandchild["task"]["thread_id"].as_str().unwrap();
+    let sibling_id = sibling["task"]["thread_id"].as_str().unwrap();
+    let later_child_id = later_child["task"]["thread_id"].as_str().unwrap();
+    note_fork_map(
+        root.path(),
+        json!({child_id: parent_id, grandchild_id: child_id, sibling_id: parent_id}),
+    );
+    notes::execute(root.path(), "notes.save", &parent).unwrap();
+    let leaf = note_list(root.path(), &grandchild);
+    for task in [&parent, &child, &sibling] {
+        let list = note_list(root.path(), task);
+        assert_eq!(list["notes"], leaf["notes"]);
+        assert_eq!(list["shared"], true);
+    }
+    let split = notes::execute(root.path(), "notes.fork", &child).unwrap();
+    assert_eq!(split["shared"], false);
+    assert_ne!(split["notes"][0]["id"], leaf["notes"][0]["id"]);
+    // Already joined descendants and siblings stay in the original group.
+    assert_eq!(note_list(root.path(), &grandchild), leaf);
+    note_fork_map(
+        root.path(),
+        json!({child_id: parent_id, grandchild_id: child_id, sibling_id: parent_id,
+        later_child_id: child_id, later_grandchild["task"]["thread_id"].as_str().unwrap(): later_child_id}),
+    );
+    let later = note_list(root.path(), &later_grandchild);
+    assert_eq!(later["notes"], split["notes"]);
+    assert_eq!(later["shared"], true);
+    assert_eq!(
+        note_list(root.path(), &later_child)["notes"],
+        split["notes"]
+    );
+    assert_eq!(note_list(root.path(), &child)["shared"], true);
+
+    let mut edit = later_grandchild.clone();
+    edit["note_id"] = split["notes"][0]["id"].clone();
+    edit["body"] = json!("detached family edit");
+    let saved = notes::execute(root.path(), "notes.save", &edit).unwrap();
+    assert_eq!(note_list(root.path(), &child)["notes"][0], saved["note"]);
+    assert_eq!(
+        note_list(root.path(), &later_child)["notes"][0],
+        saved["note"]
+    );
+    for task in [&parent, &sibling, &grandchild] {
+        assert_eq!(note_list(root.path(), task)["notes"], leaf["notes"]);
+    }
+    parent["revision"] = json!(1);
+    parent["body"] = json!("original family edit");
+    let saved = notes::execute(root.path(), "notes.save", &parent).unwrap();
+    for task in [&sibling, &grandchild] {
+        assert_eq!(note_list(root.path(), task)["notes"][0], saved["note"]);
+    }
+    assert_eq!(
+        note_list(root.path(), &child)["notes"][0]["body"],
+        "detached family edit"
+    );
+}
+
+#[test]
+fn splitting_parent_does_not_move_existing_children() {
+    let root = tempdir().unwrap();
+    let parent = note_args();
+    let mut child = note_args();
+    let sibling = note_args();
+    notes::execute(root.path(), "notes.save", &parent).unwrap();
+    note_fork_map(
+        root.path(),
+        json!({child["task"]["thread_id"].as_str().unwrap(): parent["task"]["thread_id"],
+        sibling["task"]["thread_id"].as_str().unwrap(): parent["task"]["thread_id"]}),
+    );
+    let before = note_list(root.path(), &child);
+    assert_eq!(note_list(root.path(), &sibling)["notes"], before["notes"]);
+    let split = notes::execute(root.path(), "notes.fork", &parent).unwrap();
+    assert_eq!(split["shared"], false);
+    assert_eq!(note_list(root.path(), &child), before);
+    child["note_id"] = before["notes"][0]["id"].clone();
+    child["revision"] = json!(1);
+    child["body"] = json!("children still share");
+    notes::execute(root.path(), "notes.save", &child).unwrap();
+    assert_eq!(
+        note_list(root.path(), &sibling)["notes"],
+        note_list(root.path(), &child)["notes"]
+    );
+    assert_eq!(note_list(root.path(), &parent)["notes"], split["notes"]);
+}
+
+#[test]
+fn preexisting_standalone_child_is_preserved_when_fork_metadata_appears() {
+    let root = tempdir().unwrap();
+    let parent = note_args();
+    let child = note_args();
+    notes::execute(root.path(), "notes.save", &parent).unwrap();
+    notes::execute(root.path(), "notes.save", &child).unwrap();
+    let before = note_list(root.path(), &child);
+    let path = note_document_path(root.path(), &child);
+    let bytes = std::fs::read(&path).unwrap();
+    note_fork_map(
+        root.path(),
+        json!({child["task"]["thread_id"].as_str().unwrap(): parent["task"]["thread_id"]}),
+    );
+    assert_eq!(note_list(root.path(), &child), before);
+    assert_eq!(std::fs::read(path).unwrap(), bytes);
+    assert_eq!(note_list(root.path(), &parent)["shared"], false);
+}
+
+#[test]
+fn empty_forks_share_future_changes_in_both_directions() {
+    for child_writes_first in [false, true] {
+        let root = tempdir().unwrap();
+        let parent = note_args();
+        let child = note_args();
+        let grandchild = note_args();
+        note_fork_map(
+            root.path(),
+            json!({child["task"]["thread_id"].as_str().unwrap(): parent["task"]["thread_id"],
+            grandchild["task"]["thread_id"].as_str().unwrap(): child["task"]["thread_id"]}),
+        );
+        let empty = note_list(root.path(), &grandchild);
+        assert_eq!(empty["notes"], json!([]));
+        assert_eq!(empty["shared"], true);
+        let first = if child_writes_first {
+            &grandchild
+        } else {
+            &parent
+        };
+        notes::execute(root.path(), "notes.save", first).unwrap();
+        let saved = note_list(root.path(), first);
+        for task in [&parent, &child, &grandchild] {
+            assert_eq!(note_list(root.path(), task)["notes"], saved["notes"]);
+            assert_eq!(note_list(root.path(), task)["shared"], true);
+        }
+    }
+}
+
+#[test]
+fn detaching_empty_fork_keeps_later_parent_notes_out() {
+    let root = tempdir().unwrap();
+    let parent = note_args();
+    let child = note_args();
+    note_fork_map(
+        root.path(),
+        json!({child["task"]["thread_id"].as_str().unwrap(): parent["task"]["thread_id"]}),
+    );
+    let split = notes::execute(root.path(), "notes.fork", &child).unwrap();
+    assert_eq!(split["shared"], false);
+    assert_eq!(split["notes"], json!([]));
+    notes::execute(root.path(), "notes.save", &parent).unwrap();
+    assert_eq!(note_list(root.path(), &child)["notes"], json!([]));
+    notes::execute(root.path(), "notes.save", &child).unwrap();
+    assert_eq!(
+        note_list(root.path(), &parent)["notes"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        note_list(root.path(), &parent)["notes"][0]["id"],
+        parent["note_id"]
+    );
+}
+
+#[test]
+fn remote_hosts_do_not_inherit_local_fork_relationships() {
+    let root = tempdir().unwrap();
+    let parent = note_args();
+    let child = note_args();
+    note_fork_map(
+        root.path(),
+        json!({child["task"]["thread_id"].as_str().unwrap(): parent["task"]["thread_id"]}),
+    );
+    notes::execute(root.path(), "notes.save", &parent).unwrap();
+    assert_eq!(
+        note_list(root.path(), &child)["notes"][0]["id"],
+        parent["note_id"]
+    );
+    let local = note_list(root.path(), &child);
+    let mut remote_parent = parent.clone();
+    remote_parent["task"]["host_id"] = json!("ssh:other-host");
+    notes::execute(root.path(), "notes.save", &remote_parent).unwrap();
+    let mut remote_child = child.clone();
+    remote_child["task"]["host_id"] = json!("ssh:other-host");
+    assert_eq!(note_list(root.path(), &remote_child)["notes"], json!([]));
+    assert_eq!(note_list(root.path(), &remote_child)["shared"], false);
+    notes::execute(root.path(), "notes.save", &remote_child).unwrap();
+    assert_eq!(
+        note_list(root.path(), &remote_parent)["notes"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(note_list(root.path(), &child), local);
+}
+
+#[test]
+fn fork_cycles_fail_without_creating_documents_or_groups() {
+    let root = tempdir().unwrap();
+    let a = note_args();
+    let b = note_args();
+    note_fork_map(
+        root.path(),
+        json!({a["task"]["thread_id"].as_str().unwrap(): b["task"]["thread_id"],
+        b["task"]["thread_id"].as_str().unwrap(): a["task"]["thread_id"]}),
+    );
+    for command in ["notes.list", "notes.save", "notes.fork"] {
+        assert!(notes::execute(root.path(), command, &a).is_err());
+        assert!(!root.path().join("work/control-center/notes").exists());
+        assert!(!root.path().join("work/control-center/note-groups").exists());
+    }
+}
+
+#[test]
+fn legacy_shared_group_is_reused_and_split_preserves_other_members() {
+    let root = tempdir().unwrap();
+    let parent = note_args();
+    let (path, group_path) = legacy_note_group(root.path(), &parent);
+    let parent_bytes = std::fs::read(&path).unwrap();
+    let group_bytes = std::fs::read(&group_path).unwrap();
+    let data: Value = serde_json::from_slice(&group_bytes).unwrap();
+    let child = note_args();
+    note_fork_map(
+        root.path(),
+        json!({child["task"]["thread_id"].as_str().unwrap(): parent["task"]["thread_id"]}),
+    );
+    let inherited = note_list(root.path(), &child);
+    assert_eq!(inherited["notes"], data["notes"]);
+    assert_eq!(inherited["shared"], true);
     assert_eq!(std::fs::read(&path).unwrap(), parent_bytes);
     assert_eq!(std::fs::read(&group_path).unwrap(), group_bytes);
-
-    // The explicit split command still detaches old shared documents.
     let split = notes::execute(root.path(), "notes.fork", &parent).unwrap();
+    assert_eq!(split["shared"], false);
     assert_ne!(split["notes"][0]["id"], data["notes"][0]["id"]);
-    assert_eq!(
-        notes::execute(root.path(), "notes.list", &parent).unwrap()["shared"],
-        false
-    );
+    assert_eq!(note_list(root.path(), &parent)["shared"], false);
+    assert_eq!(note_list(root.path(), &child), inherited);
     assert_eq!(std::fs::read(&group_path).unwrap(), group_bytes);
+}
+
+#[test]
+fn corrupt_or_mismatched_groups_cannot_overwrite_documents_or_groups() {
+    for damage in [
+        "invalid json",
+        "wrong group",
+        "unsupported version",
+        "missing",
+    ] {
+        let root = tempdir().unwrap();
+        let parent = note_args();
+        let (document_path, group_path) = legacy_note_group(root.path(), &parent);
+        let mut data: Value = serde_json::from_slice(&std::fs::read(&group_path).unwrap()).unwrap();
+        match damage {
+            "invalid json" => std::fs::write(&group_path, b"broken group").unwrap(),
+            "wrong group" => {
+                data["group_id"] = json!(uuid::Uuid::new_v4());
+                std::fs::write(&group_path, data.to_string()).unwrap();
+            }
+            "unsupported version" => {
+                data["version"] = json!(999);
+                std::fs::write(&group_path, data.to_string()).unwrap();
+            }
+            "missing" => std::fs::remove_file(&group_path).unwrap(),
+            _ => unreachable!(),
+        }
+        let document_bytes = std::fs::read(&document_path).unwrap();
+        let group_bytes = std::fs::read(&group_path).ok();
+        let child = note_args();
+        note_fork_map(
+            root.path(),
+            json!({child["task"]["thread_id"].as_str().unwrap(): parent["task"]["thread_id"]}),
+        );
+        for command in ["notes.list", "notes.save", "notes.fork"] {
+            for task in [&parent, &child] {
+                assert!(
+                    notes::execute(root.path(), command, task).is_err(),
+                    "{damage}: {command}"
+                );
+                assert_eq!(std::fs::read(&document_path).unwrap(), document_bytes);
+                assert_eq!(std::fs::read(&group_path).ok(), group_bytes);
+                assert_eq!(
+                    std::fs::read_dir(root.path().join("work/control-center/notes"))
+                        .unwrap()
+                        .count(),
+                    1
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn invalid_group_id_cannot_traverse_to_or_overwrite_another_file() {
+    let root = tempdir().unwrap();
+    let mut parent = note_args();
+    let (document_path, _) = legacy_note_group(root.path(), &parent);
+    let mut document: Value =
+        serde_json::from_slice(&std::fs::read(&document_path).unwrap()).unwrap();
+    document["group_id"] = json!("../outside-group");
+    std::fs::write(&document_path, document.to_string()).unwrap();
+    let document_bytes = std::fs::read(&document_path).unwrap();
+    let outside = root.path().join("work/control-center/outside-group.json");
+    // A valid-looking group outside the group directory must never be followed.
+    let sentinel = json!({"version":1,"group_id":"../outside-group","notes":[]}).to_string();
+    std::fs::write(&outside, &sentinel).unwrap();
+    parent["revision"] = json!(0);
+    for command in ["notes.list", "notes.save", "notes.fork"] {
+        assert!(notes::execute(root.path(), command, &parent).is_err());
+        assert_eq!(std::fs::read(&document_path).unwrap(), document_bytes);
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), sentinel);
+    }
 }
 
 #[test]
@@ -480,7 +796,7 @@ fn request(command: &str, args: Value) -> Request {
 }
 
 #[tokio::test]
-async fn first_note_access_resolves_native_fork_before_copying() {
+async fn first_note_access_resolves_native_fork_before_sharing() {
     let root = tempdir().unwrap();
     let parent = note_args();
     let child = note_args();
@@ -526,13 +842,41 @@ for raw in sys.stdin:
             .await["ok"],
         true
     );
-    let copied = service.dispatch(request("notes.list", child.clone())).await;
-    assert_eq!(copied["ok"], true);
-    assert_eq!(copied["result"]["notes"][0]["title"], parent["title"]);
-    assert_ne!(copied["result"]["notes"][0]["id"], parent["note_id"]);
-    assert_eq!(copied["result"]["shared"], false);
+    let shared = service.dispatch(request("notes.list", child.clone())).await;
+    assert_eq!(shared["ok"], true);
+    assert_eq!(shared["result"]["notes"][0]["title"], parent["title"]);
+    assert_eq!(shared["result"]["notes"][0]["id"], parent["note_id"]);
+    assert_eq!(shared["result"]["shared"], true);
     let repeated = service.dispatch(request("notes.list", child)).await;
-    assert_eq!(copied["result"], repeated["result"]);
+    assert_eq!(shared["result"], repeated["result"]);
+    let mut parent_edit = parent.clone();
+    parent_edit["revision"] = json!(1);
+    parent_edit["body"] = json!("concurrent parent edit");
+    let mut child_edit = parent_edit.clone();
+    child_edit["task"] = shared["result"]["task"].clone();
+    child_edit["body"] = json!("concurrent child edit");
+    let (parent_save, child_save) = tokio::join!(
+        service.dispatch(request("notes.save", parent_edit)),
+        service.dispatch(request("notes.save", child_edit))
+    );
+    assert_eq!(parent_save["ok"], true);
+    assert_eq!(child_save["ok"], true);
+    let (saved, conflict) = if parent_save["result"]["state"] == "saved" {
+        (&parent_save["result"], &child_save["result"])
+    } else {
+        (&child_save["result"], &parent_save["result"])
+    };
+    assert_eq!(saved["state"], "saved");
+    assert_eq!(conflict["state"], "conflict");
+    assert_eq!(saved["note"]["revision"], 2);
+    assert_eq!(conflict["current"], saved["note"]);
+    for task in [&parent["task"], &shared["result"]["task"]] {
+        let loaded = service
+            .dispatch(request("notes.list", json!({"task":task})))
+            .await;
+        assert_eq!(loaded["result"]["notes"][0], saved["note"]);
+        assert_eq!(loaded["result"]["shared"], true);
+    }
     // A thread not yet indexed cannot create an empty document or lose inheritance.
     let unknown = note_args();
     assert_eq!(

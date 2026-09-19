@@ -365,6 +365,76 @@ class ProviderRegistryTests(unittest.TestCase):
             with self.subTest(text=text), self.assertRaises(providers.ProviderError):
                 self.registry.render_for_host(self.profile_home, False, [], text)
 
+    def test_missing_end_marker_is_recovered_without_touching_native_settings(self):
+        saved = self.add_model()
+        self.registry.generate(self.profile_home, True, [saved['model']['id']])
+        path = self.profile_home / 'config.toml'
+        text = path.read_text(encoding='utf-8')
+        self.assertEqual(text.count(providers._BEGIN), 1)
+        self.assertEqual(text.count(providers._END), 1)
+        # A native desktop write can drop our end marker and append its own
+        # tables after the generated role and provider tables.
+        damaged = text.replace(providers._END + '\n', '') + (
+            '\n[windows]\nsandbox = "elevated"\n'
+            '[desktop]\nappearanceTheme = "dark"\npermissionMode = "limited"\n'
+            '[agents.personal]\ndescription = "keep"\n'
+            '[plugins."fixture@marketplace"]\nenabled = true\n'
+            '[marketplaces.fixture]\nsource_type = "local"\nsource = "C:/fixture"\n'
+            '# keep this trailing note\n')
+        self.assertEqual(damaged.count(providers._BEGIN), 1)
+        self.assertEqual(damaged.count(providers._END), 0)
+        path.write_text(damaged, encoding='utf-8')
+
+        self.registry.generate(self.profile_home, True, [saved['model']['id']])
+        first = path.read_bytes()
+        written = path.read_text(encoding='utf-8')
+        self.assertEqual(written.count(providers._BEGIN), 1)
+        self.assertEqual(written.count(providers._END), 1)
+        config = tomllib.loads(written)
+        self.assertEqual(config['windows'], {'sandbox': 'elevated'})
+        self.assertEqual(config['desktop'], {'appearanceTheme': 'dark', 'permissionMode': 'limited'})
+        self.assertEqual(config['agents']['personal'], {'description': 'keep'})
+        self.assertTrue(config['plugins']['fixture@marketplace']['enabled'])
+        self.assertEqual(config['marketplaces']['fixture']['source_type'], 'local')
+        self.assertIn('# keep this trailing note', written)
+        self.assertTrue(any(name.startswith('cc_external_') for name in config['agents']))
+        # The repaired file keeps one stable generated block across writes.
+        self.registry.generate(self.profile_home, True, [saved['model']['id']])
+        self.assertEqual(path.read_bytes(), first)
+
+    def test_missing_end_recovery_requires_recognized_tables_and_valid_toml(self):
+        generated = '[agents.cc_gpt_sol]\ndescription = "generated"\n'
+        for text in (
+                providers._BEGIN + '\n[windows]\nsandbox = "elevated"\n',
+                providers._BEGIN + '\n[agents.personal]\ndescription = "keep"\n',
+                providers._BEGIN + '\n' + generated + providers._BEGIN + '\n[windows]\n',
+                providers._END + '\n' + generated + providers._BEGIN + '\n',
+                providers._END + '\n[windows]\nsandbox = "elevated"\n',
+                providers._BEGIN + '\n[agents.cc_gpt_sol]\ndescription = "unterminated\n',
+        ):
+            with self.subTest(text=text), self.assertRaises(providers.ProviderError):
+                self.registry.render_for_host(self.profile_home, False, [], text)
+
+    def test_missing_end_recovery_accepts_managed_model_provider_tables(self):
+        provider = 'cc_' + 'a' * 32 + '_r7_' + 'b' * 12
+        text = (providers._BEGIN + f'\n[model_providers.{provider}]\nname = "old"\n'
+                'stream_idle_timeout_ms = 60000\n[windows]\nsandbox = "elevated"\n')
+        stripped = providers._strip_provider_block(text)
+        self.assertEqual(tomllib.loads(stripped), {'windows': {'sandbox': 'elevated'}})
+
+    def test_multiline_marker_lookalikes_are_data_not_block_markers(self):
+        fake = providers._BEGIN + '\n[windows]\nsandbox = "fiction"\n' + providers._END
+        text = 'developer_instructions = """\n' + fake + '\n"""\n'
+        text += providers._BEGIN + '\n[agents.cc_gpt_sol]\ndescription = "generated"\n'
+        text += '[native]\nnotes = """\n' + providers._END + '\n' + providers._BEGIN + '\n"""\n'
+        stripped = providers._strip_provider_block(text)
+        self.assertIn('developer_instructions = """\n' + fake + '\n"""', stripped)
+        self.assertIn('notes = """\n' + providers._END + '\n' + providers._BEGIN + '\n"""', stripped)
+        parsed = tomllib.loads(stripped)
+        self.assertEqual(parsed['developer_instructions'], fake + '\n')
+        self.assertEqual(parsed['native']['notes'], providers._END + '\n' + providers._BEGIN + '\n')
+        self.assertNotIn('agents', parsed)
+
     def test_changed_provider_archives_existing_role_revision_without_rediscovery(self):
         saved = self.add_model()
         self.registry.generate(self.profile_home, True, [saved['model']['id']])

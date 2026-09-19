@@ -19,12 +19,17 @@ internal sealed class TaskNotesPanel : Border
     private long selection;
     private bool rendering;
     private bool loadFailed;
+    private bool loading, splitting, refreshing;
+    private int pendingMutations;
+    private long contentVersion;
+    private readonly DispatcherTimer refresh = new() { Interval = TimeSpan.FromSeconds(2) };
+    private readonly TextBlock sharing = new() { Name = "NoteSharing", Foreground = Brush(153, 174, 206), FontSize = 12, Margin = new Thickness(0, 0, 0, 10), TextWrapping = TextWrapping.Wrap };
     private readonly TextBlock taskTitle = new() { Text = "작업을 열어 주세요", TextTrimming = TextTrimming.CharacterEllipsis, Foreground = Brush(169, 177, 194), Margin = new Thickness(0, 6, 0, 16) };
     private readonly TextBlock status = new() { Text = "작업별로 자동 저장됩니다", Foreground = Brush(153, 164, 184), FontSize = 12, Margin = new Thickness(0, 10, 0, 0), TextWrapping = TextWrapping.Wrap };
     private readonly WrapPanel tabs = new();
     private readonly Button add = new() { Name = "AddNote", Content = "+ 새 메모", Height = 32, Padding = new Thickness(10, 0, 10, 0), Margin = new Thickness(0), HorizontalContentAlignment = HorizontalAlignment.Center, ToolTip = "이 작업에 새 메모 추가" };
     private readonly Button options = new() { Content = "⋯", Width = 32, Height = 32, Margin = new Thickness(6, 0, 0, 0), Padding = new Thickness(0), HorizontalContentAlignment = HorizontalAlignment.Center, ToolTip = "메모 이름 변경 · 삭제 · 복구" };
-    private readonly Button fork = new() { Name = "ForkNote", Content = "메모 분리", Height = 32, Padding = new Thickness(10, 0, 10, 0), Margin = new Thickness(6, 0, 0, 0), HorizontalContentAlignment = HorizontalAlignment.Center, Visibility = Visibility.Collapsed, ToolTip = "공유 메모를 복사해 이 작업에서 독립적으로 편집합니다." };
+    private readonly Button fork = new() { Name = "ForkNote", Content = "메모 분리", Height = 32, Padding = new Thickness(10, 0, 10, 0), Margin = new Thickness(6, 0, 0, 0), HorizontalContentAlignment = HorizontalAlignment.Center, Visibility = Visibility.Collapsed, ToolTip = "현재 메모와 체크 항목을 모두 복사해 이 작업만 독립적으로 편집합니다. 다른 작업의 메모는 그대로 유지됩니다." };
     private bool shared;
     private readonly Button retry = new() { Content = "다시 저장", Visibility = Visibility.Collapsed };
     private readonly TextBox editor = new() { Name = "NoteBody", AcceptsReturn = true, AcceptsTab = true, TextWrapping = TextWrapping.Wrap,
@@ -47,7 +52,7 @@ internal sealed class TaskNotesPanel : Border
         var close = new Button { Content = "›", ToolTip = "메모 패널 접기", Width = 32, Height = 32, Margin = new Thickness(0), Padding = new Thickness(0), Background = Brushes.Transparent, BorderThickness = new Thickness(0), HorizontalContentAlignment = HorizontalAlignment.Center, HorizontalAlignment = HorizontalAlignment.Right };
         close.Click += (_, _) => CollapseRequested?.Invoke(); DockPanel.SetDock(close, Dock.Right); heading.Children.Add(close);
         heading.Children.Add(new TextBlock { Text = "작업 메모", FontSize = 18, FontWeight = FontWeights.SemiBold, VerticalAlignment = VerticalAlignment.Center });
-        var top = new StackPanel(); top.Children.Add(heading); top.Children.Add(taskTitle);
+        var top = new StackPanel(); top.Children.Add(heading); top.Children.Add(taskTitle); top.Children.Add(sharing);
         var toolbar = new DockPanel { Margin = new Thickness(0, 0, 0, 10) };
         DockPanel.SetDock(options, Dock.Right); toolbar.Children.Add(options);
         DockPanel.SetDock(fork, Dock.Right); toolbar.Children.Add(fork);
@@ -83,6 +88,9 @@ internal sealed class TaskNotesPanel : Border
             if (!rendering && editing is { } draft) { draft.Note.Body = editor.Text; Dirty(draft); }
         };
         autosave.Tick += async (_, _) => { autosave.Stop(); foreach (var draft in drafts.Values.Where(d => d.Changed != d.Saved).ToArray()) await SaveAsync(draft); };
+        refresh.Tick += async (_, _) => await RefreshSharedAsync();
+        Loaded += (_, _) => refresh.Start();
+        Unloaded += (_, _) => refresh.Stop();
         RenderTabs(); RenderEditor();
     }
     private static SolidColorBrush Brush(byte r, byte g, byte b) => new(Color.FromRgb(r,g,b));
@@ -90,13 +98,14 @@ internal sealed class TaskNotesPanel : Border
     internal async Task SelectTaskAsync(SelectedTask? task, bool reload = false)
     {
         if (!reload && selected?.Task == task?.Task) { if (task is not null) taskTitle.Text = task.Title; return; }
-        var ticket = ++selection; selected = task; editing = null; notes.Clear(); loadFailed = false;
+        var ticket = ++selection; selected = task; editing = null; notes.Clear(); loadFailed = false; loading = true; shared = false;
+        UpdateSharing();
         taskTitle.Text = task?.Title ?? "작업을 열어 주세요"; taskTitle.ToolTip = task?.Title;
         RenderTabs(); RenderEditor();
         status.Text = task is null ? "열린 작업에 메모가 연결됩니다" : "메모 불러오는 중…";
         try
         {
-            // A newly opened fork snapshots the saved parent notes. Drain any
+            // A newly opened fork joins the parent's shared notes. Drain any
             // draft save already in flight before that first read, including
             // when selection changes again while the previous save completes.
             await FlushAsync();
@@ -118,28 +127,62 @@ internal sealed class TaskNotesPanel : Border
             var first = notes.FirstOrDefault(n => !n.Deleted);
             if (first is not null) Edit(first); else { RenderTabs(); RenderEditor(); status.Text = "아직 메모가 없습니다"; }
             foreach (var draft in drafts.Values.Where(d => d.Task == task.Task && d.Changed != d.Saved).ToArray()) _ = SaveAsync(draft);
-            fork.Visibility = shared && notes.Any(n => !n.Deleted) ? Visibility.Visible : Visibility.Collapsed;
+            UpdateSharing();
         }
         catch (Exception error) { if (selection == ticket) { loadFailed = true; status.Text = "불러오기 실패 · " + error.Message; add.IsEnabled = false; retry.Content = "다시 불러오기"; retry.Visibility = Visibility.Visible; } }
+        finally { if (selection == ticket) { loading = false; UpdateSharing(); } }
+    }
+    private void UpdateSharing()
+    {
+        sharing.Text = selected is null || loading || loadFailed ? "" : shared ? "공유 메모 · 연결된 작업에 함께 반영됩니다" : "독립 메모 · 이 작업에 저장됩니다";
+        fork.Visibility = selected is not null && shared && !loading && !loadFailed ? Visibility.Visible : Visibility.Collapsed;
+        fork.IsEnabled = !splitting && pendingMutations == 0;
+    }
+    internal async Task RefreshSharedAsync()
+    {
+        // Poll read-only state while idle; never replace an active edit or reset
+        // the caret/scroll position just because another window is open.
+        bool Busy() => loading || splitting || pendingMutations > 0 || IsKeyboardFocusWithin ||
+            drafts.Values.Any(d => d.Saving || d.Changed != d.Saved);
+        if (refreshing || !IsVisible || selected is not { } task || loadFailed || Busy()) return;
+        refreshing = true; var ticket = selection; var version = contentVersion;
+        try
+        {
+            var value = await request("notes.list", new { task = task.Task.Wire });
+            if (ticket != selection || version != contentVersion || Busy()) return;
+            var incoming = value.GetProperty("notes").Deserialize<List<TaskNote>>(NoteDrafts.Json) ?? [];
+            shared = value.B("shared"); UpdateSharing();
+            if (JsonSerializer.Serialize(incoming, NoteDrafts.Json) == JsonSerializer.Serialize(notes, NoteDrafts.Json)) return;
+            var noteId = editing?.Note.Id; var offset = noteScroll.VerticalOffset;
+            notes.Clear(); notes.AddRange(incoming); editing = null;
+            var next = notes.FirstOrDefault(n => !n.Deleted && n.Id == noteId) ?? notes.FirstOrDefault(n => !n.Deleted);
+            if (next is not null) Edit(next);
+            else { RenderTabs(); RenderEditor(); status.Text = "아직 메모가 없습니다"; }
+            noteScroll.ScrollToVerticalOffset(offset);
+        }
+        catch { /* A later idle read retries; saved notes and local drafts stay visible. */ }
+        finally { refreshing = false; }
     }
     private async Task ForkAsync()
     {
-        if (selected is null || loadFailed || !shared) return;
+        if (selected is null || loadFailed || !shared || splitting || pendingMutations > 0) return;
         var task = selected; var ticket = selection;
+        splitting = true; IsEnabled = false; contentVersion++;
         try
         {
             await FlushAsync();
             if (selection != ticket) return;
             await request("notes.fork", new { task = task.Task.Wire });
             if (selection != ticket) return;
-            status.Text = "메모를 분리했습니다. 이 작업에서 독립적으로 편집합니다.";
             await SelectTaskAsync(task, reload: true);
+            if (selected?.Task == task.Task && !loadFailed) status.Text = "메모를 분리했습니다. 이 작업에서 독립적으로 편집합니다.";
         }
         catch (Exception error) { if (selection == ticket) status.Text = "메모 분리 실패 · " + error.Message; }
+        finally { splitting = false; IsEnabled = true; UpdateSharing(); }
     }
     internal void Add()
     {
-        if (selected is null || loadFailed) return;
+        if (selected is null || loadFailed || splitting) return;
         var note = new TaskNote { Title = "메모 " + (notes.Count(n => !n.Deleted) + 1) };
         notes.Add(note); Edit(note); Dirty(editing!); editor.Focus();
     }
@@ -218,7 +261,7 @@ internal sealed class TaskNotesPanel : Border
     }
     private void Dirty(NoteDraft draft)
     {
-        draft.Changed++; draft.Error = null; autosave.Stop(); autosave.Start(); UpdateStatus();
+        contentVersion++; draft.Changed++; draft.Error = null; autosave.Stop(); autosave.Start(); UpdateStatus();
     }
     private void UpdateStatus()
     {
@@ -233,6 +276,7 @@ internal sealed class TaskNotesPanel : Border
     {
         if (draft.Saving || draft.Changed == draft.Saved || draft.Note.Deleted) return;
         draft.Saving = true; UpdateStatus();
+        contentVersion++;
         try
         {
             while (draft.Changed != draft.Saved)
@@ -272,7 +316,7 @@ internal sealed class TaskNotesPanel : Border
             draft.Error = null;
         }
         catch (Exception error) { draft.Error = "저장 실패 · 초안 보존 · " + error.Message; }
-        finally { draft.Saving = false; UpdateStatus(); }
+        finally { contentVersion++; draft.Saving = false; UpdateStatus(); }
     }
     private void Rename(TaskNote note)
     {
@@ -282,12 +326,13 @@ internal sealed class TaskNotesPanel : Border
     }
     private async Task DeleteAsync(TaskNote note)
     {
-        if (selected is null) return;
+        if (selected is null || splitting) return;
         var task = selected.Task; var key = DraftKey(task,note.Id);
         if (drafts.TryGetValue(key,out var draft)) { await SaveAsync(draft); if (draft.Changed != draft.Saved) return; }
         if (MessageBox.Show(Window.GetWindow(this), $"‘{note.Title}’ 메모를 삭제할까요? ⋯ 메뉴에서 복구할 수 있습니다.", "메모 삭제", MessageBoxButton.YesNo) != MessageBoxResult.Yes) return;
         try
         {
+            pendingMutations++; contentVersion++; UpdateSharing();
             var result = await request("notes.delete",new { task = task.Wire, note_id = note.Id, revision = note.Revision });
             if (result.S("state") == "conflict") throw new InvalidOperationException("다른 창에서 변경되었습니다. 작업을 다시 열어 확인하세요.");
             note.Deleted = true; note.Revision = result.Get("note").GetProperty("revision").GetInt64();
@@ -297,20 +342,23 @@ internal sealed class TaskNotesPanel : Border
             RenderTabs(); RenderEditor();
         }
         catch (Exception error) { status.Text = error.Message; }
+        finally { pendingMutations--; contentVersion++; UpdateSharing(); }
     }
     private async Task RestoreAsync()
     {
-        if (selected is null) return;
+        if (selected is null || splitting) return;
         var task = selected.Task; var note = notes.LastOrDefault(n => n.Deleted);
         if (note is null) { status.Text = "복구할 메모가 없습니다"; return; }
         try
         {
+            pendingMutations++; contentVersion++; UpdateSharing();
             var result = await request("notes.restore",new { task = task.Wire, note_id = note.Id, revision = note.Revision });
             if (result.S("state") == "conflict") throw new InvalidOperationException("다른 창에서 변경되었습니다. 작업을 다시 열어 주세요.");
             note.Deleted = false; note.Revision = result.Get("note").GetProperty("revision").GetInt64();
             if (selected?.Task == task) Edit(note);
         }
         catch (Exception error) { status.Text = error.Message; }
+        finally { pendingMutations--; contentVersion++; UpdateSharing(); }
     }
     internal void PreserveDrafts()
     {

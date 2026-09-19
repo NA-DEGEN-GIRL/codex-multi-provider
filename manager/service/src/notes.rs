@@ -65,12 +65,20 @@ struct Group {
     notes: Vec<Note>,
 }
 
+/// Group ids come from stored JSON, so they are validated before they are
+/// turned into a file name. Anything else could escape the notes directory.
+fn valid_group_id(group_id: &str) -> bool {
+    uuid::Uuid::parse_str(group_id).is_ok()
+}
+
 fn group_path(root: &Path, group_id: &str) -> PathBuf {
+    debug_assert!(valid_group_id(group_id));
     root.join("work/control-center/note-groups")
         .join(format!("{group_id}.json"))
 }
 
-/// Local native forks inherit a snapshot; remote task identities stay isolated.
+/// Local native forks share their parent's note group; remote task identities
+/// stay isolated.
 fn fork_parent(root: &Path, task: &TaskKey) -> Option<String> {
     if task.host_id != "local" {
         return None;
@@ -115,6 +123,9 @@ fn read_document(path: &Path, task: &TaskKey) -> Result<Option<Document>, String
 }
 
 fn read_group(root: &Path, group_id: &str) -> Result<Group, String> {
+    if !valid_group_id(group_id) {
+        return Err("메모 그룹 형식이 다릅니다. 원본은 보존되었습니다.".into());
+    }
     let path = group_path(root, group_id);
     if std::fs::metadata(&path)
         .map_err(|_| "메모 그룹을 확인하지 못했습니다.")?
@@ -133,6 +144,9 @@ fn read_group(root: &Path, group_id: &str) -> Result<Group, String> {
 }
 
 fn write_group(root: &Path, group: &Group) -> Result<(), String> {
+    if !valid_group_id(&group.group_id) {
+        return Err("메모 그룹 형식이 다릅니다. 원본은 보존되었습니다.".into());
+    }
     let bytes = serde_json::to_vec_pretty(group).map_err(|_| "메모를 저장하지 못했습니다.")?;
     if bytes.len() > 4 * 1024 * 1024 {
         return Err("작업 메모 용량을 초과했습니다.".into());
@@ -174,6 +188,32 @@ fn clone_notes(notes: &[Note]) -> Vec<Note> {
         .collect()
 }
 
+/// Moves an independent document's notes into a new shared group so a native
+/// fork can join it. Note ids, revisions and checklist items are preserved.
+/// The group is written first, so a failed document write can never hide the
+/// notes; the unreferenced group file is removed again on that failure.
+fn move_notes_into_group(root: &Path, source: &mut Document) -> Result<String, String> {
+    let version = source.version;
+    let group_id = uuid::Uuid::new_v4().to_string();
+    let group = Group {
+        version: 1,
+        group_id: group_id.clone(),
+        notes: source.notes.clone(),
+    };
+    write_group(root, &group)?;
+    let notes = std::mem::take(&mut source.notes);
+    source.version = 2;
+    source.group_id = Some(group_id.clone());
+    if let Err(error) = write_document(root, source) {
+        let _ = std::fs::remove_file(group_path(root, &group_id));
+        source.version = version;
+        source.group_id = None;
+        source.notes = notes;
+        return Err(error);
+    }
+    Ok(group_id)
+}
+
 pub fn needs_fork_refresh(root: &Path, args: &Value) -> bool {
     TaskKey::parse(args)
         .map(|task| task.host_id == "local" && !task.path(root).exists())
@@ -198,17 +238,32 @@ fn load_task(
         notes: vec![],
     };
     if let Some(parent) = fork_parent(root, &task) {
-        let source = load_task(
+        let mut source = load_task(
             root,
             TaskKey {
-                host_id: task.host_id,
+                host_id: task.host_id.clone(),
                 thread_id: parent,
             },
             visited,
         )?;
-        document.notes = clone_notes(&resolved_notes(root, &source)?);
-        // Persist even an empty snapshot so later parent edits cannot appear
-        // in a fork, and nested forks resolve their immediate parent's copy.
+        // A native fork shares the parent's mutable note group instead of
+        // copying a snapshot. Documents that already exist are never
+        // rewritten by this path, so old independent notes stay untouched.
+        let group_id = match source.group_id.clone() {
+            // Join the parent's existing group, including legacy groups.
+            Some(group_id) => {
+                read_group(root, &group_id)?;
+                group_id
+            }
+            // The parent still owns independent notes: move them into a new
+            // group, keeping their ids and revisions, so both tasks share it.
+            // This also persists an empty group, so a later parent addition
+            // shows up in the fork.
+            None => move_notes_into_group(root, &mut source)?,
+        };
+        document.version = 2;
+        document.group_id = Some(group_id);
+        document.notes = vec![];
         write_document(root, &document)?;
     }
     Ok(document)
@@ -219,13 +274,26 @@ pub fn execute(root: &Path, command: &str, args: &Value) -> Result<Value, String
     let mut document = load_task(root, task, &mut HashSet::new())?;
 
     if command == "notes.fork" {
+        // "Split notes" copies a shared group into a private document with
+        // fresh ids. An already independent document has nothing to copy and
+        // must keep its ids, so a repeated split changes nothing.
+        if document.group_id.is_none() {
+            let notes = resolved_notes(root, &document)?;
+            return Ok(
+                json!({"state": "forked", "task": document.task, "notes": notes,
+                             "shared": false}),
+            );
+        }
         let current = resolved_notes(root, &document)?;
         let split = clone_notes(&current);
         document.version = 1;
         document.group_id = None;
         document.notes = split.clone();
         write_document(root, &document)?;
-        return Ok(json!({"state": "forked", "task": document.task, "notes": split}));
+        return Ok(
+            json!({"state": "forked", "task": document.task, "notes": split,
+                         "shared": false}),
+        );
     }
     if command == "notes.list" {
         return Ok(

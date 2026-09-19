@@ -34,7 +34,12 @@ def merge_desktop(text, values):
     retained, statement = [], ''
     in_desktop, in_table = False, False
     for line in text.splitlines(keepends=True):
-        if not statement and _MARKER.fullmatch(line.strip()):
+        # Standalone comments and blank lines are not part of the following
+        # statement. Retain them verbatim so native writes cannot lose markers
+        # or notes inserted around [desktop]; only our own block markers go.
+        if not statement and (not line.strip() or line.lstrip().startswith('#')):
+            if not _MARKER.fullmatch(line.strip()):
+                retained.append(line)
             continue
         statement += line
         try:

@@ -1,4 +1,4 @@
-"""Publish native conversation fork ancestry for independent note copies.
+"""Publish native conversation fork ancestry for shared task notes.
 
 The note service is a separate process and cannot read the Codex state
 databases, so the manager maintains one small mapping file:

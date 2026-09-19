@@ -209,6 +209,9 @@ def _strip_provider_block(text):
     TOML editors may place [windows] or [desktop] before our end comment.
     Comments are not table boundaries, so deleting their entire span loses
     completed sandbox setup. Validate the full semantic result before writing.
+    One begin marker without an end marker is recovered only when the file is
+    valid TOML, generated tables are actually removed, and the semantic
+    comparison below proves that nothing else changed.
     """
     try:
         original = tomllib.loads(text)
@@ -249,7 +252,14 @@ def _strip_provider_block(text):
         if not dropping:
             retained.append(statement)
         statement = ''
-    if statement or inside:
+    if statement:
+        raise ProviderError('The managed provider block is incomplete; restore the previous config.')
+    # An older release could drop the end marker while reserializing native
+    # tables around the block. Treat a lone begin marker at EOF as recoverable
+    # only when at least one recognized generated table is removed and the
+    # semantic comparison below still passes; every other marker shape stays
+    # fail-closed.
+    if inside and not removed:
         raise ProviderError('The managed provider block is incomplete; restore the previous config.')
     updated = ''.join(retained)
     expected = copy.deepcopy(original)

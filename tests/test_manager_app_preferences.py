@@ -6,6 +6,7 @@ import tomllib
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
+from manager_core import providers
 from manager_core.app_preferences import prepare, merge_desktop
 
 
@@ -75,6 +76,29 @@ class AppPreferenceTests(unittest.TestCase):
         expected['desktop']['appearanceTheme'] = 'dark'
         self.assertEqual(tomllib.loads(updated), expected)
         self.assertIn('instructions="""\n[desktop]\nnot a real table\n"""', updated)
+
+    def test_provider_markers_and_native_tables_around_desktop_are_preserved(self):
+        text = (providers._BEGIN + '\n[agents.cc_gpt_astra]\ndescription = "generated"\n'
+                '\n# keep this private note\n[desktop]\nappearanceTheme="light"\npermissionMode="limited"\n'
+                + providers._END + '\n[windows]\nsandbox="elevated"\n')
+        updated = merge_desktop(text, {'appearanceTheme': 'dark'})
+        self.assertEqual(updated.count(providers._BEGIN), 1)
+        self.assertEqual(updated.count(providers._END), 1)
+        self.assertIn('[agents.cc_gpt_astra]\ndescription = "generated"\n\n# keep this private note\n', updated)
+        data = tomllib.loads(updated)
+        self.assertEqual(data['desktop'], {'appearanceTheme': 'dark', 'permissionMode': 'limited'})
+        self.assertEqual(data['windows'], {'sandbox': 'elevated'})
+        self.assertEqual(data['agents']['cc_gpt_astra']['description'], 'generated')
+        self.assertEqual(merge_desktop(updated, {'appearanceTheme': 'dark'}), updated)
+
+    def test_provider_marker_text_inside_multiline_values_is_unchanged(self):
+        block = providers._BEGIN + '\n' + providers._END + '\n'
+        text = 'instructions = """\n' + block + '"""\n[desktop]\nappearanceTheme="light"\n'
+        updated = merge_desktop(text, {'appearanceTheme': 'dark'})
+        self.assertIn('instructions = """\n' + block + '"""', updated)
+        self.assertEqual(updated.count(providers._BEGIN), 1)
+        self.assertEqual(updated.count(providers._END), 1)
+        self.assertEqual(tomllib.loads(updated)['desktop']['appearanceTheme'], 'dark')
 
     def test_dotted_and_inline_desktop_values_preserve_unshared_fields(self):
         for text in ('desktop.appearanceTheme="light"\ndesktop.private=true\n',

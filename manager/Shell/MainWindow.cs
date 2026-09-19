@@ -461,7 +461,7 @@ public sealed class MainWindow : Window
         => Menu(actions.Select(action => (action.Label, (Func<Task>)(() => action.Action(RequireContextProfile())))).ToArray());
     private async Task InitializeAsync()
     {
-        Log($"관리 앱 시작 · 로컬 우선 실행·백그라운드 프로필 준비 56 · IPC {ManagerProtocol.Version} · 로그: {_diagnostics.Path}");
+        Log($"관리 앱 시작 · 포크 메모 공유·명시적 분리 57 · IPC {ManagerProtocol.Version} · 로그: {_diagnostics.Path}");
         if (_responsiveness is not null) Log("응답 지연 상세 로그 · " + _responsiveness.Path);
         SetStatus("관리 서비스를 연결하고 있습니다…");
         _client = await ManagerClient.ConnectAsync(_root);

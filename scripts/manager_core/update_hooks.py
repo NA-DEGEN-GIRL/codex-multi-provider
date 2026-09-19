@@ -56,6 +56,8 @@ _REQUIRED_CHECKS = (
     "initialize", "managed_idle_status", "managed_close_idle",
     "proxy_maintenance", "auth_binding",
 )
+_LAUNCH_ADMISSION_WAIT = 10.0
+_LAUNCH_ADMISSION_POLL = 0.05
 
 
 def _hash(path):
@@ -200,10 +202,27 @@ class UpdateHooks:
         return (scoped if scoped and scoped.get("state") != "released"
                 else data.get("update_maintenance"))
 
+    def _acquire_launch_admission_lock(self):
+        """Let an ordinary launch drain before checking maintenance ownership."""
+        deadline = self.clock() + _LAUNCH_ADMISSION_WAIT
+        while True:
+            try:
+                return _lock_file(self.directory / 'launch-admission.lock')
+            except UpdateError as error:
+                if error.code != 'update_in_progress':
+                    raise
+                remaining = deadline - self.clock()
+                if remaining <= 0:
+                    raise UpdateError(
+                        'profile_launch_busy',
+                        '다른 프로필을 여는 작업이 아직 진행 중입니다. 잠시 후 다시 시도해 주세요.',
+                    ) from None
+                self.sleep(min(_LAUNCH_ADMISSION_POLL, remaining))
+
     def open_local_for_remote_reconcile(self, profile_id):
         """Open the desktop without network I/O, fencing only its SSH cohort."""
         profile_id = identifier(profile_id)
-        lock = _lock_file(self.directory / 'launch-admission.lock')
+        lock = self._acquire_launch_admission_lock()
         self._admission.depth = 1
         try:
             profile = self._profile(profile_id)
@@ -391,7 +410,7 @@ class UpdateHooks:
             self.guard_launch(profile_id)
             yield
             return
-        lock = _lock_file(self.directory / "launch-admission.lock")
+        lock = self._acquire_launch_admission_lock()
         try:
             self.guard_launch(profile_id)
             self._admission.depth = 1
@@ -662,7 +681,7 @@ class UpdateHooks:
                 for profile_id in profile_scope:
                     self.store.profile(profile_id, data)
                     scoped[profile_id] = value.copy()
-        lock = _lock_file(self.directory / "launch-admission.lock")
+        lock = self._acquire_launch_admission_lock()
         try:
             self.store.mutate(begin)
         finally:
