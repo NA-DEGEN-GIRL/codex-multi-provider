@@ -9,6 +9,7 @@ from test_manager_remote_restore import Fleet
 from manager_core.profile_restart import ProfileRestarts
 from manager_core.store import atomic_json
 from manager_core.updates import UpdateError
+from control_center import ControlCenter
 
 
 class ProfileRemoteRetryTests(unittest.TestCase):
@@ -76,6 +77,30 @@ class ProfileRemoteRetryTests(unittest.TestCase):
         self.assertEqual(self.show_count, 1)
         self.assertEqual(self.fleet.calls.count(('start', 'fixture-a')), 1)
         self.assertEqual(self.fleet.calls.count(('start', 'fixture-b')), 1)
+
+    def test_first_select_after_update_reconciles_closed_local_older_ssh_then_opens(self):
+        self.fixture.instances.close(self.profile)
+        self.fixture.closes.clear()
+        for process in self.fleet.running.values():
+            process['revision'] = '0' * 64
+        def update(data):
+            self.store.profile(self.profile['id'], data)['policy']['desired_revision'] = 1
+            data['ssh_inventory'] = {self.profile['id']: {'hosts': ['fixture-a', 'fixture-b']}}
+        self.store.mutate(update)
+        center = ControlCenter.__new__(ControlCenter)
+        center.store, center.instances = self.store, self.fixture.instances
+        center.restarts, center.remote_maintenance = self.restarts, self.fleet
+        result = center.dispatch('profile.show', {'profile_id': self.profile['id']})
+        self.assertEqual(result['state'], 'updating')
+        self.assertFalse(self.fleet.calls, 'Selection must not perform synchronous SSH work')
+        self.pending.pop()()
+        job = self.restarts.status()[self.profile['id']]
+        self.assertEqual(job['phase'], 'complete', job)
+        self.assertEqual(self.show_count, 1)
+        self.assertEqual(self.fleet.calls.count(('stop', 'fixture-a')), 1)
+        self.assertEqual(self.fleet.calls.count(('stop', 'fixture-b')), 1)
+        self.assertEqual({p['revision'] for p in self.fleet.running.values()}, {'c' * 64})
+        self.hooks.guard_launch(self.profile['id'])
 
     def test_explicit_retry_recovers_an_absent_start_without_touching_started_peer(self):
         self.fleet.empty_start = 'fixture-b'

@@ -170,6 +170,30 @@ def clear_stale_record(profile):
         path.unlink(missing_ok=True)
 
 
+def obsolete_role_plan(home, previous, generated):
+    """Validate obsolete manager roles before changing any generated config."""
+    plan = []
+    for name, digest in previous.items():
+        if (name in generated or not re.fullmatch(
+                r"agents/cc_(?:gpt_(?:astra|luna|sol|terra)|external_[0-9a-f]{32}_r[0-9]+_[0-9a-f]{12})\.toml", name)):
+            continue
+        target = home / name
+        if target.is_symlink() or any(parent.is_symlink() for parent in target.parents):
+            raise ValueError("symlink obsolete role")
+        if not target.exists():
+            continue
+        content = target.read_bytes()
+        if hashlib.sha256(content).hexdigest() != digest:
+            raise ValueError("obsolete managed role was edited; preserve it before applying settings")
+        archive = home / "manager-retired-agents" / (target.stem + "." + digest[:16] + ".toml")
+        if archive.is_symlink() or any(parent.is_symlink() for parent in archive.parents):
+            raise ValueError("symlink obsolete role archive")
+        if archive.exists() and archive.read_bytes() != content:
+            raise ValueError("obsolete role archive conflict")
+        plan.append((target, archive))
+    return plan
+
+
 def acquire_instance_lock(profile, lock, fcntl, runtime):
     """Take the single-writer lock, reaping instances left by an older bundle.
 
@@ -262,6 +286,7 @@ def run(profile, revision, argv, *, managed_socket=None):
                     if current != new_digest and current != prior.get(name):
                         raise ValueError("user configuration changed")
                 files[name] = (content, new_digest)
+        retired_roles = obsolete_role_plan(codex_home, prior, files)
         if common_plan is not None:
             common.stage(codex_home, common_plan)
         # Validate every destination before updating any file; never overwrite auth.
@@ -277,6 +302,11 @@ def run(profile, revision, argv, *, managed_socket=None):
             os.replace(temporary, target)
         if common_plan is not None:
             common.commit(codex_home, common_plan)
+        # Native role discovery scans agents/*.toml even after config references
+        # disappear. Keep byte-exact backups outside that discovery directory.
+        for target, archive in retired_roles:
+            archive.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.replace(target, archive)
         _atomic(generated_path, {name: digest for name, (_, digest) in files.items()})
         common.reconcile_skills(codex_home)
         inherited_auth = {"OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_BASE", "OPENAI_ORG_ID", "OPENAI_PROJECT_ID"}

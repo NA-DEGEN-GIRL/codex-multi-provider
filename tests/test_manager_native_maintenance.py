@@ -64,6 +64,37 @@ class NativeMaintenanceTests(unittest.TestCase):
         self.assertEqual(pipe.send_json.call_args.args[0], {
             "id":2,"method":"server/managedShutdown","params":{"processId":13579}})
 
+    def start_patches(self, existing):
+        patches = [
+            patch.object(NATIVE, '_descriptor', return_value={}),
+            patch.object(NATIVE, '_running', return_value=existing),
+            patch.object(NATIVE, 'socket_path', return_value=self.profile / 'control.sock'),
+            patch.object(NATIVE, '_stop_locked'),
+            patch.object(NATIVE, '_forward_agent', return_value='fixture-agent'),
+            patch.object(NATIVE.subprocess, 'Popen'),
+            patch.object(NATIVE, '_ready', return_value=True),
+        ]
+        values = [item.start() for item in patches]
+        for item in patches:
+            self.addCleanup(item.stop)
+        return values
+
+    def test_changed_revision_requires_journaled_maintenance_before_reconnect(self):
+        previous = dict(self.record, revision='b' * 64)
+        mocks = self.start_patches(previous)
+        mocks[1].side_effect = RuntimeError('A different revision is still running')
+        with self.assertRaisesRegex(RuntimeError, 'different revision'):
+            NATIVE.start(self.profile, self.revision)
+        mocks[1].assert_called_once_with(self.profile, self.revision)
+        mocks[3].assert_not_called()
+        mocks[5].assert_not_called()
+
+    def test_same_revision_reconnect_reuses_listener_without_shutdown(self):
+        mocks = self.start_patches(self.record)
+        self.assertEqual(NATIVE.start(self.profile, self.revision), 0)
+        mocks[3].assert_not_called()
+        mocks[5].assert_not_called()
+
     def test_expected_process_is_checked_inside_the_start_lock_before_any_rpc(self):
         mocks = self.stop_patches()
         stale = dict(self.record, process_start='previous-process')

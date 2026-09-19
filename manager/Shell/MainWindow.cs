@@ -461,7 +461,7 @@ public sealed class MainWindow : Window
         => Menu(actions.Select(action => (action.Label, (Func<Task>)(() => action.Action(RequireContextProfile())))).ToArray());
     private async Task InitializeAsync()
     {
-        Log($"관리 앱 시작 · 프로젝트 소속 보호·공통 플러그인 54 · IPC {ManagerProtocol.Version} · 로그: {_diagnostics.Path}");
+        Log($"관리 앱 시작 · SSH·포크 메모·요청 형식 수정 55 · IPC {ManagerProtocol.Version} · 로그: {_diagnostics.Path}");
         if (_responsiveness is not null) Log("응답 지연 상세 로그 · " + _responsiveness.Path);
         SetStatus("관리 서비스를 연결하고 있습니다…");
         _client = await ManagerClient.ConnectAsync(_root);
@@ -692,7 +692,7 @@ public sealed class MainWindow : Window
             }
             if (_embedRequested && _profileRequestTicket is null && _selectedProfile is not null)
             {
-                if (p.Get("restart").S("phase") is "acquiring" or "closing" or "opening" or "releasing")
+                if (p.Get("restart").S("phase") is "acquiring" or "closing" or "opening" or "releasing" or "waiting" or "recovering" or "connecting")
                     _attachDeadline = DateTime.UtcNow.AddSeconds(25);
                 TryAttach(p);
             }
@@ -790,9 +790,22 @@ public sealed class MainWindow : Window
                 Log($"이전 목록 캐시 {cache.Get("removed_cache_rows")}개 정리 · 원본 기록으로 목록을 다시 불러옵니다.");
             returnedProfile = result.Get("profile").ValueKind == JsonValueKind.Object ? result.Get("profile") : result;
             if (returnedProfile.S("desktop_compatibility_notice") != "") Log(returnedProfile.S("desktop_compatibility_notice"));
-            Log($"{returnedProfile.S("alias")} · {(result.S("state") == "launched" ? "새 프로세스 시작" : "기존 프로세스 사용")} · PID {returnedProfile.N("process_id")} · 실행 {returnedProfile.S("generation")}");
             if (returnedProfile.S("id") != id || (result.S("profile_id") != "" && result.S("profile_id") != id))
                 throw new InvalidOperationException("요청한 프로필과 반환된 창 정보가 일치하지 않습니다.");
+            if (result.S("state") == "updating")
+            {
+                // A stopped profile can require SSH maintenance before launch.
+                // Its response still describes the old generation; do not pin
+                // window discovery to that generation or require a second click.
+                _expectedWindowLaunch = null;
+                _attachDeadline = DateTime.UtcNow.AddSeconds(25);
+                ++_stateRevision;
+                await RefreshAsync();
+                if (ticket == _navigation && !_closing)
+                    SetStatus("SSH 설정을 적용한 뒤 이 프로필의 창을 표시합니다…");
+                return;
+            }
+            Log($"{returnedProfile.S("alias")} · {(result.S("state") == "launched" ? "새 프로세스 시작" : "기존 프로세스 사용")} · PID {returnedProfile.N("process_id")} · 실행 {returnedProfile.S("generation")}");
             _expectedWindowLaunch = WindowLaunchIdentity.From(returnedProfile);
             ++_stateRevision;
             await RefreshAsync();

@@ -238,6 +238,33 @@ class ProviderRegistryTests(unittest.TestCase):
         selected = [role for _, role in self.selected_roles(config)]
         self.assertFalse(any(role.get('model') == 'example-model' for role in selected))
         self.assertTrue(any(role.get('model', '').startswith('gpt-') for role in selected))
+        self.assertFalse(list((self.profile_home / 'agents').glob('cc_external_*.toml')))
+        self.assertEqual(len(list((self.profile_home / 'manager-retired-agents').glob('cc_external_*.toml'))), 1)
+
+    def test_external_only_retires_native_roles_without_removing_user_roles(self):
+        saved = self.add_model()
+        self.registry.generate(self.profile_home, True, [saved['model']['id']])
+        user_role = self.profile_home / 'agents' / 'reviewer.toml'
+        user_role.write_text('name = "reviewer"\ndescription = "Custom role"\n'
+                             'developer_instructions = "Review only"\n', encoding='utf-8')
+        before = user_role.read_bytes()
+        self.registry.generate(self.profile_home, True, [saved['model']['id']], selection_mode='external_only')
+        self.assertFalse(list((self.profile_home / 'agents').glob('cc_gpt_*.toml')))
+        self.assertEqual(len(list((self.profile_home / 'manager-retired-agents').glob('cc_gpt_*.toml'))), 4)
+        self.assertEqual(user_role.read_bytes(), before)
+        first = self.snapshot()
+        self.registry.generate(self.profile_home, True, [saved['model']['id']], selection_mode='external_only')
+        self.assertEqual(self.snapshot(), first)
+
+    def test_retirement_preserves_customized_manager_named_role(self):
+        saved = self.add_model()
+        self.registry.generate(self.profile_home, True, [saved['model']['id']])
+        role = next((self.profile_home / 'agents').glob('cc_external_*.toml'))
+        role.write_text('name = "custom"\ndescription = "User owned"\n'
+                        'developer_instructions = "My custom instruction"\n', encoding='utf-8')
+        before = role.read_bytes()
+        self.registry.generate(self.profile_home, False, [])
+        self.assertEqual(role.read_bytes(), before)
 
     def test_unverified_model_cannot_be_generated(self):
         provider, model = self.definition()
@@ -310,9 +337,8 @@ class ProviderRegistryTests(unittest.TestCase):
             self.assertEqual(bool(parsed.get('model_providers')), enabled)
 
     def test_generated_agent_role_files_satisfy_runtime_validation(self):
-        # Codex ignores a role file whose `name` is empty or that omits
-        # developer_instructions, and the settings panel then reports the
-        # manager-owned role as malformed.
+        # Standalone discovery (including desktop settings) must validate the
+        # file without depending on the description in the parent config.
         saved = self.add_model()
         files = self.registry.render_for_host(self.profile_home, True, [saved['model']['id']])['files']
         roles = {name: content for name, content in files.items() if name.startswith('agents/')}
@@ -320,6 +346,8 @@ class ProviderRegistryTests(unittest.TestCase):
         for name, content in roles.items():
             parsed = tomllib.loads(content)
             self.assertTrue(parsed.get('name', '').strip(), name)
+            self.assertTrue(parsed.get('description', '').strip(), name)
+            self.assertEqual(parsed['description'], tomllib.loads(files['config.toml'])['agents'][parsed['name']]['description'])
             self.assertTrue(parsed.get('developer_instructions', '').strip(), name)
         self.assertIn('agents/cc_gpt_astra.toml', roles)
         self.assertTrue(any(name.startswith('agents/cc_external_') for name in roles))
@@ -337,7 +365,7 @@ class ProviderRegistryTests(unittest.TestCase):
             with self.subTest(text=text), self.assertRaises(providers.ProviderError):
                 self.registry.render_for_host(self.profile_home, False, [], text)
 
-    def test_changed_provider_keeps_existing_role_revision_available(self):
+    def test_changed_provider_archives_existing_role_revision_without_rediscovery(self):
         saved = self.add_model()
         self.registry.generate(self.profile_home, True, [saved['model']['id']])
         first_config = self.generated_config()
@@ -352,8 +380,10 @@ class ProviderRegistryTests(unittest.TestCase):
         new_allowlist = set(self.generated_config()['subagent_model_provider_allowlist'])
         self.assertTrue(old_allowlist.isdisjoint(new_allowlist))
         for path, content in old_roles.items():
-            self.assertTrue(path.exists())
-            self.assertEqual(path.read_bytes(), content)
+            self.assertFalse(path.exists())
+            archived = list((self.profile_home / 'manager-retired-agents').glob(path.stem + '.*.toml'))
+            self.assertEqual(len(archived), 1)
+            self.assertEqual(archived[0].read_bytes(), content)
 
     def test_catalog_uses_own_conservative_capabilities(self):
         saved = self.add_model(model='text-only-small-context')

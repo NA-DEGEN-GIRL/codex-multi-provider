@@ -31876,17 +31876,17 @@ index a6f728deb176a4dca96c53c37b45531100610857..21afba89b87da240076d1b8885779dd9
      MockResponsesConfig::new(server_uri)
          .with_model("gpt-5.4")
 diff --git a/codex-rs/codex-api/src/endpoint/responses.rs b/codex-rs/codex-api/src/endpoint/responses.rs
-index 69a8c686d142bc75548dd56c96cf33dcddda09a7..c9eebae951e7830130676edd078b9f98e396a533 100644
+index 69a8c686d142bc75548dd56c96cf33dcddda09a7..d470dd5cc3e59406e7a9e9c0c4f9a4f0b7a7302d 100644
 --- a/codex-rs/codex-api/src/endpoint/responses.rs
 +++ b/codex-rs/codex-api/src/endpoint/responses.rs
-@@ -13,6 +13,7 @@ use crate::telemetry::SseTelemetry;
- use codex_client::EncodedJsonBody;
+@@ -14,6 +14,7 @@ use codex_client::EncodedJsonBody;
  use codex_client::HttpTransport;
  use codex_client::RequestCompression;
-+use codex_client::TransportError;
  use codex_client::RequestTelemetry;
++use codex_client::TransportError;
  use codex_protocol::protocol::SessionSource;
  use http::HeaderMap;
+ use http::HeaderValue;
 @@ -46,6 +47,36 @@ impl ResponsesEndpoint {
      }
  }
@@ -34765,21 +34765,23 @@ index 6abe3610d82c7c33813d8e0ce441b95c46d03031..abb5ba5d58330359720440d298e31349
          },
      )]);
 diff --git a/codex-rs/core/src/client.rs b/codex-rs/core/src/client.rs
-index 9f03c939e09c87824aabb6108c051786908d6204..cf776bd242fdc00b0fcd3ba343d75e6e26158cc1 100644
+index 9f03c939e09c87824aabb6108c051786908d6204..9237d55260178ae5e6cb766d6a0a0d92d0db2e89 100644
 --- a/codex-rs/core/src/client.rs
 +++ b/codex-rs/core/src/client.rs
-@@ -121,6 +121,7 @@ use crate::attestation::X_OAI_ATTESTATION_HEADER;
+@@ -121,6 +121,8 @@ use crate::attestation::X_OAI_ATTESTATION_HEADER;
  use crate::client_common::Prompt;
  use crate::client_common::ResponseEvent;
  use crate::client_common::ResponseStream;
 +use crate::client_common::normalize_input_for_non_openai_provider;
++use crate::client_common::normalize_plaintext_reasoning_for_openai;
  use crate::context::BaseInstructionsFragment;
  use crate::context::ContextualUserFragment;
  use crate::cyber_access_program;
-@@ -974,16 +975,7 @@ impl ModelClient {
+@@ -973,17 +975,10 @@ impl ModelClient {
+                 Some(create_tools_raw_json_for_responses_api(&prompt.tools)?.into()),
              )
          };
-         if !is_openai {
+-        if !is_openai {
 -            for item in &mut input {
 -                item.clear_internal_chat_message_metadata_passthrough();
 -                if let ResponseItem::FunctionCall {
@@ -34790,11 +34792,14 @@ index 9f03c939e09c87824aabb6108c051786908d6204..cf776bd242fdc00b0fcd3ba343d75e6e
 -                    *encrypted_function_args = None;
 -                }
 -            }
++        if is_openai {
++            normalize_plaintext_reasoning_for_openai(&mut input);
++        } else {
 +            input = normalize_input_for_non_openai_provider(input)?;
          }
          let reasoning = self.build_reasoning(model_info, effort, summary);
          let stream_options = (self.state.concurrent_reasoning_summaries_enabled
-@@ -1533,14 +1525,31 @@ impl ModelClientSession {
+@@ -1533,14 +1528,31 @@ impl ModelClientSession {
      }
  
      fn responses_request_compression(&self, auth: Option<&CodexAuth>) -> Compression {
@@ -34833,10 +34838,10 @@ index 9f03c939e09c87824aabb6108c051786908d6204..cf776bd242fdc00b0fcd3ba343d75e6e
  
      /// Streams a turn via the OpenAI Responses API.
 diff --git a/codex-rs/core/src/client_common.rs b/codex-rs/core/src/client_common.rs
-index f2d6be2a232465c988fc9bc5869438119034824a..2c6520e46416e355b6d89ba2b14563142b8ba87c 100644
+index f2d6be2a232465c988fc9bc5869438119034824a..3a61890501cb3a7d03872e3d01edf4a1fc4575c6 100644
 --- a/codex-rs/core/src/client_common.rs
 +++ b/codex-rs/core/src/client_common.rs
-@@ -1,9 +1,12 @@
+@@ -1,9 +1,14 @@
  pub use codex_api::ResponseEvent;
 +use codex_protocol::ResponseItemId;
 +use codex_protocol::error::CodexErr;
@@ -34844,15 +34849,75 @@ index f2d6be2a232465c988fc9bc5869438119034824a..2c6520e46416e355b6d89ba2b1456314
  use codex_protocol::models::BaseInstructions;
  use codex_protocol::models::ContentItem;
  use codex_protocol::models::FunctionCallOutputContentItem;
++use codex_protocol::models::ReasoningItemContent;
++use codex_protocol::models::ReasoningItemReasoningSummary;
  use codex_protocol::models::ResponseItem;
 +use codex_protocol::models::plaintext_agent_message_content;
  use codex_tools::ToolSpec;
  use futures::Stream;
  use serde_json::Value;
-@@ -65,6 +68,52 @@ impl Prompt {
+@@ -13,6 +18,7 @@ use std::task::Context;
+ use std::task::Poll;
+ use tokio::sync::mpsc;
+ use tokio_util::sync::CancellationToken;
++use uuid::Uuid;
+ 
+ /// API request payload for a single model turn
+ #[derive(Debug, Clone)]
+@@ -65,6 +71,102 @@ impl Prompt {
      }
  }
  
++/// Replays plaintext provider reasoning as assistant context on OpenAI routes.
++/// `reasoning_text` is an output shape accepted by other Responses providers, but
++/// OpenAI input reasoning requires empty content. Its accompanying opaque state
++/// also belongs to the original provider. Only the request copy is changed;
++/// native encrypted reasoning without this plaintext shape is preserved.
++pub(crate) fn normalize_plaintext_reasoning_for_openai(input: &mut [ResponseItem]) {
++    for item in input {
++        let ResponseItem::Reasoning {
++            id,
++            summary,
++            content: Some(content),
++            ..
++        } = item
++        else {
++            continue;
++        };
++        if !content
++            .iter()
++            .any(|part| matches!(part, ReasoningItemContent::ReasoningText { .. }))
++        {
++            continue;
++        }
++        let id = id.as_ref().map(|id| {
++            ResponseItemId::with_suffix(
++                "msg",
++                Uuid::new_v5(
++                    &Uuid::NAMESPACE_OID,
++                    format!("plaintext_reasoning:{}", id.as_str()).as_bytes(),
++                ),
++            )
++        });
++        let content = summary
++            .iter()
++            .map(|ReasoningItemReasoningSummary::SummaryText { text }| text)
++            .chain(content.iter().map(|part| match part {
++                ReasoningItemContent::ReasoningText { text }
++                | ReasoningItemContent::Text { text } => text,
++            }))
++            .map(|text| ContentItem::OutputText { text: text.clone() })
++            .collect();
++        *item = ResponseItem::Message {
++            id,
++            role: "assistant".to_string(),
++            content,
++            phase: None,
++            internal_chat_message_metadata_passthrough: None,
++        };
++    }
++}
++
 +/// Removes OpenAI-only request state and lowers plaintext inter-agent messages into the
 +/// ordinary user-message form accepted by configured non-OpenAI Responses providers.
 +pub(crate) fn normalize_input_for_non_openai_provider(
@@ -34976,11 +35041,156 @@ index 1c8625af569ed017316dcfe516267b4e0f7e656e..1cda63eff8f2655bc6be07095f257689
  #[test]
  fn serializes_text_verbosity_when_set() {
      let input: Vec<ResponseItem> = vec![];
+diff --git a/codex-rs/core/src/client_plaintext_reasoning_tests.rs b/codex-rs/core/src/client_plaintext_reasoning_tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..563c004028460d78396a3161e1a3a50998bef016
+--- /dev/null
++++ b/codex-rs/core/src/client_plaintext_reasoning_tests.rs
+@@ -0,0 +1,129 @@
++use super::*;
++use codex_api::ResponseCreateWsRequest;
++use codex_protocol::models::ReasoningItemContent;
++use codex_protocol::models::ReasoningItemReasoningSummary;
++use pretty_assertions::assert_eq;
++
++#[test]
++fn plaintext_reasoning_is_preserved_only_in_openai_request_copies() -> anyhow::Result<()> {
++    let input: Vec<ResponseItem> = serde_json::from_value(json!([
++        {"type":"reasoning", "id":"rs_native", "summary":[],
++         "content":[{"type":"text","text":"Native reasoning display"}],
++         "encrypted_content":"native-encrypted-state"},
++        {"type":"reasoning", "id":"00000000-0000-4000-8000-000000000001", "summary":[],
++         "content":[{"type":"reasoning_text","text":"Keep the migration atomic."}],
++         "encrypted_content":"00000000-0000-4000-8000-000000000001-0",
++         "internal_chat_message_metadata_passthrough":{"turn_id":"foreign-turn"}},
++        {"type":"function_call", "name":"inspect", "arguments":"{}", "call_id":"call-1"},
++        {"type":"function_call_output", "call_id":"call-1",
++         "output":[{"type":"input_image", "image_url":"data:image/png;base64,cGl4ZWw="}]},
++        {"type":"message", "role":"user", "content":[{"type":"input_text","text":"Continue."}]}
++    ]))?;
++    let prompt = Prompt {
++        input: input.clone(),
++        ..Default::default()
++    };
++    for use_responses_lite in [false, true] {
++        for openai in [false, true] {
++            let mut client = test_model_client(SessionSource::Cli);
++            if openai {
++                Arc::get_mut(&mut client.state)
++                    .expect("unique test client")
++                    .provider = create_model_provider(
++                    ModelProviderInfo::create_openai_provider(/*base_url*/ None),
++                    /*auth_manager*/ None,
++                );
++            }
++            let mut model = test_model_info();
++            model.use_responses_lite = use_responses_lite;
++            let request = client.build_responses_request(
++                &prompt,
++                &model,
++                /*effort*/ None,
++                codex_protocol::config_types::ReasoningSummary::None,
++                /*service_tier*/ None,
++                &test_responses_metadata_for_client(
++                    &client,
++                    /*turn_id*/ None,
++                    "window".to_string(),
++                    /*parent_thread_id*/ None,
++                    TestCodexResponsesRequestKind::Turn,
++                ),
++            )?;
++            let start = if use_responses_lite { 2 } else { 0 };
++            let actual = &request.input[start..];
++            let mut expected = input.clone();
++            if openai {
++                expected[1] = ResponseItem::Message {
++                    id: actual[1].id().cloned(),
++                    role: "assistant".to_string(),
++                    content: vec![ContentItem::OutputText {
++                        text: "Keep the migration atomic.".to_string(),
++                    }],
++                    phase: None,
++                    internal_chat_message_metadata_passthrough: None,
++                };
++                assert!(actual[1].id().is_some_and(|id| id.is_prefixed()));
++                let mut repeated = input.clone();
++                crate::client_common::normalize_plaintext_reasoning_for_openai(&mut repeated);
++                assert_eq!(actual[1], repeated[1]);
++            } else {
++                expected[1].clear_internal_chat_message_metadata_passthrough();
++            }
++            assert_eq!(actual, expected);
++            assert_eq!(prompt.input, input);
++            let http = serde_json::to_value(&request)?;
++            let websocket = serde_json::to_value(ResponseCreateWsRequest::from(&request))?;
++            assert_eq!(http["input"], websocket["input"]);
++            if openai {
++                assert!(!http.to_string().contains("reasoning_text"));
++                assert!(
++                    !http
++                        .to_string()
++                        .contains("00000000-0000-4000-8000-000000000001-0")
++                );
++            }
++        }
++    }
++    Ok(())
++}
++
++#[test]
++fn plaintext_reasoning_preserves_summary_and_all_text_parts() {
++    let original = ResponseItem::Reasoning {
++        id: None,
++        summary: vec![ReasoningItemReasoningSummary::SummaryText {
++            text: "Summary".to_string(),
++        }],
++        content: Some(vec![
++            ReasoningItemContent::ReasoningText {
++                text: "First".to_string(),
++            },
++            ReasoningItemContent::Text {
++                text: "Second".to_string(),
++            },
++        ]),
++        encrypted_content: None,
++        internal_chat_message_metadata_passthrough: None,
++    };
++    let mut items = vec![original];
++    crate::client_common::normalize_plaintext_reasoning_for_openai(&mut items);
++    assert_eq!(
++        items,
++        vec![ResponseItem::Message {
++            id: None,
++            role: "assistant".to_string(),
++            content: ["Summary", "First", "Second"]
++                .into_iter()
++                .map(|text| ContentItem::OutputText {
++                    text: text.to_string(),
++                })
++                .collect(),
++            phase: None,
++            internal_chat_message_metadata_passthrough: None,
++        }]
++    );
++    let normalized = items.clone();
++    crate::client_common::normalize_plaintext_reasoning_for_openai(&mut items);
++    assert_eq!(items, normalized);
++}
 diff --git a/codex-rs/core/src/client_tests.rs b/codex-rs/core/src/client_tests.rs
-index 6eda1c86bfb9b0e6cbe66beeff0b7fa5c1e1c7bb..0b2e085c5cf712abbdb25b444f46f77a07c8cf82 100644
+index 6eda1c86bfb9b0e6cbe66beeff0b7fa5c1e1c7bb..859d54731b5684b7ee716f196641aaaf4572e87d 100644
 --- a/codex-rs/core/src/client_tests.rs
 +++ b/codex-rs/core/src/client_tests.rs
-@@ -351,6 +351,74 @@ fn responses_lite_prefix_ids_track_thread_and_payload() -> anyhow::Result<()> {
+@@ -93,6 +93,9 @@ use wiremock::ResponseTemplate;
+ use wiremock::matchers::method;
+ use wiremock::matchers::path;
+ 
++#[path = "client_plaintext_reasoning_tests.rs"]
++mod plaintext_reasoning;
++
+ const TEST_CHATGPT_ID_TOKEN: &str = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJlbWFpbCI6InVzZXJAZXhhbXBsZS5jb20iLCJlbWFpbF92ZXJpZmllZCI6dHJ1ZSwiaHR0cHM6Ly9hcGkub3BlbmFpLmNvbS9hdXRoIjp7ImNoYXRncHRfdXNlcl9pZCI6InVzZXItMTIzNDUiLCJ1c2VyX2lkIjoidXNlci0xMjM0NSIsImNoYXRncHRfcGxhbl90eXBlIjoicHJvIiwiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjb3VudC0xMjMifX0.c2ln";
+ const TEST_INSTALLATION_ID: &str = "11111111-1111-4111-8111-111111111111";
+ 
+@@ -351,6 +354,74 @@ fn responses_lite_prefix_ids_track_thread_and_payload() -> anyhow::Result<()> {
      Ok(())
  }
  
@@ -45598,7 +45808,7 @@ index 0000000000000000000000000000000000000000..59dba3b20cd3e32e7d8ac5dac0f3eaed
 +    Ok(())
 +}
 diff --git a/codex-rs/core/tests/suite/mod.rs b/codex-rs/core/tests/suite/mod.rs
-index 8d43ca03efd099dc8910a2622438c5e4c35f9702..f097c490759b00ac26a7a0ba18e77c0fb32a053a 100644
+index 8d43ca03efd099dc8910a2622438c5e4c35f9702..c0e1d69c64cf287318e3f999c248e5cf5db78832 100644
 --- a/codex-rs/core/tests/suite/mod.rs
 +++ b/codex-rs/core/tests/suite/mod.rs
 @@ -59,6 +59,7 @@ mod compact_remote;
@@ -45617,6 +45827,14 @@ index 8d43ca03efd099dc8910a2622438c5e4c35f9702..f097c490759b00ac26a7a0ba18e77c0f
  mod mcp_auth_elicitation;
  mod mcp_auth_refresh;
  mod mcp_optional_startup_grace;
+@@ -119,6 +121,7 @@ mod override_updates;
+ mod pending_input;
+ mod permissions_messages;
+ mod personality;
++mod plaintext_reasoning;
+ mod plugins;
+ mod prompt_cache_key;
+ mod prompt_caching;
 diff --git a/codex-rs/core/tests/suite/multi_agent_resume.rs b/codex-rs/core/tests/suite/multi_agent_resume.rs
 index 5cffeb3a7683c6654bbfe5474296b5458659aeec..026714e9b1989d28c9c460a90ef75d06d2907690 100644
 --- a/codex-rs/core/tests/suite/multi_agent_resume.rs
@@ -45675,6 +45893,103 @@ index 5cffeb3a7683c6654bbfe5474296b5458659aeec..026714e9b1989d28c9c460a90ef75d06
      let resumed = resume_builder.restart(&server, &initial).await?;
      drop(initial);
      assert_eq!(
+diff --git a/codex-rs/core/tests/suite/plaintext_reasoning.rs b/codex-rs/core/tests/suite/plaintext_reasoning.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..3cc6af9b89f7a97af691b28f65435bdb0ec9a32c
+--- /dev/null
++++ b/codex-rs/core/tests/suite/plaintext_reasoning.rs
+@@ -0,0 +1,91 @@
++use codex_core::TurnInputRequest;
++use codex_features::Feature;
++use codex_login::CodexAuth;
++use codex_protocol::protocol::EventMsg;
++use codex_protocol::protocol::Op;
++use codex_protocol::user_input::UserInput;
++use core_test_support::responses;
++use core_test_support::test_codex::test_codex;
++use core_test_support::wait_for_event;
++use pretty_assertions::assert_eq;
++use serde_json::json;
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn plaintext_reasoning_replays_in_generation_and_remote_compaction() -> anyhow::Result<()> {
++    let server = responses::start_mock_server().await;
++    let test = test_codex()
++        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
++        .with_config(|config| {
++            let _ = config.features.disable(Feature::RemoteCompactionV2);
++        })
++        .build_with_auto_env(&server)
++        .await?;
++    let native = json!({"type":"reasoning", "id":"rs_native", "summary":[],
++        "encrypted_content":"native-encrypted-state"});
++    let foreign = json!({"type":"reasoning", "id":"00000000-0000-4000-8000-000000000001",
++        "summary":[], "content":[{"type":"reasoning_text","text":"Keep the migration atomic."}],
++        "encrypted_content":"00000000-0000-4000-8000-000000000001-0"});
++    let generation = responses::mount_sse_sequence(
++        &server,
++        vec![
++            responses::sse(vec![
++                json!({"type":"response.output_item.done", "item":native.clone()}),
++                json!({"type":"response.output_item.done", "item":foreign}),
++                responses::ev_assistant_message("msg_first", "Ready."),
++                responses::ev_completed("resp_first"),
++            ]),
++            responses::sse(vec![
++                responses::ev_assistant_message("msg_second", "Continued."),
++                responses::ev_completed("resp_second"),
++            ]),
++        ],
++    )
++    .await;
++    let compact = responses::mount_compact_json_once(
++        &server,
++        json!({"output":[{
++            "type":"compaction", "encrypted_content":"compacted-state"
++        }]}),
++    )
++    .await;
++
++    for text in ["Start.", "Continue."] {
++        test.codex
++            .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
++                text: text.to_string(),
++                text_elements: vec![],
++            }]))
++            .await?;
++        wait_for_event(&test.codex, |event| {
++            matches!(event, EventMsg::TurnComplete(_))
++        })
++        .await;
++    }
++    test.codex.submit(Op::Compact).await?;
++    wait_for_event(&test.codex, |event| {
++        matches!(event, EventMsg::TurnComplete(_))
++    })
++    .await;
++
++    let requests = generation.requests();
++    assert_eq!(requests.len(), 2);
++    for request in [&requests[1], &compact.single_request()] {
++        let input = request.input();
++        let native_input = input
++            .iter()
++            .find(|item| item["type"] == "reasoning")
++            .expect("native reasoning remains");
++        assert_eq!(
++            native_input["encrypted_content"],
++            native["encrypted_content"]
++        );
++        assert!(input.iter().any(|item| item["type"] == "message"
++            && item["role"] == "assistant"
++            && item["content"]
++                == json!([{"type":"output_text","text":"Keep the migration atomic."}])));
++        let serialized = request.body_json().to_string();
++        assert!(!serialized.contains("reasoning_text"));
++        assert!(!serialized.contains("00000000-0000-4000-8000-000000000001-0"));
++    }
++    Ok(())
++}
 diff --git a/codex-rs/core/tests/suite/spawn_agent_description.rs b/codex-rs/core/tests/suite/spawn_agent_description.rs
 index 317ce27af5d7c8691fc54ed57adfa810d617eb77..2648ad1851ee97ca88f0612a2c338eba9a6726dc 100644
 --- a/codex-rs/core/tests/suite/spawn_agent_description.rs
@@ -48840,7 +49155,7 @@ index 2d54ca7158900eda362091c71e8d1bd742459d4c..754391492f0b65a073adf359c7c1abe5
  futures = { workspace = true }
  http = { workspace = true }
 diff --git a/codex-rs/http-client/src/request.rs b/codex-rs/http-client/src/request.rs
-index 7608860c3daa7d43f846a43d525514d8604bfe07..c327848b326ee8f96530cf6dc184bccb3547769a 100644
+index 7608860c3daa7d43f846a43d525514d8604bfe07..0b79d07de6cc8028b9eed4dfa4b376cb597d819c 100644
 --- a/codex-rs/http-client/src/request.rs
 +++ b/codex-rs/http-client/src/request.rs
 @@ -43,6 +43,7 @@ pub enum RequestCompression {
@@ -48851,7 +49166,7 @@ index 7608860c3daa7d43f846a43d525514d8604bfe07..c327848b326ee8f96530cf6dc184bccb
  }
  
  #[derive(Debug, Clone, PartialEq, Eq)]
-@@ -80,9 +81,23 @@ pub struct Request {
+@@ -80,9 +81,22 @@ pub struct Request {
      pub headers: HeaderMap,
      pub body: Option<RequestBody>,
      pub compression: RequestCompression,
@@ -48862,7 +49177,6 @@ index 7608860c3daa7d43f846a43d525514d8604bfe07..c327848b326ee8f96530cf6dc184bccb
      pub timeout: Option<Duration>,
  }
  
-+
 +/// Deflate a request body with gzip for providers that reject `Content-Encoding: zstd`.
 +fn gzip_encode(bytes: &[u8]) -> Result<Vec<u8>, String> {
 +    use std::io::Write;
@@ -48875,7 +49189,7 @@ index 7608860c3daa7d43f846a43d525514d8604bfe07..c327848b326ee8f96530cf6dc184bccb
  impl Request {
      pub fn new(method: Method, url: String) -> Self {
          Self {
-@@ -91,6 +106,7 @@ impl Request {
+@@ -91,6 +105,7 @@ impl Request {
              headers: HeaderMap::new(),
              body: None,
              compression: RequestCompression::None,
@@ -48883,7 +49197,7 @@ index 7608860c3daa7d43f846a43d525514d8604bfe07..c327848b326ee8f96530cf6dc184bccb
              timeout: None,
          }
      }
-@@ -206,6 +222,10 @@ impl Request {
+@@ -206,6 +221,10 @@ impl Request {
                          .map_err(|err| err.to_string())?,
                      HeaderValue::from_static("zstd"),
                  ),
@@ -48894,7 +49208,7 @@ index 7608860c3daa7d43f846a43d525514d8604bfe07..c327848b326ee8f96530cf6dc184bccb
              };
              let post_compression_bytes = compressed.len();
              let compression_duration = compression_start.elapsed();
-@@ -216,7 +236,7 @@ impl Request {
+@@ -216,7 +235,7 @@ impl Request {
                  pre_compression_bytes,
                  post_compression_bytes,
                  compression_duration_ms = compression_duration.as_millis(),
@@ -48903,7 +49217,7 @@ index 7608860c3daa7d43f846a43d525514d8604bfe07..c327848b326ee8f96530cf6dc184bccb
              );
  
              Bytes::from(compressed)
-@@ -224,6 +244,17 @@ impl Request {
+@@ -224,6 +243,17 @@ impl Request {
              body.bytes.clone()
          };
  

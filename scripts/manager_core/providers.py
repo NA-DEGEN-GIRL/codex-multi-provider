@@ -48,6 +48,39 @@ def _json(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + '\n'
 
 
+def _retire_unselected_roles(home, files):
+    """Keep old managed revisions out of standalone discovery, without deleting them."""
+    directory = home / 'agents'
+    if not directory.is_dir():
+        return
+    if directory.resolve() != directory or directory.is_symlink() or directory.is_junction():
+        raise ProviderError('Managed agent directory must not be a linked path.')
+    selected = {home / name for name in files if name.startswith('agents/')}
+    for role in tomllib.loads(files['config.toml']).get('agents', {}).values():
+        if isinstance(role, dict) and isinstance(role.get('config_file'), str):
+            selected.add((home / role['config_file']).resolve())
+    for path in directory.glob('cc_*.toml'):
+        if path in selected or not re.fullmatch(r'cc_(?:gpt_(?:astra|sol|terra|luna)|external_[0-9a-f]{32}_r\d+_[0-9a-f]{12})', path.stem):
+            continue
+        if path.is_symlink() or path.is_junction() or not path.is_file():
+            continue
+        content = path.read_bytes()
+        try:
+            parsed = tomllib.loads(content.decode('utf-8-sig'))
+        except (ValueError, UnicodeError):
+            continue
+        if parsed.get('developer_instructions') not in (_GPT_ROLE_INSTRUCTIONS, _INSTRUCTIONS):
+            continue  # A user-authored/customized role is not ours to retire.
+        archive = home / 'manager-retired-agents'
+        if archive.resolve() != archive or archive.is_symlink() or archive.is_junction():
+            raise ProviderError('Managed agent archive must not be a linked path.')
+        archive.mkdir(exist_ok=True)
+        target = archive / (path.stem + '.' + hashlib.sha256(content).hexdigest()[:16] + '.toml')
+        if target.is_symlink() or target.is_junction() or target.resolve().parent != archive:
+            raise ProviderError('Managed agent archive target must remain in its directory.')
+        os.replace(path, target)
+
+
 def _uuid(value, label='ID'):
     try:
         if not isinstance(value, str) or str(uuid.UUID(value)) != value.lower():
@@ -606,9 +639,11 @@ class ProviderRegistry:
         block, files, bindings = [_BEGIN], {}, []
         for label, model in ([] if primary_model_id or selection_mode == 'external_only' else [('astra', 'gpt-6-astra'), ('sol', 'gpt-5.6-sol'), ('terra', 'gpt-5.6-terra'), ('luna', 'gpt-5.6-luna')]):
             role = 'cc_gpt_' + label
-            block += [f'[agents.{role}]', f'description = {_toml("OpenAI / " + model + ". Use the native GPT delegation path.")}',
+            description = 'OpenAI / ' + model + '. Use the native GPT delegation path.'
+            block += [f'[agents.{role}]', f'description = {_toml(description)}',
                       f'config_file = "agents/{role}.toml"', '']
             files[f'agents/{role}.toml'] = (f'name = {_toml(role)}\n'
+                f'description = {_toml(description)}\n'
                 f'model = {_toml(model)}\n'
                 f'developer_instructions = {_toml(_GPT_ROLE_INSTRUCTIONS)}\n')
         written = set()
@@ -630,6 +665,7 @@ class ProviderRegistry:
                                f'Reasoning effort is fixed to {model["reasoning_effort"]}.')
                 block += [f'[agents.{rid}]', f'description = {_toml(description)}', f'config_file = "agents/{rid}.toml"', '']
                 files[f'agents/{rid}.toml'] = (f'name = {_toml(rid)}\n'
+                    f'description = {_toml(description)}\n'
                     f'model = {_toml(model["wire_model_id"])}\n'
                     f'model_provider = {_toml(pid)}\nmodel_catalog_json = {_toml(str(config_path / catalog_file))}\n'
                     f'model_reasoning_effort = {_toml(model["reasoning_effort"])}\n'
@@ -675,7 +711,8 @@ class ProviderRegistry:
                     tomllib.loads(content)
                 except tomllib.TOMLDecodeError:
                     raise ProviderError('Managed settings conflict with existing TOML tables; no profile files were changed.') from None
-        policy = {'enabled': enabled, 'bindings': bindings, 'primary': primary, 'selection_mode': selection_mode}
+        policy = {'enabled': enabled, 'bindings': bindings, 'primary': primary, 'selection_mode': selection_mode,
+                  'role_schema_revision': 2}
         revision = hashlib.sha256(_json(policy).encode('utf-8')).hexdigest()[:24]
         return {'files': files, 'revision': revision, 'effective_revision': revision,
                 'enabled': enabled, 'models': [m['id'] for _, m in selected],
@@ -701,6 +738,7 @@ class ProviderRegistry:
             if path.exists() and path.read_text(encoding='utf-8-sig') == content:
                 continue
             _atomic_bytes(path, content.encode('utf-8'))
+        _retire_unselected_roles(home, result['files'])
         metadata = {key: value for key, value in result.items() if key != 'files'}
         _atomic_bytes(home / 'manager-provider-binding.json', _json(metadata).encode('utf-8'))
         return {**metadata, 'files': list(result['files'])}

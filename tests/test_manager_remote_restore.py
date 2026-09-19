@@ -31,8 +31,9 @@ class Fleet(RemoteMaintenance):
         return dict(pid=self.next_pid, process_start=str(self.next_pid), boot_id='fixture-boot',
                     revision=binding['revision'], socket='/private/fixture.sock')
 
-    def prepare(self, alias, profile_id, home, model_ids):
+    def prepare(self, alias, profile_id, home, model_ids, **options):
         self.calls.append(('prepare', alias))
+        self.prepared_options = options
         if alias == self.fail_prepare:
             raise OSError('fixture preparation offline')
         profile = self.store.profile(profile_id)
@@ -43,8 +44,12 @@ class Fleet(RemoteMaintenance):
         alias = binding['alias']
         self.calls.append((operation, alias))
         process = self.running.get(alias)
+        active = None
         if process is not None and process['revision'] != binding['revision']:
-            raise UpdateError('fixture_revision_mismatch', 'fixture daemon is running a different revision')
+            if operation == 'inspect' and params.get('discover_active') is True:
+                active = dict(binding, revision=process['revision'])
+            else:
+                raise UpdateError('fixture_revision_mismatch', 'fixture daemon is running a different revision')
         if operation == 'stop':
             if params['expected_process'] != process:
                 raise UpdateError('fixture_process_mismatch', 'fixture stop identity changed')
@@ -55,7 +60,8 @@ class Fleet(RemoteMaintenance):
             if alias == self.lose_start:
                 self.lose_start = None
                 raise OSError('fixture start reply lost after process creation')
-        return dict(binding=deepcopy(binding), process=deepcopy(process), idle=True, exited=process is None)
+        return dict(binding=deepcopy(binding), process=deepcopy(process), idle=True, exited=process is None,
+                    **({'active_binding': active} if active else {}))
 
 
 class RemoteRestoreTests(unittest.TestCase):
@@ -100,6 +106,43 @@ class RemoteRestoreTests(unittest.TestCase):
         self.fleet.fail_prepare = None
         self.assertTrue(self.restore()['verified'])
         self.assertEqual(self.fleet.calls.count(('prepare', 'fixture-a')), 1)
+        self.hooks.release_maintenance(lease)
+
+    def test_closed_local_profile_with_older_listeners_can_complete_normal_restart(self):
+        for process in self.fleet.running.values():
+            process['revision'] = '0' * 64
+        original = deepcopy(self.fleet.running)
+        lease = self.close()
+        records = self.records(lease)
+        for record in records:
+            self.assertEqual(record['binding']['revision'], 'a' * 64)
+            self.assertEqual(record['active_binding']['revision'], '0' * 64)
+            self.assertEqual(record['process'], original[record['binding']['alias']])
+        self.assertTrue(self.restore()['verified'])
+        self.hooks.release_maintenance(lease)
+        self.assertEqual({b['revision'] for b in json.loads(self.manifest.read_text())['bindings']}, {'b' * 64})
+        self.hooks.guard_launch(self.profile['id'])
+
+    def test_pending_policy_binding_can_be_restarted_and_published(self):
+        self.store.mutate(lambda data: self.store.profile(self.profile['id'], data).update(
+            remote_bindings=[dict(b, prepared=True) for b in self.fleet.bindings_by_alias.values()]))
+        manifest = json.loads(self.manifest.read_text())
+        manifest['bindings'] = manifest['bindings'][:1]
+        manifest['pending_policy_hosts'] = ['fixture-b']
+        atomic_json(self.manifest, manifest)
+        lease = self.close()
+        self.assertTrue(self.restore()['verified'])
+        self.hooks.release_maintenance(lease)
+        applied = json.loads(self.manifest.read_text())
+        self.assertEqual({b['alias'] for b in applied['bindings']}, {'fixture-a', 'fixture-b'})
+        self.assertEqual(applied['pending_policy_hosts'], [])
+
+    def test_restart_forwards_external_only_model_options(self):
+        self.store.mutate(lambda data: self.store.profile(self.profile['id'], data)['policy'].update(
+            selection_mode='external_only'))
+        lease = self.close()
+        self.assertTrue(self.restore()['verified'])
+        self.assertEqual(self.fleet.prepared_options, {'selection_mode': 'external_only'})
         self.hooks.release_maintenance(lease)
 
     def test_lost_second_start_reply_is_reconciled_without_restarting_either_host(self):

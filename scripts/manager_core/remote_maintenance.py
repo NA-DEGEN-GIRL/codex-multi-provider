@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import shlex
 
-from .ssh_shim import validate_binding
+from .ssh_shim import ShimError, validate_binding
 from .store import atomic_json, identifier
 from .updates import UpdateError
 
@@ -27,6 +27,30 @@ except Exception:
 class RemoteMaintenance:
     def __init__(self, root, store, remote):
         self.root, self.store, self.remote = Path(root).resolve(), store, remote
+
+    def pending_on_open(self, profile):
+        """Local metadata only: a stopped desktop must reconcile older SSH work."""
+        inventory = self.store.read().get('ssh_inventory', {}).get(profile['id'], {})
+        if not inventory.get('hosts'):
+            return False
+        policy = profile['policy']
+        if policy.get('launched_revision') != policy.get('desired_revision'):
+            return True
+        from .startup_updates import selected_manager_proxy
+        from .release_code import runtime_revision
+        selected = selected_manager_proxy(self.root)
+        revision = runtime_revision(selected)
+        if revision and profile.get('manager_runtime_revision') != revision:
+            return True
+        path = self.store.directory / 'profiles' / identifier(profile['id']) / 'ssh-bindings.json'
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > 256000:
+            return True
+        manifest = json.loads(path.read_text(encoding='utf-8'))
+        if manifest.get('pending_policy_hosts'):
+            return True
+        requested = {b['alias']: b['revision'] for b in manifest.get('bindings', [])}
+        saved = {b['alias']: b['revision'] for b in profile.get('remote_bindings', []) if b.get('prepared') is True}
+        return any(alias in saved and requested.get(alias) != saved[alias] for alias in inventory['hosts'])
 
     def bindings(self, profile, coverage):
         """Use the running generation's manifest, never newly saved settings."""
@@ -52,6 +76,14 @@ class RemoteMaintenance:
         selected = []
         for alias in hosts[1:]:
             match = next((b for b in bindings if b['alias'] == alias), None)
+            if match is None and alias in manifest.get('pending_policy_hosts', []):
+                # Policy filtering removed the host from this manifest, but its
+                # saved binding still identifies the same private remote profile.
+                # Inspection discovers the actual running revision separately.
+                saved = [validate_binding(b, profile['id']) for b in profile.get('remote_bindings', [])
+                         if b.get('alias') == alias and b.get('prepared') is True]
+                if len(saved) == 1:
+                    match = saved[0]
             if match is None:
                 raise UpdateError('remote_binding_unknown', '이전에 연결한 SSH 서버의 실행 설정이 필요합니다.')
             selected.append(match)
@@ -79,33 +111,39 @@ class RemoteMaintenance:
             response = json.loads(result.stdout)
             value = response['result']
             if (result.returncode or response.get('ok') is not True or not isinstance(value, dict)
-                    or value.get('revision') != binding['revision']
                     or type(value.get('idle')) is not bool or type(value.get('exited')) is not bool):
                 raise ValueError()
+            actual = binding
+            if value.get('revision') != binding['revision']:
+                if (operation != 'inspect' or params.get('discover_active') is not True
+                        or value.get('requested_revision') != binding['revision']):
+                    raise ValueError()
+                actual = validate_binding({**binding, 'revision': value.get('revision')}, binding['profile_id'])
             process = value.get('process')
             if process is None:
-                if value['exited'] is not True or value['idle'] is not True:
+                if value['exited'] is not True or value['idle'] is not True or actual != binding:
                     raise ValueError()
             elif (not isinstance(process, dict) or value['exited'] is not False
                   or type(process.get('pid')) is not int or process['pid'] <= 0
                   or not all(isinstance(process.get(k), str) and process[k] for k in
                              ('process_start', 'boot_id', 'socket'))
-                  or process.get('revision') != binding['revision']):
+                  or process.get('revision') != actual['revision']):
                 raise ValueError()
-            return {'binding': binding, 'process': process, 'idle': value['idle'], 'exited': value['exited']}
-        except (ValueError, KeyError, TypeError):
+            return {'binding': binding, 'process': process, 'idle': value['idle'], 'exited': value['exited'],
+                    **({'active_binding': actual} if actual != binding else {})}
+        except (ValueError, KeyError, TypeError, ShimError):
             raise UpdateError('remote_maintenance_unverified', 'SSH 실행 상태 확인이 필요합니다. 설정 적용 결과를 추정하지 않았습니다.') from None
 
     def snapshot(self, profile, coverage):
-        return [self.request(binding, 'inspect') for binding in self.bindings(profile, coverage)]
+        return [self.request(binding, 'inspect', discover_active=True) for binding in self.bindings(profile, coverage)]
 
     def stop(self, entry):
-        return self.request(entry['binding'], 'stop', expected_process=entry['process'])
+        return self.request(entry.get('active_binding', entry['binding']), 'stop', expected_process=entry['process'])
 
     def reconcile(self, entry):
         """Read evidence after a lost result; never replay a lifecycle mutation."""
         if entry.get('state') == 'stop_requested':
-            proof = self.request(entry['binding'], 'inspect')
+            proof = self.request(entry.get('active_binding', entry['binding']), 'inspect')
             if proof['exited'] and proof['idle']:
                 entry.update(state='closed', exit_proof=proof)
         elif entry.get('state') == 'start_requested':
@@ -125,7 +163,8 @@ class RemoteMaintenance:
                     raise UpdateError('policy_changed', '이전 SSH 설정 적용 결과를 확인한 뒤 최신 설정을 적용해야 합니다.')
                 continue
             alias = entry['binding']['alias']
-            binding = self.remote.prepare(alias, profile['id'], profile['home'], model_ids)
+            from .model_settings import render_options
+            binding = self.remote.prepare(alias, profile['id'], profile['home'], model_ids, **render_options(profile))
             if binding.get('prepared') is not True:
                 raise UpdateError('remote_preparation_pending', 'SSH 서버에 새 설정을 준비하지 못했습니다.')
             def save(data):
@@ -215,9 +254,12 @@ class RemoteMaintenance:
                         or proof['process'].get('revision') != new['revision'] or proof.get('exited') is not False):
                     raise UpdateError('remote_start_unverified', '실제 적용된 SSH 설정을 확인해야 합니다.')
                 matches = [i for i, binding in enumerate(bindings) if binding['alias'] == old['alias']]
-                if len(matches) != 1 or bindings[matches[0]] not in (old, new):
+                if not matches and old['alias'] in manifest.get('pending_policy_hosts', []):
+                    bindings.append(new)
+                elif len(matches) == 1 and bindings[matches[0]] in (old, new):
+                    bindings[matches[0]] = new
+                else:
                     raise UpdateError('remote_binding_changed', 'SSH 연결 설정이 별도로 변경되어 덮어쓰지 않았습니다.')
-                bindings[matches[0]] = new
                 applied.add(new['alias'])
             updated = {**manifest, 'bindings': bindings}
             if 'pending_policy_hosts' in updated:

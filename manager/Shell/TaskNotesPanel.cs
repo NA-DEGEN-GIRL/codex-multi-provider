@@ -24,7 +24,7 @@ internal sealed class TaskNotesPanel : Border
     private readonly WrapPanel tabs = new();
     private readonly Button add = new() { Name = "AddNote", Content = "+ 새 메모", Height = 32, Padding = new Thickness(10, 0, 10, 0), Margin = new Thickness(0), HorizontalContentAlignment = HorizontalAlignment.Center, ToolTip = "이 작업에 새 메모 추가" };
     private readonly Button options = new() { Content = "⋯", Width = 32, Height = 32, Margin = new Thickness(6, 0, 0, 0), Padding = new Thickness(0), HorizontalContentAlignment = HorizontalAlignment.Center, ToolTip = "메모 이름 변경 · 삭제 · 복구" };
-    private readonly Button fork = new() { Name = "ForkNote", Content = "?? fork", Height = 32, Padding = new Thickness(10, 0, 10, 0), Margin = new Thickness(6, 0, 0, 0), HorizontalContentAlignment = HorizontalAlignment.Center, Visibility = Visibility.Collapsed, ToolTip = "????? ??? ??? ? ???? ??? ?????. ???? ??? ????? ????." };
+    private readonly Button fork = new() { Name = "ForkNote", Content = "메모 분리", Height = 32, Padding = new Thickness(10, 0, 10, 0), Margin = new Thickness(6, 0, 0, 0), HorizontalContentAlignment = HorizontalAlignment.Center, Visibility = Visibility.Collapsed, ToolTip = "공유 메모를 복사해 이 작업에서 독립적으로 편집합니다." };
     private bool shared;
     private readonly Button retry = new() { Content = "다시 저장", Visibility = Visibility.Collapsed };
     private readonly TextBox editor = new() { Name = "NoteBody", AcceptsReturn = true, AcceptsTab = true, TextWrapping = TextWrapping.Wrap,
@@ -90,14 +90,17 @@ internal sealed class TaskNotesPanel : Border
     internal async Task SelectTaskAsync(SelectedTask? task, bool reload = false)
     {
         if (!reload && selected?.Task == task?.Task) { if (task is not null) taskTitle.Text = task.Title; return; }
-        if (editing is { } old) _ = SaveAsync(old);
         var ticket = ++selection; selected = task; editing = null; notes.Clear(); loadFailed = false;
         taskTitle.Text = task?.Title ?? "작업을 열어 주세요"; taskTitle.ToolTip = task?.Title;
         RenderTabs(); RenderEditor();
-        if (task is null) { status.Text = "열린 작업에 메모가 연결됩니다"; return; }
-        status.Text = "메모 불러오는 중…";
+        status.Text = task is null ? "열린 작업에 메모가 연결됩니다" : "메모 불러오는 중…";
         try
         {
+            // A newly opened fork snapshots the saved parent notes. Drain any
+            // draft save already in flight before that first read, including
+            // when selection changes again while the previous save completes.
+            await FlushAsync();
+            if (selection != ticket || task is null) return;
             var value = await request("notes.list", new { task = task.Task.Wire });
             if (selection != ticket) return;
             notes.AddRange(value.GetProperty("notes").Deserialize<List<TaskNote>>(NoteDrafts.Json) ?? []);
@@ -122,14 +125,17 @@ internal sealed class TaskNotesPanel : Border
     private async Task ForkAsync()
     {
         if (selected is null || loadFailed || !shared) return;
-        if (editing is { } draft) await SaveAsync(draft);
+        var task = selected; var ticket = selection;
         try
         {
-            await request("notes.fork", new { task = selected.Task.Wire });
-            status.Text = "??? ??????. ?? ? ??? ?? ?????.";
-            await SelectTaskAsync(selected, reload: true);
+            await FlushAsync();
+            if (selection != ticket) return;
+            await request("notes.fork", new { task = task.Task.Wire });
+            if (selection != ticket) return;
+            status.Text = "메모를 분리했습니다. 이 작업에서 독립적으로 편집합니다.";
+            await SelectTaskAsync(task, reload: true);
         }
-        catch (Exception error) { status.Text = "?? fork ?? ? " + error.Message; }
+        catch (Exception error) { if (selection == ticket) status.Text = "메모 분리 실패 · " + error.Message; }
     }
     internal void Add()
     {

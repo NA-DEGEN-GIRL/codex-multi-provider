@@ -237,10 +237,14 @@ class ManifestTests(unittest.TestCase):
                                        ssh_proxy=proxy,real_ssh=real,selected_model_ids=[])
             manifest=json.loads(Path(scoped['CODEX_MANAGER_SSH_BINDINGS']).read_text())
             self.assertEqual(manifest['bindings'],[])
+            self.assertEqual(manifest['pending_policy_hosts'], ['remote-dev'])
+            self.assertEqual(manifest['auto_prepare_aliases'], ['remote-dev'])
             command=native_command(native_bodies()['native-proxy'],bytes(range(8)))
             with self.assertRaises(ShimError) as raised:
                 route_arguments(['remote-dev',command],manifest)
-            self.assertEqual(raised.exception.code,'ssh_policy_pending')
+            self.assertEqual(raised.exception.code,'host_binding_required')
+            # Preparing a requested saved alias never rewrites desktop visibility.
+            self.assertFalse((root/'work/control-center/profiles'/PROFILE/'codex/.codex-global-state.json').exists())
 
     def test_stale_policy_host_with_saved_alias_is_repaired_instead_of_blocked(self):
         # A reboot or a policy change can leave every prepared host pending.

@@ -88,6 +88,8 @@ def prepare(home, source, *, account_id=None, ssh_ready_aliases=None, canonical=
     donor_state = source / '.codex-global-state.json'
     original = json.loads(donor_state.read_text(encoding='utf-8-sig')) if donor_state.is_file() else {}
     current = json.loads(state.read_text(encoding='utf-8-sig')) if state.exists() else {}
+    from .ssh_connection_recovery import apply_pending, finish as finish_ssh_recovery
+    ssh_recovery = apply_pending(home, current)
     from .app_workspace import merge_workspace, remove_imported_projects
     project_aliases, result['workspace'] = merge_workspace(current, original, owned, source,
         ssh_ready_aliases=ssh_ready_aliases, signals=signals)
@@ -133,4 +135,5 @@ def prepare(home, source, *, account_id=None, ssh_ready_aliases=None, canonical=
         result['onboarding'] = 'common_setup_completed'
     atomic_json(state, current)
     atomic_json(metadata, owned)
+    finish_ssh_recovery(home, ssh_recovery)
     return result

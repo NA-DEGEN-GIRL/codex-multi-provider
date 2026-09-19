@@ -132,6 +132,21 @@ impl Service {
             };
         }
         if command.starts_with("notes.") {
+            // A native fork may be opened before the next manager state poll.
+            // Resolve only this task's metadata before creating its snapshot.
+            if notes::needs_fork_refresh(&self.root, &request.args) {
+                let refreshed = self
+                    .backend
+                    .request("notes.refresh_forks", request.args.clone())
+                    .await;
+                if refreshed["ok"] != true {
+                    return error(
+                        id,
+                        "notes_failed",
+                        "메모 원본 작업을 확인하지 못했습니다. 다시 불러와 주세요.",
+                    );
+                }
+            }
             let root = self.root.clone();
             let args = request.args;
             let command = command.to_string();

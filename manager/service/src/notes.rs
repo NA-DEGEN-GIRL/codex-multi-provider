@@ -70,8 +70,11 @@ fn group_path(root: &Path, group_id: &str) -> PathBuf {
         .join(format!("{group_id}.json"))
 }
 
-/// Forked conversations inherit one shared note document until the user splits it.
+/// Local native forks inherit a snapshot; remote task identities stay isolated.
 fn fork_parent(root: &Path, task: &TaskKey) -> Option<String> {
+    if task.host_id != "local" {
+        return None;
+    }
     let path = root.join("work/control-center/note-forks.json");
     let metadata = std::fs::metadata(&path).ok()?;
     if metadata.len() > 4 * 1024 * 1024 {
@@ -85,7 +88,7 @@ fn fork_parent(root: &Path, task: &TaskKey) -> Option<String> {
             .and_then(Value::as_str)
             .map(str::to_string)
     })?;
-    (parent != task.thread_id).then_some(parent)
+    (parent != task.thread_id && uuid::Uuid::parse_str(&parent).is_ok()).then_some(parent)
 }
 
 fn read_document(path: &Path, task: &TaskKey) -> Result<Option<Document>, String> {
@@ -147,24 +150,6 @@ fn write_document(root: &Path, document: &Document) -> Result<(), String> {
         .map_err(|_| "메모 저장에 실패했습니다. 편집 내용은 유지됩니다.".into())
 }
 
-/// Start sharing: turn a task's own notes into the first document of a group.
-fn migrate_to_group(root: &Path, document: &mut Document) -> Result<String, String> {
-    let group_id = uuid::Uuid::new_v4().to_string();
-    write_group(
-        root,
-        &Group {
-            version: 1,
-            group_id: group_id.clone(),
-            notes: document.notes.clone(),
-        },
-    )?;
-    document.version = 2;
-    document.group_id = Some(group_id.clone());
-    document.notes = vec![];
-    write_document(root, document)?;
-    Ok(group_id)
-}
-
 fn clone_notes(notes: &[Note]) -> Vec<Note> {
     notes
         .iter()
@@ -189,56 +174,56 @@ fn clone_notes(notes: &[Note]) -> Vec<Note> {
         .collect()
 }
 
-pub fn execute(root: &Path, command: &str, args: &Value) -> Result<Value, String> {
-    let task = TaskKey::parse(args)?;
-    let path = task.path(root);
-    let existed = path.exists();
-    let mut document = read_document(&path, &task)?.unwrap_or(Document {
+pub fn needs_fork_refresh(root: &Path, args: &Value) -> bool {
+    TaskKey::parse(args)
+        .map(|task| task.host_id == "local" && !task.path(root).exists())
+        .unwrap_or(false)
+}
+
+fn load_task(
+    root: &Path,
+    task: TaskKey,
+    visited: &mut HashSet<String>,
+) -> Result<Document, String> {
+    if let Some(document) = read_document(&task.path(root), &task)? {
+        return Ok(document); // Never overwrite a task that already has its own notes.
+    }
+    if visited.len() >= 64 || !visited.insert(task.thread_id.clone()) {
+        return Err("메모 원본 작업의 분기 관계를 확인하지 못했습니다.".into());
+    }
+    let mut document = Document {
         version: 1,
         task: task.clone(),
         group_id: None,
         notes: vec![],
-    });
-
-    // A forked conversation starts on the same note group as its source, so
-    // both tasks keep editing one document until the user splits it.
-    if !existed {
-        if let Some(parent) = fork_parent(root, &task) {
-            let source_task = TaskKey {
-                host_id: task.host_id.clone(),
+    };
+    if let Some(parent) = fork_parent(root, &task) {
+        let source = load_task(
+            root,
+            TaskKey {
+                host_id: task.host_id,
                 thread_id: parent,
-            };
-            if let Ok(Some(mut source)) = read_document(&source_task.path(root), &source_task) {
-                let group = match source.group_id.clone() {
-                    Some(id) => Some(id),
-                    None if !source.notes.is_empty() => Some(migrate_to_group(root, &mut source)?),
-                    None => None,
-                };
-                if let Some(group_id) = group {
-                    document.version = 2;
-                    document.group_id = Some(group_id);
-                    document.notes = vec![];
-                    write_document(root, &document)?;
-                }
-            }
-        }
+            },
+            visited,
+        )?;
+        document.notes = clone_notes(&resolved_notes(root, &source)?);
+        // Persist even an empty snapshot so later parent edits cannot appear
+        // in a fork, and nested forks resolve their immediate parent's copy.
+        write_document(root, &document)?;
     }
+    Ok(document)
+}
+
+pub fn execute(root: &Path, command: &str, args: &Value) -> Result<Value, String> {
+    let task = TaskKey::parse(args)?;
+    let mut document = load_task(root, task, &mut HashSet::new())?;
 
     if command == "notes.fork" {
         let current = resolved_notes(root, &document)?;
-        let group_id = uuid::Uuid::new_v4().to_string();
         let split = clone_notes(&current);
-        write_group(
-            root,
-            &Group {
-                version: 1,
-                group_id: group_id.clone(),
-                notes: split.clone(),
-            },
-        )?;
-        document.version = 2;
-        document.group_id = Some(group_id);
-        document.notes = vec![];
+        document.version = 1;
+        document.group_id = None;
+        document.notes = split.clone();
         write_document(root, &document)?;
         return Ok(json!({"state": "forked", "task": document.task, "notes": split}));
     }

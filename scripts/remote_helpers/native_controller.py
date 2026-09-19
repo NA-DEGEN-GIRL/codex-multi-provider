@@ -68,7 +68,7 @@ def process_record(revision, path):
             "revision": revision, "socket": str(path)}
 
 
-def _running(profile, revision):
+def _running(profile, revision, *, allow_other_revision=False):
     import launch
     path = profile / "native-instance.json"
     if not path.exists():
@@ -77,7 +77,7 @@ def _running(profile, revision):
     if (not data.get("process_start") or _process_start(data.get("pid")) != data.get("process_start") or
             data.get("boot_id") != Path("/proc/sys/kernel/random/boot_id").read_text().strip()):
         return None
-    if data.get("revision") != revision:
+    if data.get("revision") != revision and not allow_other_revision:
         raise RuntimeError("A different revision is still running; wait for its jobs to finish.")
     return data
 
@@ -193,58 +193,63 @@ def stop(profile, revision, *, expected_process=None):
         raise ValueError("start lock symlink")
     with lock_path.open("a+b") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        observed = _running(profile, revision)
-        if expected_process is not None:
-            if observed is not None and observed != expected_process:
-                raise RuntimeError("Remote runtime identity changed before shutdown.")
-            if (observed is None and _process_start(expected_process.get("pid")) ==
-                    expected_process.get("process_start")):
-                raise RuntimeError("Expected remote process exit is not verified.")
-        if observed is None:
+        return _stop_locked(profile, revision, expected_process=expected_process)
+
+
+def _stop_locked(profile, revision, *, expected_process=None):
+    """Gracefully stop one observed listener with native-start.lock held."""
+    observed = _running(profile, revision)
+    if expected_process is not None:
+        if observed is not None and observed != expected_process:
+            raise RuntimeError("Remote runtime identity changed before shutdown.")
+        if (observed is None and _process_start(expected_process.get("pid")) ==
+                expected_process.get("process_start")):
+            raise RuntimeError("Expected remote process exit is not verified.")
+    if observed is None:
+        if _instance_lock_released(profile):
+            return 0
+        raise RuntimeError("Another runtime still owns this profile; maintenance is deferred.")
+    path = socket_path(profile)
+    if observed.get("socket") != str(path):
+        raise RuntimeError("Remote socket identity changed.")
+    deadline = time.monotonic() + 90
+    # `app-server proxy` relays bytes; it does not translate WebSocket frames.
+    # Use the existing bounded client directly on the exact private socket.
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(5)
+        connection.connect(str(path))
+        connection.settimeout(None)
+        with connection.makefile("rb", buffering=0) as reader, connection.makefile("wb") as writer:
+            try:
+                pipe = WebSocketPipe(reader, writer, max_message=1024 * 1024)
+                pipe.handshake(timeout=5)
+                _control_request(pipe, 1, "initialize", {
+                    "clientInfo": {"name": "codex_control_maintenance", "version": "1"},
+                    "capabilities": {"experimentalApi": True},
+                }, deadline)
+                if _running(profile, revision) != observed:
+                    raise RuntimeError("Remote runtime identity changed during maintenance.")
+                response = _control_request(pipe, 2, "server/managedShutdown", {
+                    "processId": observed["pid"],
+                }, deadline)
+                if (response.get("processId") != observed["pid"] or
+                        response.get("shutdownRequested") is not True or
+                        response.get("writerReleaseVerified") is not True):
+                    raise RuntimeError("Remote runtime did not provide a graceful shutdown proof.")
+            finally:
+                # Wake the reader before closing its file, including on timeout.
+                try:
+                    connection.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+    while time.monotonic() < deadline:
+        if _process_start(observed["pid"]) != observed["process_start"]:
             if _instance_lock_released(profile):
                 return 0
-            raise RuntimeError("Another runtime still owns this profile; maintenance is deferred.")
-        path = socket_path(profile)
-        if observed.get("socket") != str(path):
-            raise RuntimeError("Remote socket identity changed.")
-        deadline = time.monotonic() + 90
-        # `app-server proxy` relays bytes; it does not translate WebSocket frames.
-        # Use the existing bounded client directly on the exact private socket.
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-            connection.settimeout(5)
-            connection.connect(str(path))
-            connection.settimeout(None)
-            with connection.makefile("rb", buffering=0) as reader, connection.makefile("wb") as writer:
-                try:
-                    pipe = WebSocketPipe(reader, writer, max_message=1024 * 1024)
-                    pipe.handshake(timeout=5)
-                    _control_request(pipe, 1, "initialize", {
-                        "clientInfo": {"name": "codex_control_maintenance", "version": "1"},
-                        "capabilities": {"experimentalApi": True},
-                    }, deadline)
-                    if _running(profile, revision) != observed:
-                        raise RuntimeError("Remote runtime identity changed during maintenance.")
-                    response = _control_request(pipe, 2, "server/managedShutdown", {
-                        "processId": observed["pid"],
-                    }, deadline)
-                    if (response.get("processId") != observed["pid"] or
-                            response.get("shutdownRequested") is not True or
-                            response.get("writerReleaseVerified") is not True):
-                        raise RuntimeError("Remote runtime did not provide a graceful shutdown proof.")
-                finally:
-                    # Wake the reader before closing its file, including on timeout.
-                    try:
-                        connection.shutdown(socket.SHUT_RDWR)
-                    except OSError:
-                        pass
-        while time.monotonic() < deadline:
-            if _process_start(observed["pid"]) != observed["process_start"]:
-                if _instance_lock_released(profile):
-                    return 0
-                # Child/OS handle teardown can finish just after the process
-                # becomes a zombie. Keep waiting for both pieces of evidence.
-            time.sleep(0.1)
-        raise RuntimeError("Remote runtime exit and profile lock release are not both verified; settings and updates remain pending.")
+            # Child/OS handle teardown can finish just after the process
+            # becomes a zombie. Keep waiting for both pieces of evidence.
+        time.sleep(0.1)
+    raise RuntimeError("Remote runtime exit and profile lock release are not both verified; settings and updates remain pending.")
 
 
 def main(profile, revision, operation):

@@ -140,8 +140,21 @@ class ControlCenter:
                 if result.get('prepared') is not True or result.get('revision') == binding.get('revision'):
                     continue
 
-                def save(data, profile_id=profile['id'], alias=alias, result=result):
+                def save(data, profile_id=profile['id'], alias=alias, result=result,
+                         observed_binding=binding, generation=profile.get('generation'),
+                         selected=models, expected_options=options):
                     item = self.store.profile(profile_id, data)
+                    current_models = list(item['policy']['model_ids']) if item.get('policy', {}).get('enabled') else []
+                    current_binding = next((b for b in item.get('remote_bindings', []) if b.get('alias') == alias), None)
+                    # Network preparation can outlive a policy edit, reconnect,
+                    # or profile restart. Never publish that stale snapshot over
+                    # the binding a foreground preparation just applied.
+                    if (item.get('removed_at') or item.get('view_only')
+                            or item.get('generation') != generation
+                            or sorted(current_models) != sorted(selected)
+                            or render_options(item) != expected_options
+                            or current_binding != observed_binding):
+                        return
                     item['remote_bindings'] = [b for b in item.get('remote_bindings', [])
                                                if b.get('alias') != alias] + [result]
                     self.store.remote_source(data, result, item['alias'])
@@ -166,7 +179,7 @@ class ControlCenter:
             def register(data):
                 Store._source(data,Path.home()/'.codex','original:local','기존 Codex')
             self.store.mutate(register);state=self.store.read()
-        # Forked tasks share their source memo until the user splits it; the
+        # Forked tasks copy their source memo into an independent document; the
         # note service reads this mapping instead of opening state databases.
         try:
             from manager_core.note_forks import refresh as refresh_note_forks
@@ -243,6 +256,10 @@ class ControlCenter:
 
     def dispatch(self,command,args):
         if not isinstance(args,dict):raise ValueError('명령 인수가 올바르지 않습니다.')
+        if command=='notes.refresh_forks':
+            from manager_core.note_forks import refresh
+            refresh(self.root, self.store.read(), thread_id=args['task']['thread_id'])
+            return dict(refreshed=True)
         if command=='state':return self.state()
         if command=='skills.personal.list':return self.personal_skills.list()
         if command=='skills.personal.set':return self.personal_skills.set(args['skill_id'],args['enabled'])
@@ -319,7 +336,14 @@ class ControlCenter:
                 Store._source(data,account['home'],'usage:'+uid,account['alias']);return p
             return self.store.mutate(bind)
         if command=='profile.prepare':return self.instances.prepare(self.store.profile(args['profile_id']))
-        if command=='profile.show':return self.instances.show(args['profile_id'])
+        if command=='profile.show':
+            profile=self.store.profile(args['profile_id'])
+            observed=self.instances.observe(profile)
+            if observed.get('status')!='running' and self.remote_maintenance.pending_on_open(profile):
+                job=self.restarts.schedule(profile['id'])
+                return dict(profile_id=profile['id'], profile={**profile,**observed},
+                            state='updating', restart=job)
+            return self.instances.show(args['profile_id'])
         if command=='shortcut.add':
             host=args.get('host_id','local');source_id=args['source_store_id']
             discovered=self.remote_catalog.shortcut_source(host,source_id,identifier(args['thread_id'])) if host.startswith('ssh:') and source_id.startswith('legacy:') else None

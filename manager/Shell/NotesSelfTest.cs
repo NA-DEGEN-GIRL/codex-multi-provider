@@ -22,6 +22,11 @@ internal static class NotesSelfTest
         var client = await ManagerClient.ConnectAsync(root, deadline.Token);
         var task = new SelectedTask(new("local", Guid.NewGuid().ToString()), "Codex 작업 공간 개발");
         var other = new SelectedTask(new("local", Guid.NewGuid().ToString()), "다른 작업");
+        // This UI fixture tests existing task documents without starting an
+        // account adapter. First-access native ancestry is covered by the
+        // SQLite/WAL and service note-copy tests using indexed fork metadata.
+        SeedEmptyNotes(root, task.Task);
+        SeedEmptyNotes(root, other.Task);
         var window = new MainWindow(root, fixture: true) { WindowState = WindowState.Normal, Width = 1600, Height = 1020, Left = -28000, Top = -28000, ShowActivated = false, ShowInTaskbar = false };
         try
         {
@@ -110,6 +115,8 @@ internal static class NotesSelfTest
             // Same task in a different profile is intentionally the same storage key.
             var service = await client.RequestAsync("supervisor.status");
             Require(service.S("engine") == "rust" && service.S("backend_status") == "not_started", "Rust notes run without account adapter");
+            await VerifySaveBeforeForkAsync(root, supersede: false);
+            await VerifySaveBeforeForkAsync(root, supersede: true);
             File.WriteAllText(report, JsonSerializer.Serialize(new { passed = true, checks, root, png, service = "Rust named pipe + real WPF controls; no account or original app access" }));
         }
         finally
@@ -117,6 +124,63 @@ internal static class NotesSelfTest
             await client.RequestAsync("supervisor.retire", cancellationToken: deadline.Token);
             window.Close(); await client.DisposeAsync();
         }
+    }
+    private static void SeedEmptyNotes(string root, NoteTask task)
+    {
+        var directory = Path.Combine(root, "work", "control-center", "notes");
+        Directory.CreateDirectory(directory);
+        var key = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
+            JsonSerializer.SerializeToUtf8Bytes(task.Wire))).ToLowerInvariant();
+        File.WriteAllText(Path.Combine(directory, key + ".json"),
+            JsonSerializer.Serialize(new { version = 1, task = task.Wire, notes = Array.Empty<object>() }));
+    }
+    private static async Task VerifySaveBeforeForkAsync(string root, bool supersede)
+    {
+        var parent = new SelectedTask(new("local", Guid.NewGuid().ToString()), "원본");
+        var child = new SelectedTask(new("local", Guid.NewGuid().ToString()), "분기");
+        var latest = new SelectedTask(new("local", Guid.NewGuid().ToString()), "다음 분기");
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var reads = new List<string>();
+        var saved = "저장된 원본"; long revision = 0;
+        var noteId = Guid.NewGuid().ToString();
+        var panel = new TaskNotesPanel(root, async (command, args) =>
+        {
+            var wire = JsonSerializer.SerializeToElement(args);
+            if (command == "notes.save")
+            {
+                entered.TrySetResult();
+                await release.Task;
+                saved = wire.GetProperty("body").GetString()!;
+                return JsonSerializer.SerializeToElement(new { state = "saved", note = new { revision = ++revision } });
+            }
+            if (command != "notes.list") throw new InvalidOperationException("Unexpected note fixture command");
+            var thread = wire.GetProperty("task").GetProperty("thread_id").GetString()!;
+            reads.Add(thread);
+            return JsonSerializer.SerializeToElement(new { shared = false,
+                notes = new[] { new TaskNote { Id = noteId, Title = "원본 메모", Body = saved, Revision = revision } } }, NoteDrafts.Json);
+        });
+        var fixture = new Window { Content = panel, Width = 440, Height = 600,
+            Left = -28000, Top = -28000, ShowActivated = false, ShowInTaskbar = false };
+        try
+        {
+            fixture.Show();
+            await panel.SelectTaskAsync(parent); fixture.UpdateLayout();
+            NoteBody(panel).Text = "저장 중인 초안";
+            var pendingSave = panel.FlushAsync();
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            NoteBody(panel).Text = "분기 직전 최신 초안";
+            var opening = panel.SelectTaskAsync(child);
+            var newest = supersede ? panel.SelectTaskAsync(latest) : Task.CompletedTask;
+            Require(!opening.IsCompleted && reads.SequenceEqual(new[] { parent.Task.ThreadId }),
+                "fork read waits asynchronously for an in-flight parent save");
+            release.TrySetResult();
+            await Task.WhenAll(pendingSave, opening, newest).WaitAsync(TimeSpan.FromSeconds(5));
+            Require(NoteBody(panel).Text == "분기 직전 최신 초안", "fork receives the latest draft including edits during an earlier save");
+            Require(reads.SequenceEqual(new[] { parent.Task.ThreadId, (supersede ? latest : child).Task.ThreadId }),
+                "superseded selection cannot load or snapshot the wrong task");
+        }
+        finally { release.TrySetResult(); fixture.Close(); }
     }
     private static TextBox NoteBody(TaskNotesPanel panel) => Descendants(panel).OfType<TextBox>().Single(t => t.Name == "NoteBody");
     private static IEnumerable<TextBox> ItemInputs(TaskNotesPanel panel) => Descendants(panel).OfType<TextBox>().Where(t => t.Tag is string);

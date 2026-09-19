@@ -67,9 +67,10 @@ wait_agent_enabled = true
 max_concurrent_threads_per_session = 4
 '''
         for role, model in roles.items():
-            common += f'\n[agents.{role}]\ndescription = {quoted("OpenAI / " + model + ". Choose according to the delegated task.")}\nconfig_file = "agents/{role}.toml"\n'
+            description = "OpenAI / " + model + ". Choose according to the delegated task."
+            common += f'\n[agents.{role}]\ndescription = {quoted(description)}\nconfig_file = "agents/{role}.toml"\n'
             (home / 'agents' / (role + '.toml')).write_text(
-                f'name = "{role}"\nmodel = "{model}"\n'
+                f'name = "{role}"\ndescription = {quoted(description)}\nmodel = "{model}"\n'
                 'developer_instructions = "Complete only the delegated task with the available tools. '
                 'Read files before editing, verify results, and report accurately. Do not spawn further agents."\n',
                 encoding='utf-8')
@@ -92,10 +93,17 @@ stream_max_retries = 0
 stream_idle_timeout_ms = 60000
 '''
         (home / 'config.toml').write_text(common, encoding='utf-8')
-        (home / 'agents/deepseek.toml').write_text(
-            f'model = {quoted(provider["model"])}\nmodel_provider = "deepseek_external"\n'
-            f'model_catalog_json = {quoted(catalog)}\nmodel_reasoning_effort = {quoted(reasoning_effort_for_model(provider["model"]))}\n'
-            'developer_instructions = "Work only on the assigned task inside the test workspace. Do not spawn more agents. Use the available tools, verify changes, and return a concise factual result."\n', encoding='utf-8')
+        external_role = home / 'agents/deepseek.toml'
+        if mode == 'runtime':
+            external_role.write_text(
+                'name = "deepseek"\ndescription = "DeepSeek external provider for bounded delegated tasks."\n'
+                f'model = {quoted(provider["model"])}\nmodel_provider = "deepseek_external"\n'
+                f'model_catalog_json = {quoted(catalog)}\nmodel_reasoning_effort = {quoted(reasoning_effort_for_model(provider["model"]))}\n'
+                'developer_instructions = "Work only on the assigned task inside the test workspace. Do not spawn more agents. Use the available tools, verify changes, and return a concise factual result."\n', encoding='utf-8')
+        elif external_role.exists():
+            # Native directory discovery must not enable the external test role
+            # in the upstream-only comparison profile. Keep the old file.
+            external_role.replace(external_role.with_suffix('.toml.disabled'))
     return provider
 
 

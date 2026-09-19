@@ -37,17 +37,25 @@ def connection(profile):
                     pass
 
 
-def inspect(profile, revision):
+def inspect(profile, revision, *, discover_active=False):
     """Advisory only; shutdown rechecks all clients under the runtime fence."""
     lock_path = profile / 'native-start.lock'
     if lock_path.is_symlink() or not lock_path.is_file():
         raise RuntimeError('Lifecycle lock is unavailable.')
     with lock_path.open('r+b') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        process = native._running(profile, revision)
+        requested_revision = revision
+        process = (native._running(profile, revision, allow_other_revision=True) if discover_active
+                   else native._running(profile, revision))
         if process is None:
             return {'process': None, 'idle': native._instance_lock_released(profile),
                     'exited': True, 'revision': revision}
+        if discover_active:
+            revision = process.get('revision')
+            # Prepared definitions can coexist with an older live listener. The
+            # actual descriptor must belong to this profile and host, and must
+            # never be reported as having applied the requested configuration.
+            native._descriptor(profile, revision)
         with connection(profile) as request:
             diagnostics = request('server/diagnostics', {})
             if diagnostics.get('process', {}).get('id') != process['pid']:
@@ -92,7 +100,8 @@ def inspect(profile, revision):
             idle = idle and set(loaded).issubset(covered)
             if native._running(profile, revision) != process:
                 raise RuntimeError('Runtime identity changed during observation.')
-            return {'process': process, 'idle': idle, 'exited': False, 'revision': revision}
+            return {'process': process, 'idle': idle, 'exited': False, 'revision': revision,
+                    'requested_revision': requested_revision}
 
 
 def dispatch(payload):
@@ -105,7 +114,7 @@ def dispatch(payload):
     native._descriptor(profile, revision)
     operation = payload['operation']
     if operation == 'inspect':
-        return inspect(profile, revision)
+        return inspect(profile, revision, discover_active=payload.get('discover_active') is True)
     if operation == 'stop':
         observed = payload['expected_process']
         if not isinstance(observed, dict) or observed.get('revision') != revision:

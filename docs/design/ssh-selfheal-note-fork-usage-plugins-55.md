@@ -1,5 +1,8 @@
 # SSH self-heal, shared fork memos, quota details and plugin long paths
 
+The memo design below describes the earlier implementation. Native fork
+discovery and independent copies now follow [Native fork note copies](native-fork-note-copies.md).
+
 ## SSH policy deadlock
 
 Changing a profile's model policy (for example switching profile 02 to an
@@ -8,7 +11,7 @@ external-only subagent policy) marks every prepared host as
 "This host must apply the selected profile model settings before SSH
 reconnects" and never entered the scoped auto-prepare path, which only ran for
 hosts with no binding at all. A reboot or a failed maintenance pass therefore
-left SSH permanently blocked, which is why the remote `remote-project` project and
+left SSH permanently blocked, which is why a remote project and
 its sessions disappeared from the profile list even though the catalog cache
 and the remote threads still existed.
 

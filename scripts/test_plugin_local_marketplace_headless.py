@@ -54,7 +54,7 @@ def write_native(home):
         f'[plugins."{PLUGIN}@{NATIVE}"]\nenabled = true\n', encoding='utf-8')
 
 
-def serve(home, binary, requests, *, timeout=60):
+def serve(home, binary, requests, *, timeout=60, notifications=None):
     env = {key: value for key, value in os.environ.items()
            if not key.upper().startswith(('CODEX_', 'OPENAI_', 'AZURE_OPENAI_', 'CHATGPT_'))
            and key.upper() != 'ELECTRON_RUN_AS_NODE'}
@@ -94,6 +94,8 @@ def serve(home, binary, requests, *, timeout=60):
             if value is None:
                 error = (process.stderr.read() or b'').decode('utf-8', 'replace')[:800]
                 raise RuntimeError('app-server exited: ' + error)
+            if notifications is not None and 'method' in value and 'id' not in value:
+                notifications.append(value)
             if value.get('id') == identity and 'method' not in value:
                 if 'error' in value:
                     raise RuntimeError(f'{method}: {value["error"]}')

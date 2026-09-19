@@ -330,7 +330,10 @@ def prepare_environment(root: Path | str, profile_id: str, host_bindings: list[d
                    and ALIAS.fullmatch(entry['alias'])}
     except (OSError, ValueError, TypeError):
         aliases = set()
-    manifest['auto_prepare_aliases'] = sorted(aliases)
+    # A saved binding remains a valid target when a desktop migration dropped its
+    # connection declaration. This only authorizes a native command explicitly
+    # requesting that alias; it does not recreate or auto-connect hidden hosts.
+    manifest['auto_prepare_aliases'] = sorted(aliases | {item['alias'] for _, item in validated})
     manifest['selected_model_ids'] = sorted(selected or [])
     manifest['model_options'] = model_options
     if environment.get('CODEX_MANAGER_PRIMARY_MODEL'):
