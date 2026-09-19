@@ -31,6 +31,23 @@ class UsageTests(unittest.TestCase):
         self.assertNotIn('secret-credit-id',str(result))
         self.assertEqual(normalize({'rateLimits':{'primary':{'usedPercent':1}}})['reset_credits'],None)
 
+    def test_zero_reset_credits_are_known_with_or_without_details(self):
+        for details in (None, []):
+            with self.subTest(details=details):
+                result=normalize({'rateLimits':{'primary':{'usedPercent':10}},
+                                  'rateLimitResetCredits':{'availableCount':0,'credits':details}})
+                self.assertEqual(result['reset_credits'],{'available':0,'expires_at':None})
+        self.assertIsNone(normalize({'rateLimits':{'primary':{'usedPercent':10}}})['reset_credits'])
+
+    def test_newer_zero_reset_credits_replace_old_positive_count(self):
+        older={'windows':[{'label':'주간','used_percent':50,'remaining_percent':50,'resets_at':1}],
+               'observed_at':'2026-09-18T00:00:00+00:00','reset_credits':{'available':2,'expires_at':9}}
+        latest={'windows':[{'label':'주간','used_percent':60,'remaining_percent':40,'resets_at':1}],
+                'observed_at':'2026-09-18T01:00:00+00:00','reset_credits':{'available':0,'expires_at':None}}
+        self.assertEqual(newer(older,latest),latest)
+        self.assertEqual(newer(latest,older),latest)
+        self.assertEqual(older['reset_credits'],{'available':2,'expires_at':9})
+
     def test_newer_snapshot_keeps_credit_count_from_older_reply(self):
         older={'windows':[{'label':'주간','used_percent':50,'remaining_percent':50,'resets_at':1}],
                'observed_at':'2026-09-18T00:00:00+00:00','reset_credits':{'available':1,'expires_at':9}}

@@ -29,9 +29,10 @@ public sealed class MainWindow : Window
     private WindowState _lastVisibleState = WindowState.Maximized;
     private JsonElement _state;
     private readonly ListBox _profiles = new();
+    private readonly TextBlock _profileCount = new() { Foreground = Muted, FontSize = 11, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(6, 0, 0, 0) };
     private readonly ProfileOrdering _profileOrdering;
     private readonly ListBox _shortcuts = new();
-    private readonly TextBlock _status = new() { TextWrapping = TextWrapping.Wrap, FontSize = 12, Foreground = Muted, MaxHeight = 68 };
+    private readonly TextBlock _status = new() { TextWrapping = TextWrapping.Wrap, TextTrimming = TextTrimming.CharacterEllipsis, FontSize = 11, LineHeight = 16, Foreground = Muted, MaxHeight = 32 };
     private readonly TextBlock _identity = new() { FontSize = 16, FontWeight = FontWeights.SemiBold, Foreground = new SolidColorBrush(Color.FromRgb(163, 193, 255)) };
     private readonly TextBlock _taskIdentity = new() { FontSize = 19, FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 4, 0, 2), TextTrimming = TextTrimming.CharacterEllipsis };
     private readonly TextBlock _attention = new() { Foreground = Brushes.Orange, FontSize = 12, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 4, 0, 0), Visibility = Visibility.Collapsed };
@@ -144,7 +145,7 @@ public sealed class MainWindow : Window
         WindowState = WindowState.Maximized;
         StateChanged += (_, _) => { if (WindowState != WindowState.Minimized) _lastVisibleState = WindowState; };
         var layout = new Grid();
-        layout.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(272) });
+        layout.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(304) });
         layout.ColumnDefinitions.Add(new ColumnDefinition());
         var sidebarFrame = new Grid { Background = new SolidColorBrush(Color.FromRgb(32, 34, 40)) };
         sidebarFrame.RowDefinitions.Add(new RowDefinition());
@@ -154,18 +155,22 @@ public sealed class MainWindow : Window
         sidebar.RowDefinitions.Add(new RowDefinition { Height = new GridLength(3, GridUnitType.Star), MinHeight = 160 });
         sidebar.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         sidebar.RowDefinitions.Add(new RowDefinition { Height = new GridLength(4, GridUnitType.Star), MinHeight = 120 });
-        var heading = new StackPanel { Margin = new Thickness(16, 20, 16, 8) };
-        heading.Children.Add(new TextBlock { Text = "Codex 작업 공간", FontSize = 21, FontWeight = FontWeights.SemiBold });
-        heading.Children.Add(new TextBlock { Text = "계정과 작업을 한곳에서", Foreground = Muted, FontSize = 12, Margin = new Thickness(0, 5, 0, 18) });
-        heading.Children.Add(Row(Label("프로필"), Action("＋", AddProfileAsync, "Codex 계정 또는 외부 API 프로필 추가"), Action("↻", RefreshAccountsAsync, "계정·사용량 새로고침")));
-        heading.Children.Add(MenuButton("프로필 관리", ("외부 모델 기본 설정", EditExternalModelAsync), ("하위 에이전트 설정", ProfileProvidersAsync), ("로그인 · API 키 관리", LoginProfileAsync),
+        var heading = new StackPanel { Margin = new Thickness(18, 22, 18, 8) };
+        heading.Children.Add(new TextBlock { Text = "Codex 작업 공간", FontSize = 20, FontWeight = FontWeights.SemiBold });
+        heading.Children.Add(new TextBlock { Text = "계정과 작업을 한곳에서", Foreground = Muted, FontSize = 11, Margin = new Thickness(0, 5, 0, 20) });
+        var profileMenu = MenuButton("프로필 관리", ("외부 모델 기본 설정", EditExternalModelAsync), ("하위 에이전트 설정", ProfileProvidersAsync), ("로그인 · API 키 관리", LoginProfileAsync),
             ("현재 앱의 로그인 계정 연결", RegisterCurrentAsync), ("로그인 상태 새로 확인", RefreshLoginStatusAsync),
             ("이 프로필 다시 열기", RecoverProfileAsync), ("작업 종료 후 설정 적용 예약", RestartProfileAsync),
             ("원래 창으로 분리", DetachAsync), ("별칭 변경", RenameProfileAsync),
-            ("계정을 목록에서 제거", RemoveProfileAsync), ("제거한 계정 복원", RestoreProfileAsync), ("프로필 준비", PrepareProfileAsync)));
+            ("계정을 목록에서 제거", RemoveProfileAsync), ("제거한 계정 복원", RestoreProfileAsync), ("프로필 준비", PrepareProfileAsync));
+        heading.Children.Add(SidebarSection("프로필", _profileCount,
+            SidebarIcon(Action("＋", AddProfileAsync), "AddProfile", "＋", "Codex 계정 또는 외부 API 프로필 추가"),
+            SidebarIcon(Action("↻", RefreshAccountsAsync), "RefreshProfiles", "↻", "계정·사용량·리딤 횟수 새로고침"),
+            SidebarIcon(profileMenu, "ProfileActions", "⋯", "선택한 프로필 관리")));
         sidebar.Children.Add(heading);
         _profiles.Margin = new Thickness(8, 0, 8, 8);
         _profiles.ItemTemplate = ProfileOrdering.Template();
+        _profiles.ItemContainerStyle = ProfileCards.ContainerStyle();
         _profileOrdering = new ProfileOrdering(_profiles, move => Safe(() => MoveProfileAsync(move)));
         _profiles.SelectionChanged += async (_, _) => { if (!_rendering && _profiles.SelectedItem is Choice choice) await Safe(() => ShowProfileAsync(choice.Id)); };
         _profiles.PreviewMouseLeftButtonDown += (_, e) =>
@@ -196,11 +201,12 @@ public sealed class MainWindow : Window
         };
         _profiles.ContextMenu.Closed += (_, _) => _contextProfile = null;
         Grid.SetRow(_profiles, 1); sidebar.Children.Add(_profiles);
-        var tasks = new StackPanel { Margin = new Thickness(18, 12, 18, 5) };
-        tasks.Children.Add(Label("작업 바로가기"));
-        tasks.Children.Add(new TextBlock { Text = "모든 프로필에서 함께 사용", Foreground = Muted, FontSize = 12, Margin = new Thickness(0, 4, 0, 8) });
-        tasks.Children.Add(Action("작업 찾아서 추가", AddShortcutAsync));
-        tasks.Children.Add(MenuButton("바로가기 관리", ("지금 열린 작업 추가", CaptureShortcutAsync), ("삭제한 링크 복구", UndoShortcutAsync)));
+        var tasks = new StackPanel { Margin = new Thickness(18, 16, 18, 5) };
+        tasks.Children.Add(new Border { Height = 1, Background = new SolidColorBrush(Color.FromRgb(48, 53, 63)), Margin = new Thickness(0, 0, 0, 12) });
+        tasks.Children.Add(SidebarSection("작업 바로가기", null,
+            SidebarIcon(Action("＋", AddShortcutAsync), "AddShortcut", "＋", "작업 찾아서 바로가기 추가"),
+            SidebarIcon(MenuButton("바로가기 관리", ("지금 열린 작업 추가", CaptureShortcutAsync), ("삭제한 링크 복구", UndoShortcutAsync)), "ShortcutActions", "⋯", "바로가기 관리")));
+        tasks.Children.Add(new TextBlock { Text = "모든 프로필에서 함께 사용", Foreground = Muted, FontSize = 11, Margin = new Thickness(0, 2, 0, 5) });
         Grid.SetRow(tasks, 2); sidebar.Children.Add(tasks);
         _shortcuts.Margin = new Thickness(8, 0, 8, 8);
         _shortcuts.ItemTemplate = ShortcutCards.Create(async (sender, e) =>
@@ -226,8 +232,11 @@ public sealed class MainWindow : Window
         };
         _shortcuts.ContextMenu.Closed += (_, _) => _contextShortcut = null;
         Grid.SetRow(_shortcuts, 3); sidebar.Children.Add(_shortcuts);
-        var footer = new StackPanel { Margin = new Thickness(16, 8, 16, 12) };
-        footer.Children.Add(Action("전체 기록 · 대표 계정", ShowCatalogAsync));
+        var footer = new StackPanel { Margin = new Thickness(18, 8, 18, 12) };
+        footer.Children.Add(new Border { Height = 1, Background = new SolidColorBrush(Color.FromRgb(48, 53, 63)), Margin = new Thickness(0, 0, 0, 8) });
+        var allRecords = Action("전체 기록", ShowCatalogAsync, "대표 계정으로 전체 작업 기록 보기");
+        allRecords.Background = Brushes.Transparent; allRecords.BorderThickness = new Thickness(0); allRecords.Padding = new Thickness(2, 7, 2, 7);
+        footer.Children.Add(allRecords);
         var settings = new StackPanel();
         settings.Children.Add(Action("공통 개인 스킬", PersonalSkillsAsync));
         settings.Children.Add(Action("하위 에이전트 · API 공급자", ProvidersAsync));
@@ -245,6 +254,9 @@ public sealed class MainWindow : Window
             WorkspaceBuild.CopyText + "\n\n현재 실행 중인 작업공간앱 버전입니다. 클릭하면 버전 정보가 복사됩니다.");
         version.Name = "WorkspaceVersion";
         version.FontSize = 12;
+        version.Background = Brushes.Transparent;
+        version.BorderThickness = new Thickness(0);
+        version.Padding = new Thickness(2, 6, 2, 6);
         version.Foreground = Muted;
         version.HorizontalContentAlignment = HorizontalAlignment.Left;
         version.Margin = new Thickness(0, 8, 0, 0);
@@ -434,6 +446,26 @@ public sealed class MainWindow : Window
 
     private static TextBlock Label(string text) => new() { Text = text, FontWeight = FontWeights.SemiBold, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 10, 0) };
     private static StackPanel Row(params UIElement[] children) { var row = new StackPanel { Orientation = Orientation.Horizontal }; foreach (var child in children) row.Children.Add(child); return row; }
+    private static Button SidebarIcon(Button button, string name, string glyph, string tip)
+    {
+        button.Name = name; button.Content = glyph; button.ToolTip = tip;
+        button.Width = 30; button.Height = 30; button.Padding = new Thickness(0);
+        button.Margin = new Thickness(3, 0, 0, 0); button.FontSize = 18;
+        button.Background = Brushes.Transparent; button.BorderThickness = new Thickness(0);
+        button.HorizontalContentAlignment = HorizontalAlignment.Center;
+        System.Windows.Automation.AutomationProperties.SetName(button, tip);
+        return button;
+    }
+    private static Grid SidebarSection(string title, TextBlock? count, params Button[] actions)
+    {
+        var row = new Grid();
+        row.ColumnDefinitions.Add(new ColumnDefinition()); row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        var label = Row(new TextBlock { Text = title, FontWeight = FontWeights.SemiBold, FontSize = 12, VerticalAlignment = VerticalAlignment.Center });
+        if (count is not null) label.Children.Add(count);
+        row.Children.Add(label);
+        var buttons = Row(actions); Grid.SetColumn(buttons, 1); row.Children.Add(buttons);
+        return row;
+    }
     private Button Action(string text, Func<Task> action, string? tip = null)
     {
         var button = new Button { Content = text, ToolTip = tip, Margin = new Thickness(0, 3, 5, 3) };
@@ -591,6 +623,7 @@ public sealed class MainWindow : Window
             var startup = _state.Get("startup_updates");
             _profileUpdateStatus.Text = startup.Message("전체 프로필 업데이트 확인 중");
             var warmup = _state.Get("profile_warmup");
+            _profileCount.Text = _state.Arr("profiles").Count().ToString();
             if (!_profileOrdering.IsInteracting) Fill(_profiles, _state.Arr("profiles").Select(p =>
             {
                 var update = startup.Arr("profiles").FirstOrDefault(item => item.S("profile_id") == p.S("id"));
@@ -605,7 +638,7 @@ public sealed class MainWindow : Window
                 }
                 var label = p.S("auth_mode") == "external" ? "[API] " + p.S("alias") : p.S("alias", "이름 없는 프로필");
                 var usage = p.S("auth_mode") == "external" ? p.S("external_model_name", "외부 API") : Usage(p.Get("usage"));
-                return new Choice(p.S("id"), $"{label}\n{usage} · {Status(p.S("status"))}" + suffix, p);
+                return new Choice(p.S("id"), $"{label}\n{usage} · {Status(p.S("status"))}" + suffix, p) { ProfileNotice = suffix };
             }), _selectedProfile);
             var shortcuts = _state.Arr("shortcuts");
             Fill(_shortcuts, shortcuts.Select(s => new Choice(s.S("id"), s.S("alias", "이름 없는 작업") + "\n" +
@@ -741,7 +774,7 @@ public sealed class MainWindow : Window
     {
         var items = values.ToArray();
         var old = box.Items.OfType<Choice>().ToArray();
-        if (!old.Select(x => (x.Id, x.Label, x.Hint, x.AgentBadge, x.AgentHint)).SequenceEqual(items.Select(x => (x.Id, x.Label, x.Hint, x.AgentBadge, x.AgentHint))))
+        if (!old.Select(x => (x.Id, x.Label, x.Hint, x.AgentBadge, x.AgentHint, x.Card)).SequenceEqual(items.Select(x => (x.Id, x.Label, x.Hint, x.AgentBadge, x.AgentHint, x.Card))))
         {
             box.Items.Clear(); foreach (var value in items) box.Items.Add(value);
         }
@@ -773,8 +806,9 @@ public sealed class MainWindow : Window
         var resetText = reset.ValueKind == JsonValueKind.Object && reset.Get("resets_at").ValueKind == JsonValueKind.Number
             ? $" · {DateTimeOffset.FromUnixTimeSeconds(reset.Get("resets_at").GetInt64()).ToLocalTime():M/d HH:mm} 초기화" : "";
         var credits = usage.Get("reset_credits");
-        var creditText = credits.ValueKind == JsonValueKind.Object && credits.N("available") > 0
-            ? $" · 초기화권 {credits.N("available")}회" : "";
+        var available = credits.Get("available");
+        var creditText = available.ValueKind == JsonValueKind.Number && available.TryGetInt64(out var count) && count is >= 0 and <= 1_000_000
+            ? $" · 리딤 {count:N0}회" : " · 리딤 확인 안 됨";
         return string.Join(" / ", text) + resetText + creditText + stamp;
     }
     private async Task ShowProfileAsync(string id, string command = "profile.show")

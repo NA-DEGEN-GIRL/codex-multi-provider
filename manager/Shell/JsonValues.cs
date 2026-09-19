@@ -20,6 +20,10 @@ internal static class JsonValues
 internal sealed record Choice(string Id, string Label, JsonElement Data = default)
 {
     public override string ToString() => Label;
+    public string ShortcutName => Data.S("alias", Label.Split('\n')[0]);
+    public string ShortcutTarget => Label.Split('\n').Skip(1).FirstOrDefault() ?? "";
+    public string ProfileNotice { get; init; } = "";
+    public ProfileCardData Card => ProfileCardData.Create(Data, Label, ProfileNotice);
     public string AgentBadge => ProfileAgentPresentation.Badge(Data);
     public string AgentHint => ProfileAgentPresentation.Hint(Data);
     public System.Windows.Visibility AgentBadgeVisibility => AgentBadge.Length > 0 ? System.Windows.Visibility.Visible : System.Windows.Visibility.Collapsed;
@@ -30,7 +34,7 @@ internal sealed record Choice(string Id, string Label, JsonElement Data = defaul
             if (Data.S("thread_id") != "") return "작업 이름을 누르면 표시된 계정에서 열립니다.\n계정 이동·별칭 변경·링크 삭제는 아래 버튼을 사용하세요.";
             var usage = Data.Get("usage");
             var observed = usage.S("observed_at");
-            if (DateTimeOffset.TryParse(observed, out var time)) return $"사용량 마지막 확인: {time.ToLocalTime():yyyy-MM-dd HH:mm:ss}\n{Data.S("status_message")}";
+            if (DateTimeOffset.TryParse(observed, out var time)) return $"{Label}\n사용량 마지막 확인: {time.ToLocalTime():yyyy-MM-dd HH:mm:ss}\n{Data.S("status_message")}";
             return Data.S("status_message", Data.S("source_store_id", Label));
         }
     }

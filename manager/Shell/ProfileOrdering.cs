@@ -57,46 +57,7 @@ internal sealed class ProfileOrdering
         };
     }
 
-    internal static DataTemplate Template()
-    {
-        var row = new FrameworkElementFactory(typeof(DockPanel));
-        var grip = new FrameworkElementFactory(typeof(Border));
-        grip.SetValue(FrameworkElement.TagProperty, "ProfileDragGrip");
-        grip.SetValue(FrameworkElement.WidthProperty, 24d);
-        grip.SetValue(FrameworkElement.MarginProperty, new Thickness(-4, 0, 6, 0));
-        grip.SetValue(FrameworkElement.ToolTipProperty, "드래그하여 순서 변경 · 오른쪽 클릭으로 위/아래 이동");
-        grip.SetValue(FrameworkElement.CursorProperty, Cursors.SizeNS);
-        grip.SetValue(Border.BackgroundProperty, Brushes.Transparent);
-        grip.SetValue(DockPanel.DockProperty, Dock.Left);
-        var dots = new FrameworkElementFactory(typeof(TextBlock));
-        dots.SetValue(TextBlock.TextProperty, "⠿");
-        dots.SetValue(TextBlock.FontSizeProperty, 18d);
-        dots.SetValue(TextBlock.ForegroundProperty, new SolidColorBrush(Color.FromRgb(142, 155, 178)));
-        dots.SetValue(FrameworkElement.VerticalAlignmentProperty, VerticalAlignment.Center);
-        dots.SetValue(FrameworkElement.HorizontalAlignmentProperty, HorizontalAlignment.Center);
-        grip.AppendChild(dots); row.AppendChild(grip);
-        var content = new FrameworkElementFactory(typeof(StackPanel));
-        var label = new FrameworkElementFactory(typeof(TextBlock));
-        label.SetBinding(TextBlock.TextProperty, new System.Windows.Data.Binding(nameof(Choice.Label)));
-        label.SetValue(TextBlock.TextWrappingProperty, TextWrapping.Wrap);
-        label.SetValue(TextBlock.LineHeightProperty, 20d);
-        content.AppendChild(label);
-        var badge = new FrameworkElementFactory(typeof(Border));
-        badge.SetBinding(UIElement.VisibilityProperty, new System.Windows.Data.Binding(nameof(Choice.AgentBadgeVisibility)));
-        badge.SetBinding(FrameworkElement.ToolTipProperty, new System.Windows.Data.Binding(nameof(Choice.AgentHint)));
-        badge.SetValue(FrameworkElement.HorizontalAlignmentProperty, HorizontalAlignment.Left);
-        badge.SetValue(FrameworkElement.MarginProperty, new Thickness(0, 5, 0, 1));
-        badge.SetValue(Border.PaddingProperty, new Thickness(6, 2, 6, 2));
-        badge.SetValue(Border.CornerRadiusProperty, new CornerRadius(4));
-        badge.SetValue(Border.BackgroundProperty, new SolidColorBrush(Color.FromRgb(44, 48, 68)));
-        var badgeText = new FrameworkElementFactory(typeof(TextBlock));
-        badgeText.SetBinding(TextBlock.TextProperty, new System.Windows.Data.Binding(nameof(Choice.AgentBadge)));
-        badgeText.SetValue(TextBlock.FontSizeProperty, 11d);
-        badgeText.SetValue(TextBlock.TextWrappingProperty, TextWrapping.Wrap);
-        badgeText.SetValue(TextBlock.ForegroundProperty, new SolidColorBrush(Color.FromRgb(198, 207, 255)));
-        badge.AppendChild(badgeText); content.AppendChild(badge); row.AppendChild(content);
-        return new DataTemplate { VisualTree = row };
-    }
+    internal static DataTemplate Template() => ProfileCards.Create();
 
     private static bool IsGrip(object source)
     {
