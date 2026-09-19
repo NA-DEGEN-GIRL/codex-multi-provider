@@ -462,6 +462,38 @@ fn stop(root: &Path, args: &Value) -> Result<Value, String> {
                 break;
             }
         }
+        // A mode switch can hand the UI to a process that is no longer a child
+        // of the tracked pid, which left ChatGPT processes running after the
+        // workspace app closed. Reclaim every managed process whose command
+        // line carries this profile's own --user-data-dir.
+        if let Some(ui) = profile["ui_home"].as_str() {
+            let desktop = root.join("artifacts/managed-desktop");
+            for pid in rows.keys() {
+                if held.contains_key(pid)
+                    || preserved.contains(pid)
+                    || *pid == std::process::id()
+                    || other_profiles.contains(pid)
+                {
+                    continue;
+                }
+                let Some(candidate) = Process::open(*pid, true) else {
+                    continue;
+                };
+                if !under(&candidate.identity.executable_path, &desktop) {
+                    continue;
+                }
+                let Ok(arguments) = candidate.arguments() else {
+                    continue;
+                };
+                if arguments
+                    .iter()
+                    .filter_map(|a| a.strip_prefix("--user-data-dir="))
+                    .any(|value| same_path(value, ui))
+                {
+                    held.insert(*pid, candidate);
+                }
+            }
+        }
         if !terminated {
             held[&(profile["process_id"].as_u64().unwrap() as u32)].terminate()?;
             terminated = true;

@@ -1225,6 +1225,27 @@ public sealed class MainWindow : Window
                 throw new InvalidOperationException("일부 Codex가 종료 요청에 응답하지 않았습니다. 관리창을 유지합니다. 구버전 프로필은 원래 창에서 앱을 종료해 주세요.");
             if (_client?.IsConnected == true)
             {
+                // A mode switch can hand the UI to a process that is no longer a
+                // child of the tracked window, so the graceful close above can
+                // leave ChatGPT processes behind. The service reaps every managed
+                // process that carries this profile's own --user-data-dir.
+                foreach (var profile in _state.Arr("profiles"))
+                {
+                    var id = profile.S("id");
+                    if (id == "" || profile.S("process_id") == "") continue;
+                    try
+                    {
+                        using var stopDeadline = new CancellationTokenSource(TimeSpan.FromSeconds(6));
+                        await _client.RequestAsync("process.stop",
+                            new { profile_id = id, generation = profile.S("generation") },
+                            cancellationToken: stopDeadline.Token);
+                        Log($"남은 Codex 프로세스 정리 · {profile.S("alias", id)}");
+                    }
+                    catch (Exception error) { Log("프로세스 정리 건너뜀 · " + error.Message); }
+                }
+            }
+            if (_client?.IsConnected == true)
+            {
                 try
                 {
                     using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(4));
