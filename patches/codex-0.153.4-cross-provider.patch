@@ -43495,7 +43495,7 @@ index 0000000000000000000000000000000000000000..a42b4e983bc20861327112b1c305fea2
 +    }
 +}
 diff --git a/codex-rs/core/src/tools/handlers/view_image.rs b/codex-rs/core/src/tools/handlers/view_image.rs
-index 7f80995857c867a480f86e9f29269562edf5da05..72aba8dddd0379354b3a01fd5b6df2c1230694af 100644
+index 7f80995857c867a480f86e9f29269562edf5da05..a69ea48957f5a4895a5c0933d6c2db6dbf7c2cf5 100644
 --- a/codex-rs/core/src/tools/handlers/view_image.rs
 +++ b/codex-rs/core/src/tools/handlers/view_image.rs
 @@ -194,8 +194,35 @@ impl ViewImageHandler {
@@ -43598,6 +43598,30 @@ index 7f80995857c867a480f86e9f29269562edf5da05..72aba8dddd0379354b3a01fd5b6df2c1
          if self.unified_image_budget {
              serde_json::json!({ "image_url": self.image_url })
          } else {
+@@ -321,9 +364,10 @@ mod tests {
+     #[test]
+     fn log_preview_omits_image_data() {
+         let output = ViewImageOutput {
+-            image_url: "data:image/png;base64,AAA".to_string(),
++            image_url: Some("data:image/png;base64,AAA".to_string()),
+             image_detail: DEFAULT_IMAGE_DETAIL,
+             unified_image_budget: false,
++            omitted: None,
+         };
+ 
+         assert_eq!(output.log_output(), "<image data URL omitted: 25 bytes>");
+@@ -332,9 +376,10 @@ mod tests {
+     #[test]
+     fn code_mode_result_returns_image_url_object() {
+         let output = ViewImageOutput {
+-            image_url: "data:image/png;base64,AAA".to_string(),
++            image_url: Some("data:image/png;base64,AAA".to_string()),
+             image_detail: DEFAULT_IMAGE_DETAIL,
+             unified_image_budget: false,
++            omitted: None,
+         };
+ 
+         let result = output.code_mode_result(&ToolPayload::Function {
 diff --git a/codex-rs/core/src/tools/parallel.rs b/codex-rs/core/src/tools/parallel.rs
 index 7de566390bf06f6de72b93dbc5f893999c52d41e..6448396f4e23aba985539ddbb7cfba12e16cf505 100644
 --- a/codex-rs/core/src/tools/parallel.rs
