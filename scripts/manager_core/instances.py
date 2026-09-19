@@ -257,6 +257,13 @@ class Instances:
             env['CODEX_MANAGER_PRIMARY_MODEL'] = json.dumps(binding)
         if selected_models:
             env.update(self.providers.environment(list(dict.fromkeys(selected_models))))
+        # Request-size policy for provider traffic: lossless zstd above the
+        # automatic threshold, a byte budget measured after compression, and a
+        # per-image cap that replaces an oversized screenshot with a path
+        # marker instead of re-sending its bytes on every later turn.
+        env.setdefault('CODEX_REQUEST_COMPRESSION', 'auto')
+        env.setdefault('CODEX_MAX_REQUEST_BYTES', str(40 * 1024 * 1024))
+        env.setdefault('CODEX_MAX_INLINE_IMAGE_BYTES', str(8 * 1024 * 1024))
         if profile.get('record_catalog_path'):
             if not runtime_info.get('capabilities',{}).get('native_record_catalog'):
                 raise RuntimeError('전체 기록 조회 런타임이 아직 검증·배포되지 않았습니다.')
