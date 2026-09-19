@@ -59,6 +59,7 @@ class ControlCenter:
         self.handoffs=HandoffManager(self.root,self.store,self.instances)
         self.native_login=NativeLogin(self.root,self.store,self.instances)
         self.native_login.migrate_verified_shared_history()
+        self._remote_reconcile_started = False
         from manager_core.usage_refresh import UsageRefresh
         self.usage_refresh=UsageRefresh(self.root,self.store)
         self.profile_lifecycle=ProfileLifecycle(self.store,self.instances)
@@ -110,6 +111,46 @@ class ControlCenter:
             if self.instances.observe(profile)['status']!='running':break
             time.sleep(.25)
 
+    def _reconcile_remote_hosts(self):
+        """Re-apply every remote binding once per start so helper updates land.
+
+        Uploading is content-addressed and skipped when nothing changed, so an
+        unchanged host costs a short SSH round trip and a drifted host is
+        repaired without the user pressing SSH connect first.
+        """
+        from manager_core.model_settings import render_options
+        try:
+            state = self.store.read()
+        except (ValueError, RuntimeError, OSError):
+            return
+        for profile in state.get('profiles', []):
+            if profile.get('removed_at') or profile.get('view_only'):
+                continue
+            models = list(profile['policy']['model_ids']) if profile.get('policy', {}).get('enabled') else []
+            options = render_options(profile)
+            for binding in profile.get('remote_bindings') or []:
+                alias = binding.get('alias')
+                if not alias:
+                    continue
+                try:
+                    result = self.remote.prepare(alias, profile['id'], profile['home'], models,
+                                                 reuse_host_runtime=True, **options)
+                except (ValueError, RuntimeError, OSError, KeyError):
+                    continue
+                if result.get('prepared') is not True or result.get('revision') == binding.get('revision'):
+                    continue
+
+                def save(data, profile_id=profile['id'], alias=alias, result=result):
+                    item = self.store.profile(profile_id, data)
+                    item['remote_bindings'] = [b for b in item.get('remote_bindings', [])
+                                               if b.get('alias') != alias] + [result]
+                    self.store.remote_source(data, result, item['alias'])
+
+                try:
+                    self.store.mutate(save)
+                except (ValueError, RuntimeError, OSError):
+                    continue
+
     def state(self):
         notices=[]
         if time.monotonic()-self._sync_at>30:
@@ -117,6 +158,10 @@ class ControlCenter:
             except (ValueError,RuntimeError,OSError):notices.append('llm-usage 연결을 확인하지 못했습니다. 등록된 프로필은 유지합니다.')
             self._sync_at=time.monotonic()
         state=self.store.read()
+        if not self._remote_reconcile_started:
+            self._remote_reconcile_started = True
+            threading.Thread(target=self._reconcile_remote_hosts, daemon=True,
+                             name='codex-remote-reconcile').start()
         if not any(Path(s['home']).resolve()==(Path.home()/'.codex').resolve() for s in state['sources']):
             def register(data):
                 Store._source(data,Path.home()/'.codex','original:local','기존 Codex')
