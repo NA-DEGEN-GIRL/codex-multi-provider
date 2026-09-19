@@ -68,7 +68,11 @@ max_concurrent_threads_per_session = 4
 '''
         for role, model in roles.items():
             common += f'\n[agents.{role}]\ndescription = {quoted("OpenAI / " + model + ". Choose according to the delegated task.")}\nconfig_file = "agents/{role}.toml"\n'
-            (home / 'agents' / (role + '.toml')).write_text(f'model = "{model}"\n', encoding='utf-8')
+            (home / 'agents' / (role + '.toml')).write_text(
+                f'name = "{role}"\nmodel = "{model}"\n'
+                'developer_instructions = "Complete only the delegated task with the available tools. '
+                'Read files before editing, verify results, and report accurately. Do not spawn further agents."\n',
+                encoding='utf-8')
         if mode == 'runtime':
             common += '''
 [agents.deepseek]

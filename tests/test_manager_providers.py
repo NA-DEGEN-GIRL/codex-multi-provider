@@ -309,6 +309,21 @@ class ProviderRegistryTests(unittest.TestCase):
             self.assertEqual(parsed['agents']['personal'], {'description': 'keep'})
             self.assertEqual(bool(parsed.get('model_providers')), enabled)
 
+    def test_generated_agent_role_files_satisfy_runtime_validation(self):
+        # Codex ignores a role file whose `name` is empty or that omits
+        # developer_instructions, and the settings panel then reports the
+        # manager-owned role as malformed.
+        saved = self.add_model()
+        files = self.registry.render_for_host(self.profile_home, True, [saved['model']['id']])['files']
+        roles = {name: content for name, content in files.items() if name.startswith('agents/')}
+        self.assertTrue(roles)
+        for name, content in roles.items():
+            parsed = tomllib.loads(content)
+            self.assertTrue(parsed.get('name', '').strip(), name)
+            self.assertTrue(parsed.get('developer_instructions', '').strip(), name)
+        self.assertIn('agents/cc_gpt_astra.toml', roles)
+        self.assertTrue(any(name.startswith('agents/cc_external_') for name in roles))
+
     def test_provider_markers_and_tables_inside_multiline_values_are_not_instructions(self):
         value = providers._BEGIN + '\n[windows]\nsandbox="fiction"\n' + providers._END
         text = 'developer_instructions = \'\'\'\n' + value + '\n\'\'\'\n'

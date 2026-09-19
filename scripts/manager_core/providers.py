@@ -34,6 +34,10 @@ _PROTOCOLS = {'responses', 'chat_completions', 'anthropic_messages'}
 _EFFORTS = {'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'}
 _BEGIN = '# BEGIN CODEX CONTROL CENTER PROVIDERS'
 _END = '# END CODEX CONTROL CENTER PROVIDERS'
+_GPT_ROLE_INSTRUCTIONS = ('You are a native GPT subagent for this workspace. '
+                        'Complete only the delegated task with the available tools. '
+                        'Read files before editing, verify results, and report accurately. '
+                        'Do not spawn further agents.')
 _INSTRUCTIONS = ('You are a coding agent using the configured external model. '
                  'Complete only the delegated task with the available tools. '
                  'Read files before editing, verify results, and report accurately. '
@@ -604,7 +608,9 @@ class ProviderRegistry:
             role = 'cc_gpt_' + label
             block += [f'[agents.{role}]', f'description = {_toml("OpenAI / " + model + ". Use the native GPT delegation path.")}',
                       f'config_file = "agents/{role}.toml"', '']
-            files[f'agents/{role}.toml'] = f'model = {_toml(model)}\n'
+            files[f'agents/{role}.toml'] = (f'name = {_toml(role)}\n'
+                f'model = {_toml(model)}\n'
+                f'developer_instructions = {_toml(_GPT_ROLE_INSTRUCTIONS)}\n')
         written = set()
         for provider, model in selected:
             pid = self._runtime_provider_id(provider)
@@ -623,7 +629,8 @@ class ProviderRegistry:
                                f'{external_namespace}.spawn_agent with agent_type={rid}, fresh context only. '
                                f'Reasoning effort is fixed to {model["reasoning_effort"]}.')
                 block += [f'[agents.{rid}]', f'description = {_toml(description)}', f'config_file = "agents/{rid}.toml"', '']
-                files[f'agents/{rid}.toml'] = (f'model = {_toml(model["wire_model_id"])}\n'
+                files[f'agents/{rid}.toml'] = (f'name = {_toml(rid)}\n'
+                    f'model = {_toml(model["wire_model_id"])}\n'
                     f'model_provider = {_toml(pid)}\nmodel_catalog_json = {_toml(str(config_path / catalog_file))}\n'
                     f'model_reasoning_effort = {_toml(model["reasoning_effort"])}\n'
                     f'model_context_window = {model_settings.context_limit(model)}\n'
