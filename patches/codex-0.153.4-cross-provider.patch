@@ -1,5 +1,5 @@
 diff --git a/codex-rs/Cargo.lock b/codex-rs/Cargo.lock
-index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2fc10630de 100644
+index e217b702497e6ff02969a51046f7ba887024f487..a5965af4d5d729417a0b1b33c629016c05b364d2 100644
 --- a/codex-rs/Cargo.lock
 +++ b/codex-rs/Cargo.lock
 @@ -394,7 +394,7 @@ checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
@@ -605,7 +605,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "anyhow",
   "async-channel",
-@@ -3484,7 +3485,7 @@ dependencies = [
+@@ -3484,11 +3485,12 @@ dependencies = [
  
  [[package]]
  name = "codex-http-client"
@@ -614,7 +614,12 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "bytes",
   "codex-utils-cargo-bin",
-@@ -3516,7 +3517,7 @@ dependencies = [
+  "codex-utils-rustls-provider",
++ "flate2",
+  "futures",
+  "http 1.4.0",
+  "native-tls",
+@@ -3516,7 +3518,7 @@ dependencies = [
  
  [[package]]
  name = "codex-image-generation-extension"
@@ -623,7 +628,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "base64 0.22.1",
   "codex-api",
-@@ -3543,7 +3544,7 @@ dependencies = [
+@@ -3543,7 +3545,7 @@ dependencies = [
  
  [[package]]
  name = "codex-install-context"
@@ -632,7 +637,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "codex-utils-absolute-path",
   "codex-utils-home-dir",
-@@ -3556,7 +3557,7 @@ dependencies = [
+@@ -3556,7 +3558,7 @@ dependencies = [
  
  [[package]]
  name = "codex-keyring-store"
@@ -641,7 +646,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "keyring",
   "tracing",
-@@ -3564,7 +3565,7 @@ dependencies = [
+@@ -3564,7 +3566,7 @@ dependencies = [
  
  [[package]]
  name = "codex-linux-sandbox"
@@ -650,7 +655,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "clap",
   "codex-core",
-@@ -3591,7 +3592,7 @@ dependencies = [
+@@ -3591,7 +3593,7 @@ dependencies = [
  
  [[package]]
  name = "codex-lmstudio"
@@ -659,7 +664,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "codex-core",
   "codex-http-client",
-@@ -3605,7 +3606,7 @@ dependencies = [
+@@ -3605,7 +3607,7 @@ dependencies = [
  
  [[package]]
  name = "codex-login"
@@ -668,7 +673,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "anyhow",
   "base64 0.22.1",
-@@ -3648,7 +3649,7 @@ dependencies = [
+@@ -3648,7 +3650,7 @@ dependencies = [
  
  [[package]]
  name = "codex-mcp"
@@ -677,7 +682,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "anyhow",
   "arc-swap",
-@@ -3688,7 +3689,7 @@ dependencies = [
+@@ -3688,7 +3690,7 @@ dependencies = [
  
  [[package]]
  name = "codex-mcp-extension"
@@ -686,7 +691,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "anyhow",
   "axum",
-@@ -3719,7 +3720,7 @@ dependencies = [
+@@ -3719,7 +3721,7 @@ dependencies = [
  
  [[package]]
  name = "codex-mcp-server"
@@ -695,7 +700,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "anyhow",
   "app_test_support",
-@@ -3758,7 +3759,7 @@ dependencies = [
+@@ -3758,7 +3760,7 @@ dependencies = [
  
  [[package]]
  name = "codex-memories-extension"
@@ -704,7 +709,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "codex-core",
   "codex-extension-api",
-@@ -3779,7 +3780,7 @@ dependencies = [
+@@ -3779,7 +3781,7 @@ dependencies = [
  
  [[package]]
  name = "codex-memories-read"
@@ -713,7 +718,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "codex-protocol",
   "codex-shell-command",
-@@ -3789,7 +3790,7 @@ dependencies = [
+@@ -3789,7 +3791,7 @@ dependencies = [
  
  [[package]]
  name = "codex-memories-write"
@@ -722,7 +727,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "anyhow",
   "chrono",
-@@ -3826,7 +3827,7 @@ dependencies = [
+@@ -3826,7 +3828,7 @@ dependencies = [
  
  [[package]]
  name = "codex-message-history"
@@ -731,7 +736,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "codex-config",
   "memchr",
-@@ -3840,7 +3841,7 @@ dependencies = [
+@@ -3840,7 +3842,7 @@ dependencies = [
  
  [[package]]
  name = "codex-model-provider"
@@ -740,7 +745,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "codex-agent-identity",
   "codex-api",
-@@ -3864,7 +3865,7 @@ dependencies = [
+@@ -3864,7 +3866,7 @@ dependencies = [
  
  [[package]]
  name = "codex-model-provider-info"
@@ -749,7 +754,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "codex-api",
   "codex-protocol",
-@@ -3881,7 +3882,7 @@ dependencies = [
+@@ -3881,7 +3883,7 @@ dependencies = [
  
  [[package]]
  name = "codex-models-manager"
@@ -758,7 +763,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "chrono",
   "codex-collaboration-mode-templates",
-@@ -3901,7 +3902,7 @@ dependencies = [
+@@ -3901,7 +3903,7 @@ dependencies = [
  
  [[package]]
  name = "codex-network-proxy"
@@ -767,7 +772,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "anyhow",
   "base64 0.22.1",
-@@ -3939,7 +3940,7 @@ dependencies = [
+@@ -3939,7 +3941,7 @@ dependencies = [
  
  [[package]]
  name = "codex-ollama"
@@ -776,7 +781,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "assert_matches",
   "async-stream",
-@@ -3959,7 +3960,7 @@ dependencies = [
+@@ -3959,7 +3961,7 @@ dependencies = [
  
  [[package]]
  name = "codex-otel"
@@ -785,7 +790,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "chrono",
   "codex-api",
-@@ -3992,7 +3993,7 @@ dependencies = [
+@@ -3992,7 +3994,7 @@ dependencies = [
  
  [[package]]
  name = "codex-otel-trace-websocket"
@@ -794,7 +799,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "anyhow",
   "axum",
-@@ -4003,7 +4004,7 @@ dependencies = [
+@@ -4003,7 +4005,7 @@ dependencies = [
  
  [[package]]
  name = "codex-plugin"
@@ -803,7 +808,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "codex-config",
   "codex-protocol",
-@@ -4017,7 +4018,7 @@ dependencies = [
+@@ -4017,7 +4019,7 @@ dependencies = [
  
  [[package]]
  name = "codex-process-hardening"
@@ -812,7 +817,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "libc",
   "pretty_assertions",
-@@ -4025,7 +4026,7 @@ dependencies = [
+@@ -4025,7 +4027,7 @@ dependencies = [
  
  [[package]]
  name = "codex-prompts"
@@ -821,7 +826,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "anyhow",
   "codex-context-fragments",
-@@ -4039,7 +4040,7 @@ dependencies = [
+@@ -4039,7 +4041,7 @@ dependencies = [
  
  [[package]]
  name = "codex-protocol"
@@ -830,7 +835,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "anyhow",
   "chardetng",
-@@ -4083,7 +4084,7 @@ dependencies = [
+@@ -4083,7 +4085,7 @@ dependencies = [
  
  [[package]]
  name = "codex-queue-extension"
@@ -839,7 +844,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "anyhow",
   "codex-core",
-@@ -4104,7 +4105,7 @@ dependencies = [
+@@ -4104,7 +4106,7 @@ dependencies = [
  
  [[package]]
  name = "codex-realtime-webrtc"
@@ -848,7 +853,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "anyhow",
   "codex-install-context",
-@@ -4117,7 +4118,7 @@ dependencies = [
+@@ -4117,7 +4119,7 @@ dependencies = [
  
  [[package]]
  name = "codex-response-debug-context"
@@ -857,7 +862,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "base64 0.22.1",
   "codex-api",
-@@ -4128,7 +4129,7 @@ dependencies = [
+@@ -4128,7 +4130,7 @@ dependencies = [
  
  [[package]]
  name = "codex-responses-api-proxy"
@@ -866,7 +871,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "anyhow",
   "clap",
-@@ -4145,7 +4146,7 @@ dependencies = [
+@@ -4145,7 +4147,7 @@ dependencies = [
  
  [[package]]
  name = "codex-rmcp-client"
@@ -875,7 +880,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "anyhow",
   "axum",
-@@ -4191,7 +4192,7 @@ dependencies = [
+@@ -4191,7 +4193,7 @@ dependencies = [
  
  [[package]]
  name = "codex-rollout"
@@ -884,7 +889,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "anyhow",
   "chrono",
-@@ -4218,7 +4219,7 @@ dependencies = [
+@@ -4218,7 +4220,7 @@ dependencies = [
  
  [[package]]
  name = "codex-rollout-trace"
@@ -893,7 +898,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "anyhow",
   "codex-code-mode",
-@@ -4234,7 +4235,7 @@ dependencies = [
+@@ -4234,7 +4236,7 @@ dependencies = [
  
  [[package]]
  name = "codex-sandboxing"
@@ -902,7 +907,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "anyhow",
   "appcontainer_common",
-@@ -4261,7 +4262,7 @@ dependencies = [
+@@ -4261,7 +4263,7 @@ dependencies = [
  
  [[package]]
  name = "codex-secrets"
@@ -911,7 +916,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "age",
   "anyhow",
-@@ -4282,7 +4283,7 @@ dependencies = [
+@@ -4282,7 +4284,7 @@ dependencies = [
  
  [[package]]
  name = "codex-shell-command"
@@ -920,7 +925,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "anyhow",
   "base64 0.22.1",
-@@ -4305,7 +4306,7 @@ dependencies = [
+@@ -4305,7 +4307,7 @@ dependencies = [
  
  [[package]]
  name = "codex-shell-escalation"
@@ -929,7 +934,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "anyhow",
   "clap",
-@@ -4325,7 +4326,7 @@ dependencies = [
+@@ -4325,7 +4327,7 @@ dependencies = [
  
  [[package]]
  name = "codex-skills"
@@ -938,7 +943,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "codex-protocol",
   "codex-shell-command",
-@@ -4342,7 +4343,7 @@ dependencies = [
+@@ -4342,7 +4344,7 @@ dependencies = [
  
  [[package]]
  name = "codex-skills-extension"
@@ -947,7 +952,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "assert_matches",
   "codex-analytics",
-@@ -4379,7 +4380,7 @@ dependencies = [
+@@ -4379,7 +4381,7 @@ dependencies = [
  
  [[package]]
  name = "codex-state"
@@ -956,7 +961,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "anyhow",
   "chrono",
-@@ -4403,7 +4404,7 @@ dependencies = [
+@@ -4403,7 +4405,7 @@ dependencies = [
  
  [[package]]
  name = "codex-stdio-to-uds"
@@ -965,7 +970,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "anyhow",
   "codex-uds",
-@@ -4415,7 +4416,7 @@ dependencies = [
+@@ -4415,7 +4417,7 @@ dependencies = [
  
  [[package]]
  name = "codex-terminal-detection"
@@ -974,7 +979,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "pretty_assertions",
   "tracing",
-@@ -4423,7 +4424,7 @@ dependencies = [
+@@ -4423,7 +4425,7 @@ dependencies = [
  
  [[package]]
  name = "codex-test-binary-support"
@@ -983,7 +988,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "codex-arg0",
   "tempfile",
-@@ -4431,7 +4432,7 @@ dependencies = [
+@@ -4431,7 +4433,7 @@ dependencies = [
  
  [[package]]
  name = "codex-thread-manager-sample"
@@ -992,7 +997,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "anyhow",
   "clap",
-@@ -4442,7 +4443,7 @@ dependencies = [
+@@ -4442,7 +4444,7 @@ dependencies = [
  
  [[package]]
  name = "codex-thread-store"
@@ -1001,7 +1006,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "chrono",
   "codex-app-server-protocol",
-@@ -4472,7 +4473,7 @@ dependencies = [
+@@ -4472,7 +4474,7 @@ dependencies = [
  
  [[package]]
  name = "codex-tools"
@@ -1010,7 +1015,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "bitflags 2.13.1",
   "codex-code-mode",
-@@ -4497,7 +4498,7 @@ dependencies = [
+@@ -4497,7 +4499,7 @@ dependencies = [
  
  [[package]]
  name = "codex-tui"
@@ -1019,7 +1024,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "anyhow",
   "app_test_support",
-@@ -4610,7 +4611,7 @@ dependencies = [
+@@ -4610,7 +4612,7 @@ dependencies = [
  
  [[package]]
  name = "codex-uds"
@@ -1028,7 +1033,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "async-io",
   "pretty_assertions",
-@@ -4622,7 +4623,7 @@ dependencies = [
+@@ -4622,7 +4624,7 @@ dependencies = [
  
  [[package]]
  name = "codex-utils-absolute-path"
@@ -1037,7 +1042,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "dirs",
   "dunce",
-@@ -4636,14 +4637,14 @@ dependencies = [
+@@ -4636,14 +4638,14 @@ dependencies = [
  
  [[package]]
  name = "codex-utils-approval-presets"
@@ -1054,7 +1059,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "base64 0.22.1",
   "codex-protocol",
-@@ -4657,7 +4658,7 @@ dependencies = [
+@@ -4657,7 +4659,7 @@ dependencies = [
  
  [[package]]
  name = "codex-utils-cache"
@@ -1063,7 +1068,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "lru",
   "sha1 0.10.6",
-@@ -4666,7 +4667,7 @@ dependencies = [
+@@ -4666,7 +4668,7 @@ dependencies = [
  
  [[package]]
  name = "codex-utils-cargo-bin"
@@ -1072,7 +1077,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "assert_cmd",
   "runfiles",
-@@ -4675,7 +4676,7 @@ dependencies = [
+@@ -4675,7 +4677,7 @@ dependencies = [
  
  [[package]]
  name = "codex-utils-cli"
@@ -1081,7 +1086,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "clap",
   "codex-protocol",
-@@ -4687,15 +4688,15 @@ dependencies = [
+@@ -4687,15 +4689,15 @@ dependencies = [
  
  [[package]]
  name = "codex-utils-elapsed"
@@ -1100,7 +1105,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "codex-git-utils",
   "codex-utils-absolute-path",
-@@ -4708,7 +4709,7 @@ dependencies = [
+@@ -4708,7 +4710,7 @@ dependencies = [
  
  [[package]]
  name = "codex-utils-home-dir"
@@ -1109,7 +1114,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "codex-utils-absolute-path",
   "dirs",
-@@ -4718,7 +4719,7 @@ dependencies = [
+@@ -4718,7 +4720,7 @@ dependencies = [
  
  [[package]]
  name = "codex-utils-image"
@@ -1118,7 +1123,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "base64 0.22.1",
   "codex-utils-cache",
-@@ -4731,7 +4732,7 @@ dependencies = [
+@@ -4731,7 +4733,7 @@ dependencies = [
  
  [[package]]
  name = "codex-utils-json-to-toml"
@@ -1127,7 +1132,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "pretty_assertions",
   "serde_json",
-@@ -4740,7 +4741,7 @@ dependencies = [
+@@ -4740,7 +4742,7 @@ dependencies = [
  
  [[package]]
  name = "codex-utils-oss"
@@ -1136,7 +1141,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "codex-core",
   "codex-lmstudio",
-@@ -4750,7 +4751,7 @@ dependencies = [
+@@ -4750,7 +4752,7 @@ dependencies = [
  
  [[package]]
  name = "codex-utils-output-truncation"
@@ -1145,7 +1150,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "codex-protocol",
   "codex-utils-string",
-@@ -4759,7 +4760,7 @@ dependencies = [
+@@ -4759,7 +4761,7 @@ dependencies = [
  
  [[package]]
  name = "codex-utils-path"
@@ -1154,7 +1159,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "codex-utils-absolute-path",
   "dunce",
-@@ -4769,7 +4770,7 @@ dependencies = [
+@@ -4769,7 +4771,7 @@ dependencies = [
  
  [[package]]
  name = "codex-utils-path-uri"
@@ -1163,7 +1168,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "base64 0.22.1",
   "codex-utils-absolute-path",
-@@ -4785,7 +4786,7 @@ dependencies = [
+@@ -4785,7 +4787,7 @@ dependencies = [
  
  [[package]]
  name = "codex-utils-plugins"
@@ -1172,7 +1177,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "codex-exec-server",
   "codex-exec-server-protocol",
-@@ -4799,7 +4800,7 @@ dependencies = [
+@@ -4799,7 +4801,7 @@ dependencies = [
  
  [[package]]
  name = "codex-utils-pty"
@@ -1181,7 +1186,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "anyhow",
   "filedescriptor",
-@@ -4815,7 +4816,7 @@ dependencies = [
+@@ -4815,7 +4817,7 @@ dependencies = [
  
  [[package]]
  name = "codex-utils-readiness"
@@ -1190,7 +1195,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "assert_matches",
   "thiserror 2.0.18",
-@@ -4825,7 +4826,7 @@ dependencies = [
+@@ -4825,7 +4827,7 @@ dependencies = [
  
  [[package]]
  name = "codex-utils-redacted-string"
@@ -1199,7 +1204,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "schemars 0.8.22",
   "serde",
-@@ -4833,14 +4834,14 @@ dependencies = [
+@@ -4833,14 +4835,14 @@ dependencies = [
  
  [[package]]
  name = "codex-utils-rustls-provider"
@@ -1216,7 +1221,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "codex-protocol",
   "codex-utils-absolute-path",
-@@ -4849,7 +4850,7 @@ dependencies = [
+@@ -4849,7 +4851,7 @@ dependencies = [
  
  [[package]]
  name = "codex-utils-sleep-inhibitor"
@@ -1225,7 +1230,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "core-foundation 0.9.4",
   "libc",
-@@ -4859,14 +4860,14 @@ dependencies = [
+@@ -4859,14 +4861,14 @@ dependencies = [
  
  [[package]]
  name = "codex-utils-stream-parser"
@@ -1242,7 +1247,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "pretty_assertions",
   "regex-lite",
-@@ -4876,14 +4877,14 @@ dependencies = [
+@@ -4876,14 +4878,14 @@ dependencies = [
  
  [[package]]
  name = "codex-utils-template"
@@ -1259,7 +1264,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "pretty_assertions",
   "v8",
-@@ -4891,7 +4892,7 @@ dependencies = [
+@@ -4891,7 +4893,7 @@ dependencies = [
  
  [[package]]
  name = "codex-voice-host"
@@ -1268,7 +1273,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "anyhow",
   "codex-install-context",
-@@ -4905,7 +4906,7 @@ dependencies = [
+@@ -4905,7 +4907,7 @@ dependencies = [
  
  [[package]]
  name = "codex-web-search-extension"
@@ -1277,7 +1282,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "codex-api",
   "codex-core",
-@@ -4926,7 +4927,7 @@ dependencies = [
+@@ -4926,7 +4928,7 @@ dependencies = [
  
  [[package]]
  name = "codex-websocket-client"
@@ -1286,7 +1291,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "codex-http-client",
   "codex-utils-rustls-provider",
-@@ -4942,7 +4943,7 @@ dependencies = [
+@@ -4942,7 +4944,7 @@ dependencies = [
  
  [[package]]
  name = "codex-windows-sandbox"
@@ -1295,7 +1300,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "anyhow",
   "base64 0.22.1",
-@@ -4968,7 +4969,7 @@ dependencies = [
+@@ -4968,7 +4970,7 @@ dependencies = [
  
  [[package]]
  name = "codex-workload-identity"
@@ -1304,7 +1309,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "codex-http-client",
   "pretty_assertions",
-@@ -4983,7 +4984,7 @@ dependencies = [
+@@ -4983,7 +4985,7 @@ dependencies = [
  
  [[package]]
  name = "codex-worktree"
@@ -1313,7 +1318,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "anyhow",
   "codex-git-utils",
-@@ -5222,7 +5223,7 @@ dependencies = [
+@@ -5222,7 +5224,7 @@ dependencies = [
  
  [[package]]
  name = "core_test_support"
@@ -1322,7 +1327,7 @@ index e217b702497e6ff02969a51046f7ba887024f487..34c69b24e0699d20e702e5493d605a2f
  dependencies = [
   "anyhow",
   "assert_cmd",
-@@ -9520,7 +9521,7 @@ dependencies = [
+@@ -9520,7 +9522,7 @@ dependencies = [
  
  [[package]]
  name = "mcp_test_support"
@@ -31870,6 +31875,149 @@ index a6f728deb176a4dca96c53c37b45531100610857..21afba89b87da240076d1b8885779dd9
  fn mock_responses_config(server_uri: &str) -> MockResponsesConfig {
      MockResponsesConfig::new(server_uri)
          .with_model("gpt-5.4")
+diff --git a/codex-rs/codex-api/src/endpoint/responses.rs b/codex-rs/codex-api/src/endpoint/responses.rs
+index 69a8c686d142bc75548dd56c96cf33dcddda09a7..c9eebae951e7830130676edd078b9f98e396a533 100644
+--- a/codex-rs/codex-api/src/endpoint/responses.rs
++++ b/codex-rs/codex-api/src/endpoint/responses.rs
+@@ -13,6 +13,7 @@ use crate::telemetry::SseTelemetry;
+ use codex_client::EncodedJsonBody;
+ use codex_client::HttpTransport;
+ use codex_client::RequestCompression;
++use codex_client::TransportError;
+ use codex_client::RequestTelemetry;
+ use codex_protocol::protocol::SessionSource;
+ use http::HeaderMap;
+@@ -46,6 +47,36 @@ impl ResponsesEndpoint {
+     }
+ }
+ 
++/// Bodies smaller than this stay uncompressed so a small turn is byte-identical.
++const AUTO_COMPRESSION_MIN_BYTES: usize = 256 * 1024;
++
++/// A 4xx that names the request encoding is a compression rejection, not a
++/// conversation error, so exactly one uncompressed retry is allowed.
++fn is_encoding_rejection(error: &ApiError) -> bool {
++    let ApiError::Transport(TransportError::Http { status, body, .. }) = error else {
++        return false;
++    };
++    if !status.is_client_error() {
++        return false;
++    }
++    if status.as_u16() == 415 {
++        return true;
++    }
++    let Some(body) = body.as_deref() else {
++        return false;
++    };
++    let body = body.to_ascii_lowercase();
++    [
++        "content-encoding",
++        "content_encoding",
++        "encoding",
++        "compression",
++        "unsupported content",
++    ]
++    .iter()
++    .any(|needle| body.contains(needle))
++}
++
+ pub struct ResponsesClient<T: HttpTransport> {
+     session: EndpointSession<T>,
+     sse_telemetry: Option<Arc<dyn SseTelemetry>>,
+@@ -149,6 +180,15 @@ impl<T: HttpTransport> ResponsesClient<T> {
+     ) -> Result<ResponseStream, ApiError> {
+         let body = EncodedJsonBody::encode(&body)
+             .map_err(|e| ApiError::Stream(format!("failed to encode responses request: {e}")))?;
++        // `auto` keeps small turns byte-identical and only pays for compression
++        // when the serialized body is large enough to matter.
++        let compression = match compression {
++            Compression::Auto if body.as_bytes().len() >= AUTO_COMPRESSION_MIN_BYTES => {
++                Compression::Zstd
++            }
++            Compression::Auto => Compression::None,
++            other => other,
++        };
+         self.stream_encoded(body, extra_headers, compression, turn_state)
+             .await
+     }
+@@ -159,11 +199,44 @@ impl<T: HttpTransport> ResponsesClient<T> {
+         extra_headers: HeaderMap,
+         compression: Compression,
+         turn_state: Option<Arc<OnceLock<String>>>,
++    ) -> Result<ResponseStream, ApiError> {
++        match self
++            .stream_encoded_once(
++                body.clone(),
++                extra_headers.clone(),
++                compression,
++                turn_state.clone(),
++            )
++            .await
++        {
++            Err(error) if compression != Compression::None && is_encoding_rejection(&error) => {
++                // A provider that refuses `Content-Encoding` must not lose the
++                // turn: retry the exact same payload once, uncompressed.
++                tracing::warn!(
++                    "provider rejected compressed request body; retrying once without request compression"
++                );
++                self.stream_encoded_once(body, extra_headers, Compression::None, turn_state)
++                    .await
++            }
++            other => other,
++        }
++    }
++
++    async fn stream_encoded_once(
++        &self,
++        body: EncodedJsonBody,
++        extra_headers: HeaderMap,
++        compression: Compression,
++        turn_state: Option<Arc<OnceLock<String>>>,
+     ) -> Result<ResponseStream, ApiError> {
+         let request_compression = match compression {
+-            Compression::None => RequestCompression::None,
++            Compression::None | Compression::Auto => RequestCompression::None,
+             Compression::Zstd => RequestCompression::Zstd,
+         };
++        let max_body_bytes = std::env::var("CODEX_MAX_REQUEST_BYTES")
++            .ok()
++            .and_then(|value| value.trim().parse::<u64>().ok())
++            .filter(|limit| *limit > 0);
+ 
+         let stream_response = self
+             .session
+@@ -178,6 +251,7 @@ impl<T: HttpTransport> ResponsesClient<T> {
+                         HeaderValue::from_static("text/event-stream"),
+                     );
+                     req.compression = request_compression;
++                    req.max_body_bytes = max_body_bytes;
+                 },
+             )
+             .await?;
+diff --git a/codex-rs/codex-api/src/provider.rs b/codex-rs/codex-api/src/provider.rs
+index 849513af557446763065813fbc719cf819b5898b..aafb40bc23d640ed70fe8ac9ab838b13345c2cb8 100644
+--- a/codex-rs/codex-api/src/provider.rs
++++ b/codex-rs/codex-api/src/provider.rs
+@@ -81,6 +81,7 @@ impl Provider {
+             headers: self.headers.clone(),
+             body: None,
+             compression: RequestCompression::None,
++            max_body_bytes: None,
+             timeout: None,
+         }
+     }
+diff --git a/codex-rs/codex-api/src/requests/responses.rs b/codex-rs/codex-api/src/requests/responses.rs
+index 9a16ceb1c44c0986183acc084633627a5edc10eb..7c83fed7c41c88c9335c90034675462dc89c75c0 100644
+--- a/codex-rs/codex-api/src/requests/responses.rs
++++ b/codex-rs/codex-api/src/requests/responses.rs
+@@ -2,5 +2,7 @@
+ pub enum Compression {
+     #[default]
+     None,
++    /// Compress only when the encoded body is large enough to benefit.
++    Auto,
+     Zstd,
+ }
 diff --git a/codex-rs/config/src/config_toml.rs b/codex-rs/config/src/config_toml.rs
 index 5f0cc99a4740803805791250d7e87332673c6d85..a2aff0cf331bd71b2991d38173efa0e77e6f1e6d 100644
 --- a/codex-rs/config/src/config_toml.rs
@@ -34617,7 +34765,7 @@ index 6abe3610d82c7c33813d8e0ce441b95c46d03031..abb5ba5d58330359720440d298e31349
          },
      )]);
 diff --git a/codex-rs/core/src/client.rs b/codex-rs/core/src/client.rs
-index 9f03c939e09c87824aabb6108c051786908d6204..bfee9a2f67af07a996a8378c1a6f0f6022ea93b6 100644
+index 9f03c939e09c87824aabb6108c051786908d6204..cf776bd242fdc00b0fcd3ba343d75e6e26158cc1 100644
 --- a/codex-rs/core/src/client.rs
 +++ b/codex-rs/core/src/client.rs
 @@ -121,6 +121,7 @@ use crate::attestation::X_OAI_ATTESTATION_HEADER;
@@ -34646,6 +34794,44 @@ index 9f03c939e09c87824aabb6108c051786908d6204..bfee9a2f67af07a996a8378c1a6f0f60
          }
          let reasoning = self.build_reasoning(model_info, effort, summary);
          let stream_options = (self.state.concurrent_reasoning_summaries_enabled
+@@ -1533,14 +1525,31 @@ impl ModelClientSession {
+     }
+ 
+     fn responses_request_compression(&self, auth: Option<&CodexAuth>) -> Compression {
+-        if self.client.state.enable_request_compression
+-            && auth.is_some_and(CodexAuth::uses_codex_backend)
+-            && self.client.state.provider.info().is_openai()
++        if !self.client.state.enable_request_compression {
++            return Compression::None;
++        }
++        // An explicit per-profile override wins over the provider default.
++        match std::env::var("CODEX_REQUEST_COMPRESSION")
++            .ok()
++            .as_deref()
++            .map(str::trim)
+         {
+-            Compression::Zstd
+-        } else {
+-            Compression::None
++            Some("off") | Some("none") | Some("") => return Compression::None,
++            Some("zstd") => return Compression::Zstd,
++            Some("auto") => return Compression::Auto,
++            Some(_) | None => {}
++        }
++        if self.client.state.provider.info().is_openai() {
++            return if auth.is_some_and(CodexAuth::uses_codex_backend) {
++                Compression::Zstd
++            } else {
++                Compression::None
++            };
+         }
++        // Custom OpenAI-compatible providers (external APIs and local backends)
++        // use lossless zstd above the automatic size threshold. Providers that
++        // reject `Content-Encoding` are retried once without compression.
++        Compression::Auto
+     }
+ 
+     /// Streams a turn via the OpenAI Responses API.
 diff --git a/codex-rs/core/src/client_common.rs b/codex-rs/core/src/client_common.rs
 index f2d6be2a232465c988fc9bc5869438119034824a..2c6520e46416e355b6d89ba2b14563142b8ba87c 100644
 --- a/codex-rs/core/src/client_common.rs
@@ -43308,6 +43494,110 @@ index 0000000000000000000000000000000000000000..a42b4e983bc20861327112b1c305fea2
 +        self.handler.create_diff_consumer()
 +    }
 +}
+diff --git a/codex-rs/core/src/tools/handlers/view_image.rs b/codex-rs/core/src/tools/handlers/view_image.rs
+index 7f80995857c867a480f86e9f29269562edf5da05..72aba8dddd0379354b3a01fd5b6df2c1230694af 100644
+--- a/codex-rs/core/src/tools/handlers/view_image.rs
++++ b/codex-rs/core/src/tools/handlers/view_image.rs
+@@ -194,8 +194,35 @@ impl ViewImageHandler {
+             DEFAULT_IMAGE_DETAIL
+         };
+ 
++        // A single oversized screenshot would otherwise be re-sent on every
++        // later turn. When a byte cap is configured, replace the payload with a
++        // marker that keeps the original path so the model can re-read a
++        // smaller crop instead of losing the reference entirely.
++        let max_inline_bytes = std::env::var("CODEX_MAX_INLINE_IMAGE_BYTES")
++            .ok()
++            .and_then(|value| value.trim().parse::<usize>().ok())
++            .filter(|limit| *limit > 0);
++        let omitted = max_inline_bytes
++            .filter(|limit| file_bytes.len() > *limit)
++            .map(|limit| {
++                format!(
++                    "image omitted: {} bytes at {} exceeds CODEX_MAX_INLINE_IMAGE_BYTES={}; request a smaller crop or downscale the file before viewing it again",
++                    file_bytes.len(),
++                    model_visible_path,
++                    limit
++                )
++            });
++        if omitted.is_some() {
++            tracing::info!(
++                bytes = file_bytes.len(),
++                "view_image payload omitted by byte budget"
++            );
++        }
+         // The history insertion path owns image preparation and resizing.
+-        let image_url = data_url_from_bytes("application/octet-stream", &file_bytes);
++        let image_url = match omitted {
++            Some(_) => None,
++            None => Some(data_url_from_bytes("application/octet-stream", &file_bytes)),
++        };
+ 
+         let item = TurnItem::ImageView(ImageViewItem {
+             id: call_id,
+@@ -208,6 +235,7 @@ impl ViewImageHandler {
+             image_url,
+             image_detail,
+             unified_image_budget: self.options.unified_image_budget,
++            omitted,
+         }))
+     }
+ }
+@@ -219,14 +247,20 @@ impl CoreToolRuntime for ViewImageHandler {
+ }
+ 
+ pub struct ViewImageOutput {
+-    image_url: String,
++    image_url: Option<String>,
+     image_detail: ImageDetail,
+     unified_image_budget: bool,
++    /// Present when the byte budget replaced the payload with a path marker.
++    omitted: Option<String>,
+ }
+ 
+ impl ToolOutput for ViewImageOutput {
+     fn log_output(&self) -> String {
+-        format!("<image data URL omitted: {} bytes>", self.image_url.len())
++        match (&self.image_url, &self.omitted) {
++            (Some(url), _) => format!("<image data URL omitted: {} bytes>", url.len()),
++            (None, Some(reason)) => format!("<image omitted: {reason}>"),
++            (None, None) => "<image unavailable>".to_string(),
++        }
+     }
+ 
+     fn success_for_logging(&self) -> bool {
+@@ -234,11 +268,17 @@ impl ToolOutput for ViewImageOutput {
+     }
+ 
+     fn to_response_item(&self, call_id: &str, _payload: &ToolPayload) -> ResponseInputItem {
+-        let body =
+-            FunctionCallOutputBody::ContentItems(vec![FunctionCallOutputContentItem::InputImage {
+-                image_url: self.image_url.clone(),
++        let items = match (&self.image_url, &self.omitted) {
++            (Some(image_url), _) => vec![FunctionCallOutputContentItem::InputImage {
++                image_url: image_url.clone(),
+                 detail: Some(self.image_detail),
+-            }]);
++            }],
++            (None, Some(reason)) => vec![FunctionCallOutputContentItem::InputText {
++                text: reason.clone(),
++            }],
++            (None, None) => Vec::new(),
++        };
++        let body = FunctionCallOutputBody::ContentItems(items);
+         let output = FunctionCallOutputPayload {
+             body,
+             success: Some(true),
+@@ -251,6 +291,9 @@ impl ToolOutput for ViewImageOutput {
+     }
+ 
+     fn code_mode_result(&self, _payload: &ToolPayload) -> serde_json::Value {
++        if let Some(reason) = &self.omitted {
++            return serde_json::json!({ "image_omitted": reason });
++        }
+         if self.unified_image_budget {
+             serde_json::json!({ "image_url": self.image_url })
+         } else {
 diff --git a/codex-rs/core/src/tools/parallel.rs b/codex-rs/core/src/tools/parallel.rs
 index 7de566390bf06f6de72b93dbc5f893999c52d41e..6448396f4e23aba985539ddbb7cfba12e16cf505 100644
 --- a/codex-rs/core/src/tools/parallel.rs
@@ -48513,6 +48803,112 @@ index 0000000000000000000000000000000000000000..43d7cba1bf5762975a9dca9441706697
 +    assert!(refreshed.has_pending_work());
 +    assert!(refreshed.try_seal_for_managed_close().is_none());
 +}
+diff --git a/codex-rs/http-client/Cargo.toml b/codex-rs/http-client/Cargo.toml
+index 2d54ca7158900eda362091c71e8d1bd742459d4c..754391492f0b65a073adf359c7c1abe509793634 100644
+--- a/codex-rs/http-client/Cargo.toml
++++ b/codex-rs/http-client/Cargo.toml
+@@ -6,6 +6,7 @@ version.workspace = true
+ 
+ [dependencies]
+ bytes = { workspace = true }
++flate2 = { workspace = true }
+ codex-utils-rustls-provider = { workspace = true }
+ futures = { workspace = true }
+ http = { workspace = true }
+diff --git a/codex-rs/http-client/src/request.rs b/codex-rs/http-client/src/request.rs
+index 7608860c3daa7d43f846a43d525514d8604bfe07..c327848b326ee8f96530cf6dc184bccb3547769a 100644
+--- a/codex-rs/http-client/src/request.rs
++++ b/codex-rs/http-client/src/request.rs
+@@ -43,6 +43,7 @@ pub enum RequestCompression {
+     #[default]
+     None,
+     Zstd,
++    Gzip,
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+@@ -80,9 +81,23 @@ pub struct Request {
+     pub headers: HeaderMap,
+     pub body: Option<RequestBody>,
+     pub compression: RequestCompression,
++    /// Optional local byte budget for the compact JSON body, checked before
++    /// compression so a request that cannot fit is reported locally instead of
++    /// failing at the provider or a local reverse proxy.
++    pub max_body_bytes: Option<u64>,
+     pub timeout: Option<Duration>,
+ }
+ 
++
++/// Deflate a request body with gzip for providers that reject `Content-Encoding: zstd`.
++fn gzip_encode(bytes: &[u8]) -> Result<Vec<u8>, String> {
++    use std::io::Write;
++
++    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
++    encoder.write_all(bytes).map_err(|err| err.to_string())?;
++    encoder.finish().map_err(|err| err.to_string())
++}
++
+ impl Request {
+     pub fn new(method: Method, url: String) -> Self {
+         Self {
+@@ -91,6 +106,7 @@ impl Request {
+             headers: HeaderMap::new(),
+             body: None,
+             compression: RequestCompression::None,
++            max_body_bytes: None,
+             timeout: None,
+         }
+     }
+@@ -206,6 +222,10 @@ impl Request {
+                         .map_err(|err| err.to_string())?,
+                     HeaderValue::from_static("zstd"),
+                 ),
++                RequestCompression::Gzip => (
++                    gzip_encode(body.as_bytes())?,
++                    HeaderValue::from_static("gzip"),
++                ),
+             };
+             let post_compression_bytes = compressed.len();
+             let compression_duration = compression_start.elapsed();
+@@ -216,7 +236,7 @@ impl Request {
+                 pre_compression_bytes,
+                 post_compression_bytes,
+                 compression_duration_ms = compression_duration.as_millis(),
+-                "Compressed request body with zstd"
++                "Compressed request body"
+             );
+ 
+             Bytes::from(compressed)
+@@ -224,6 +244,17 @@ impl Request {
+             body.bytes.clone()
+         };
+ 
++        // The budget applies to what is actually sent, so a compressed body is
++        // measured after compression.
++        if let Some(limit) = self.max_body_bytes
++            && bytes.len() as u64 > limit
++        {
++            return Err(format!(
++                "request body is {} bytes which exceeds the configured limit of {limit} bytes; compact the conversation or start a new thread",
++                bytes.len()
++            ));
++        }
++
+         if !headers.contains_key(http::header::CONTENT_TYPE) {
+             headers.insert(
+                 http::header::CONTENT_TYPE,
+diff --git a/codex-rs/http-client/src/transport.rs b/codex-rs/http-client/src/transport.rs
+index 337b1e86759e230cc32823e50a98292a78c1b9d3..47149d7fbea38cc17c5672573acd5c866e948bac 100644
+--- a/codex-rs/http-client/src/transport.rs
++++ b/codex-rs/http-client/src/transport.rs
+@@ -58,6 +58,7 @@ impl ReqwestTransport {
+             headers: _,
+             body: _,
+             compression: _,
++            max_body_bytes: _,
+             timeout,
+         } = req;
+ 
 diff --git a/codex-rs/model-provider/src/auth.rs b/codex-rs/model-provider/src/auth.rs
 index f4d276465d18bba5db9e0e33c6aacdbb213af3b6..be38b766dc850083fd4038490ae88e1ad51c02b3 100644
 --- a/codex-rs/model-provider/src/auth.rs
