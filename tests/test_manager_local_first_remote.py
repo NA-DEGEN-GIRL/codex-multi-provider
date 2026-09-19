@@ -9,9 +9,10 @@ from uuid import uuid4
 import test_manager_update_hooks as fixtures
 from test_manager_remote_restore import Fleet
 from manager_core.profile_restart import ProfileRestarts
+from manager_core.ssh_inventory import SshInventory
 from manager_core.ssh_shim import validate_binding
-from manager_core.store import atomic_json
-from manager_core.updates import UpdateError
+from manager_core.store import Store, atomic_json
+from manager_core.updates import UpdateError, _lock_file, _unlock_file
 
 
 class LocalFirstRemoteTests(unittest.TestCase):
@@ -76,6 +77,85 @@ class LocalFirstRemoteTests(unittest.TestCase):
         self.assertEqual(self.instances.observe(self.store.profile(self.profile['id']))['status'], 'running')
         self.assertEqual(self.fixture.closes, [])
         self.assertNotIn('private diagnostic', json.dumps(self.job()))
+
+    def test_remote_host_snapshot_and_gate_exclude_a_late_ssh_enrollment(self):
+        inventory = SshInventory(self.fixture.root, identity=lambda _: {})
+        inventory.prepare(self.profile['id'], self.profile['generation'])
+        snapshot_saved, publish_gate, attempted = (threading.Event() for _ in range(3))
+        errors, admitted, shown = [], [], []
+        save_lease = self.hooks._save_lease
+        mutate = inventory.store.mutate
+
+        def pause_after_snapshot(lease):
+            save_lease(lease)
+            if not snapshot_saved.is_set():
+                snapshot_saved.set()
+                if not publish_gate.wait(3):
+                    raise TimeoutError('fixture did not release gate publication')
+
+        def observe_attempt(operation):
+            attempted.set()
+            return mutate(operation)
+
+        def open_local():
+            try:
+                shown.append(self.hooks.open_local_for_remote_reconcile(self.profile['id']))
+            except Exception as error:
+                errors.append(('open', error))
+
+        def connect_late():
+            try:
+                with inventory.execution(self.profile['id'], self.profile['generation'],
+                                         dict(operation='native-start', alias='fixture-late')):
+                    admitted.append(True)
+            except Exception as error:
+                errors.append(('ssh', error))
+
+        # A host admitted before the fence must appear even while its local
+        # command is still active. A competing new host must be fenced before
+        # its execution body runs, rather than omitted from the saved cohort.
+        with inventory.execution(self.profile['id'], self.profile['generation'],
+                                 dict(operation='native-start', alias='fixture-early')):
+            opener = threading.Thread(target=open_local)
+            connector = threading.Thread(target=connect_late)
+            try:
+                with patch.object(self.hooks, '_save_lease', side_effect=pause_after_snapshot), \
+                     patch.object(inventory.store, 'mutate', side_effect=observe_attempt):
+                    opener.start()
+                    self.assertTrue(snapshot_saved.wait(2))
+                    probe = None
+                    try:
+                        # Prove the snapshot-to-gate interval excludes a
+                        # separate file handle, without a scheduling race.
+                        with self.assertRaises(UpdateError):
+                            probe = _lock_file(self.store.directory / 'state.lock')
+                    finally:
+                        if probe is not None:
+                            _unlock_file(probe)
+                    connector.start()
+                    self.assertTrue(attempted.wait(2))
+                    publish_gate.set()
+                    opener.join(3)
+                    connector.join(3)
+            finally:
+                publish_gate.set()
+                for worker in (opener, connector):
+                    if worker.ident is not None:
+                        worker.join(3)
+            self.assertFalse(opener.is_alive() or connector.is_alive())
+            self.assertEqual(admitted, [])
+            self.assertEqual(len(shown), 1)
+            self.assertEqual(len(errors), 1)
+            source, error = errors[0]
+            self.assertEqual(source, 'ssh')
+            self.assertIsInstance(error, UpdateError)
+            self.assertEqual(error.code, 'ssh_settings_pending')
+            lease = json.loads(self.hooks._lease_path(shown[0][1]).read_text())
+            aliases = {record['alias'] for record in lease['profiles'][0]['remotes']}
+            self.assertEqual(aliases, {'fixture-a', 'fixture-b', 'fixture-early'})
+            stored = self.store.read()['ssh_inventory'][self.profile['id']]
+            self.assertEqual(set(stored['hosts']), aliases)
+            self.assertEqual(self.fleet.calls, [])
 
     def test_active_remote_waits_while_new_local_work_is_unfenced(self):
         self.open()
@@ -206,6 +286,78 @@ class LocalFirstRemoteTests(unittest.TestCase):
         self.fleet.fail_prepare = None
         self.pending.pop()()
         self.assertEqual(self.gate()['state'], 'released')
+
+    def test_old_runtime_preflight_leaves_state_available_for_unrelated_updates(self):
+        self.failed_legacy_preparation()
+        peer = self.store.add_profile('unrelated profile')
+        independent = Store(self.fixture.root)
+        finished = threading.Event()
+        errors = []
+        original_live = self.hooks._live
+
+        def update_peer():
+            try:
+                independent.mutate(lambda data: independent.profile(peer['id'], data).update(alias='updated peer'))
+            except Exception as error:
+                errors.append(error)
+            finally:
+                finished.set()
+
+        worker = threading.Thread(target=update_peer)
+
+        def preflight(profile):
+            worker.start()
+            self.assertTrue(finished.wait(1), 'old-runtime preflight held the shared state lock')
+            return original_live(profile)
+
+        try:
+            with patch.object(self.hooks, '_live', side_effect=preflight):
+                shown, _ = self.hooks.open_local_for_remote_reconcile(self.profile['id'])
+        finally:
+            if worker.ident is not None:
+                worker.join(3)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(shown['state'], 'launched')
+        self.assertEqual(self.store.profile(peer['id'])['alias'], 'updated peer')
+
+    def test_old_runtime_preflight_revalidates_its_profile_gates_and_saved_lease(self):
+        self.failed_legacy_preparation()
+        baseline = self.store.read()
+        prior = baseline['profile_maintenance'][self.profile['id']]
+        lease_path = self.hooks._lease_path(prior['transaction_id'])
+        saved_lease = json.loads(lease_path.read_text())
+        original_live = self.hooks._live
+
+        for transition in ('generation', 'profile_gate', 'ssh_gate', 'saved_lease'):
+            with self.subTest(transition=transition):
+                def restore(data):
+                    data.clear()
+                    data.update(deepcopy(baseline))
+                self.store.mutate(restore)
+                atomic_json(lease_path, saved_lease)
+
+                def preflight(profile):
+                    result = original_live(profile)
+                    if transition == 'saved_lease':
+                        atomic_json(lease_path, {**saved_lease, 'state': 'changed'})
+                    else:
+                        def change(data):
+                            if transition == 'generation':
+                                self.store.profile(self.profile['id'], data)['generation'] = str(uuid4())
+                            elif transition == 'profile_gate':
+                                data['profile_maintenance'][self.profile['id']]['transaction_id'] = str(uuid4())
+                            else:
+                                data.setdefault('ssh_maintenance', {})[self.profile['id']] = dict(
+                                    state='held', transaction_id=str(uuid4()))
+                        self.store.mutate(change)
+                    return result
+
+                with patch.object(self.hooks, '_live', side_effect=preflight):
+                    with self.assertRaises(UpdateError) as caught:
+                        self.hooks.open_local_for_remote_reconcile(self.profile['id'])
+                self.assertEqual(caught.exception.code, 'restoration_changed')
+                self.assertEqual(self.instances.show_calls, [])
 
     def test_global_maintenance_is_never_bypassed(self):
         self.store.mutate(lambda d: d.update(update_maintenance=dict(state='held', transaction_id=str(uuid4()))))

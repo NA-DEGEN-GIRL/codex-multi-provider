@@ -382,7 +382,7 @@ def _load_manifest(environment: dict[str, str]) -> tuple[dict, Path]:
 
 def _audit(path: Path, event: dict) -> None:
     try:
-        allowed = {key: event[key] for key in ('operation', 'alias', 'profile_id', 'revision', 'code', 'stage', 'exit_code') if key in event}
+        allowed = {key: event[key] for key in ('operation', 'alias', 'profile_id', 'revision', 'code', 'stage', 'error_type', 'exit_code') if key in event}
         allowed.update(at=datetime.now(timezone.utc).isoformat(), proxy_pid=os.getpid())
         with path.with_name('ssh-routing.jsonl').open('a', encoding='utf-8') as stream:
             stream.write(json.dumps(allowed, ensure_ascii=True) + '\n')
@@ -648,9 +648,11 @@ def main(arguments: list[str] | None = None) -> int:
             generation = manifest['generation']
             stage = 'wait_for_settings'
             wait_for_settings(args, manifest)
+            stage = 'reload_manifest'
             manifest, path = _load_manifest(os.environ)
             if manifest.get('generation') != generation:
                 raise ShimError('ssh_generation_changed', 'SSH 프로필 실행이 변경되었습니다.')
+        stage = 'route_arguments'
         executable = Path(manifest.get('real_ssh', ''))
         if not executable.is_absolute() or not executable.is_file():
             raise ShimError('real_ssh_missing', 'The original OpenSSH executable is unavailable.')
@@ -669,17 +671,20 @@ def main(arguments: list[str] | None = None) -> int:
             from manager_core.ssh_inventory import SshInventory
             admission = SshInventory(manifest['inventory_root']).execution(
                 manifest['profile_id'], manifest['generation'], event)
+        stage = 'enroll_ssh'
         with admission:
             stage = 'execute'
             return _execute(executable, rewritten, args, manifest, path, event)
     except (RuntimeError, ValueError, KeyError, TypeError, OSError) as error:
         from manager_core.remote import RemoteError
-        known = isinstance(error, (ShimError,RemoteError))
+        from manager_core.updates import UpdateError
+        known = isinstance(error, (ShimError, RemoteError, UpdateError))
         code = error.code if known else 'shim_start_failed'
         if path is not None:
             invocation=parse_invocation(args)
             alias=invocation.destination if isinstance(invocation.destination,str) and ALIAS.fullmatch(invocation.destination) else None
-            _audit(path, {'operation': 'blocked', 'code': code, 'alias': alias, 'stage': stage})
+            _audit(path, {'operation': 'blocked', 'code': code, 'alias': alias,
+                          'stage': stage, 'error_type': type(error).__name__})
         message = str(error) if known else 'The managed SSH adapter could not start.'
         sys.stderr.write('Codex Control Center: ' + message + '\n')
         return 125

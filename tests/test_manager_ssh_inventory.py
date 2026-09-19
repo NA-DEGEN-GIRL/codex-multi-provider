@@ -3,6 +3,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 import unittest
@@ -68,6 +69,98 @@ class InventoryTests(unittest.TestCase):
         with self.inventory.execution(peer['id'], peer['generation'], {'operation': 'native-version'}):
             self.assertFalse(self.inventory.coverage(peer)['complete'])
         self.assertTrue(self.inventory.coverage(peer)['complete'])
+
+    def test_ssh_enrollment_does_not_wait_for_an_unrelated_desktop_launch(self):
+        self.inventory.identity = lambda _: {}
+        peer = self.store.add_profile('launching desktop')
+        hooks = UpdateHooks(self.root, self.store, None)
+        finished = threading.Event()
+        errors, admitted = [], []
+
+        def connect():
+            try:
+                for operation in ('native-version', 'native-start', 'native-proxy'):
+                    with self.execute(operation):
+                        admitted.append(operation)
+            except Exception as error:
+                errors.append(error)
+            finally:
+                finished.set()
+
+        worker = threading.Thread(target=connect)
+        try:
+            # This real file lock remains owned throughout the assertion. No
+            # app or SSH process is started by the fixture enrollment contexts.
+            with hooks.launch_admission(peer['id']):
+                worker.start()
+                self.assertTrue(finished.wait(2), 'SSH enrollment waited for desktop launch admission')
+        finally:
+            if worker.ident is not None:
+                worker.join(3)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(admitted, ['native-version', 'native-start', 'native-proxy'])
+        self.assertEqual(self.inventory.coverage(self.profile)['hosts'], ['local', 'remote-dev'])
+
+    def test_enrollment_rechecks_gates_and_generation_after_waiting_for_state(self):
+        self.inventory.identity = lambda _: {}
+        for transition in ('global', 'profile', 'ssh', 'generation'):
+            with self.subTest(transition=transition):
+                def reset(data):
+                    for key in ('update_maintenance', 'profile_maintenance', 'ssh_maintenance'):
+                        data.pop(key, None)
+                self.store.mutate(reset)
+                self.inventory.prepare(self.profile['id'], self.profile['generation'])
+                attempted = threading.Event()
+                errors, admitted = [], []
+                mutate = self.inventory.store.mutate
+
+                def observe_attempt(operation):
+                    attempted.set()
+                    return mutate(operation)
+
+                def connect():
+                    try:
+                        with self.execute('native-start'):
+                            admitted.append(True)
+                    except Exception as error:
+                        errors.append(error)
+
+                def change(data):
+                    gate = dict(state='held', transaction_id=str(uuid4()))
+                    if transition == 'global':
+                        data['update_maintenance'] = gate
+                    elif transition == 'profile':
+                        data['profile_maintenance'] = {self.profile['id']: gate}
+                    elif transition == 'ssh':
+                        data['ssh_maintenance'] = {self.profile['id']: gate}
+                    else:
+                        data['ssh_inventory'][self.profile['id']]['generation'] = str(uuid4())
+
+                worker = threading.Thread(target=connect)
+                try:
+                    with patch.object(self.inventory.store, 'mutate', side_effect=observe_attempt):
+                        # Separate Store objects contend on the actual state
+                        # file lock, so the child cannot enroll from stale data.
+                        with self.store.locked():
+                            worker.start()
+                            self.assertTrue(attempted.wait(2))
+                            self.store.mutate(change)
+                        worker.join(3)
+                finally:
+                    if worker.ident is not None:
+                        worker.join(3)
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(admitted, [])
+                self.assertEqual(len(errors), 1)
+                self.assertIsInstance(errors[0], UpdateError)
+                self.assertEqual(errors[0].code, {
+                    'global': 'profile_restarting', 'profile': 'profile_restarting',
+                    'ssh': 'ssh_settings_pending', 'generation': 'ssh_generation_changed',
+                }[transition])
+                inventory = self.store.read()['ssh_inventory'][self.profile['id']]
+                self.assertEqual(inventory['hosts'], [])
+                self.assertEqual(inventory['operations'], {})
 
     def test_ssh_only_gate_blocks_a_late_native_start_without_blocking_local_launch(self):
         hooks=UpdateHooks(self.root,self.store,None)

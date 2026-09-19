@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 from contextlib import nullcontext
+from io import StringIO
 import os
 from pathlib import Path
 import shlex
@@ -16,6 +17,7 @@ from manager_core.ssh_shim import (ADAPTER_VERSION, MarkerGate, ShimError, decod
                                    native_bodies, native_command, parse_invocation,
                                    prepare_environment, quote_always, route_arguments,
                                    validate_binding)
+from manager_core.updates import UpdateError
 
 
 PROFILE = '00000000-0000-4000-9000-000000000007'
@@ -40,6 +42,19 @@ def manifest(profile=PROFILE):
 
 def unwrap(command):
     return shlex.split(command)[4]
+
+
+class RaisingAdmission:
+    """SshInventory.execution stand-in that fails when its context is entered."""
+
+    def __init__(self, error):
+        self.error = error
+
+    def __enter__(self):
+        raise self.error
+
+    def __exit__(self, *exception):
+        return False
 
 
 class NativeFixtureTests(unittest.TestCase):
@@ -384,6 +399,55 @@ class ManifestTests(unittest.TestCase):
             self.assertIn('native_command_changed', audit)
             self.assertNotIn('pkill', audit)
             self.assertNotIn('CODEX_REMOTE_PAYLOAD', audit)
+
+
+class ShimStartFailureTests(unittest.TestCase):
+    """Startup failures after the manifest loads must land in the audit trail."""
+
+    def blocked_start(self, error):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            executable=root/'ssh.exe'
+            executable.write_bytes(b'fixture')
+            path=root/'ssh-bindings.json'
+            data={**manifest(),'generation':OTHER,'inventory_root':str(root),'real_ssh':str(executable)}
+            stderr=StringIO()
+            with patch('manager_core.ssh_shim._load_manifest',side_effect=[(data,path),(data,path)]), \
+                    patch('manager_core.ssh_connection_wait.wait_for_settings'), \
+                    patch('manager_core.ssh_inventory.SshInventory.execution',return_value=RaisingAdmission(error)), \
+                    patch('manager_core.ssh_shim._execute') as execute, patch('sys.stderr',stderr):
+                code=main(['remote-dev',FIXTURE['proxyWrapped']])
+            return code,path.with_name('ssh-routing.jsonl').read_text(encoding='utf-8'),stderr.getvalue(),execute
+
+    def blocked(self, audit):
+        return [entry for entry in map(json.loads,audit.splitlines()) if entry.get('operation')=='blocked']
+
+    def test_context_entry_update_error_is_reported_as_profile_restarting(self):
+        # The maintenance gate raises through SshInventory.execution's context
+        # entry. The shim must preserve its code instead of reporting a generic
+        # shim_start_failed, and must attribute it to the enrollment stage.
+        code,audit,_,execute=self.blocked_start(
+            UpdateError('profile_restarting','This profile is applying settings. Reconnect after it reopens.'))
+        self.assertEqual(code,125)
+        execute.assert_not_called()
+        blocked=self.blocked(audit)
+        self.assertEqual(len(blocked),1)
+        self.assertEqual(blocked[0]['code'],'profile_restarting')
+        self.assertEqual(blocked[0]['stage'],'enroll_ssh')
+
+    def test_unexpected_runtime_error_is_typed_without_repeating_private_text(self):
+        private='ssh-hidden-detail-2f9d'
+        code,audit,stderr,execute=self.blocked_start(RuntimeError('transport unavailable: '+private))
+        self.assertEqual(code,125)
+        execute.assert_not_called()
+        self.assertNotIn(private,audit)
+        self.assertNotIn(private,stderr)
+        self.assertIn('could not start',stderr)
+        blocked=self.blocked(audit)
+        self.assertEqual(len(blocked),1)
+        self.assertEqual(blocked[0]['code'],'shim_start_failed')
+        self.assertEqual(blocked[0]['stage'],'enroll_ssh')
+        self.assertEqual(blocked[0].get('error_type'),'RuntimeError')
 
 
 if __name__ == '__main__':

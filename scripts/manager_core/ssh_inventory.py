@@ -1,44 +1,26 @@
 """Conservative SSH coverage, enrolled before a managed SSH process may start.
 
-The launch gate and this enrollment share one interprocess lock. A disconnected
-proxy does not prove its remote server stopped, so remote hosts remain recorded.
+The maintenance gate and enrollment share the atomic state transaction. Desktop
+launches must not stall SSH enrollment. A disconnected proxy does not prove its
+remote server stopped, so remote hosts remain recorded.
 """
 from __future__ import annotations
 
 from contextlib import contextmanager
 from copy import deepcopy
 import os
-import time
 from uuid import uuid4
 
 from .store import Store, identifier, now
 from .instances import process_identity
 from .process_state import process_liveness
-from .updates import UpdateError, _lock_file, _unlock_file
+from .updates import UpdateError
 
 
 class SshInventory:
     def __init__(self, root, *, identity=process_identity, liveness=process_liveness):
         self.store = Store(root)
         self.identity, self.liveness = identity, liveness
-
-    @contextmanager
-    def _admission(self):
-        # Several inherited hosts connect at once. The lock protects a short
-        # enrollment transaction; contention is not an update/connection error.
-        deadline = time.monotonic() + 5
-        while True:
-            try:
-                lock = _lock_file(self.store.directory / 'updates' / 'maintenance' / 'launch-admission.lock')
-                break
-            except UpdateError:
-                if time.monotonic() >= deadline:
-                    raise
-                time.sleep(.02)
-        try:
-            yield
-        finally:
-            _unlock_file(lock)
 
     def prepare(self, profile_id, generation):
         profile_id, generation = identifier(profile_id), identifier(generation)
@@ -129,8 +111,11 @@ class SshInventory:
                 alias=event.get('alias'), revision=event.get('revision'),
                 pid=pid, process_created=created, generation=generation, started_at=now())
             inventory['updated_at'] = now()
-        with self._admission():
-            self.store.mutate(enroll)
+        # Gate validation and enrollment commit are indivisible. Maintenance
+        # snapshots use this same Store lock before publishing their gate, so
+        # an admitted operation is either included or rejected. Do not acquire
+        # launch-admission here: it spans slow, unrelated desktop launches.
+        self.store.mutate(enroll)
         try:
             yield
         finally:
