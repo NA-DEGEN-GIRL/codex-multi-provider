@@ -61,7 +61,8 @@ public static class NativeHostSelfTest
         var checks = new List<string>();
         Process? fixture = null;
         nint fixtureWindow = 0;
-        var host = new NativeWindowHost();
+        var dragLeaseDirectory = Path.Combine(Path.GetTempPath(), "codex-native-drag-" + Guid.NewGuid().ToString("N"));
+        var host = new NativeWindowHost { WindowStateDirectory = dragLeaseDirectory };
         var surface = new System.Windows.Controls.Grid();
         surface.Children.Add(host);
         var deck = new NativeHostDeck(child => surface.Children.Add(child));
@@ -118,6 +119,9 @@ public static class NativeHostSelfTest
             host.Diagnostic -= feedbackLayout;
             Require(feedbackLayoutCount == 1, "Feedback-layout regression stimulus did not run.");
             Require(host.AttachedHandle == fixtureWindow, "Attached handle was not recorded.");
+            Require((typeof(NativeWindowHost).GetField("_rootSource", BindingFlags.Instance | BindingFlags.NonPublic)!
+                .GetValue(host) as HwndSource)?.Handle == new WindowInteropHelper(window).Handle,
+                "Native viewport observed a different root HWND from the manager.");
             Require(GetParent(fixtureWindow) == originalParent && GetWindow(fixtureWindow, GwOwner) == 0, "Independent parent/owner changed.");
             Require((ReadStyle(fixtureWindow, GwlStyle).ToInt64() & WsChild) == 0, "Native input window became a child.");
             checks.Add("Kept the verified native input queue independent during reentrant WPF layout. " + host.DpiSummary);
@@ -144,6 +148,128 @@ public static class NativeHostSelfTest
                 && origin.X == containerBounds.Left && origin.Y == containerBounds.Top,
                 "Native client area was left at the wrong screen origin.");
             checks.Add("Kept native frame/input styles; clipped and aligned its client area without reparenting.");
+            void RootMessage(int message)
+            {
+                Require(PostMessageW(new WindowInteropHelper(window).Handle, (uint)message, 0, 0),
+                    "Fixture could not post the native size/move message.");
+            }
+            bool HasClip()
+            {
+                var region = CreateRectRgn(0, 0, 0, 0);
+                try { return GetWindowRgn(fixtureWindow, region) == 2; }
+                finally { DeleteObject(region); }
+            }
+            async Task Settled()
+            {
+                var until = DateTime.UtcNow.AddSeconds(4);
+                while (host.IsViewportSettling && DateTime.UtcNow < until) await Task.Delay(40);
+                Require(!host.IsViewportSettling, "Viewport settlement did not verify its final geometry.");
+                var currentOrigin = new NativeWindowInterop.Point();
+                Require(GetClientRect(fixtureWindow, out var currentClient) &&
+                    GetClientRect(host.ContainerHandle, out var expectedClient) &&
+                    ClientToScreen(fixtureWindow, ref currentOrigin) &&
+                    GetWindowRect(host.ContainerHandle, out var expectedBounds) &&
+                    currentClient.Right == expectedClient.Right && currentClient.Bottom == expectedClient.Bottom &&
+                    currentOrigin.X == expectedBounds.Left && currentOrigin.Y == expectedBounds.Top && HasClip(),
+                    "Settled viewport does not match its actual client pixels and region.");
+            }
+            SetWindowRgn(fixtureWindow, 0, true);
+            Require(!HasClip(), "Fixture failed to remove its native clipping region.");
+            host.SynchronizeLayout();
+            Require(HasClip(), "An externally removed region was not repaired at unchanged dimensions.");
+            // Simulate an already exhausted repair episode without waiting for a
+            // real unresponsive app; explicit restore must bypass this budget.
+            var attachment = typeof(NativeWindowHost).GetField("_attachment", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(host)!;
+            var policy = (NativeResizePolicy)attachment.GetType().GetProperty("ResizePolicy")!.GetValue(attachment)!;
+            host.ResizeClock = () => 3000;
+            policy.Request(parentRect.Right, parentRect.Bottom, true, false, 0, out _);
+            policy.Request(parentRect.Right, parentRect.Bottom, false, false, 1000, out _);
+            policy.Request(parentRect.Right, parentRect.Bottom, false, false, 2000, out _);
+            SetWindowPos(fixtureWindow, 0, -27000, -27000, 300, 250, SwpNoActivate | SwpNoZOrder);
+            Require(host.RestoreViewport(), "Explicit viewport repair rejected a live attachment.");
+            await Settled();
+            host.ResizeClock = () => Environment.TickCount64;
+            GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
+            RootMessage(0x231);
+            await Task.Delay(180);
+            Require(host.IsViewportSettling, "Root size/move hook was lost after garbage collection.");
+            Require(GetWindowRect(fixtureWindow, out var parked), "Cannot inspect the parked source.");
+            Require(GetWindowRect(new WindowInteropHelper(window).Handle, out var parkedRoot) &&
+                (parked.Right <= parkedRoot.Left || parked.Left >= parkedRoot.Right ||
+                    parked.Bottom <= parkedRoot.Top || parked.Top >= parkedRoot.Bottom),
+                "Parking clamped the independent source back over the off-screen manager.");
+            string dragLeasePath = Path.Combine(dragLeaseDirectory, $"{fixture.Id}.json");
+            var leaseBeforeDrag = File.ReadAllText(dragLeasePath);
+            var leaseWriteTime = File.GetLastWriteTimeUtc(dragLeasePath);
+            for (int drag = 0; drag < 8; drag++)
+            {
+                window.Left += 12; window.Top += 4; window.Width += 9; window.Height += 6;
+                window.UpdateLayout(); host.SynchronizeLayout();
+                await Task.Delay(20);
+                Require(GetWindowRect(fixtureWindow, out var during) && during.Equals(parked),
+                    "Live movement resized or moved the parked source for each frame.");
+            }
+            Require(File.ReadAllText(dragLeasePath) == leaseBeforeDrag && File.GetLastWriteTimeUtc(dragLeasePath) == leaseWriteTime,
+                "Live movement rewrote native geometry leases for each frame.");
+            Require(IsWindowVisible(fixtureWindow) && GetParent(fixtureWindow) == 0 && GetWindow(fixtureWindow, GwOwner) == 0,
+                "Live mirror movement hid or reparented its independent source.");
+            RootMessage(0x232);
+            await Settled();
+            // A second short loop at unchanged dimensions still needs a forced
+            // return from parking, even inside the previous repair's backoff.
+            RootMessage(0x231);
+            await Task.Delay(80);
+            Require(host.IsViewportSettling, "A repeated move loop did not suspend native presentation.");
+            RootMessage(0x232);
+            await Settled();
+            Require(GetClientRect(host.ContainerHandle, out parentRect), "Cannot refresh settled fixture dimensions.");
+            checks.Add("Native size/move hook survives GC; removed clipping and exhausted budgets recover; eight live drag frames retain one parked independent source and unchanged lease before verified settlement.");
+            Require(host.RestoreViewport(), "Cannot start hidden-settlement fixture.");
+            host.Visibility = Visibility.Hidden;
+            typeof(NativeWindowHost).GetField("_settleStarted", BindingFlags.Instance | BindingFlags.NonPublic)!
+                .SetValue(host, Environment.TickCount64 - 6001);
+            host.SynchronizeLayout();
+            host.Visibility = Visibility.Visible;
+            await Settled();
+            Require(host.HasLiveAttachment, "Time spent hidden expired the resumed viewport placement.");
+            checks.Add("Suspended placement resumes after a hidden profile without counting hidden time as a timeout.");
+            NativeWindowLeaseSelfTest.Run(Path.Combine(dragLeaseDirectory, "publication"));
+            checks.Add("Native-only geometry and drag flags survive lease publication races without redundant writes.");
+            long regionNow = 0;
+            host.ResizeClock = () => regionNow;
+            host.SynchronizeLayout();
+            for (int attempt = 0; attempt < 3; attempt++)
+            {
+                regionNow = attempt * 1000;
+                SetWindowRgn(fixtureWindow, 0, true); host.SynchronizeLayout();
+                Require(HasClip(), "A bounded native region repair was not applied.");
+                SetWindowRgn(fixtureWindow, 0, true); host.SynchronizeLayout();
+                Require(!HasClip(), "Region disagreement bypassed its one-second backoff.");
+            }
+            regionNow = 3000;
+            for (int rejected = 0; rejected < 20; rejected++) host.SynchronizeLayout();
+            Require(!HasClip() && host.HasLiveAttachment, "Region repair continued beyond its bounded budget.");
+            Require(host.RestoreViewport(), "Explicit recovery did not reset the region repair budget.");
+            await Settled();
+            host.ResizeClock = () => Environment.TickCount64;
+            int failureNotifications = 0;
+            void OnRecoveryFailure(string _) => failureNotifications++;
+            host.ViewportRecoveryFailed += OnRecoveryFailure;
+            var foregroundBeforeFailure = GetForegroundWindow();
+            Require(host.RestoreViewport(), "Fixture could not begin its timed settlement.");
+            typeof(NativeWindowHost).GetField("_settleStarted", BindingFlags.Instance | BindingFlags.NonPublic)!
+                .SetValue(host, Environment.TickCount64 - 6001);
+            Require(!host.SynchronizeLayout(), "Expired settlement did not stop native repair.");
+            await Task.Delay(180);
+            Require(!host.IsAttached && failureNotifications == 1 && IsWindowVisible(fixtureWindow) &&
+                GetParent(fixtureWindow) == 0 && GetWindow(fixtureWindow, GwOwner) == 0 &&
+                GetForegroundWindow() == foregroundBeforeFailure && !fixture.HasExited,
+                "Failed settlement did not restore one usable independent window without activation.");
+            host.ViewportRecoveryFailed -= OnRecoveryFailure;
+            Require(host.Attach(fixtureWindow, fixture.Id, executable, out error), error);
+            await Task.Delay(150);
+            host.SynchronizeLayout();
+            checks.Add("Repeated region loss has three bounded retries; explicit restore renews them, and expired settlement returns a visible independent window without stealing focus.");
             window.IsEnabled = false;
             await Task.Delay(100);
             Require(IsWindowVisible(fixtureWindow) && GetWindow(new WindowInteropHelper(window).Handle, 2) == fixtureWindow,
@@ -158,9 +284,14 @@ public static class NativeHostSelfTest
                 $"A delayed native show covered the disabled manager: visible={IsWindowVisible(fixtureWindow)}, " +
                 $"exStyle={ReadStyle(fixtureWindow, GwlExStyle):X}, next={GetWindow(new WindowInteropHelper(window).Handle, 2)}, fixture={fixtureWindow}.");
             window.IsEnabled = true;
-            await Task.Delay(100);
+            var modalSettledBy = DateTime.UtcNow.AddMilliseconds(500);
+            while (GetWindow(new WindowInteropHelper(window).Handle, 3) != fixtureWindow && DateTime.UtcNow < modalSettledBy)
+                await Task.Delay(25);
             Require(GetWindow(new WindowInteropHelper(window).Handle, 3) == fixtureWindow,
-                "Closing settings did not return the native editor above its manager.");
+                $"Closing settings did not return the native editor above its manager: settling={host.IsViewportSettling}, " +
+                $"previous={GetWindow(new WindowInteropHelper(window).Handle, 3)}, fixture={fixtureWindow}, " +
+                $"next={GetWindow(new WindowInteropHelper(window).Handle, 2)}, enabled={host.IsEnabled}/{IsWindowEnabled(new WindowInteropHelper(window).Handle)}, " +
+                $"root={new WindowInteropHelper(window).Handle}, sourceNext={GetWindow(fixtureWindow, 2)}, exStyle={ReadStyle(fixtureWindow, GwlExStyle):X}, error={host.LastError}.");
             checks.Add("Disabled manager retains its live backdrop with native input behind it; delayed TOPMOST show is corrected and closing restores editor order.");
             // Losing foreground must keep the viewport painted behind the new
             // foreground app, without topmost, owner or activation links.

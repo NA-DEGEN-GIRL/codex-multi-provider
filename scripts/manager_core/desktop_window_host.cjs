@@ -146,7 +146,12 @@
         } catch {}
         return;
       }
-      if (state.mode === 'viewport' && state.bounds) {
+      // New shells own physical geometry, including parking the input surface
+      // during a native move/size loop. Replaying a delayed lease here would
+      // undo a newer Win32 placement (or expose the parked surface). Keep this
+      // legacy path only for an older shell that has no geometry authority.
+      const nativeGeometry = state.geometryOwner === 'native';
+      if (state.mode === 'viewport' && state.bounds && !nativeGeometry) {
         const key = `${state.token}:` + JSON.stringify(state.bounds);
         const {x,y,width,height,dpi} = state.bounds;
         const pixels = {x,y,width,height};
@@ -172,6 +177,12 @@
         viewportVisible = false;
         return;
       }
+      if (state.mode === 'viewport' && nativeGeometry && state.interactiveMove) {
+        // The DWM mirror stays live while the shell moves as one window. Do not
+        // show, hide or pulse the independent source until settlement finishes.
+        keepFrames(true);
+        return;
+      }
       const lease = state.token || `${state.shellPid}:${state.hwnd}`;
       const epoch = state.presentationEpoch || 0;
       if (presentedLease === lease && presentedEpoch === epoch && viewportVisible !== false) return;
@@ -191,7 +202,7 @@
         // its compositor's old same-size surface intact. Commit a native size
         // transition once per selection/restore, then the exact target bounds.
         // The viewport clip hides the extra pixel; never activate or reload.
-        if (state.mode === 'viewport' && state.bounds) {
+        if (state.mode === 'viewport' && state.bounds && !nativeGeometry) {
           const {x,y,width,height,dpi} = state.bounds, scale = dpi / 96;
           const target = typeof screen?.screenToDipRect === 'function' ? screen.screenToDipRect(win, {x,y,width,height}) :
             {x:Math.round(x/scale),y:Math.round(y/scale),width:Math.round(width/scale),height:Math.round(height/scale)};

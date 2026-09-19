@@ -24,6 +24,16 @@ internal static class NativeWindowLeaseSelfTest
             using var document = JsonDocument.Parse(File.ReadAllText(file));
             if (!expected(document.RootElement)) throw new InvalidOperationException(message);
         }
+        RequireState(s => s.GetProperty("geometryOwner").GetString() == "native" &&
+            !s.GetProperty("interactiveMove").GetBoolean(), "The native host did not claim exclusive geometry ownership.");
+        WithSharingViolation(() => lease.SetInteractiveMove(true));
+        lease.SetInteractiveMove(true);
+        RequireState(s => s.GetProperty("interactiveMove").GetBoolean(), "Interactive movement did not recover a failed lease write.");
+        var unchanged = File.GetLastWriteTimeUtc(file);
+        lease.SetInteractiveMove(true);
+        if (File.GetLastWriteTimeUtc(file) != unchanged) throw new InvalidOperationException("Unchanged drag state rewrote the lease.");
+        lease.SetInteractiveMove(false);
+        RequireState(s => !s.GetProperty("interactiveMove").GetBoolean(), "Settled placement retained interactive movement.");
         WithSharingViolation(() => lease.SetVisible(true));
         RequireState(s => !s.GetProperty("visible").GetBoolean(), "Failed write unexpectedly changed the published lease.");
         lease.SetVisible(true);

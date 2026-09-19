@@ -135,6 +135,10 @@ internal static class NativeWindowInterop
     [DllImport("user32.dll")]
     internal static extern int GetWindowRgn(nint hwnd, nint region);
     [DllImport("gdi32.dll")]
+    internal static extern int GetRgnBox(nint region, out Rect bounds);
+    [DllImport("user32.dll")]
+    internal static extern int GetSystemMetrics(int index);
+    [DllImport("gdi32.dll")]
     internal static extern uint GetRegionData(nint region, uint size, byte[]? data);
     [DllImport("gdi32.dll")]
     internal static extern nint ExtCreateRegion(nint transform, uint size, byte[] data);

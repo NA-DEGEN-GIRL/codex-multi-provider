@@ -120,6 +120,19 @@ public sealed class MainWindow : Window
             host.Responsiveness = _responsiveness;
             host.Diagnostic += message => Log("창 연결 · " + message);
             host.AttachmentLost += (hwnd, parentChanged) => OnAttachmentLost(host, hwnd, parentChanged);
+            host.ViewportRecoveryFailed += message =>
+            {
+                if (host != _host) return;
+                _embedRequested = false;
+                host.Visibility = Visibility.Collapsed;
+                _empty.Visibility = Visibility.Visible;
+                _empty.Text = message;
+                SetStatus(message, true);
+            };
+            host.ViewportRecoveryCompleted += (_, _) =>
+            {
+                if (host == _host) SetStatus("Codex 표시 영역을 맞췄습니다.");
+            };
             _clientSurface.Children.Insert(0, host);
         });
         _hostDeck.Select("");
@@ -461,7 +474,7 @@ public sealed class MainWindow : Window
         => Menu(actions.Select(action => (action.Label, (Func<Task>)(() => action.Action(RequireContextProfile())))).ToArray());
     private async Task InitializeAsync()
     {
-        Log($"관리 앱 시작 · 포크 메모 공유·명시적 분리 57 · IPC {ManagerProtocol.Version} · 로그: {_diagnostics.Path}");
+        Log($"관리 앱 시작 · 창 이동·크기 조절 일체화 58 · IPC {ManagerProtocol.Version} · 로그: {_diagnostics.Path}");
         if (_responsiveness is not null) Log("응답 지연 상세 로그 · " + _responsiveness.Path);
         SetStatus("관리 서비스를 연결하고 있습니다…");
         _client = await ManagerClient.ConnectAsync(_root);
@@ -1198,7 +1211,19 @@ public sealed class MainWindow : Window
         _attached = null; _host.Visibility = Visibility.Collapsed; _empty.Visibility = Visibility.Visible; _empty.Text = "선택한 Codex를 원래 창으로 표시하고 있습니다.\n관리창 안에 표시 버튼으로 다시 가져올 수 있습니다.";
         SetStatus("원본 창을 분리했습니다. 작업은 계속됩니다."); return Task.CompletedTask;
     }
-    private async Task AttachSelectedAsync() { BeginAttach(); if (_viewingCatalog) { Render(); TryAttach(_viewerProfile); } else await ShowProfileAsync(RequireProfile()); }
+    private async Task AttachSelectedAsync()
+    {
+        BeginAttach();
+        if (_viewingCatalog) { Render(); TryAttach(_viewerProfile); }
+        else await ShowProfileAsync(RequireProfile());
+        if (_host.HasLiveAttachment)
+        {
+            bool requested = _host.RestoreViewport();
+            if (!requested || _host.IsViewportSettling)
+                SetStatus("Codex 표시 영역을 다시 맞추고 있습니다. 잠시만 기다려 주세요.");
+            if (!requested) Log("표시 영역 복구 요청을 다시 시도하고 있습니다. " + _host.LastError);
+        }
+    }
     private bool _shutdownInProgress, _shutdownComplete;
     private async void OnClosing(object? sender, CancelEventArgs e)
     {

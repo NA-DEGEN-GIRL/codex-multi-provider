@@ -135,6 +135,7 @@ function preloadFixture() {
         writeFileSync(_,data){fixture.report=JSON.parse(data)},
         unlinkSync(file){if(!file.endsWith('.render.json'))fixture.marker=null},
       };
+      if(name==='node:child_process') throw Error('Unexpected subprocess in viewport fixture');
       return require(name);
     },
   });
@@ -208,3 +209,44 @@ function preloadFixture() {
     'shutdown does not need renderer readiness or a preceding viewport attach');
 }
 console.log('PASS: hidden preload before lease, startup no-focus, renderer ready, auxiliary windows and explicit detach');
+
+// A queued lease may describe an older position than the shell has already
+// applied. Only the native host may place/pulse a source owned by that host.
+{
+  const fixture=preloadFixture(), main=fixture.window(123);
+  const bounds={x:150,y:300,width:900,height:600,dpi:144};
+  fixture.lease({geometryOwner:'native',visible:true,bounds,presentationEpoch:1});
+  main.ready();
+  assert.deepEqual(fixture.calls,[[123,'setOpacity',1],[123,'showInactive']],
+    'first presentation must not replay physical bounds or a compositor size pulse');
+  fixture.calls=[];
+  for(const dpi of [96,120,144,192]){
+    fixture.marker.bounds={x:-1920,y:400,width:1200,height:800,dpi};
+    fixture.tick();
+    fixture.marker.bounds=bounds; // Simulate a late old lease after native placement.
+    fixture.tick();
+  }
+  assert.deepEqual(fixture.calls,[],'late/mixed-DPI leases cannot move the source');
+
+  fixture.marker.interactiveMove=true;
+  fixture.marker.presentationEpoch=2;
+  for(let i=0;i<8;i++){fixture.tick();main.show();main.showInactive();main.setBounds(bounds);}
+  assert.deepEqual(fixture.calls,[],
+    'drag presentation must not unpark, nudge or hide the independent source');
+  assert.equal(fixture.report.presentationEpoch,1,'a pending drag epoch is not prematurely acknowledged');
+  fixture.marker.interactiveMove=false;
+  fixture.tick();
+  assert.deepEqual(fixture.calls,[[123,'hide'],[123,'setOpacity',1],[123,'showInactive']],
+    'verified settlement resumes the deferred presentation exactly once');
+  assert.equal(fixture.report.presentationEpoch,2);
+  fixture.tick();assert.equal(fixture.calls.length,3);
+
+  fixture.calls=[];fixture.marker.interactiveMove=true;fixture.marker.visible=false;
+  fixture.tick();assert.deepEqual(fixture.calls,[[123,'hide']],
+    'minimizing/hiding wins over an in-progress drag');
+  fixture.marker.mode='released';fixture.tick();fixture.calls=[];
+  main.setBounds(bounds);main.focus();
+  assert.deepEqual(fixture.calls,[[123,'setBounds',bounds],[123,'focus']],
+    'explicit detach restores original geometry and focus methods');
+}
+console.log('PASS: native geometry authority, late leases, mixed DPI, parked drag and deferred presentation');

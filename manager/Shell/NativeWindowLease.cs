@@ -14,6 +14,7 @@ internal sealed class NativeWindowLease : IDisposable
     private readonly string hwnd;
     private readonly FileSystemWatcher? watcher;
     private bool visible;
+    private bool interactiveMove;
     private bool released;
     private bool dirty = true;
     internal string? PublicationError { get; private set; }
@@ -55,6 +56,14 @@ internal sealed class NativeWindowLease : IDisposable
         Write();
     }
 
+    internal void SetInteractiveMove(bool value)
+    {
+        if (interactiveMove == value && !dirty) return;
+        interactiveMove = value;
+        dirty = true;
+        Write();
+    }
+
     internal void Release(bool show) { visible = show; released = true; dirty = true; Write(); }
 
     internal async Task NavigateAsync(NoteTask task, CancellationToken cancellation)
@@ -89,6 +98,7 @@ internal sealed class NativeWindowLease : IDisposable
             {
                 version = 1, appPid, hwnd, shellPid = Environment.ProcessId, token,
                 mode = released ? "released" : "viewport", visible, presentationEpoch,
+                geometryOwner = "native", interactiveMove,
                 bounds,
                 recovery,
                 notificationPipe = NotificationPipe

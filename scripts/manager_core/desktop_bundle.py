@@ -17,7 +17,7 @@ from uuid import UUID, uuid4
 
 from .store import atomic_json
 
-REVISION = 21
+REVISION = 22
 _LOCK = threading.Lock()
 _ORIGINAL = b'if(process.platform===`win32`)return i.join(`\\\\\\\\.\\\\pipe`,`codex-ipc`);'
 _REPLACEMENT = (b'if(process.platform===`win32`){let p=process.env.CODEX_MANAGER_DESKTOP_PIPE;'

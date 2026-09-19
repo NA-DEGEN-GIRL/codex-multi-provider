@@ -22,10 +22,15 @@ public sealed class NativeWindowHost : HwndHost
     private nint _container, _foregroundHook, _presentationHook;
     private Attachment? _attachment;
     private HwndSource? _rootSource;
+    private readonly HwndSourceHook _rootMessages;
     private readonly WinEventCallback _foregroundChanged, _presentationChanged;
-    private readonly DispatcherTimer _watch;
-    private bool _changingWindow, _resizing, _queued;
-    private bool _liveResize, _finalResize;
+    private readonly DispatcherTimer _watch, _settleWatch;
+    private bool _changingWindow, _resizing;
+    private DispatcherOperation? _queuedLayout;
+    private bool _liveResize, _settling, _forceRepair, _settleHidden;
+    private bool _settleFailureQueued;
+    private long _settleStarted;
+    private int _settleVersion;
     private string? _lastInputState, _lastPresentationState, _lastLayoutFailure;
     internal string? WindowStateDirectory { get; set; }
     internal ResponsivenessMonitor? Responsiveness { get; set; }
@@ -34,6 +39,7 @@ public sealed class NativeWindowHost : HwndHost
     internal Func<nint> ForegroundWindow = GetForegroundWindow;
     internal nint ContainerHandle => _container;
     public bool IsTransitioning => _changingWindow || _resizing;
+    internal bool IsViewportSettling => _settling;
     public nint AttachedHandle => _attachment?.Hwnd ?? 0;
     public bool IsAttached => AttachedHandle != 0;
     public bool HasLiveAttachment => _attachment is { } attached && IsAlive(attached) && IsIndependent(attached);
@@ -42,12 +48,17 @@ public sealed class NativeWindowHost : HwndHost
     public string DpiSummary { get; private set; } = "";
     public event EventHandler? AttachmentChanged;
     public event Action<nint, bool>? AttachmentLost;
+    public event Action<string>? ViewportRecoveryFailed;
+    public event EventHandler? ViewportRecoveryCompleted;
     public event Action<string>? Diagnostic;
     internal Task NavigateAsync(NoteTask task, CancellationToken cancellation) => HasLiveAttachment && _attachment?.Lease is { } lease
         ? lease.NavigateAsync(task, cancellation) : Task.FromException(new InvalidOperationException("Codex 창이 아직 연결되지 않았습니다."));
 
     public NativeWindowHost()
     {
+        // Keep the exact root hook delegate for the entire host lifetime and
+        // use that same instance when removing it from a replaced root source.
+        _rootMessages = RootMessages;
         Focusable = true;
         _foregroundChanged = (_, _, _, _, _, _, _) => QueueLayout();
         _presentationChanged = (_, eventId, hwnd, objectId, _, _, _) =>
@@ -62,6 +73,9 @@ public sealed class NativeWindowHost : HwndHost
         _watch = new DispatcherTimer(TimeSpan.FromSeconds(1), DispatcherPriority.Background,
             (_, _) => CheckAttachedWindow(), Dispatcher);
         _watch.Stop();
+        _settleWatch = new DispatcherTimer(TimeSpan.FromMilliseconds(40), DispatcherPriority.Render,
+            (_, _) => SynchronizeLayout(), Dispatcher);
+        _settleWatch.Stop();
         IsVisibleChanged += (_, _) => { SynchronizeLayout(); QueueLayout(); };
         IsEnabledChanged += (_, _) => QueueLayout();
         Loaded += (_, _) => { ObserveRoot(); QueueLayout(); };
@@ -181,6 +195,7 @@ public sealed class NativeWindowHost : HwndHost
         var extended = ReadStyle(a.Hwnd, GwlExStyle).ToInt64();
         if ((extended & (WsExAppWindow | WsExToolWindow)) == WsExToolWindow) return true;
         ApplyViewportStyle(a);
+        repaired = true;
         return true;
     }
 
@@ -189,12 +204,21 @@ public sealed class NativeWindowHost : HwndHost
         var source = HwndSource.FromHwnd(GetAncestor(_container, GaRoot));
         if (source != _rootSource)
         {
-            _rootSource?.RemoveHook(RootMessages);
+            _rootSource?.RemoveHook(_rootMessages);
             _rootSource = source;
-            source?.AddHook(RootMessages);
+            source?.AddHook(_rootMessages);
         }
         if (_foregroundHook == 0)
             _foregroundHook = SetWinEventHook(3 /* EVENT_SYSTEM_FOREGROUND */, 3, 0, _foregroundChanged, 0, 0, 0);
+        // A newly selected/created profile may join a root whose move loop has
+        // already started, before this host was present to receive ENTERSIZEMOVE.
+        var gui = new GuiThreadInfo { Size = (uint)Marshal.SizeOf<GuiThreadInfo>() };
+        if (source is not null && GetGUIThreadInfo(GetWindowThreadProcessId(source.Handle, out _), ref gui) &&
+            (gui.Flags & 2 /* GUI_INMOVESIZE */) != 0)
+        {
+            _liveResize = true;
+            BeginViewportSettlement(park: true);
+        }
     }
 
     private nint RootMessages(nint hwnd, int message, nint wParam, nint lParam, ref bool handled)
@@ -203,15 +227,18 @@ public sealed class NativeWindowHost : HwndHost
         // unchanged while the manager moves to a different monitor.
         if (message == 0x231 /* ENTERSIZEMOVE */)
         {
-            // While the user drags, keep the embedded window in step with the
-            // frame instead of letting it trail the manager chrome.
             _liveResize = true;
+            _settleWatch.Stop();
+            try { BeginViewportSettlement(park: true); }
+            catch (Win32Exception error) { LastError = error.Message; Diagnostic?.Invoke(error.Message); }
             QueueLayout();
         }
         else if (message == 0x232 /* EXITSIZEMOVE */)
         {
             _liveResize = false;
-            _finalResize = true;
+            _settleStarted = Environment.TickCount64;
+            _forceRepair = true;
+            if (_settling) _settleWatch.Start();
             QueueLayout();
         }
         if (message is 0x47 /* WINDOWPOSCHANGED */ or 5 /* SIZE */ or 0x18 /* SHOWWINDOW */
@@ -221,16 +248,73 @@ public sealed class NativeWindowHost : HwndHost
 
     private void QueueLayout()
     {
-        if (_queued || Dispatcher.HasShutdownStarted) return;
-        _queued = true;
-        // Location/visibility storms must not outrank keyboard and mouse input,
-        // but a live drag has to land in the same frame as the manager window.
-        var priority = _liveResize || _finalResize ? DispatcherPriority.Render : DispatcherPriority.Background;
-        Dispatcher.BeginInvoke(priority, new Action(() =>
+        if (Dispatcher.HasShutdownStarted) return;
+        var priority = _liveResize || _settling ? DispatcherPriority.Render : DispatcherPriority.Background;
+        if (_queuedLayout is { Status: DispatcherOperationStatus.Pending } pending)
         {
-            _queued = false;
+            if (pending.Priority < priority) pending.Priority = priority;
+            return;
+        }
+        _queuedLayout = Dispatcher.BeginInvoke(priority, new Action(() =>
+        {
+            _queuedLayout = null;
             SynchronizeLayout();
         }));
+    }
+
+    /// <summary>Repair the current viewport without detaching or changing native input ownership.</summary>
+    public bool RestoreViewport()
+    {
+        Dispatcher.VerifyAccess();
+        if (_attachment is null || !HasLiveAttachment) return false;
+        BeginViewportSettlement(park: false);
+        if (!_liveResize) _settleWatch.Start();
+        return SynchronizeLayout();
+    }
+
+    private void BeginViewportSettlement(bool park)
+    {
+        if (_attachment is not { } a || !HasLiveAttachment || !ShouldShow(a)) return;
+        _settling = true;
+        _settleHidden = false;
+        _settleFailureQueued = false;
+        _settleStarted = Environment.TickCount64;
+        _settleVersion++;
+        _forceRepair = true;
+        a.Lease?.SetInteractiveMove(true);
+        UpdateCaptureMirror(a, true);
+        SynchronizeZOrder(a);
+        if (!park || a.Parked) return;
+        if (!GetWindowRect(a.Hwnd, out var bounds)) return;
+        // A demoted source would still protrude when the manager moves away or
+        // shrinks. Keep it visible for DWM, but wholly outside the virtual desktop.
+        GetWindowRect(GetAncestor(_container, GaRoot), out var rootBounds);
+        int width = bounds.Right - bounds.Left, height = bounds.Bottom - bounds.Top;
+        var desktop = new NativeWindowInterop.Rect
+        {
+            Left = GetSystemMetrics(76 /* SM_XVIRTUALSCREEN */), Top = GetSystemMetrics(77 /* SM_YVIRTUALSCREEN */)
+        };
+        desktop.Right = desktop.Left + GetSystemMetrics(78 /* SM_CXVIRTUALSCREEN */);
+        desktop.Bottom = desktop.Top + GetSystemMetrics(79 /* SM_CYVIRTUALSCREEN */);
+        bool Outside(int x, int y, NativeWindowInterop.Rect rect) =>
+            x + width <= rect.Left || x >= rect.Right || y + height <= rect.Top || y >= rect.Bottom;
+        foreach (var candidate in new[]
+        {
+            (desktop.Left - width - 128, desktop.Top - height - 128),
+            (desktop.Right + 128, desktop.Top - height - 128),
+            (desktop.Left - width - 128, desktop.Bottom + 128),
+            (desktop.Right + 128, desktop.Bottom + 128)
+        })
+        {
+            // USER32 clamps extreme coordinates; an off-screen test manager can
+            // already be at that limit. Base parking on the desktop, not its root.
+            int x = Math.Clamp(candidate.Item1, -32768, Math.Max(-32768, 32767 - width));
+            int y = Math.Clamp(candidate.Item2, -32768, Math.Max(-32768, 32767 - height));
+            if (!Outside(x, y, desktop) || !Outside(x, y, rootBounds)) continue;
+            if (SetWindowPos(a.Hwnd, 0, x, y, 0, 0, SwpNoActivate | SwpNoZOrder | SwpNoSize | SwpAsyncWindowPos))
+                a.Parked = true;
+            break;
+        }
     }
 
     private bool ShouldShow(Attachment a)
@@ -254,7 +338,7 @@ public sealed class NativeWindowHost : HwndHost
             QueueLayout();
             return;
         }
-        if (!IsEnabled || !IsWindowEnabled(root))
+        if (_settling || !IsEnabled || !IsWindowEnabled(root))
         {
             // The disabled manager covers the independent input window. Its
             // live DWM mirror supplies the backdrop, so clicks cannot reach the
@@ -288,6 +372,16 @@ public sealed class NativeWindowHost : HwndHost
     {
         using var timing = Responsiveness?.Stage($"native.visibility.{a.Pid}.{visible}");
         a.Lease?.SetVisible(visible);
+        UpdateCaptureMirror(a, visible);
+        bool topmost = (ReadStyle(a.Hwnd, GwlExStyle).ToInt64() & 8) != 0;
+        if (IsWindowVisible(a.Hwnd) == visible && !topmost) return;
+        if (!SetWindowPos(a.Hwnd, -2, 0, 0, 0, 0, SwpNoActivate | SwpNoMove | SwpNoSize |
+                SwpAsyncWindowPos | (topmost ? 0 : SwpNoZOrder) | (visible ? SwpShowWindow : SwpHideWindow)))
+            throw new Win32Exception(Marshal.GetLastPInvokeError(), "Cannot change viewport visibility.");
+    }
+
+    private void UpdateCaptureMirror(Attachment a, bool visible)
+    {
         int captureStatus = a.CaptureMirror.Update(GetAncestor(_container, GaRoot), a.Hwnd, _container, visible);
         if (captureStatus != a.CaptureStatus)
         {
@@ -295,11 +389,6 @@ public sealed class NativeWindowHost : HwndHost
             Diagnostic?.Invoke(captureStatus >= 0 ? "캡처 화면 연결 완료 · 관리자창에 Codex 화면 합성" :
                 $"캡처 화면 연결 실패 · DWM 0x{captureStatus:X8}");
         }
-        bool topmost = (ReadStyle(a.Hwnd, GwlExStyle).ToInt64() & 8) != 0;
-        if (IsWindowVisible(a.Hwnd) == visible && !topmost) return;
-        if (!SetWindowPos(a.Hwnd, -2, 0, 0, 0, 0, SwpNoActivate | SwpNoMove | SwpNoSize |
-                SwpAsyncWindowPos | (topmost ? 0 : SwpNoZOrder) | (visible ? SwpShowWindow : SwpHideWindow)))
-            throw new Win32Exception(Marshal.GetLastPInvokeError(), "Cannot change viewport visibility.");
     }
 
     public void Detach() => DetachWindow(true);
@@ -313,15 +402,17 @@ public sealed class NativeWindowHost : HwndHost
         finally { _changingWindow = false; }
     }
 
-    private void DetachCore(bool restoreVisibility = true)
+    private void DetachCore(bool restoreVisibility = true, bool restoreMaximized = true, bool forceVisible = false)
     {
         _watch.Stop();
+        _settleWatch.Stop();
         if (_attachment is not { } a) return;
         LastError = "";
         if (!IsAlive(a)) { ForgetAttachment(""); return; }
         try
         {
-            a.Lease?.Release(restoreVisibility && (a.Style.ToInt64() & WsVisible) != 0);
+            bool visible = restoreVisibility && (forceVisible || (a.Style.ToInt64() & WsVisible) != 0);
+            a.Lease?.Release(visible);
             a.Lease?.Dispose(); a.Lease = null;
             if (SetWindowRgn(a.Hwnd, a.Region, true) != 0) a.Region = 0;
             WriteStyle(a.Hwnd, GwlStyle, (nint)(a.Style.ToInt64() & ~WsVisible));
@@ -333,11 +424,12 @@ public sealed class NativeWindowHost : HwndHost
             // No parenting restoration: it never changed. Preserve the native
             // maximized placement only on explicit detach, never during close.
             var placement = a.Placement;
-            placement.ShowCmd = restoreVisibility && (a.Style.ToInt64() & WsVisible) != 0 ? (placement.ShowCmd == 3 ? 3u : 4u) : 0;
+            placement.ShowCmd = visible ?
+                (restoreMaximized && placement.ShowCmd == 3 ? 3u : 4u) : 0;
             if (!SetWindowPlacement(a.Hwnd, in placement))
                 throw new Win32Exception(Marshal.GetLastPInvokeError(), "Cannot restore window placement.");
             SetWindowPos(a.Hwnd, 0, 0, 0, 0, 0, SwpNoZOrder | SwpNoActivate | SwpNoMove | SwpNoSize | SwpAsyncWindowPos |
-                (restoreVisibility && (a.Style.ToInt64() & WsVisible) != 0 ? SwpShowWindow : SwpHideWindow));
+                (visible ? SwpShowWindow : SwpHideWindow));
         }
         catch (Exception ex) when (ex is Win32Exception or IOException or UnauthorizedAccessException)
         {
@@ -356,7 +448,7 @@ public sealed class NativeWindowHost : HwndHost
     protected override void DestroyWindowCore(HandleRef hwnd)
     {
         DetachForClose();
-        _rootSource?.RemoveHook(RootMessages); _rootSource = null;
+        _rootSource?.RemoveHook(_rootMessages); _rootSource = null;
         if (_foregroundHook != 0) UnhookWinEvent(_foregroundHook);
         _foregroundHook = 0;
         if (IsWindow(hwnd.Handle)) DestroyWindow(hwnd.Handle);
@@ -482,8 +574,9 @@ public sealed class NativeWindowHost : HwndHost
             AttachmentLost?.Invoke(a.Hwnd, changed);
             return;
         }
+        if (_settling) a.Lease?.SetInteractiveMove(true);
         SynchronizeLayout();
-        if (IsVisible)
+        if (IsVisible && !_liveResize && !_settling)
         {
             var state = InputDiagnostic();
             if (_lastInputState != state) { _lastInputState = state; Diagnostic?.Invoke(state); }
@@ -534,10 +627,40 @@ public sealed class NativeWindowHost : HwndHost
     {
         if (_attachment is not { } a || !HasLiveAttachment) return false;
         bool show = ShouldShow(a);
-        if (!show) { SetVisible(a, false); a.Shown = false; return true; }
+        if (!show) { SetVisible(a, false); a.Shown = false; _settleHidden = true; _settleWatch.Stop(); return true; }
+        if (_liveResize)
+        {
+            a.NeedsFrameChange |= frameChanged;
+            if (!_settling)
+            {
+                // A profile can finish attaching or become selected mid-drag.
+                BeginViewportSettlement(park: true);
+                SetVisible(a, true);
+            }
+            // The manager owns this DWM surface, so it follows native movement
+            // immediately. No cross-process geometry, region or lease write is
+            // needed for each drag event; the source keeps its original frame.
+            UpdateCaptureMirror(a, true);
+            SynchronizeZOrder(a);
+            return true;
+        }
+        if (_settling && _settleHidden)
+        {
+            // Time spent minimized or on another profile is not a failed
+            // placement attempt. Resume with a fresh bounded verification.
+            _settleStarted = Environment.TickCount64;
+            _forceRepair = true;
+            _settleWatch.Start();
+        }
+        _settleHidden = false;
+        if (_settling && Environment.TickCount64 - _settleStarted >= 6000)
+        {
+            FailViewportSettlement(a);
+            return false;
+        }
         bool repaired = false;
         if (show && !RepairStyle(a, out repaired)) return false;
-        frameChanged |= repaired;
+        frameChanged |= repaired || a.NeedsFrameChange;
         if (!GetClientRect(_container, out var size) || !GetWindowRect(_container, out var target)) return false;
         int width = size.Right, height = size.Bottom;
         if (width <= 1 || height <= 1) return true;
@@ -550,38 +673,108 @@ public sealed class NativeWindowHost : HwndHost
         bool moved = a.Left != target.Left || a.Top != target.Top;
         bool matches = origin.X == target.Left && origin.Y == target.Top && client.Right == width && client.Bottom == height;
         bool clipChanged = a.ClipX != insetX || a.ClipY != insetY || a.Width != width || a.Height != height;
-        if (clipChanged)
+        bool dimensionsChanged = a.Width != width || a.Height != height;
+        bool forceRepair = _forceRepair;
+        bool resize = a.ResizePolicy.Request(width, height, frameChanged || moved || clipChanged || forceRepair,
+            matches, ResizeClock(), out var report);
+        if (report)
         {
-            using var timing = Responsiveness?.Stage($"native.SetWindowRgn.{a.Pid}");
-            nint region = CreateRectRgn(insetX, insetY, insetX + width, insetY + height);
-            if (region == 0 || SetWindowRgn(a.Hwnd, region, true) == 0)
-            { if (region != 0) DeleteObject(region); throw new Win32Exception(Marshal.GetLastPInvokeError(), "Cannot clip native viewport."); }
-            // SetWindowRgn owns the region after success.
-            a.ClipX = insetX; a.ClipY = insetY;
+            Diagnostic?.Invoke("Codex가 요청 크기를 유지하지 않아 반복 조절을 멈췄습니다.");
+            if (_settling) { FailViewportSettlement(a); return false; }
         }
-        bool resize = a.ResizePolicy.Request(width, height, frameChanged || moved || clipChanged, matches, ResizeClock(), out var report);
-        if (report) Diagnostic?.Invoke("Codex가 요청 크기를 유지하지 않아 반복 조절을 멈췄습니다.");
         if (resize)
         {
-            // SWP_ASYNCWINDOWPOS posts the request to the target thread, which is
-            // what made the embedded window trail the manager while dragging.
-            // Placement stays synchronous during and just after a size/move drag.
-            bool synchronous = _liveResize || _finalResize;
-            uint flags = SwpNoActivate | SwpNoZOrder | (frameChanged ? SwpFrameChanged : 0)
-                | (synchronous ? 0u : SwpAsyncWindowPos);
+            uint flags = SwpNoActivate | SwpNoZOrder | SwpAsyncWindowPos | (frameChanged ? SwpFrameChanged : 0);
             if (!SetWindowPos(a.Hwnd, 0, target.Left - insetX, target.Top - insetY, outerWidth, outerHeight, flags))
                 throw new Win32Exception(Marshal.GetLastPInvokeError(), "Cannot position native viewport.");
+            a.Parked = false;
+            a.NeedsFrameChange = false;
+            _forceRepair = false;
         }
+        // Cache the desired geometry even if a native region operation fails.
+        // Re-observation checks reality, while retries keep their bounded budget.
         a.Left = target.Left; a.Top = target.Top;
-        if (a.Width != width || a.Height != height) Diagnostic?.Invoke($"표시 영역 크기 요청 · {width} × {height} px");
         a.Width = width; a.Height = height;
+        a.ClipX = insetX; a.ClipY = insetY;
+        // Chromium may replace its window region independently of its bounds.
+        // Never infer actual clipping from our last requested dimensions alone.
+        bool regionMatches = HasViewportRegion(a, insetX, insetY, width, height);
+        bool repairRegion = a.RegionPolicy.Request(width, height, clipChanged || frameChanged || forceRepair,
+            regionMatches, ResizeClock(), out var reportRegion);
+        if (reportRegion)
+        {
+            Diagnostic?.Invoke("Codex 창 테두리 복구를 반복해서 적용할 수 없어 조절을 멈췄습니다.");
+            if (_settling) { FailViewportSettlement(a); return false; }
+        }
+        if (repairRegion && !regionMatches)
+        {
+            using var timing = Responsiveness?.Stage($"native.SetWindowRgn.{a.Pid}");
+            bool wholeWindow = insetX == 0 && insetY == 0 &&
+                bounds.Right - bounds.Left == width && bounds.Bottom - bounds.Top == height;
+            nint region = wholeWindow ? 0 : CreateRectRgn(insetX, insetY, insetX + width, insetY + height);
+            if ((!wholeWindow && region == 0) || SetWindowRgn(a.Hwnd, region, true) == 0)
+            { if (region != 0) DeleteObject(region); throw new Win32Exception(Marshal.GetLastPInvokeError(), "Cannot clip native viewport."); }
+            // SetWindowRgn owns the region after success.
+        }
+        if (dimensionsChanged) Diagnostic?.Invoke($"표시 영역 크기 요청 · {width} × {height} px");
         SetVisible(a, show);
+        // A posted placement is not an acknowledgement. Keep the live mirror
+        // above the source until a later observation verifies geometry AND clip.
+        if (_settling && !resize && matches && HasViewportRegion(a, insetX, insetY, width, height))
+        {
+            a.Lease?.SetInteractiveMove(false);
+            if (a.Lease?.PublicationError is null)
+            {
+                _settling = false;
+                a.Parked = false;
+                _settleWatch.Stop();
+                ViewportRecoveryCompleted?.Invoke(this, EventArgs.Empty);
+            }
+        }
         if (show) SynchronizeZOrder(a);
 
         a.Shown = show;
         LastError = "";
-        _finalResize = false;
         return true;
+    }
+
+    private static bool HasViewportRegion(Attachment a, int x, int y, int width, int height)
+    {
+        if (a.RegionProbe == 0) a.RegionProbe = CreateRectRgn(0, 0, 0, 0);
+        if (a.RegionProbe == 0) return false;
+        int kind = GetWindowRgn(a.Hwnd, a.RegionProbe);
+        // A frameless Chromium window commonly removes its explicit region on
+        // placement. That is already an exact clip when the entire HWND is the
+        // requested client viewport; forcing a region back would fight Chromium.
+        if (kind == 0) return x == 0 && y == 0 && GetWindowRect(a.Hwnd, out var bounds) &&
+            bounds.Right - bounds.Left == width && bounds.Bottom - bounds.Top == height;
+        return kind == 2 /* SIMPLEREGION */ &&
+            GetRgnBox(a.RegionProbe, out var actual) == 2 && actual.Left == x && actual.Top == y &&
+            actual.Right == x + width && actual.Bottom == y + height;
+    }
+
+    private void FailViewportSettlement(Attachment a)
+    {
+        if (_settleFailureQueued) return;
+        _settleFailureQueued = true;
+        int version = _settleVersion;
+        _settleWatch.Stop();
+        // Leave the resize guard before lifecycle callbacks. Only this verified
+        // independent lifetime may be restored; a changed parent/owner is never
+        // reclaimed by geometry or style writes.
+        Dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(() =>
+        {
+            if (_attachment != a || !_settling || version != _settleVersion || !IsAlive(a) || !IsIndependent(a)) return;
+            _changingWindow = true;
+            try { DetachCore(restoreVisibility: true, restoreMaximized: false, forceVisible: true); }
+            finally { _changingWindow = false; }
+            LastError = LastError.Length == 0 ?
+                "Codex 표시 영역을 복구하지 못해 원래 창으로 돌려보냈습니다. ‘관리창 안에 표시’로 다시 연결할 수 있습니다." :
+                "Codex 표시 영역 복구와 원래 창 복원이 지연되었습니다. ‘관리창 안에 표시’로 다시 시도해 주세요. " + LastError;
+            Diagnostic?.Invoke(LastError);
+            AttachmentLost?.Invoke(a.Hwnd, false);
+            ViewportRecoveryFailed?.Invoke(LastError);
+        }));
     }
 
     public string InputDiagnostic()
@@ -599,6 +792,8 @@ public sealed class NativeWindowHost : HwndHost
     private void ForgetAttachment(string error)
     {
         _watch.Stop();
+        _settleWatch.Stop();
+        _settling = _forceRepair = _settleHidden = _settleFailureQueued = false;
         if (_presentationHook != 0) UnhookWinEvent(_presentationHook);
         _presentationHook = 0;
         if (_attachment is { Marked: true } a && IsWindow(a.Hwnd) && GetPropW(a.Hwnd, a.MarkerName) == a.MarkerValue)
@@ -614,9 +809,10 @@ public sealed class NativeWindowHost : HwndHost
         public nint MarkerValue { get; } = 1;
         public bool Marked { get; set; }
         public NativeResizePolicy ResizePolicy { get; } = new();
+        public NativeResizePolicy RegionPolicy { get; } = new();
         public int Width, Height, Left, Top, ClipX = -1, ClipY = -1;
-        public nint Region;
-        public bool Shown;
+        public nint Region, RegionProbe;
+        public bool Shown, Parked, NeedsFrameChange;
         public NativeWindowLease? Lease;
         public NativeWindowHostCaptureMirror CaptureMirror { get; } = new();
         public int? CaptureStatus;
@@ -625,7 +821,7 @@ public sealed class NativeWindowHost : HwndHost
             CaptureMirror.Dispose();
             try { Lease?.Dispose(); }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Text.Json.JsonException) { }
-            finally { if (Region != 0) DeleteObject(Region); Process.Dispose(); }
+            finally { if (Region != 0) DeleteObject(Region); if (RegionProbe != 0) DeleteObject(RegionProbe); Process.Dispose(); }
         }
     }
 }

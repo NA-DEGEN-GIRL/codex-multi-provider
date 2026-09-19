@@ -68,7 +68,9 @@ def run():
     try {
      const frames=await win.webContents.executeJavaScript('window.__viewportFixtureFrames',false);
      fs.writeFileSync(path.join(root,'fixture-body.txt'),await win.webContents.executeJavaScript('document.body.innerText',false));
-     fs.writeFileSync(path.join(root,'frames.json'),JSON.stringify({frames,
+     const viewport=await win.webContents.executeJavaScript('({width:innerWidth,height:innerHeight,dpr:devicePixelRatio})',false);
+     fs.writeFileSync(path.join(root,'frames.json'),JSON.stringify({frames,viewport,
+      bounds:win.getBounds(),contentBounds:win.getContentBounds?.(),
       backgroundThrottling:win.webContents.getBackgroundThrottling?.(),
       canInvalidate:typeof win.webContents.invalidate==='function',
       canSetThrottling:typeof win.webContents.setBackgroundThrottling==='function'}));
