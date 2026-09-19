@@ -6,17 +6,19 @@ from .login_health import inspect as login_health
 
 
 class ProfileWarmup:
-    """Run one serial worker; the injected launcher must preserve existing windows.
+    """Overlap a bounded number of launches without foreground navigation.
 
     Launch callbacks receive a profile ID and must use the same profile-scoped
     admission lock as foreground opens, with ``reopen_existing=False``. Shutdown
     cancels pending work; a callback already admitted may finish normally.
     """
 
-    def __init__(self, store, instances, launch, *, spawn=None, health=login_health):
+    def __init__(self, store, instances, launch, *, spawn=None, health=login_health,
+                 max_workers=4):
         self.store, self.instances, self.launch = store, instances, launch
         self.health = health
         self.spawn = spawn or self._spawn
+        self.max_workers = max(1, min(8, int(max_workers)))
         self.lock = threading.RLock()
         self.stopping = threading.Event()
         self.started = False
@@ -92,20 +94,18 @@ class ProfileWarmup:
                 }
                 self.pending = list(self.entries)
                 self.result['profiles'] = list(self.entries.values())
-            while True:
-                with self.lock:
-                    if self.stopping.is_set() or not self.pending:
-                        break
-                    profile_id = self.priority if self.priority in self.pending else self.pending[0]
-                    self.priority = None
-                    self.pending.remove(profile_id)
-                    self.entries[profile_id]['state'] = 'checking'
-                try:
-                    self._prepare(profile_id)
-                except Exception:
-                    # Status is public UI state; never copy provider/credential diagnostics into it.
-                    self._update(profile_id, state='attention', code='prepare_failed',
-                                 message='프로필을 미리 열지 못했습니다. 선택해서 다시 열 수 있습니다.')
+            workers = []
+            try:
+                for index in range(min(self.max_workers, len(profiles)) - 1):
+                    worker = threading.Thread(target=self._drain, name=f'profile-warmup-{index}',
+                                              daemon=True)
+                    worker.start()
+                    workers.append(worker)
+                self._drain()
+            finally:
+                # Keep worker_active true until every admitted callback finishes.
+                for worker in workers:
+                    worker.join()
         except Exception:
             failed = True
             with self.lock:
@@ -124,6 +124,22 @@ class ProfileWarmup:
                     if failed or any(e['state'] == 'attention' for e in self.entries.values())
                     else 'complete',
                 )
+
+    def _drain(self):
+        while True:
+            with self.lock:
+                if self.stopping.is_set() or not self.pending:
+                    return
+                profile_id = self.priority if self.priority in self.pending else self.pending[0]
+                self.priority = None
+                self.pending.remove(profile_id)
+                self.entries[profile_id]['state'] = 'checking'
+            try:
+                self._prepare(profile_id)
+            except Exception:
+                # Status is public UI state; never copy provider/credential diagnostics into it.
+                self._update(profile_id, state='attention', code='prepare_failed',
+                             message='프로필을 미리 열지 못했습니다. 선택해서 다시 열 수 있습니다.')
 
     def _prepare(self, profile_id):
         # Re-read immediately before each attempt: account removal or login changes

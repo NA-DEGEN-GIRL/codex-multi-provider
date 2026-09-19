@@ -7,7 +7,7 @@ def patch(data):
             raise ValueError('External reasoning picker is not verified for this desktop version.')
         return data
     before = b'let e=o?r.supportedReasoningEfforts:r.supportedReasoningEfforts.filter(({reasoningEffort:e})=>e!==`ultra`)'
-    gates = [b'.filter(({reasoningEffort:e})=>' + name + b'(e)&&i.has(e))' for name in (b'gj', b'WXn')]
+    gates = [b'.filter(({reasoningEffort:e})=>' + name + b'(e)&&i.has(e))' for name in (b'gj', b'WXn', b'UXn')]
     found = [gate for gate in gates if gate in data]
     if data.count(marker) != 1 or data.count(before) != 1 or len(found) != 1 or data.count(found[0]) != 1:
         raise ValueError('External reasoning picker is ambiguous.')

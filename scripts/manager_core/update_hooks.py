@@ -8,7 +8,8 @@ proof for every loaded managed subtree, and rechecks process birth identity.
 Wiring:
     hooks = UpdateHooks(root, store, instances)
     updater = UpdateManager(root, **hooks.callbacks())
-    # Hold hooks.launch_admission(profile_id) across every Instances.show().
+    # instances.launch_admission = hooks.launch_admission fences preparation
+    # and process publication; ordinary window waits happen after release.
     # hooks.restore_instance() uses its own scoped restoration permit.
 
 Compatibility evidence is deliberately not inferred from a version string.
@@ -145,6 +146,7 @@ class UpdateHooks:
         self.remote_maintenance = remote_maintenance
         self.clock, self.sleep, self.timeout = clock or time.monotonic, sleep or time.sleep, timeout
         self._mutex = threading.RLock()
+        self._launch_queue = threading.RLock()
         self._restoration = threading.local()
         self._admission = threading.local()
 
@@ -203,6 +205,23 @@ class UpdateHooks:
                 else data.get("update_maintenance"))
 
     def _acquire_launch_admission_lock(self):
+        # Queue this service's parallel preparations before starting the OS-lock
+        # timeout. A cold desktop bundle can take longer than ten seconds; it
+        # must not turn the other warmup workers into spurious launch failures.
+        self._launch_queue.acquire()
+        try:
+            return self._acquire_external_launch_lock()
+        except BaseException:
+            self._launch_queue.release()
+            raise
+
+    def _release_launch_admission_lock(self, lock):
+        try:
+            _unlock_file(lock)
+        finally:
+            self._launch_queue.release()
+
+    def _acquire_external_launch_lock(self):
         """Let an ordinary launch drain before checking maintenance ownership."""
         deadline = self.clock() + _LAUNCH_ADMISSION_WAIT
         while True:
@@ -222,7 +241,9 @@ class UpdateHooks:
     def open_local_for_remote_reconcile(self, profile_id):
         """Open the desktop without network I/O, fencing only its SSH cohort."""
         profile_id = identifier(profile_id)
-        lock = self._acquire_launch_admission_lock()
+        from .launch_metrics import LaunchMetrics
+        with LaunchMetrics(self.store.directory).phase(profile_id, 'ssh_launch_admission_wait'):
+            lock = self._acquire_launch_admission_lock()
         self._admission.depth = 1
         try:
             observed_profile = self._profile(profile_id)
@@ -317,7 +338,7 @@ class UpdateHooks:
                         gate.update(state='released', adopted_by=transaction_id, updated_at=now())
                 self.store.mutate(hold)
             self._restoration.ssh_transaction_id = transaction_id
-            shown = self.instances.show(profile_id, reopen_existing=False)
+            shown = self.instances.show(profile_id, reopen_existing=False, wait_for_window=False)
             current = self._profile(profile_id)
             def launched(state):
                 gate = state['ssh_maintenance'][profile_id]
@@ -342,7 +363,6 @@ class UpdateHooks:
                     if alias in published:
                         record['publication_binding'] = published[alias]
             self._save_lease(lease)
-            return shown, transaction_id
         except (RuntimeError, ValueError, OSError, KeyError):
             if getattr(self._restoration, 'ssh_transaction_id', None):
                 self.remote_open_failed(profile_id, transaction_id, 'local_launch_failed')
@@ -350,7 +370,15 @@ class UpdateHooks:
         finally:
             self._restoration.ssh_transaction_id = None
             self._admission.depth = 0
-            _unlock_file(lock)
+            self._release_launch_admission_lock(lock)
+        # The SSH lease now refers to the published process generation. Waiting
+        # for Chromium's first window is read-only and must not hold the global
+        # launch/update fence, or every background profile starts in sequence.
+        try:
+            return self.instances.finish_show(shown), transaction_id
+        except (RuntimeError, ValueError, OSError, KeyError):
+            self.remote_open_failed(profile_id, transaction_id, 'local_launch_failed')
+            raise
 
     def reconcile_opened_remotes(self, profile_id, transaction_id):
         """Advance only SSH; the newly opened local process is never closed."""
@@ -433,7 +461,7 @@ class UpdateHooks:
 
     @contextmanager
     def launch_admission(self, profile_id):
-        """Hold across Instances.show, including process creation and state commit."""
+        """Fence launch preparation, process creation and identity publication."""
         if getattr(self._admission, "depth", 0):
             self.guard_launch(profile_id)
             yield
@@ -445,7 +473,7 @@ class UpdateHooks:
             yield
         finally:
             self._admission.depth = 0
-            _unlock_file(lock)
+            self._release_launch_admission_lock(lock)
 
     def _host_coverage(self, profile):
         if not self.host_inventory:
@@ -713,7 +741,7 @@ class UpdateHooks:
         try:
             self.store.mutate(begin)
         finally:
-            _unlock_file(lock)
+            self._release_launch_admission_lock(lock)
 
     def acquire_maintenance(self, instances, *, transaction_id, profile_scope=None):
         transaction_id = identifier(transaction_id)

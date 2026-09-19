@@ -38,7 +38,8 @@ class LocalFirstRemoteTests(unittest.TestCase):
         self.store.mutate(record)
         self.instances.close(self.profile)
         original_show = self.instances.show
-        def show(profile_id, *, reopen_existing=True):
+        def show(profile_id, *, reopen_existing=True, wait_for_window=True):
+            self.assertFalse(wait_for_window, 'window wait must be outside the SSH publication fence')
             existing = profile_id in self.instances.running
             result = original_show(profile_id)
             self.hooks.authorize_restoration_generation(result['profile'])
@@ -52,6 +53,7 @@ class LocalFirstRemoteTests(unittest.TestCase):
             result['state'] = 'existing' if existing else 'launched'
             return result
         self.instances.show = show
+        self.instances.finish_show = lambda result: result
         self.pending = []
         self.restarts = ProfileRestarts(self.store, self.instances, self.hooks,
                                        spawn=self.pending.append, owner_alive=lambda _: False)
@@ -77,6 +79,45 @@ class LocalFirstRemoteTests(unittest.TestCase):
         self.assertEqual(self.instances.observe(self.store.profile(self.profile['id']))['status'], 'running')
         self.assertEqual(self.fixture.closes, [])
         self.assertNotIn('private diagnostic', json.dumps(self.job()))
+
+    def test_window_wait_runs_after_ssh_publication_and_global_unlock(self):
+        def finish(result):
+            lock = _lock_file(self.hooks.directory / 'launch-admission.lock')
+            _unlock_file(lock)
+            self.assertEqual(self.hooks._admission.depth, 0)
+            self.assertEqual(self.gate()['generation'], result['profile']['generation'])
+            return result
+        self.instances.finish_show = finish
+        self.assertEqual(self.open()['state'], 'launched')
+
+    def test_same_service_queue_does_not_consume_external_lock_timeout(self):
+        waiting, entered, release = threading.Event(), threading.Event(), threading.Event()
+        errors = []
+        clock = [0]
+        self.hooks.clock = lambda: clock[0]
+        acquire = self.hooks._acquire_launch_admission_lock
+        def queued():
+            waiting.set()
+            return acquire()
+        def second():
+            try:
+                with self.hooks.launch_admission(self.profile['id']):
+                    entered.set()
+            except Exception as error:
+                errors.append(error)
+            finally:
+                release.set()
+        worker = threading.Thread(target=second)
+        with self.hooks.launch_admission(self.profile['id']):
+            with patch.object(self.hooks, '_acquire_launch_admission_lock', side_effect=queued):
+                worker.start()
+                self.assertTrue(waiting.wait(2))
+                clock[0] = 100
+                self.assertFalse(entered.is_set())
+        self.assertTrue(release.wait(2))
+        worker.join(2)
+        self.assertEqual(errors, [])
+        self.assertTrue(entered.is_set())
 
     def test_remote_host_snapshot_and_gate_exclude_a_late_ssh_enrollment(self):
         inventory = SshInventory(self.fixture.root, identity=lambda _: {})

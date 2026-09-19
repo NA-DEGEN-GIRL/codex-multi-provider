@@ -120,7 +120,8 @@ console.log('PASS: scoped application shutdown before renderer readiness, no dup
 // Preloaded windows have no native lease until the user selects their profile.
 // These fixtures execute startup callbacks without creating any native window.
 function preloadFixture() {
-  const fixture = {marker:null, ownerAlive:true, calls:[], report:null};
+  const fixture = {marker:null, ownerAlive:true, calls:[], report:null, fileReads:0, stamp:0};
+  let serialized;
   vm.runInNewContext(source, {
     process:{platform:'win32', pid:42,
       env:{CODEX_MANAGER_ROOT:'fixture', CODEX_MANAGER_PRELOAD_HIDDEN:'1'},
@@ -129,9 +130,14 @@ function preloadFixture() {
     require(name){
       if(name==='electron') return {app:{on(_,fn){fixture.created=fn},quit(){fixture.quit=true}}};
       if(name==='node:fs') return {
-        mkdirSync(){},watch(){},
-        statSync(){if(!fixture.marker)throw Error('missing');return {size:100}},
-        readFileSync(){return JSON.stringify(fixture.marker)},
+        mkdirSync(){},watch(_,options,fn){fixture.watch=fn},
+        statSync(){
+          if(!fixture.marker)throw Error('missing');
+          const value=JSON.stringify(fixture.marker);
+          if(value!==serialized){serialized=value;fixture.stamp++;}
+          return {size:100,mtimeMs:fixture.stamp,ctimeMs:fixture.stamp,ino:1};
+        },
+        readFileSync(){fixture.fileReads++;return JSON.stringify(fixture.marker)},
         writeFileSync(_,data){fixture.report=JSON.parse(data)},
         unlinkSync(file){if(!file.endsWith('.render.json'))fixture.marker=null},
       };
@@ -250,3 +256,25 @@ console.log('PASS: hidden preload before lease, startup no-focus, renderer ready
     'explicit detach restores original geometry and focus methods');
 }
 console.log('PASS: native geometry authority, late leases, mixed DPI, parked drag and deferred presentation');
+
+{
+  const fixture=preloadFixture(), main=fixture.window(123);
+  fixture.lease({geometryAuthority:'native',visible:true,presentationEpoch:1});
+  main.ready();
+  const reads=fixture.fileReads;
+  for(let i=0;i<100;i++){main.setBounds({x:0});main.focus();main.show();fixture.tick();}
+  assert.equal(fixture.fileReads,reads,'unchanged lease must not be read/parsed for every guard');
+  fixture.marker.visible=false;fixture.tick();
+  assert.equal(main.visible,false,'poll detects a missed watch notification');
+  assert.equal(fixture.fileReads,reads+1);
+  fixture.watch('rename','42.json');
+  assert.equal(fixture.fileReads,reads+2,'atomic replacement watch invalidates even unchanged timestamps');
+  const before=fixture.fileReads;
+  fixture.watch('change','42.health.json');fixture.watch('change','43.json');
+  assert.equal(fixture.fileReads,before,'unrelated files do not invalidate the cache');
+  fixture.ownerAlive=false;fixture.calls=[];main.focus();
+  assert.deepEqual(fixture.calls,[[123,'focus']],'cached data does not bypass owner liveness');
+  fixture.marker=null;fixture.ownerAlive=true;fixture.calls=[];main.focus();
+  assert.deepEqual(fixture.calls,[[123,'focus']],'deleted lease restores native behavior');
+}
+console.log('PASS: lease read cache, missed watches, atomic replacement, owner liveness and deletion');

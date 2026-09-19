@@ -44,7 +44,7 @@ _PIPE_VARIANTS = {_ORIGINAL: _REPLACEMENT,
     _ORIGINAL.replace(b'return i.join', b'return s.join'): _REPLACEMENT.replace(b'return i.join', b'return s.join')}
 _RENDERER_VARIANTS = {_CONTEXT_RENDERER: _CONTEXT_RENDERER_REPLACEMENT,
     **{_CONTEXT_RENDERER.replace(b't7.', binding): _CONTEXT_RENDERER_REPLACEMENT.replace(b't7.', binding)
-       for binding in (b'F9.', b'R9.')}}
+       for binding in (b'F9.', b'R9.', b'L9.')}}
 _CONTEXT_VARIANTS = {_CONTEXT_MAIN: _CONTEXT_MAIN_REPLACEMENT,
     _CONTEXT_MAIN.replace(b's.type', b'c.type'): _CONTEXT_MAIN_REPLACEMENT.replace(
         b's.type', b'c.type').replace(b't.sender,s.route,s.title', b'i.sender,c.route,c.title')}

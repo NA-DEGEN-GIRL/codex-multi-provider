@@ -14,13 +14,16 @@ from manager_core.instances import Instances
 
 class FakeInstances(Instances):
     def __init__(self, root):
-        super().__init__(root, Mock(), Mock(), embed_windows=True)
+        super().__init__(root, Mock(directory=root / 'work/control-center'), Mock(), embed_windows=True)
         self.calls = []
         self.launch = lambda _: dict(state='launched')
 
     def _show(self, profile_id, *, reopen_existing=True):
         self.calls.append((profile_id, reopen_existing))
         return self.launch(profile_id)
+
+    def finish_show(self, result):
+        return result
 
 
 class LaunchDrainTests(unittest.TestCase):

@@ -25,10 +25,13 @@ class RecordingInstances:
         assert Path(profile['home']) == expected / 'codex'
         assert Path(profile['ui_home']) == expected / 'ui'
 
-    def show(self, profile_id, *, reopen_existing=True):
+    def show(self, profile_id, *, reopen_existing=True, wait_for_window=True):
         with self.hooks.launch_admission(profile_id):
             self.show_calls.append((profile_id, reopen_existing))
             return dict(state='fixture_only', profile=self.store.profile(profile_id))
+
+    def finish_show(self, result):
+        return result
 
 
 class FakeClock:

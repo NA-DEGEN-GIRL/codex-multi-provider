@@ -67,10 +67,8 @@ class ControlCenter:
         self._mutex=threading.RLock()
         self._request_gates={}
         self._request_gate_lock=threading.Lock()
-        from manager_core.personal_skills import PersonalSkills
-        self.personal_skills=PersonalSkills(self.store)
-        from manager_core.plugin_sync import PluginSync
-        self.shared_plugins=PluginSync(self.store)
+        self.personal_skills=self.instances.personal_skills
+        self.shared_plugins=self.instances.shared_plugins
         from manager_core.profile_warmup import ProfileWarmup
         self.profile_warmup=ProfileWarmup(self.store,self.instances,self._open_profile_locally)
 

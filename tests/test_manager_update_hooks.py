@@ -84,6 +84,9 @@ class FakeInstances:
         for pid in (profile["process_id"], profile["process_id"] + 1, profile["process_id"] + 2):
             self.live_pids.pop(pid, None)
 
+    def finish_show(self, result):
+        return result
+
     def show(self, profile_id):
         # Simulate root's production reservation around the entire launch.
         with self.hooks.launch_admission(profile_id):

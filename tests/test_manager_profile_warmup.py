@@ -21,7 +21,8 @@ class ProfileWarmupTests(unittest.TestCase):
         self.workers, self.launched, self.observed = [], [], []
         self.running, self.unhealthy = {}, set()
         self.warmup = ProfileWarmup(self.store, self, self.launch, spawn=self.workers.append,
-                                   health=lambda p: dict(blocks_launch=p['id'] in self.unhealthy))
+                                   health=lambda p: dict(blocks_launch=p['id'] in self.unhealthy),
+                                   max_workers=1)
 
     def observe(self, profile):
         self.observed.append(profile['id'])
@@ -54,6 +55,56 @@ class ProfileWarmupTests(unittest.TestCase):
         self.assertEqual(self.launched, [p['id'] for p in self.profiles])
         complete['profiles'].clear()
         self.assertEqual(len(self.warmup.status()['profiles']), 3)
+
+    def test_default_pool_bounds_concurrency_prioritizes_and_cancels_queued_profiles(self):
+        self.profiles += [self.store.add_profile('parallel') for _ in range(4)]
+        entered = {p['id']: threading.Event() for p in self.profiles}
+        release = {p['id']: threading.Event() for p in self.profiles}
+        workers, active, peak = [], set(), [0]
+        gate = threading.Lock()
+        def launch(profile_id):
+            with gate:
+                active.add(profile_id)
+                peak[0] = max(peak[0], len(active))
+            entered[profile_id].set()
+            try:
+                if not release[profile_id].wait(5):
+                    raise TimeoutError('fixture launch was not released')
+                return self.launch(profile_id)
+            finally:
+                with gate:
+                    active.remove(profile_id)
+        def spawn(fn):
+            worker = threading.Thread(target=fn)
+            workers.append(worker)
+            worker.start()
+        warmup = ProfileWarmup(self.store, self, launch, spawn=spawn,
+                               health=lambda _: dict(blocks_launch=False))
+        try:
+            warmup.start()
+            for profile in self.profiles[:4]:
+                self.assertTrue(entered[profile['id']].wait(2))
+            self.assertEqual(peak[0], 4)
+            self.assertEqual(warmup.status()['counts']['pending'], 7)
+            chosen = self.profiles[-1]['id']
+            self.assertTrue(warmup.prioritize(chosen))
+            release[self.profiles[0]['id']].set()
+            self.assertTrue(entered[chosen].wait(2))
+            self.assertFalse(entered[self.profiles[4]['id']].is_set())
+            warmup.shutdown()
+            self.assertTrue(warmup.status()['worker_active'])
+            self.assertEqual(warmup.status()['counts']['cancelled'], 2)
+        finally:
+            warmup.shutdown()
+            for event in release.values():
+                event.set()
+            for worker in workers:
+                worker.join(3)
+        self.assertTrue(all(not worker.is_alive() for worker in workers))
+        self.assertEqual(peak[0], 4)
+        self.assertEqual(len(self.launched), len(set(self.launched)))
+        self.assertEqual(warmup.status()['state'], 'stopped')
+        self.assertFalse(warmup.status()['worker_active'])
 
     def test_running_window_is_never_launched_or_focused(self):
         self.running[self.profiles[0]['id']] = dict(status='running', window_handle=99)
@@ -194,7 +245,7 @@ class ProfileWarmupTests(unittest.TestCase):
             workers.append(thread)
             thread.start()
         self.warmup = ProfileWarmup(self.store, self, launch, spawn=spawn,
-                                   health=lambda _: dict(blocks_launch=False))
+                                   health=lambda _: dict(blocks_launch=False), max_workers=1)
         try:
             self.warmup.start()
             self.assertTrue(entered.wait(2))
@@ -227,7 +278,7 @@ class ProfileWarmupTests(unittest.TestCase):
             workers.append(thread)
             thread.start()
         self.warmup = ProfileWarmup(self.store, self, launch, spawn=spawn,
-                                   health=lambda _: dict(blocks_launch=False))
+                                   health=lambda _: dict(blocks_launch=False), max_workers=1)
         def interact():
             responses.append(self.warmup.status())
             responses.append(self.warmup.prioritize(self.profiles[2]['id']))

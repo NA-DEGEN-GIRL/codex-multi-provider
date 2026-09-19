@@ -9,6 +9,22 @@
   const { app, Menu, screen } = require('electron');
   const marker = path.join(root, 'work', 'control-center', 'window-hosts', `${process.pid}.json`);
   const checks = new Set(), presentations = new Set();
+  let leaseCache;
+  const readLease = () => {
+    try {
+      // Geometry/menu guards can run dozens of times per presentation. Check
+      // metadata, but read and parse only a changed file. Watch invalidation
+      // also handles atomic replacement with identical size/timestamps.
+      const stat = fs.statSync(marker);
+      if (stat.size > 32768) { leaseCache = undefined; return false; }
+      const stamp = [stat.size, stat.mtimeMs, stat.ctimeMs, stat.ino].join(':');
+      const cacheable = Number.isFinite(stat.mtimeMs) && Number.isFinite(stat.ctimeMs);
+      if (cacheable && leaseCache?.stamp === stamp) return leaseCache.state;
+      const state = JSON.parse(fs.readFileSync(marker, 'utf8'));
+      leaseCache = cacheable ? {stamp, state} : undefined;
+      return state;
+    } catch { leaseCache = undefined; return false; }
+  };
   // STARTUPINFO only hides the initial native show. The app's ready callbacks
   // and startup fallback can still call show/focus before the shell attaches.
   // Hand back startup control permanently at the first valid lease, so later
@@ -44,6 +60,7 @@
       // Health samples, render acknowledgements and other profiles share this
       // directory. They must not trigger native layout work in every process.
       if (filename && filename.toString() !== path.basename(marker)) return;
+      leaseCache = undefined;
       for (const present of presentations) present();
     });
   } catch { /* The timer remains a fallback on filesystems without watches. */ }
@@ -52,9 +69,8 @@
     let lastHostState, recovering;
     const hostState = () => {
       try {
-        const stat = fs.statSync(marker);
-        if (stat.size > 32768) return false;
-        const state = JSON.parse(fs.readFileSync(marker, 'utf8'));
+        const state = readLease();
+        if (!state) return false;
         if (state.version !== 1 || state.appPid !== process.pid || state.hwnd !== hwnd ||
             !Number.isSafeInteger(state.shellPid) || state.shellPid <= 0) return false;
         if (state.mode === 'viewport') lastHostState = state;

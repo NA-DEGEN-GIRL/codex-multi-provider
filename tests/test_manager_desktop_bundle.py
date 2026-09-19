@@ -84,6 +84,19 @@ class DesktopBundleTests(unittest.TestCase):
         with self.assertRaises(ValueError):bundle.patch_archive(self.path,self.root/'patched.asar')
         self.assertFalse((self.root/'patched.asar').exists())
 
+    def test_verified_renderer_binding_from_new_package_keeps_task_context_hook(self):
+        # Same route/effect arguments, only the bundled React identifier changed.
+        self.path.write_bytes(self.path.read_bytes().replace(b't7.', b'L9.'))
+        target = self.root / 'patched.asar'
+        bundle.patch_archive(self.path, target)
+        with target.open('rb') as stream:
+            header, base = bundle.read_header(stream)
+            item = dict(bundle._entries(header))['webview/assets/app-initial-fixture.js']
+            stream.seek(base + int(item['offset']))
+            content = stream.read(item['size'])
+        self.assertIn(bundle._CONTEXT_RENDERER_REPLACEMENT.replace(b't7.', b'L9.'), content)
+        self.assertNotIn(bundle._CONTEXT_RENDERER_REPLACEMENT, content)
+
     def test_unknown_notification_callback_fails_before_publication(self):
         archive(self.path, notification=b'changed notification callback')
         with self.assertRaises(ValueError): bundle.patch_archive(self.path, self.root / 'patched.asar')

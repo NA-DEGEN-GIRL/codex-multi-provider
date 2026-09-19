@@ -1,7 +1,7 @@
 """Launch only isolated, manager-owned Codex instances; never the calling app."""
 import ctypes
 from ctypes import wintypes
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 import json
 import os
 from pathlib import Path
@@ -117,6 +117,12 @@ class Instances:
         self._launch_lock=threading.Lock()
         self._launch_count=0
         self._launch_stopping=False
+        from .launch_metrics import LaunchMetrics
+        self.metrics = LaunchMetrics(store.directory)
+        from .personal_skills import PersonalSkills
+        from .plugin_sync import PluginSync
+        self.personal_skills = PersonalSkills(store)
+        self.shared_plugins = PluginSync(store)
         from .catalog_refresh import CatalogRefresh
         self.catalog_refresh=CatalogRefresh(self.root)
         from .source_catalog import build as source_catalog_build
@@ -169,12 +175,12 @@ class Instances:
         from .common import prepare_common
         common=prepare_common(home,Path.home()/'.codex') if not profile.get('view_only') else {'mcp':'viewer_disabled'}
         if not profile.get('view_only') and (self.store.directory/'personal-skills.json').is_file():
-            from .personal_skills import PersonalSkills
-            common['personal_skills'] = PersonalSkills(self.store).reconcile(force=True)
+            with self.metrics.phase(profile['id'], 'shared_skills'):
+                common['personal_skills'] = self.personal_skills.reconcile()
         if not profile.get('view_only'):
-            from .plugin_sync import PluginSync
             try:
-                common['shared_plugins'] = PluginSync(self.store).reconcile(force=True)
+                with self.metrics.phase(profile['id'], 'shared_plugins'):
+                    common['shared_plugins'] = self.shared_plugins.reconcile()
             except (OSError, ValueError) as error:
                 common['shared_plugins'] = dict(applied=0, shared=0, removed=0, errors=[str(error)])
         if not profile.get('view_only'):
@@ -313,14 +319,26 @@ class Instances:
                 env['CODEX_MANAGER_SSH_SCRIPT'] = str(frozen_shim)
         return env
 
-    def show(self, profile_id, *, reopen_existing=True):
+    @contextmanager
+    def _admitted(self, profile_id):
+        # Only preparation, spawning and identity publication need the global
+        # update fence. Chromium can initialize after this fence is released.
+        started = time.perf_counter()
+        with self.launch_admission(profile_id) if self.launch_admission else nullcontext():
+            self.metrics.record(profile_id, 'admission_wait', started)
+            with self.metrics.phase(profile_id, 'prepare_and_spawn'):
+                yield
+
+    def show(self, profile_id, *, reopen_existing=True, wait_for_window=True):
         with self._launch_lock:
             if self._launch_stopping:
                 raise RuntimeError('관리창을 닫는 중이므로 새 프로필 실행을 중지했습니다.')
             self._launch_count+=1
         try:
-            with self.launch_admission(profile_id) if self.launch_admission else nullcontext():
-                return self._show(profile_id, reopen_existing=reopen_existing)
+            with self.metrics.phase(profile_id, 'show_total'):
+                with self._admitted(profile_id):
+                    result = self._show(profile_id, reopen_existing=reopen_existing)
+                return self.finish_show(result) if wait_for_window else result
         finally:
             with self._launch_lock:
                 self._launch_count-=1
@@ -383,10 +401,13 @@ class Instances:
                     or not NativeAccountGuard({'CODEX_HOME':profile['home'],
                         'CODEX_MANAGER_EXPECTED_ACCOUNT_FINGERPRINT':profile['account_fingerprint']}).matches()):
                 raise RuntimeError('이 프로필의 로그인 계정을 먼저 확인하세요. 다른 계정으로 작업을 시작하지 않았습니다.')
-        preparation = self.prepare(profile)
+        with self.metrics.phase(profile_id, 'profile_configuration'):
+            preparation = self.prepare(profile)
         from desktop_launch import find_app
         from .desktop_bundle import prepare as prepare_desktop
-        app=prepare_desktop(self.root, find_app());profile['generation']=str(uuid4())
+        with self.metrics.phase(profile_id, 'desktop_bundle'):
+            app=prepare_desktop(self.root, find_app())
+        profile['generation']=str(uuid4())
         profile['shared_catalog_path']=None
         if profile.get('view_only'):
             from .runtime_build import resolve
@@ -398,7 +419,8 @@ class Instances:
         restoration = getattr(self, 'authorize_restoration_generation', None)
         if restoration is not None:
             restoration(profile)
-        env=self.environment(profile)
+        with self.metrics.phase(profile_id, 'environment'):
+            env=self.environment(profile)
         profile['shared_catalog_path']=env.get('CODEX_MANAGER_SHARED_CATALOG')
         profile['manager_release']=env.get('CODEX_CLI_PATH')
         from .release_code import runtime_revision
@@ -436,8 +458,31 @@ class Instances:
             supersede_previous_notice(data, p)
             return p
         profile=self.store.mutate(save)
+        return dict(profile_id=profile['id'],profile=profile,state='launched', preparation=preparation)
+
+    def finish_show(self, result):
+        if result.get('state') != 'launched':
+            return result
+        with self.metrics.phase(result['profile_id'], 'window_ready'):
+            return self._finish_show(result)
+
+    def _finish_show(self, result):
+        profile = result['profile']
+        process = self.processes.get(profile['id'])
+        lifetime = ('generation', 'process_id', 'process_created', 'executable_path')
+        def same_launch(current):
+            return (not current.get('removed_at') and
+                    all(current.get(key) == profile.get(key) for key in lifetime))
+        # An update/removal may have won after launch admission was released.
+        # An old window waiter must never publish an HWND into a new lifetime.
+        if (process is None or process.pid != profile.get('process_id') or
+                not same_launch(self.store.profile(profile['id']))):
+            return {**result, 'state': 'superseded'}
+        window = None
         deadline=time.monotonic()+8
         while time.monotonic()<deadline:
+            if self.launch_status()['stopping']:
+                break
             window=main_window(process.pid)
             if window or process.poll() is not None:
                 break
@@ -451,7 +496,18 @@ class Instances:
                 pass
             if process.poll() is not None:
                 raise RuntimeError('로그인 창이 시작 중 종료되었습니다. 로그인 완료 대기 상태가 아닙니다. 관리 앱의 최신 버전에서 ‘이 프로필에 로그인’을 다시 누르세요.')
-        if window:
-            self.handles[profile['id']]=window
-            self.store.mutate(lambda data:self.store.profile(profile['id'],data).update(window_handle=window))
-        return dict(profile_id=profile['id'],profile={**profile,**self.observe(profile)},state='launched', preparation=preparation)
+        identity = process_identity(process.pid)
+        if window and identity and all(identity.get(key) == profile.get(key) for key in lifetime[1:]):
+            def publish(data):
+                current = self.store.profile(profile['id'], data)
+                if not same_launch(current):
+                    return False
+                current['window_handle'] = window
+                self.handles[profile['id']] = window
+                return True
+            if not self.store.mutate(publish):
+                return {**result, 'state': 'superseded'}
+        current = self.store.profile(profile['id'])
+        if not same_launch(current):
+            return {**result, 'state': 'superseded'}
+        return {**result, 'profile': {**current, **self.observe(current)}}
