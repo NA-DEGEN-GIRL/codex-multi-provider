@@ -37,6 +37,21 @@ def connection(profile):
                     pass
 
 
+def identity(profile, revision):
+    """Verify a reusable listener, without assuming its work is idle."""
+    process = native._running(profile, revision)
+    if process is None:
+        return {'process': None, 'idle': native._instance_lock_released(profile),
+                'exited': True, 'revision': revision}
+    with connection(profile) as request:
+        diagnostics = request('server/diagnostics', {})
+        if diagnostics.get('process', {}).get('id') != process['pid']:
+            raise RuntimeError('Runtime diagnostics identity changed.')
+    if native._running(profile, revision) != process:
+        raise RuntimeError('Runtime identity changed during observation.')
+    return {'process': process, 'idle': False, 'exited': False, 'revision': revision}
+
+
 def inspect(profile, revision, *, discover_active=False):
     """Advisory only; shutdown rechecks all clients under the runtime fence."""
     lock_path = profile / 'native-start.lock'
@@ -113,6 +128,8 @@ def dispatch(payload):
     revision = binding['revision']
     native._descriptor(profile, revision)
     operation = payload['operation']
+    if operation == 'identity':
+        return identity(profile, revision)
     if operation == 'inspect':
         return inspect(profile, revision, discover_active=payload.get('discover_active') is True)
     if operation == 'stop':

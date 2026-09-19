@@ -204,7 +204,9 @@ class ProfileRestarts:
                     code = getattr(error, 'code', 'remote_prepare_failed')
                     self.hooks.remote_open_failed(profile_id, job['transaction_id'], code)
                     self._write(profile_id, job_id, phase='attention', code=code,
-                                message='로컬 창은 사용할 수 있습니다. SSH 연결 준비 상태를 확인해 주세요.')
+                                message=('로컬 창은 사용할 수 있습니다. ' + str(error)
+                                         if isinstance(error, UpdateError) else
+                                         '로컬 창은 사용할 수 있습니다. SSH 연결 준비 상태를 확인해 주세요.'))
                 return True
             if (job.get('automatic_key') and not job.get('transaction_id')
                     and profile.get('generation') != job.get('generation')):

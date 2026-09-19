@@ -1,4 +1,5 @@
 """No live SSH, credentials, or account files; exercise real archive helpers."""
+from copy import deepcopy
 import hashlib
 import importlib.util
 import io
@@ -73,6 +74,16 @@ class Registry:
         return {"CODEX_EXTERNAL_TEST_API_KEY": "synthetic-secret-for-test"} if model_ids else {}
 
 
+class SettingsRegistry(Registry):
+    def render_for_host(self, config_home, enabled, model_ids, **kwargs):
+        rendered = super().render_for_host(config_home, enabled, model_ids, **kwargs)
+        settings = dict(enabled=enabled, models=model_ids, primary_model_id=kwargs.get('primary_model_id'),
+                        primary_settings=kwargs.get('primary_settings'),
+                        selection_mode=kwargs.get('selection_mode', 'automatic'))
+        rendered['files']['config.toml'] += '# fixture settings: ' + json.dumps(settings, sort_keys=True) + '\n'
+        return rendered
+
+
 class RemoteTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -90,6 +101,77 @@ class RemoteTests(unittest.TestCase):
             self.calls.append((args, kwargs))
             return callback(args, kwargs) if callback else subprocess.CompletedProcess(args, 0, probe(), b"")
         return RemoteManager(self.root, ssh_config=self.config, runner=runner, ssh_executable="ssh.exe", registry=Registry())
+
+    def prepared_settings_fixture(self):
+        artifact = make_artifact(self.root)
+        helpers = self.root / 'scripts/remote_helpers'
+        helpers.mkdir(parents=True)
+        for name in ('install', 'launch', 'native_controller', 'common', 'managed_sources', 'ws_client'):
+            (helpers / (name + '.py')).write_bytes((ROOT / 'scripts/remote_helpers' / (name + '.py')).read_bytes())
+        remote = self.root / 'simulated-settings-remote'
+        def runner(args, options):
+            if args[-1] == INSPECT_COMMAND:
+                return subprocess.CompletedProcess(args, 0, probe(), b'')
+            if args[-1].endswith('--preflight'):
+                result = INSTALL.preflight(json.loads(options['input']), remote)
+            elif 'stdin' in options:
+                result = INSTALL.install(io.BytesIO(options['stdin'].read()), remote)
+            else:
+                result = LAUNCH.configure(remote / 'profiles' / PROFILE, json.loads(options['input']), expected_host='f' * 64)
+            return subprocess.CompletedProcess(args, 0, json.dumps(result).encode(), b'')
+        manager = self.manager(runner)
+        manager._registry = SettingsRegistry()
+        binding = manager.prepare('staging', PROFILE, self.root, ['model1'])
+        self.assertIs(binding['prepared'], True)
+        profile = dict(id=PROFILE, auth_mode='chatgpt', policy=dict(enabled=True, model_ids=['model1']))
+        self.calls.clear()
+        return manager, profile, binding, artifact, helpers
+
+    def test_prepared_remote_definition_ignores_manager_only_build_changes_without_ssh(self):
+        manager, profile, binding, _, _ = self.prepared_settings_fixture()
+        self.assertTrue(manager.binding_matches_settings(profile, binding))
+        (self.root / 'scripts/manager_core').mkdir()
+        (self.root / 'scripts/manager_core/release_code.py').write_text('# different manager revision\n')
+        (self.root / 'manager-shell.exe').write_bytes(b'new UI build')
+        with patch('manager_core.release_code.runtime_revision', side_effect=AssertionError('UI revision consulted')):
+            self.assertTrue(manager.binding_matches_settings(profile, binding))
+        self.assertEqual(self.calls, [])
+
+    def test_prepared_remote_definition_detects_helpers_models_bundle_and_host_changes(self):
+        manager, profile, binding, artifact, helpers = self.prepared_settings_fixture()
+        for path in helpers.glob('*.py'):
+            original = path.read_bytes()
+            with self.subTest(helper=path.name):
+                path.write_bytes(original + b'\n# changed remote helper\n')
+                self.assertFalse(manager.binding_matches_settings(profile, binding))
+                path.write_bytes(original)
+                self.assertTrue(manager.binding_matches_settings(profile, binding))
+        variants = []
+        changed = deepcopy(profile)
+        changed['policy']['model_ids'] = ['model2']
+        variants.append(changed)
+        changed = deepcopy(profile)
+        changed['policy']['enabled'] = False
+        variants.append(changed)
+        changed = deepcopy(profile)
+        changed['policy']['selection_mode'] = 'external_only'
+        variants.append(changed)
+        changed = deepcopy(profile)
+        changed.update(auth_mode='external', external_model_id='model2', external_settings={'reasoning_effort': 'high'})
+        variants.append(changed)
+        for changed in variants:
+            with self.subTest(profile=changed):
+                self.assertFalse(manager.binding_matches_settings(changed, binding))
+        for field, value in [('host_identity', 'e' * 64), ('host_identity', None),
+                             ('runtime_bundle', 'missing-bundle'), ('prepared', False), ('revision', 'b' * 64)]:
+            with self.subTest(field=field, value=value):
+                self.assertFalse(manager.binding_matches_settings(profile, {**binding, field: value}))
+        path = artifact / 'manifest.json'
+        manifest = json.loads(path.read_text())
+        manifest['version'] = '0.153.4-new'
+        path.write_text(json.dumps(manifest))
+        self.assertFalse(manager.binding_matches_settings(profile, binding))
+        self.assertEqual(self.calls, [])
 
     def test_discovery_only_exposes_exact_aliases_and_safe_include(self):
         (self.config.parent / "more.conf").write_text("Host gpu\n  HostName private-host\nMatch exec 'never execute'\nHost !negated wild* [range]\n")

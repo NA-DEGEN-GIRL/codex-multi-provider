@@ -39,12 +39,6 @@ class RemoteMaintenance:
         policy = profile['policy']
         if policy.get('launched_revision') != policy.get('desired_revision'):
             return True
-        from .startup_updates import selected_manager_proxy
-        from .release_code import runtime_revision
-        selected = selected_manager_proxy(self.root)
-        revision = runtime_revision(selected)
-        if revision and profile.get('manager_runtime_revision') != revision:
-            return True
         path = self.store.directory / 'profiles' / identifier(profile['id']) / 'ssh-bindings.json'
         if path.is_symlink() or not path.is_file() or path.stat().st_size > 256000:
             return True
@@ -53,7 +47,44 @@ class RemoteMaintenance:
             return True
         requested = {b['alias']: b['revision'] for b in manifest.get('bindings', [])}
         saved = {b['alias']: b['revision'] for b in profile.get('remote_bindings', []) if b.get('prepared') is True}
-        return any(alias in saved and requested.get(alias) != saved[alias] for alias in inventory['hosts'])
+        if any(alias in saved and requested.get(alias) != saved[alias] for alias in inventory['hosts']):
+            return True
+        # GUI, clipboard and other manager-only updates must not restart SSH.
+        bindings = {b['alias']: b for b in profile.get('remote_bindings', []) if b.get('prepared') is True}
+        return any(alias not in bindings or not self.remote.binding_matches_settings(profile, bindings[alias])
+                   for alias in inventory['hosts'])
+
+    def reuse_unchanged(self, profile, records):
+        """Recover only a wholly unmodified preflight, never a partial restart."""
+        if not records or any(r.get('state') != 'unobserved' or r.get('reinspect')
+                              or any(key in r for key in ('next_binding', 'exit_proof', 'started', 'process'))
+                              for r in records):
+            return False
+        saved = {b['alias']: b for b in profile.get('remote_bindings', []) if b.get('prepared') is True}
+        for record in records:
+            binding = record.get('binding')
+            if (not binding or binding != record.get('publication_binding')
+                    or binding['alias'] not in saved
+                    or validate_binding(saved[binding['alias']], profile['id']) != binding
+                    or not self.remote.binding_matches_settings(profile, saved[binding['alias']])):
+                return False
+        # Matching settings do not certify inactivity. Verify identity only;
+        # normal native reconnect/start still rechecks the exact descriptor.
+        for record in records:
+            self.request(record['binding'], 'identity')
+        path = self.store.directory / 'profiles' / identifier(profile['id']) / 'ssh-bindings.json'
+        if path.is_symlink() or path.stat().st_size > 256000:
+            raise UpdateError('remote_binding_unknown', 'SSH 연결 설정을 확인해야 합니다.')
+        manifest = json.loads(path.read_text(encoding='utf-8'))
+        if (manifest.get('profile_id') != profile['id']
+                or manifest.get('generation') != profile.get('generation')
+                or manifest.get('pending_policy_hosts')):
+            raise UpdateError('remote_generation_changed', 'SSH 연결 설정이 확인 중 변경되었습니다.')
+        published = [validate_binding(b, profile['id']) for b in manifest.get('bindings', [])]
+        if (len({binding['alias'] for binding in published}) != len(published)
+                or any(published.count(r['binding']) != 1 for r in records)):
+            raise UpdateError('remote_binding_changed', 'SSH 연결 설정이 확인 중 변경되었습니다.')
+        return True
 
     def bindings(self, profile, coverage):
         """Use the running generation's manifest, never newly saved settings."""
@@ -144,7 +175,10 @@ class RemoteMaintenance:
             return {'binding': binding, 'process': process, 'idle': value['idle'], 'exited': value['exited'],
                     **({'active_binding': actual} if actual != binding else {})}
         except (ValueError, KeyError, TypeError, ShimError):
-            raise UpdateError('remote_maintenance_unverified', 'SSH 실행 상태 확인이 필요합니다. 설정 적용 결과를 추정하지 않았습니다.') from None
+            stage = {'identity': '기존 실행 확인', 'inspect': '작업 상태 확인',
+                     'stop': '종료 확인', 'start': '시작 확인'}.get(operation, '상태 확인')
+            raise UpdateError('remote_maintenance_unverified',
+                binding['alias'] + ' · ' + stage + ': SSH 실행 상태를 확인하지 못해 설정 적용을 보류했습니다.') from None
 
     def snapshot(self, profile, coverage):
         return [self.request(binding, 'inspect', discover_active=True) for binding in self.bindings(profile, coverage)]

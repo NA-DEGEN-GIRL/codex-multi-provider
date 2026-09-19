@@ -298,6 +298,51 @@ class RemoteManager:
             self._registry = ProviderRegistry(self.root)
         return self._registry
 
+    def _definition_revision(self, files, bundle, host_identity, *, legacy):
+        """Only remote execution inputs belong in the SSH definition identity."""
+        values = {"files": files, "runtime": bundle, "host_identity": host_identity}
+        for key, name in (('installer', 'install'), ('launcher', 'launch'),
+                          ('native_controller', 'native_controller'), ('ws_client', 'ws_client'),
+                          ('common', 'common'), ('managed_sources', 'managed_sources')):
+            values[key] = _hash(script_path(self.root, 'scripts/remote_helpers/' + name + '.py'))
+        values['catalog_legacy'] = (_hash(script_path(self.root, 'scripts/remote_helpers/catalog_legacy.py'))
+                                    if legacy else None)
+        return hashlib.sha256(json.dumps(values, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+    def binding_matches_settings(self, profile, binding):
+        """Local comparison only; never stop SSH because the shell bundle changed.
+
+        A reconnect still validates the remote descriptor and exact live revision.
+        Missing/old metadata must take the normal preparation path.
+        """
+        from .model_settings import render_options
+        from .ssh_shim import validate_binding
+        try:
+            valid = validate_binding(binding, profile['id'])
+            if binding.get('prepared') is not True or not SHA256.fullmatch(binding.get('host_identity', '')):
+                return False
+            artifact = None
+            for arch in ('x86_64', 'aarch64'):
+                path = self.root / 'artifacts/remote' / ('linux-' + arch) / 'manifest.json'
+                if not path.is_file():
+                    continue
+                value = json.loads(path.read_text(encoding='utf-8-sig'))
+                bundle = value['version'] + '-' + hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()[:16]
+                if (value.get('schema') == 1 and value.get('platform') == 'linux'
+                        and value.get('architecture') == arch and bundle == binding.get('runtime_bundle')):
+                    artifact = value
+                    break
+            if artifact is None:
+                return False
+            model_ids = profile['policy']['model_ids'] if profile['policy']['enabled'] else []
+            home = str(PurePosixPath(valid['remote_launcher']).parent / 'codex')
+            rendered = self._registry_instance().render_for_host(home, bool(model_ids), model_ids,
+                existing_config='[features]\ncode_mode_host = true\n', **render_options(profile))
+            return valid['revision'] == self._definition_revision(rendered['files'], binding['runtime_bundle'],
+                binding['host_identity'], legacy=artifact.get('mixed_source_catalog_present') is True)
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+            return False
+
     def prepare(self, alias: str, profile_id: str, profile_home: Path | str,
                 model_ids: list[str], *, primary_model_id=None, primary_settings=None, selection_mode='automatic', reuse_host_runtime=False) -> dict:
         alias = self._alias(alias)
@@ -342,16 +387,8 @@ class RemoteManager:
             if not legacy_helper.is_file():
                 raise RemoteError('remote_helper_missing', '기존 SSH 기록을 찾는 도우미 파일이 없습니다.')
             legacy_bytes = legacy_helper.read_bytes()
-        revision = hashlib.sha256(json.dumps({"files": rendered["files"], "runtime": artifact["bundle_id"],
-                                             "host_identity": observed["host_identity"],
-                                             "installer": hashlib.sha256(helper.read_bytes()).hexdigest(),
-                                             "launcher": hashlib.sha256(launcher_bytes).hexdigest(),
-                                             "native_controller": hashlib.sha256(controller_bytes).hexdigest(),
-                                             "ws_client": hashlib.sha256(websocket_bytes).hexdigest(),
-                                             "common": hashlib.sha256(common_bytes).hexdigest(),
-                                             "managed_sources": hashlib.sha256(managed_bytes).hexdigest(),
-                                             "catalog_legacy": hashlib.sha256(legacy_bytes).hexdigest() if legacy_bytes is not None else None},
-                                            sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+        revision = self._definition_revision(rendered['files'], artifact['bundle_id'],
+            observed['host_identity'], legacy=legacy_bytes is not None)
         entries = {}
         runtime_hashes = {}
         for item in artifact["files"]:

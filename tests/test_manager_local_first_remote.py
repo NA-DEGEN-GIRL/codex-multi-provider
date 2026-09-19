@@ -3,7 +3,7 @@ from copy import deepcopy
 import json
 import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
 import test_manager_update_hooks as fixtures
@@ -22,6 +22,8 @@ class LocalFirstRemoteTests(unittest.TestCase):
         self.store, self.hooks = self.fixture.store, self.fixture.hooks
         self.instances, self.profile = self.fixture.instances, self.fixture.profile
         self.fleet = Fleet(self.fixture.root, self.store, self.profile)
+        # Existing tests exercise a genuine remote-input change unless opted in.
+        self.fleet.binding_matches_settings = lambda profile, binding: False
         self.hooks.remote_maintenance = self.fleet
         self.hooks.host_inventory = lambda p: dict(complete=True, generation=p['generation'],
                                                    hosts=['local', 'fixture-a', 'fixture-b'])
@@ -95,6 +97,85 @@ class LocalFirstRemoteTests(unittest.TestCase):
         self.assertEqual(self.instances.show_calls, [self.profile['id']])
         self.assertEqual(self.fixture.closes, [])
         self.assertEqual({b['revision'] for b in json.loads(self.manifest.read_text())['bindings']}, {'b' * 64})
+
+    def unchanged_live_fleet(self):
+        self.fleet.binding_matches_settings = lambda profile, binding: True
+        original = self.fleet.request
+        def identity_only(binding, operation, **params):
+            self.assertEqual(operation, 'identity', 'unchanged active or ephemeral work must not enter idle/shutdown')
+            return {**original(binding, operation, **params), 'idle': False}
+        self.fleet.request = identity_only
+
+    def test_unchanged_active_fleet_releases_gate_without_restart_or_idle_probe(self):
+        self.unchanged_live_fleet()
+        processes = deepcopy(self.fleet.running)
+        shown = self.open()
+        manifest = self.manifest.read_bytes()
+        self.pending.pop()()
+        self.assertEqual(self.job()['phase'], 'complete')
+        self.assertEqual(self.gate()['state'], 'released')
+        self.assertEqual(self.fleet.calls, [('identity', 'fixture-a'), ('identity', 'fixture-b')])
+        self.assertEqual(self.fleet.running, processes)
+        self.assertEqual(self.manifest.read_bytes(), manifest)
+        self.assertEqual(self.store.profile(self.profile['id'])['generation'], shown['profile']['generation'])
+        self.assertEqual(self.fixture.admin.calls, [])
+        self.assertEqual(self.fixture.closes, [])
+        lease = json.loads(self.hooks._lease_path(self.gate()['transaction_id']).read_text())
+        self.assertIs(lease['reused_unchanged'], True)
+
+    def test_unchanged_preflight_attention_can_retry_without_touching_existing_work(self):
+        self.unchanged_live_fleet()
+        original = self.fleet.request
+        self.fleet.request = lambda *a, **k: (_ for _ in ()).throw(OSError('identity unavailable'))
+        self.open()
+        self.pending.pop()()
+        self.assertEqual(self.gate()['state'], 'attention')
+        self.fleet.request = original
+        self.open()
+        self.pending.pop()()
+        self.assertEqual(self.gate()['state'], 'released')
+        self.assertEqual(self.fleet.calls, [('identity', 'fixture-a'), ('identity', 'fixture-b')])
+        self.assertEqual(self.fixture.closes, [])
+
+    def test_generation_change_during_unchanged_identity_cannot_release_gate(self):
+        self.unchanged_live_fleet()
+        self.open()
+        original = self.fleet.request
+        def changed(binding, operation, **params):
+            result = original(binding, operation, **params)
+            if binding['alias'] == 'fixture-a':
+                self.store.mutate(lambda data: self.store.profile(self.profile['id'], data).update(generation=str(uuid4())))
+            return result
+        self.fleet.request = changed
+        self.pending.pop()()
+        self.assertEqual(self.job()['code'], 'ssh_generation_changed')
+        self.assertEqual(self.gate()['state'], 'attention')
+        self.assertTrue(all(operation == 'identity' for operation, _ in self.fleet.calls))
+
+    def test_foreign_manifest_during_unchanged_identity_cannot_release_gate(self):
+        self.unchanged_live_fleet()
+        self.open()
+        original = self.fleet.request
+        changed = json.loads(self.manifest.read_text())
+        changed['bindings'][0]['revision'] = 'd' * 64
+        def changed_publication(binding, operation, **params):
+            result = original(binding, operation, **params)
+            atomic_json(self.manifest, changed)
+            return result
+        self.fleet.request = changed_publication
+        self.pending.pop()()
+        self.assertEqual(self.job()['code'], 'remote_binding_changed')
+        self.assertEqual(self.gate()['state'], 'attention')
+        self.assertEqual(json.loads(self.manifest.read_text()), changed)
+        self.assertTrue(all(operation == 'identity' for operation, _ in self.fleet.calls))
+
+    def test_truthy_unimplemented_reuse_does_not_skip_real_maintenance(self):
+        self.fleet.reuse_unchanged = MagicMock()
+        self.open()
+        self.pending.pop()()
+        self.assertEqual(self.job()['phase'], 'complete')
+        self.assertEqual([alias for operation, alias in self.fleet.calls if operation == 'stop'],
+                         ['fixture-a', 'fixture-b'])
 
     def test_prepare_failure_preserves_local_and_retry_reprepares_old_saved_binding(self):
         self.open()

@@ -86,7 +86,7 @@ class WorkspaceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             source, target = (Path(temp) / name for name in ('source', 'target'))
             source.mkdir()
-            hosts = ['remote-ssh-discovered:remote-dev', 'remote-ssh-discovered:hp']
+            hosts = ['remote-ssh-discovered:remote-dev', 'remote-ssh-discovered:render-host']
             donor = {'codex-managed-remote-connections': [
                 {'hostId': host, 'alias': host.split(':')[1]} for host in hosts],
                 'remote-connection-auto-connect-by-host-id': dict.fromkeys(hosts, True)}
@@ -105,6 +105,71 @@ class WorkspaceTests(unittest.TestCase):
             owned_path.write_text(json.dumps(owned))
             prepare(target, source, ssh_ready_aliases={'remote-dev', 'remote-c'})
             self.assertEqual(json.loads(path.read_text())['remote-connection-auto-connect-by-host-id'], dict.fromkeys(hosts, True))
+
+    def test_prepare_heals_lost_managed_alias_connections_without_touching_edits(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source, target = (Path(temp) / name for name in ('source', 'target'))
+            source.mkdir()
+            hosts = ['remote-ssh-discovered:off-a', 'remote-ssh-discovered:off-b',
+                     'remote-ssh-discovered:build-host', 'remote-ssh-discovered:render-host',
+                     'remote-ssh-discovered:dev-host']
+            def connection(host):
+                alias = host.split(':')[1]
+                return {'hostId': host, 'displayName': alias, 'source': 'discovered', 'alias': alias,
+                        'hostname': None, 'sshPort': None, 'identity': None}
+            donor = {'codex-managed-remote-connections': [connection(host) for host in hosts],
+                     'remote-connection-auto-connect-by-host-id': dict.fromkeys(hosts, True)}
+            (source/'.codex-global-state.json').write_text(json.dumps(donor))
+            prepared = {'build-host', 'render-host', 'dev-host'}
+            prepare(target, source, ssh_ready_aliases=prepared)
+            state_path = target/'.codex-global-state.json'
+            # The desktop app keeps one connection, records profile-owned analytics,
+            # drops its auto key (leaving no preference), keeps an explicit False
+            # for a pruned host, and the profile adds a manual hostname host.
+            state = json.loads(state_path.read_text())
+            survivor = next(v for v in state['codex-managed-remote-connections'] if v['alias'] == 'dev-host')
+            survivor['connectionAnalyticsId'] = 'profile-tracking'
+            survivor['displayName'] = 'Dev host (local edit)'
+            manual = {'hostId': 'remote-ssh-managed:manual', 'displayName': 'Manual', 'source': 'codex-managed',
+                      'alias': None, 'hostname': 'manual.example', 'sshPort': 22, 'identity': None}
+            state['codex-managed-remote-connections'] = [survivor, manual]
+            state['remote-connection-auto-connect-by-host-id'] = {
+                'remote-ssh-discovered:render-host': False}
+            state_path.write_text(json.dumps(state))
+            prepare(target, source, ssh_ready_aliases=prepared)
+            healed = json.loads(state_path.read_text())
+            by_alias = {v.get('alias'): v for v in healed['codex-managed-remote-connections']}
+            # Prepared managed aliases return; unprepared donor hosts stay out.
+            self.assertEqual({v['hostId'] for v in healed['codex-managed-remote-connections']},
+                {'remote-ssh-discovered:dev-host', 'remote-ssh-discovered:build-host',
+                 'remote-ssh-discovered:render-host', 'remote-ssh-managed:manual'})
+            self.assertEqual(by_alias['dev-host']['connectionAnalyticsId'], 'profile-tracking')
+            self.assertEqual(by_alias['dev-host']['displayName'], 'Dev host (local edit)')
+            self.assertNotIn('connectionAnalyticsId', by_alias['build-host'])
+            self.assertNotIn('connectionAnalyticsId', by_alias['render-host'])
+            self.assertEqual(by_alias[None], manual)
+            auto = healed['remote-connection-auto-connect-by-host-id']
+            self.assertIs(auto['remote-ssh-discovered:build-host'], True)
+            self.assertIs(auto['remote-ssh-discovered:render-host'], False)
+            # A surviving previously imported prepared alias regains the donor
+            # preference that the desktop save cleared; explicit False above stays.
+            self.assertIs(auto['remote-ssh-discovered:dev-host'], True)
+            self.assertNotIn('remote-ssh-discovered:off-a', auto)
+            self.assertNotIn('remote-ssh-discovered:off-b', auto)
+            # Repeated prepare is stable and does not duplicate healed entries.
+            prepare(target, source, ssh_ready_aliases=prepared)
+            repeated = json.loads(state_path.read_text())
+            self.assertEqual(repeated['codex-managed-remote-connections'], healed['codex-managed-remote-connections'])
+            self.assertEqual(repeated['remote-connection-auto-connect-by-host-id'], auto)
+            # Donor removal stays authoritative and is not resurrected by healing.
+            donor['codex-managed-remote-connections'] = [v for v in donor['codex-managed-remote-connections']
+                                                          if v['alias'] != 'build-host']
+            donor['remote-connection-auto-connect-by-host-id'].pop('remote-ssh-discovered:build-host')
+            (source/'.codex-global-state.json').write_text(json.dumps(donor))
+            prepare(target, source, ssh_ready_aliases=prepared)
+            removed = json.loads(state_path.read_text())
+            self.assertNotIn('build-host', {v.get('alias') for v in removed['codex-managed-remote-connections']})
+            self.assertNotIn('remote-ssh-discovered:build-host', removed['remote-connection-auto-connect-by-host-id'])
 
     def test_legacy_folder_grouping_uses_deepest_root_and_respects_projectless(self):
         with tempfile.TemporaryDirectory() as temp:

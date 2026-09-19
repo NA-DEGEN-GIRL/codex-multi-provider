@@ -186,6 +186,30 @@ def merge_workspace(current, original, owned, source, *, ssh_ready_aliases=None,
     normalized = {k: {f: v.get(f) for f in ('hostId', 'displayName', 'source', 'alias', 'hostname', 'sshPort', 'identity')}
                   for k, v in old_connections.items()}
     merged = merge_entries(normalized, connections, previous.get(key, {}))
+    # Startup healing of known managed alias loss. A desktop save can drop a
+    # previously imported alias-backed discovered connection while the donor
+    # still declares it; merge_entries reads "missing but previously imported"
+    # as a profile edit, so the entry would stay lost forever. The same save
+    # clears the host's auto-connect value, so a surviving prepared alias can
+    # also be left without its donor preference. Prepared bindings are the only
+    # aliases the launcher can reconnect, so limit healing to them when known.
+    # Manual hostname declarations, profile edits, explicit False values and
+    # donor removals keep their existing merge semantics; no tombstone schema
+    # is introduced.
+    prepared_aliases = None if ssh_ready_aliases is None else set(ssh_ready_aliases)
+    healed, managed = {}, set()
+    for host_id, value in connections.items():
+        if host_id not in previous.get(key, {}):
+            continue
+        if value.get('source') != 'discovered' or not value.get('alias') or value.get('hostname') is not None:
+            continue
+        if prepared_aliases is not None and str(value['alias']).strip() not in prepared_aliases:
+            continue
+        managed.add(host_id)
+        if host_id not in normalized:
+            healed[host_id] = value
+    for host_id, value in healed.items():
+        merged[host_id] = deepcopy(value)
     current[key] = [{**v, **({'connectionAnalyticsId': analytics[k]} if analytics.get(k) else {})}
                     for k, v in merged.items()]
     previous[key] = deepcopy(connections)
@@ -199,6 +223,10 @@ def merge_workspace(current, original, owned, source, *, ssh_ready_aliases=None,
     for key, donor in updates.items():
         current[key] = merge_entries(current.get(key, {}), donor, previous.get(key, {}))
         previous[key] = deepcopy(donor)
+    for host_id in managed:
+        auto_values = current.setdefault('remote-connection-auto-connect-by-host-id', {})
+        if host_id not in auto_values and isinstance(auto.get(host_id), bool):
+            auto_values[host_id] = auto[host_id]
     # Project declarations are common. A native importer changing updatedAt
     # must not turn a removed common project into a private profile addition.
     for key in removed:

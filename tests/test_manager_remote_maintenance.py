@@ -1,5 +1,6 @@
 """SSH admission metadata and the runtime's lazy diagnostic registration."""
 from contextlib import contextmanager
+from copy import deepcopy
 import importlib.util
 import json
 from pathlib import Path
@@ -44,21 +45,121 @@ class RemoteMaintenanceTests(unittest.TestCase):
 
     def test_closed_profile_only_queues_maintenance_when_tracked_ssh_settings_changed(self):
         self.profile['policy']['launched_revision'] = self.profile['policy']['desired_revision']
+        self.profile['remote_bindings'] = [dict(self.binding, prepared=True)]
+        self.service.remote = MagicMock()
+        self.service.remote.binding_matches_settings.return_value = True
         self.store.mutate(lambda data: data.update(ssh_inventory={
             self.profile['id']: {'hosts': ['remote-dev']}}))
-        with patch('manager_core.startup_updates.selected_manager_proxy', return_value=None):
+        with patch('manager_core.release_code.runtime_revision', side_effect=AssertionError('manager revision is not a remote input')):
             self.assertFalse(self.service.pending_on_open(self.profile))
+            self.service.remote.binding_matches_settings.return_value = False
+            self.assertTrue(self.service.pending_on_open(self.profile))
+            self.service.remote.binding_matches_settings.return_value = True
             self.profile['remote_bindings'] = [dict(self.binding, prepared=True, revision='b' * 64)]
             self.assertTrue(self.service.pending_on_open(self.profile))
             self.profile['remote_bindings'] = [dict(self.binding, prepared=True)]
             atomic_json(self.path, dict(profile_id=self.profile['id'], generation=self.profile['generation'],
                 bindings=[self.binding], pending_policy_hosts=['remote-dev']))
             self.assertTrue(self.service.pending_on_open(self.profile))
-        with patch('manager_core.startup_updates.selected_manager_proxy', return_value='fixture-proxy'), \
-             patch('manager_core.release_code.runtime_revision', return_value='b' * 64):
-            self.assertTrue(self.service.pending_on_open(self.profile))
+        self.service.remote._run.assert_not_called()
         self.store.mutate(lambda data: data.update(ssh_inventory={}))
         self.assertFalse(self.service.pending_on_open(self.profile))
+
+    def unchanged_records(self):
+        self.profile['remote_bindings'] = [dict(self.binding, prepared=True)]
+        self.service.remote = MagicMock()
+        self.service.remote.binding_matches_settings.return_value = True
+        self.service.request = MagicMock(return_value=dict(process={'pid': 12}, idle=False, exited=False))
+        return [dict(binding=deepcopy(self.binding), publication_binding=deepcopy(self.binding), state='unobserved')]
+
+    def test_reuse_requires_identity_but_never_idle_or_lifecycle_requests(self):
+        records = self.unchanged_records()
+        before = deepcopy(records)
+        self.assertIs(self.service.reuse_unchanged(self.profile, records), True)
+        self.service.request.assert_called_once_with(self.binding, 'identity')
+        self.assertEqual(records, before)
+
+    def test_reuse_rejects_partial_journals_before_any_remote_request(self):
+        clean = self.unchanged_records()[0]
+        changes = [dict(state=state) for state in ('observed', 'stop_requested', 'closed',
+                    'prepared', 'start_requested', 'started')]
+        changes += [dict(reinspect=True), dict(process=None), dict(next_binding=self.binding),
+                    dict(exit_proof={'exited': True}), dict(started={}),
+                    dict(publication_binding=dict(self.binding, revision='b' * 64))]
+        for change in changes:
+            with self.subTest(change=change):
+                self.assertIs(self.service.reuse_unchanged(self.profile, [{**clean, **change}]), False)
+        self.assertFalse(self.service.reuse_unchanged(self.profile, []))
+        self.service.request.assert_not_called()
+
+    def test_reuse_rejects_changed_settings_and_saved_binding_without_observation(self):
+        records = self.unchanged_records()
+        self.service.remote.binding_matches_settings.return_value = False
+        self.assertFalse(self.service.reuse_unchanged(self.profile, records))
+        self.service.remote.binding_matches_settings.return_value = True
+        self.profile['remote_bindings'][0]['revision'] = 'b' * 64
+        self.assertFalse(self.service.reuse_unchanged(self.profile, records))
+        self.service.request.assert_not_called()
+
+    def test_reuse_cannot_release_changed_generation_or_foreign_publication(self):
+        records = self.unchanged_records()
+        original = json.loads(self.path.read_text())
+        variants = [dict(original, generation=str(uuid4())), dict(original, profile_id=str(uuid4())),
+                    dict(original, pending_policy_hosts=['remote-dev']),
+                    dict(original, bindings=[dict(self.binding, revision='b' * 64)]),
+                    dict(original, bindings=[self.binding, self.binding]),
+                    dict(original, bindings=[self.binding, dict(self.binding, revision='b' * 64)])]
+        for manifest in variants:
+            with self.subTest(manifest=manifest):
+                atomic_json(self.path, original)
+                self.service.request.side_effect = lambda *a, **k: atomic_json(self.path, manifest)
+                with self.assertRaises(UpdateError):
+                    self.service.reuse_unchanged(self.profile, records)
+
+    def identity_helper(self, process):
+        native = types.SimpleNamespace(_running=MagicMock(return_value=process),
+                                       _instance_lock_released=MagicMock(return_value=True))
+        spec = importlib.util.spec_from_file_location('maintenance_identity_fixture', ROOT / 'scripts/remote_helpers/maintenance.py')
+        module = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, {'native_controller': native,
+                'ws_client': types.SimpleNamespace(WebSocketPipe=MagicMock()),
+                'fcntl': types.SimpleNamespace(LOCK_EX=2, LOCK_NB=4, flock=MagicMock())}):
+            spec.loader.exec_module(module)
+        return module, native
+
+    def test_live_identity_accepts_busy_or_ephemeral_actors_without_asserting_idle(self):
+        process = dict(pid=12, revision='a' * 64, process_start='34', boot_id='fixture', socket='/private.sock')
+        module, native = self.identity_helper(process)
+        methods = []
+        @contextmanager
+        def connection(profile):
+            def request(method, params):
+                methods.append(method)
+                self.assertEqual(method, 'server/diagnostics', 'identity must not inspect or unload ephemeral actors')
+                return dict(process={'id': 12}, gauges=[dict(name='app.managed.requests.pending_completion', value=8)])
+            yield request
+        with patch.object(module, 'connection', connection):
+            result = module.identity(self.root, process['revision'])
+        self.assertEqual(result, dict(process=process, revision=process['revision'], idle=False, exited=False))
+        self.assertEqual(methods, ['server/diagnostics'])
+        self.assertEqual(native._running.call_count, 2)
+        native._instance_lock_released.assert_not_called()
+
+    def test_live_identity_rejects_diagnostics_pid_or_process_identity_change(self):
+        process = dict(pid=12, revision='a' * 64, process_start='34', boot_id='fixture', socket='/private.sock')
+        for changed in ({'pid': 13}, {'process_start': '35'}, {'boot_id': 'new-boot'}, {'socket': '/new.sock'}):
+            with self.subTest(changed=changed):
+                module, native = self.identity_helper(process)
+                native._running.side_effect = [process, {**process, **changed}]
+                connection = MagicMock()
+                connection.return_value.__enter__.return_value.return_value = {'process': {'id': 12}}
+                with patch.object(module, 'connection', connection), self.assertRaises(RuntimeError):
+                    module.identity(self.root, process['revision'])
+        module, _ = self.identity_helper(process)
+        connection = MagicMock()
+        connection.return_value.__enter__.return_value.return_value = {'process': {'id': 99}}
+        with patch.object(module, 'connection', connection), self.assertRaises(RuntimeError):
+            module.identity(self.root, process['revision'])
 
     def test_unknown_proxy_revision_or_another_operation_cannot_claim_coverage(self):
         for changes in ({'revision': 'b' * 64}, {'operation': 'native-start'}, {'generation': str(uuid4())}):

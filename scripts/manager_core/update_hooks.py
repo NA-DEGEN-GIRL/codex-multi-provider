@@ -349,7 +349,9 @@ class UpdateHooks:
         if self.remote_maintenance is None:
             raise UpdateError('remote_binding_unknown', 'SSH 준비 구성요소를 확인해야 합니다.')
         records = entry.get('remotes', [])
-        for record in records:
+        reusable = getattr(self.remote_maintenance, 'reuse_unchanged', None)
+        reused = callable(reusable) and reusable(current(), records) is True
+        for record in ([] if reused else records):
             current()
             if record.get('state') == 'unobserved' or record.get('reinspect'):
                 binding = record.get('next_binding') or record.get('active_binding') or record.get('binding')
@@ -376,12 +378,13 @@ class UpdateHooks:
                 if record['state'] in ('stop_requested', 'start_requested'):
                     return False
         current()
-        self._close_remotes(lease, entry, lifecycle_guard=current)
-        profile = current()
-        self.remote_maintenance.prepare_and_start(profile, records, lambda: self._save_lease(lease),
-                                                  lifecycle_guard=current)
-        profile = current()
-        self.remote_maintenance.publish_started(profile, records)
+        if not reused:
+            self._close_remotes(lease, entry, lifecycle_guard=current)
+            profile = current()
+            self.remote_maintenance.prepare_and_start(profile, records, lambda: self._save_lease(lease),
+                                                      lifecycle_guard=current)
+            profile = current()
+            self.remote_maintenance.publish_started(profile, records)
         def release(data):
             gate = data['ssh_maintenance'][profile_id]
             profile = self.store.profile(profile_id, data)
@@ -391,6 +394,8 @@ class UpdateHooks:
                 raise UpdateError('ssh_generation_changed', 'SSH 준비 중 프로필 설정이 변경되었습니다.')
             gate.update(state='released', updated_at=now())
         self.store.mutate(release)
+        if reused:
+            lease['reused_unchanged'] = True
         lease['state'] = 'released'
         self._save_lease(lease)
         return True
