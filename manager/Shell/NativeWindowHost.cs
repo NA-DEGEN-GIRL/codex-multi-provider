@@ -25,6 +25,7 @@ public sealed class NativeWindowHost : HwndHost
     private readonly WinEventCallback _foregroundChanged, _presentationChanged;
     private readonly DispatcherTimer _watch;
     private bool _changingWindow, _resizing, _queued;
+    private bool _liveResize, _finalResize;
     private string? _lastInputState, _lastPresentationState, _lastLayoutFailure;
     internal string? WindowStateDirectory { get; set; }
     internal ResponsivenessMonitor? Responsiveness { get; set; }
@@ -200,6 +201,19 @@ public sealed class NativeWindowHost : HwndHost
     {
         // Native movement is screen-space; HwndHost's relative layout can remain
         // unchanged while the manager moves to a different monitor.
+        if (message == 0x231 /* ENTERSIZEMOVE */)
+        {
+            // While the user drags, keep the embedded window in step with the
+            // frame instead of letting it trail the manager chrome.
+            _liveResize = true;
+            QueueLayout();
+        }
+        else if (message == 0x232 /* EXITSIZEMOVE */)
+        {
+            _liveResize = false;
+            _finalResize = true;
+            QueueLayout();
+        }
         if (message is 0x47 /* WINDOWPOSCHANGED */ or 5 /* SIZE */ or 0x18 /* SHOWWINDOW */
             or 6 /* ACTIVATE */ or 10 /* ENABLE */ or 0x2E0 /* DPICHANGED */) QueueLayout();
         return 0;
@@ -209,8 +223,10 @@ public sealed class NativeWindowHost : HwndHost
     {
         if (_queued || Dispatcher.HasShutdownStarted) return;
         _queued = true;
-        // Location/visibility storms must not outrank keyboard and mouse input.
-        Dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(() =>
+        // Location/visibility storms must not outrank keyboard and mouse input,
+        // but a live drag has to land in the same frame as the manager window.
+        var priority = _liveResize || _finalResize ? DispatcherPriority.Render : DispatcherPriority.Background;
+        Dispatcher.BeginInvoke(priority, new Action(() =>
         {
             _queued = false;
             SynchronizeLayout();
@@ -547,7 +563,12 @@ public sealed class NativeWindowHost : HwndHost
         if (report) Diagnostic?.Invoke("Codex가 요청 크기를 유지하지 않아 반복 조절을 멈췄습니다.");
         if (resize)
         {
-            uint flags = SwpNoActivate | SwpAsyncWindowPos | SwpNoZOrder | (frameChanged ? SwpFrameChanged : 0);
+            // SWP_ASYNCWINDOWPOS posts the request to the target thread, which is
+            // what made the embedded window trail the manager while dragging.
+            // Placement stays synchronous during and just after a size/move drag.
+            bool synchronous = _liveResize || _finalResize;
+            uint flags = SwpNoActivate | SwpNoZOrder | (frameChanged ? SwpFrameChanged : 0)
+                | (synchronous ? 0u : SwpAsyncWindowPos);
             if (!SetWindowPos(a.Hwnd, 0, target.Left - insetX, target.Top - insetY, outerWidth, outerHeight, flags))
                 throw new Win32Exception(Marshal.GetLastPInvokeError(), "Cannot position native viewport.");
         }
@@ -559,6 +580,7 @@ public sealed class NativeWindowHost : HwndHost
 
         a.Shown = show;
         LastError = "";
+        _finalResize = false;
         return true;
     }
 
