@@ -2,9 +2,10 @@ const assert=require('node:assert/strict'),fs=require('node:fs'),vm=require('nod
 const source=fs.readFileSync('scripts/manager_core/desktop_profile_resume.cjs','utf8');
 async function check(renderer){
   const id='11111111-1111-4111-8111-111111111111';
-  const context={require,process:{env:{CODEX_RECORD_SIGNALS:'unused'}},setInterval:()=>({unref(){}}),
+  const context={require,process:{env:{CODEX_RECORD_SIGNALS:'unused'}},setInterval:()=>({unref(){}}),setTimeout:()=>1,clearTimeout(){},
     document:{addEventListener(){}},window:{addEventListener(){}}};
   vm.createContext(context);vm.runInContext(source,context);
+  if(!renderer)vm.runInContext(fs.readFileSync('scripts/manager_core/desktop_signal_files.cjs','utf8'),context);
   vm.runInContext(fs.readFileSync('scripts/manager_core/desktop_'+(renderer?'renderer_':'')+'record_sync.cjs','utf8'),context);
   let provider='openai',model='gpt-6-astra',sourceProvider='cc_deepseek',writes=[];
   const m={hostId:'local',threadStore:{threadsById:new Map()},requestClient:{async sendRequest(method,params){

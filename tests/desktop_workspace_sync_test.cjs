@@ -1,6 +1,6 @@
 const fs=require('node:fs'),os=require('node:os'),path=require('node:path'),vm=require('node:vm'),assert=require('node:assert/strict');
 const root=fs.mkdtempSync(path.join(os.tmpdir(),'workspace-share-'));
-const source=fs.readFileSync('scripts/manager_core/desktop_workspace_sync.cjs','utf8');
+const source=fs.readFileSync('scripts/manager_core/desktop_signal_files.cjs','utf8')+'\n'+fs.readFileSync('scripts/manager_core/desktop_workspace_sync.cjs','utf8');
 const project={id:'11111111-1111-4111-8111-111111111111',hostId:'remote-ssh-discovered:remote-dev',remotePath:'/home/test/example-game',label:'example-game'};
 function app(writer,projects=[]){
   const state=new Map([['remote-projects',projects],['project-order',['local-project']],['selected-project',{id:'private-selection'}],['auth','PRIVATE']]),listeners=new Map(),messages=[];

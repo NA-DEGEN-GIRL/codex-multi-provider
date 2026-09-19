@@ -1,5 +1,5 @@
 const fs = require('node:fs'), vm = require('node:vm'), assert = require('node:assert/strict');
-const source = fs.readFileSync(process.argv[2], 'utf8');
+const source = fs.readFileSync('scripts/manager_core/desktop_signal_files.cjs','utf8')+'\n'+fs.readFileSync(process.argv[2], 'utf8');
 const id = '11111111-1111-4111-8111-111111111111';
 const profile = '22222222-2222-4222-8222-222222222222.json';
 let stamp = 0, seq = 0, calls = [], busy = false, whileReading = null;
@@ -36,7 +36,10 @@ sync.catalog({getCoordinator:host=>{assert.equal(host,'local');return{handleImpo
  sync.observe(manager,'turn/started',{threadId:id,turn:{id:'local'}});
  calls=[];stamp++;seq++;await sync.tick();
  assert(!calls.some(c=>c[0]==='read'),'local native stream must not be hydrated');
+ sync.observe(manager,'item/agentMessage/delta',{threadId:id,delta:'no turn id on partial notification'});
  sync.observe(manager,'turn/completed',{threadId:id,turn:{id:'local'}});
+ calls=[];stamp++;seq++;await sync.tick();
+ assert(calls.some(c=>c[0]==='applied'),'partial deltas must preserve the turn ID so completion releases the refresh guard');
  const request=manager.requestClient.sendRequest('turn/start',{threadId:id});
  calls=[];stamp++;seq++;await sync.tick();
  assert(!calls.some(c=>c[0]==='read'),'local start request before notification must be protected');

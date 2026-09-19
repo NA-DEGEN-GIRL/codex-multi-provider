@@ -12,6 +12,8 @@
   const refreshing = new WeakMap(), activity = new WeakMap();
   const profile = process.env.CODEX_MANAGER_PROFILE_ID;
   const ownFile = (profile || '00000000-0000-4000-8000-000000000001') + (profile ? '.desktop.json' : '.json');
+  const files=globalThis.__codexSignalFiles.create(directory,{maxFiles:64,maxBytes:32768,createDirectory:false,
+    accept:f=>f!==ownFile&&f!==profile+'.json'&&/^[a-f0-9-]{36}(?:\.desktop)?\.json$/i.test(f)});
   const generation = require('node:crypto').randomUUID();
   const changed = new Map();
   const signals = new Set(['thread/started','thread/name/updated','thread/settings/updated',
@@ -37,19 +39,9 @@
     return [...managers];
   };
   async function scan() {
-    let names;
-    try { names = await fs.readdir(directory); }
-    catch (error) { if (error.code === 'ENOENT') return; throw error; }
-    const files = names.filter(f => f !== ownFile && f !== profile+'.json' && /^[a-f0-9-]{36}(?:\.desktop)?\.json$/i.test(f)).slice(0, 64);
-    for (const file of files) {
-      try {
-      const full = path.join(directory, file), info = await fs.stat(full);
-      if (info.size > 32768 || !info.isFile()) continue;
-      const version = `${info.mtimeMs}:${info.size}`;
-      if (seen.get(file)?.fileVersion === version) continue;
-      const data = JSON.parse(await fs.readFile(full, 'utf8'));
+    try { await files.scan((file,data)=>{
       if (![1,2].includes(data.version) || typeof data.generation !== 'string' ||
-          !Array.isArray(data.changes) || data.changes.length > 256) continue;
+          !Array.isArray(data.changes) || data.changes.length > 256) return false;
       const previous = seen.get(file), sequence = previous?.generation === data.generation ? previous.sequence : 0;
       let last = sequence;
       for (const change of data.changes) {
@@ -69,9 +61,9 @@
         pending.set(key, { id, host, kind, deleted:kind==='deleted', remaining: 3, due: Date.now(), failures: 0 });
       }
       while (pending.size > 1024) pending.delete(pending.keys().next().value);
-      seen.set(file, { fileVersion: version, generation: data.generation, sequence: last });
-      } catch { counters.failures++; }
-    }
+      seen.delete(file);seen.set(file, { generation: data.generation, sequence: last });
+      while(seen.size>256)seen.delete(seen.keys().next().value);
+    }); } catch(error) { if(error.code!=='ENOENT')throw error; }
   }
   async function tick() {
     if (running || stopped) return;
@@ -205,7 +197,7 @@
       const turnId = params?.turn?.id || params?.turnId;
       if (local) {
         if (method === 'turn/started' || method === 'item/started' || method === 'item/agentMessage/delta')
-          local.turns.set(id, turnId || null);
+          local.turns.set(id, turnId || local.turns.get(id) || null);
         if (method === 'turn/completed' && (!turnId || local.turns.get(id) === turnId)) local.turns.delete(id);
         if (method === 'thread/closed' || method === 'thread/deleted' ||
             (method === 'thread/status/changed' && params?.status?.type === 'idle')) local.turns.delete(id);
@@ -242,9 +234,9 @@
       return !request || (!deletedKeys.has(request.manager.hostId+'\0'+request.id) && !archivedKeys.has(request.manager.hostId+'\0'+request.id) && !active(request.manager, request.id));
     },
     tick,
-    status() { return { ...counters, managers: localManagers().length, sources:seen.size, pending: pending.size,
+    status() { return { ...counters, signalFiles:globalThis.__codexSignalFiles.status(), managers: localManagers().length, sources:seen.size, pending: pending.size,
       archived:archivedKeys.size, deleted:deletedKeys.size }; },
-    stop() { stopped = true; clearInterval(timer); }
+    stop() { stopped = true; clearInterval(timer); files.close(); }
   };
   const timer = setInterval(tick, 400);
   timer.unref();

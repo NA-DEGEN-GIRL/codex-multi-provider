@@ -64,6 +64,9 @@ class DesktopBundleTests(unittest.TestCase):
                 data[name] = stream.read(item['size'])
         self.assertEqual(data['.vite/build/before.bin'], b'FIRST')
         self.assertEqual(data['.vite/build/after.bin'], b'AFTER')
+        sync_module = next(value for value in data.values() if b'const files=globalThis.__codexSignalFiles.create' in value)
+        self.assertLess(sync_module.index(b'globalThis.__codexSignalFiles={create'),
+                        sync_module.index(b'const files=globalThis.__codexSignalFiles.create'))
         self.assertIn(bundle._NOTIFICATION_REPLACEMENT, data['.vite/build/notifications.js'])
         self.assertIn(b'originalCallback();', data['.vite/build/notifications.js'])
         self.assertIn(bundle._BROWSER_RUNTIME_REPLACEMENT, data['.vite/build/browser-runtime.js'])

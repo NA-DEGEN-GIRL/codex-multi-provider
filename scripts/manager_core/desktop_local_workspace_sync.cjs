@@ -9,6 +9,8 @@
   const home=process.env.CODEX_HOME||path.join(require('node:os').homedir(),'.codex'),host='local:'+home;
   const key='local-projects',mapKey='app-server-project-id-by-legacy-project-id-by-host';
   const uuid=/^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i;
+  const files=globalThis.__codexSignalFiles.create(directory,{
+    accept:n=>n.endsWith('.json')&&uuid.test(n.slice(0,-5))});
   const identity=id=>typeof id==='string'&&(uuid.test(id)||/^local-[a-f0-9]{32}$/i.test(id));
   const valid=p=>p&&identity(p.id)&&typeof p.name==='string'&&p.name.length<=512&&
     Array.isArray(p.rootPaths)&&p.rootPaths.length<=128&&p.rootPaths.every(r=>typeof r==='string'&&r.length<=4096)&&
@@ -51,13 +53,8 @@
   async function tick(){
     if(!store||running)return;running=true;const generation=epoch;
     try{
-      await fs.mkdir(directory,{recursive:true});
-      for(const name of (await fs.readdir(directory)).filter(n=>n.endsWith('.json')&&uuid.test(n.slice(0,-5))).slice(0,256)){
-        try{
-          const full=path.join(directory,name),stat=await fs.stat(full);
-          if(!stat.isFile()||stat.size>4*1024*1024)continue;
-          const data=JSON.parse(await fs.readFile(full,'utf8'));
-          if(data.version!==1||!Array.isArray(data.projects)||data.projects.length>4096)continue;
+      await files.scan((name,data)=>{
+          if(data?.version!==1||!Array.isArray(data.projects)||data.projects.length>4096)return false;
           for(const row of data.projects){
             if(!Array.isArray(row)||row.length!==4)continue;
             const [id,seq,author,value]=row;
@@ -67,8 +64,7 @@
             if(!previous||seq>previous[1]||(seq===previous[1]&&author>previous[2])){records.set(id,row);revision++;}
             if(author===writer&&(!owned.has(id)||seq>owned.get(id)[1]))owned.set(id,row);
           }
-        }catch{/* One damaged writer cannot stall all the other profiles. */}
-      }
+      });
       if(generation!==epoch)return;
       if(!ready){
         const nativeIds=new Set([...records.values()].map(r=>r[3]?.serverId).filter(Boolean));

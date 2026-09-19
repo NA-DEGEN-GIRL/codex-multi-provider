@@ -41,6 +41,8 @@ class OriginalSyncBundleTests(unittest.TestCase):
         self.assertEqual(contents['.vite/build/before.bin'], b'FIRST')
         self.assertEqual(contents['.vite/build/after.bin'], b'AFTER')
         main = contents['.vite/build/main.js']
+        self.assertLess(main.index(b'globalThis.__codexSignalFiles={create'),
+                        main.index(b'const files=globalThis.__codexSignalFiles.create'))
         for replacement in bundle.PATCHES.values():
             self.assertIn(replacement, main)
         self.assertEqual(entries['.vite/build/main.js']['integrity']['hash'], hashlib.sha256(main).hexdigest())

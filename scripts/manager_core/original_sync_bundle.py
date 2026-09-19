@@ -115,7 +115,7 @@ def patch_archive(source, destination):
             updated = Path(__file__).with_name('desktop_profile_resume.cjs').read_bytes() + b'\n' + updated
             if not module.startswith('webview/'):
                 updated = b'\n'.join(Path(__file__).with_name(name).read_bytes() for name in (
-                    'desktop_workspace_sync.cjs', 'desktop_project_membership.cjs', 'desktop_local_workspace_sync.cjs',
+                    'desktop_signal_files.cjs', 'desktop_workspace_sync.cjs', 'desktop_project_membership.cjs', 'desktop_local_workspace_sync.cjs',
                     'desktop_plugin_sync.cjs')) + b'\n' + updated
             if module == name:
                 updated = Path(__file__).with_name('desktop_network_policy.cjs').read_bytes() + b'\n' + updated
@@ -155,6 +155,7 @@ def prepare(root, app):
     stat = archive.stat()
     adapter = Path(__file__).with_name('desktop_record_sync.cjs')
     identity = dict(source=str(source), version=app['Version'], size=stat.st_size, modified=stat.st_mtime_ns,
+        signal_files=hashlib.sha256(Path(__file__).with_name('desktop_signal_files.cjs').read_bytes()).hexdigest(),
         adapter=hashlib.sha256(adapter.read_bytes()).hexdigest(),
         workspace=hashlib.sha256(Path(__file__).with_name('desktop_workspace_sync.cjs').read_bytes()).hexdigest(),
         local_workspace=hashlib.sha256(Path(__file__).with_name('desktop_local_workspace_sync.cjs').read_bytes()).hexdigest(),

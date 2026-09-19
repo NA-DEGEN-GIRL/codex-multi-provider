@@ -1,7 +1,7 @@
 const assert=require('node:assert/strict'),fs=require('node:fs'),vm=require('node:vm');
 const id='11111111-1111-4111-8111-111111111111';
 let receive,visibleChanged,now=0,requests=[],publications=[],duringRead,finish,draft='';
-const ctx={setInterval(){},Date:{now:()=>now},document:{visibilityState:'visible',addEventListener(event,fn){if(event==='visibilitychange')visibleChanged=fn;},querySelector:()=>({textContent:draft})},window:{location:{pathname:'/local/'+id},addEventListener(event,fn){if(event==='message')receive=fn;},
+const ctx={setTimeout:()=>1,clearTimeout(){},Date:{now:()=>now},document:{visibilityState:'visible',addEventListener(event,fn){if(event==='visibilitychange')visibleChanged=fn;},querySelector:()=>({textContent:draft})},window:{location:{pathname:'/local/'+id},addEventListener(event,fn){if(event==='message')receive=fn;},
   electronBridge:{sendMessageFromView:m=>publications.push(m)}}};
 vm.createContext(ctx);vm.runInContext(fs.readFileSync('scripts/manager_core/desktop_renderer_record_sync.cjs','utf8'),ctx);
 const sync=ctx.__codexRendererRecordSync;

@@ -188,7 +188,7 @@ def patch_archive(source, destination):
             signal = b'globalThis.__codexRecordSync?.observe(this,e,t);'
             sync_data = sync_data.replace(signal, signal + b'globalThis.__codexManagerNotificationActivity?.(this.hostId,e,t);')
             sync_adapter = b'\n'.join(Path(__file__).with_name(name).read_bytes() for name in
-                ('desktop_profile_resume.cjs', 'desktop_workspace_sync.cjs', 'desktop_project_membership.cjs', 'desktop_local_workspace_sync.cjs', 'desktop_plugin_sync.cjs', 'desktop_record_sync.cjs'))
+                ('desktop_signal_files.cjs', 'desktop_profile_resume.cjs', 'desktop_workspace_sync.cjs', 'desktop_project_membership.cjs', 'desktop_local_workspace_sync.cjs', 'desktop_plugin_sync.cjs', 'desktop_record_sync.cjs'))
             changed[sync_name] = (sync_target, sync_adapter + b'\n' + sync_data)
         if len(sync_renderers) != 1:
             if not any(b'globalThis.__codexRendererRecordSync?.register(this)' in row[2] for row in renderers):
@@ -246,7 +246,7 @@ def prepare(root, app):
         raise ValueError('Invalid desktop version.')
     stat = archive.stat()
     adapters = ['desktop_network_policy.cjs', 'desktop_window_host.cjs', 'desktop_window_health.cjs', 'desktop_notification_activation.cjs', 'desktop_task_context.cjs',
-        'desktop_record_sync.cjs', 'desktop_renderer_record_sync.cjs', 'desktop_plugin_renderer_sync.cjs', 'desktop_profile_resume.cjs',
+        'desktop_signal_files.cjs', 'desktop_record_sync.cjs', 'desktop_renderer_record_sync.cjs', 'desktop_plugin_renderer_sync.cjs', 'desktop_profile_resume.cjs',
         'desktop_workspace_sync.cjs', 'desktop_project_membership.cjs', 'desktop_local_workspace_sync.cjs', 'desktop_plugin_sync.cjs', 'desktop_reasoning_ui.py', 'original_sync_bundle.py',
         'desktop_publication.py']
     identity = dict(version=version, source=str(source), size=stat.st_size, modified=stat.st_mtime_ns, revision=REVISION,

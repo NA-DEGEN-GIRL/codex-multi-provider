@@ -8,9 +8,11 @@
   const fs=require('node:fs').promises,path=require('node:path');
   const writer=process.env.CODEX_MANAGER_PROFILE_ID||'00000000-0000-4000-8000-000000000001';
   const directory=path.join(root,'project-membership-proofs'),file=path.join(directory,writer+'.json');
-  const proven=new Set(),owned=new Set(),stamps=new Map(),wakeups=new Set(),connections=new WeakSet();
+  const proven=new Set(),owned=new Set(),wakeups=new Set(),connections=new WeakSet();
   let proofDirty=false,proofRunning=false;
   const registered=new WeakSet(),drainers=new WeakMap(),uuid=/^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i;
+  const files=globalThis.__codexSignalFiles.create(directory,{
+    accept:n=>n.endsWith('.json')&&uuid.test(n.slice(0,-5)),maxBytes:8*1024*1024});
   const assignmentKey='thread-project-assignments',migrationKey='app-server-projects-migration-by-host';
   function confirm(id){
     if(typeof id!=='string'||!uuid.test(id))return;
@@ -20,17 +22,10 @@
   async function proofTick(){
     if(proofRunning)return;proofRunning=true;
     try{
-      await fs.mkdir(directory,{recursive:true});
-      for(const name of (await fs.readdir(directory)).filter(n=>n.endsWith('.json')&&uuid.test(n.slice(0,-5))).slice(0,256)){
-        try{
-          const full=path.join(directory,name),stat=await fs.stat(full),stamp=stat.mtimeMs+':'+stat.size;
-          if(!stat.isFile()||stat.size>8*1024*1024||stamps.get(name)===stamp)continue;
-          const data=JSON.parse(await fs.readFile(full,'utf8'));
-          if(data.version!==1||!Array.isArray(data.thread_ids)||data.thread_ids.length>131072||data.thread_ids.some(id=>typeof id!=='string'||!uuid.test(id)))continue;
+      await files.scan((name,data)=>{
+          if(data?.version!==1||!Array.isArray(data.thread_ids)||data.thread_ids.length>131072||data.thread_ids.some(id=>typeof id!=='string'||!uuid.test(id)))return false;
           for(const id of data.thread_ids){proven.add(id);if(name===writer+'.json')owned.add(id);}
-          stamps.set(name,stamp);
-        }catch{/* One damaged writer cannot turn unknown membership into a removal. */}
-      }
+      });
       if(proofDirty&&owned.size<=131072){
         const size=owned.size,temp=file+'.'+process.pid+'.tmp';
         await fs.writeFile(temp,JSON.stringify({version:1,thread_ids:[...owned].sort()}),'utf8');

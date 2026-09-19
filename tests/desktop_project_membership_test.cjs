@@ -2,7 +2,7 @@ const assert=require('node:assert/strict'),fs=require('node:fs'),vm=require('nod
 const id='11111111-1111-4111-8111-111111111111',project='22222222-2222-4222-8222-222222222222';
 const state=new Map([['thread-project-assignments',{}],['projectless-thread-ids',[id]],['selected-project','KEEP']]);
 const database=new Map([[id,null]]),requests=[];let reject=false,commits=0;
-const source=fs.readFileSync('scripts/manager_core/desktop_project_membership.cjs','utf8');
+const source=fs.readFileSync('scripts/manager_core/desktop_signal_files.cjs','utf8')+'\n'+fs.readFileSync('scripts/manager_core/desktop_project_membership.cjs','utf8');
 const disk=new Map();let stamp=0;
 const io={async mkdir(){},async readdir(){return [...disk.keys()].filter(p=>p.endsWith('.json')).map(p=>require('node:path').basename(p));},
  async stat(p){return{isFile:()=>true,mtimeMs:stamp,size:Buffer.byteLength(disk.get(p))};},async readFile(p){if(!disk.has(p))throw Error('missing');return disk.get(p);},

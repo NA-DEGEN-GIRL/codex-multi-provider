@@ -7,6 +7,8 @@
   const writer=process.env.CODEX_MANAGER_PROFILE_ID||'00000000-0000-4000-8000-000000000001';
   const directory=path.join(root,'workspaces'),file=path.join(directory,writer+'.json');
   const uuid=/^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i;
+  const files=globalThis.__codexSignalFiles.create(directory,{
+    accept:n=>n.endsWith('.json')&&uuid.test(n.slice(0,-5))});
   const key='remote-projects', records=new Map(), owned=new Map();
   let store,windows,unsubscribe,last=new Map(),clock=0,ready=false,applying=false,dirty=false,running=false,epoch=0;
   const valid=p=>p&&uuid.test(p.id)&&typeof p.hostId==='string'&&p.hostId.startsWith('remote-ssh-')&&
@@ -27,12 +29,8 @@
     if(!store||running)return;running=true;
     const generation=epoch;
     try{
-      await fs.mkdir(directory,{recursive:true});
-      for(const name of (await fs.readdir(directory)).filter(n=>uuid.test(n.slice(0,-5))&&n.endsWith('.json')).slice(0,256)){
-        const full=path.join(directory,name),stat=await fs.stat(full);
-        if(!stat.isFile()||stat.size>4*1024*1024)continue;
-        const data=JSON.parse(await fs.readFile(full,'utf8'));
-        if(data.version!==1||!Array.isArray(data.projects)||data.projects.length>4096)continue;
+      await files.scan((name,data)=>{
+        if(data?.version!==1||!Array.isArray(data.projects)||data.projects.length>4096)return false;
         for(const row of data.projects){
           if(!Array.isArray(row)||row.length!==4)continue;
           const [id,seq,author,value]=row;
@@ -43,7 +41,7 @@
           if(!old||seq>old[1]||(seq===old[1]&&author>old[2]))records.set(id,row);
           if(author===writer&&(!owned.has(id)||seq>owned.get(id)[1]))owned.set(id,row);
         }
-      }
+      });
       if(generation!==epoch)return;
       if(!ready){
         // Seed pre-upgrade declarations only when no shared event/tombstone exists.

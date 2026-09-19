@@ -5,14 +5,68 @@
   const pending = new Map(), uuid = /^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i;
   const deletedKeys=new Set();
   const archivedKeys=new Set();
-  const counters = {refreshes:0, failures:0, unavailable:0, deferred:0, draftDeferred:0};
+  const counters = {refreshes:0, failures:0, unavailable:0, deferred:0, draftDeferred:0,
+    ipcMessages:0,ipcCoalesced:0};
   const signals=new Set(['thread/started','thread/name/updated','thread/settings/updated','thread/project/updated','thread/archived','thread/unarchived','thread/deleted','turn/started','turn/completed','item/started','item/completed','item/agentMessage/delta']);
   let running = false;
   let composing = false;
+  let refreshTimer, deltaTimer, cleanupTimer;
+  const deltaPending=new Map(), lastPublished=new Map(), DELTA_INTERVAL=200;
+  const post = (id,host,kind='changed') => {
+    window.electronBridge?.sendMessageFromView?.({type:'manager-record-changed',threadId:id,hostId:host,kind});
+    counters.ipcMessages++;
+    const key=host+'\0'+id;
+    lastPublished.delete(key);lastPublished.set(key,Date.now());
+    while(lastPublished.size>512)lastPublished.delete(lastPublished.keys().next().value);
+  };
+  function scheduleDeltas(){
+    if(deltaTimer!==undefined||!deltaPending.size)return;
+    deltaTimer=setTimeout(()=>{
+      deltaTimer=undefined;
+      for(const [key,{id,host}] of deltaPending){
+        if(deletedKeys.has(key)||archivedKeys.has(key)){deltaPending.delete(key);continue;}
+        if(Date.now()-(lastPublished.get(key)??-Infinity)<DELTA_INTERVAL)continue;
+        deltaPending.delete(key);post(id,host);
+      }
+      scheduleDeltas();
+    },DELTA_INTERVAL);
+  }
+  function publish(m,id,method){
+    const host=m.hostId,key=host+'\0'+id;
+    if(method==='item/agentMessage/delta'){
+      if(deletedKeys.has(key)||archivedKeys.has(key))return;
+      if(Date.now()-(lastPublished.get(key)??-Infinity)<DELTA_INTERVAL){
+        deltaPending.set(key,{id,host});counters.ipcCoalesced++;
+        if(deltaPending.size>512){
+          const oldest=deltaPending.keys().next().value,entry=deltaPending.get(oldest);
+          deltaPending.delete(oldest);post(entry.id,entry.host);
+        }
+        scheduleDeltas();return;
+      }
+    }
+    deltaPending.delete(key);
+    if(!deltaPending.size&&deltaTimer!==undefined){clearTimeout(deltaTimer);deltaTimer=undefined;}
+    post(id,host,({'thread/deleted':'deleted','thread/archived':'archived','thread/unarchived':'unarchived'})[method]||'changed');
+  }
+  function scheduleRefresh(){
+    if(!pending.size||document.visibilityState==='hidden'){
+      if(refreshTimer!==undefined){clearTimeout(refreshTimer);refreshTimer=undefined;}
+      return;
+    }
+    if(refreshTimer!==undefined||running)return;
+    const due=Math.min(...[...pending.values()].map(state=>state.due));
+    refreshTimer=setTimeout(()=>{refreshTimer=undefined;void tick();},Math.max(400,due-Date.now()));
+  }
   const liveManagers = () => {
     for(const m of managers)if(m.disposed)managers.delete(m);
     return managers;
   };
+  function scheduleCleanup(){
+    if(cleanupTimer!==undefined||!managers.size)return;
+    // Some native owners mark themselves disposed without calling dispose().
+    // Keep a cheap, coarse fallback so idle transcript graphs are released too.
+    cleanupTimer=setTimeout(()=>{cleanupTimer=undefined;liveManagers();scheduleCleanup();},30000);
+  }
   const hasDraft = id => {
     // Native transcript hydration can recreate the composer when its latest
     // turn changes. Defer that task's merge while the user owns an unsent draft;
@@ -25,7 +79,7 @@
     liveManagers();
     // Hidden profiles keep invalidations, not repeated transcript hydration.
     // One visibility transition drains the latest state without dropping tasks.
-    if(running || !pending.size || document.visibilityState==='hidden') return;
+    if(running || !pending.size || document.visibilityState==='hidden'){scheduleRefresh();return;}
     running = true;
     try {
       for(const [key,state] of [...pending].filter(([,s])=>s.due<=Date.now()).slice(0,8)) {
@@ -53,13 +107,19 @@
         if(failed){if(++state.failures>=3)pending.delete(key);}
         else if(applied&&!deferred)pending.delete(key);
       }
-    } finally {running=false;}
+    } finally {running=false;scheduleRefresh();}
   }
   globalThis.__codexRendererRecordSync = {
     register(m) {
       liveManagers();
       if(m.disposed||managers.has(m))return;
       managers.add(m);local.set(m,{turns:new Map(),requests:new Map()});
+      scheduleCleanup();
+      const dispose=m.dispose;
+      if(typeof dispose==='function')m.dispose=function(...args){
+        try{return Reflect.apply(dispose,this,args);}
+        finally{managers.delete(m);local.delete(m);}
+      };
       const client=m.requestClient,send=client.sendRequest;
       client.sendRequest=async function(method,params,...rest){
         if(globalThis.__codexProfileResume)params=await globalThis.__codexProfileResume(m,send,this,method,params);
@@ -76,18 +136,20 @@
       if(method==='thread/deleted'){deletedKeys.add(m.hostId+'\0'+id);pending.delete(m.hostId+'\0'+id);}
       if(method==='thread/archived'){archivedKeys.add(m.hostId+'\0'+id);pending.delete(m.hostId+'\0'+id);}
       if(method==='thread/unarchived')archivedKeys.delete(m.hostId+'\0'+id);
-      if(signals.has(method))window.electronBridge?.sendMessageFromView?.({type:'manager-record-changed',threadId:id,hostId:m.hostId,kind:({'thread/deleted':'deleted','thread/archived':'archived','thread/unarchived':'unarchived'})[method]||'changed'});
-      if(['turn/started','item/started','item/agentMessage/delta'].includes(method))state.turns.set(id,turn||null);
+      if(signals.has(method))publish(m,id,method);
+      if(['turn/started','item/started','item/agentMessage/delta'].includes(method))state.turns.set(id,turn||state.turns.get(id)||null);
       if(method==='turn/completed'&&(!turn||state.turns.get(id)===turn))state.turns.delete(id);
       if(['thread/closed','thread/deleted'].includes(method)||(method==='thread/status/changed'&&params?.status?.type==='idle'))state.turns.delete(id);
     },
     canApply(store){const r=refreshing.get(store);return !r||(!deletedKeys.has(r.m.hostId+'\0'+r.id)&&!archivedKeys.has(r.m.hostId+'\0'+r.id)&&!active(r.m,r.id)&&!hasDraft(r.id));},
-    status(){return {...counters,managers:liveManagers().size,pending:pending.size,archived:archivedKeys.size,deleted:deletedKeys.size};},
+    status(){return {...counters,managers:liveManagers().size,pending:pending.size,
+      pendingNotifications:deltaPending.size,refreshScheduled:refreshTimer!==undefined,
+      archived:archivedKeys.size,deleted:deletedKeys.size};},
     tick
   };
   window.addEventListener('compositionstart',event=>{if(event.target?.closest?.('[data-codex-composer]'))composing=true;});
   window.addEventListener('compositionend',()=>{composing=false;});
-  document.addEventListener?.('visibilitychange',()=>{if(document.visibilityState!=='hidden')void tick();});
+  document.addEventListener?.('visibilitychange',()=>{scheduleRefresh();if(document.visibilityState!=='hidden')void tick();});
   window.addEventListener('message',event=>{
     const data=event.data;
     if(data?.type!=='manager-record-invalidated'||!Array.isArray(data.threadIds))return;
@@ -111,5 +173,4 @@
     while(pending.size>1024)pending.delete(pending.keys().next().value);
     void tick();
   });
-  setInterval(tick,400);
 })();
