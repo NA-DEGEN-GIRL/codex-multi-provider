@@ -136,7 +136,7 @@ public sealed class MainWindow : Window
             _clientSurface.Children.Insert(0, host);
         });
         _hostDeck.Select("");
-        Title = "Codex 작업 공간";
+        Title = WorkspaceBuild.Title;
         Background = new SolidColorBrush(Color.FromRgb(23, 25, 30));
         Foreground = new SolidColorBrush(Color.FromRgb(233, 236, 242));
         FontFamily = new FontFamily("Segoe UI, Malgun Gothic"); FontSize = 14;
@@ -241,6 +241,14 @@ public sealed class MainWindow : Window
         footer.Children.Add(new Expander { Header = "설정 및 관리", Margin = new Thickness(0, 8, 0, 0),
             Content = new ScrollViewer { Content = settings, MaxHeight = 330, VerticalScrollBarVisibility = ScrollBarVisibility.Auto } });
         _status.Margin = new Thickness(0, 10, 0, 0); footer.Children.Add(_status);
+        var version = Action($"{WorkspaceBuild.Label} · 버전 복사", CopyVersionAsync,
+            WorkspaceBuild.CopyText + "\n\n현재 실행 중인 작업공간앱 버전입니다. 클릭하면 버전 정보가 복사됩니다.");
+        version.Name = "WorkspaceVersion";
+        version.FontSize = 12;
+        version.Foreground = Muted;
+        version.HorizontalContentAlignment = HorizontalAlignment.Left;
+        version.Margin = new Thickness(0, 8, 0, 0);
+        footer.Children.Add(version);
         // Keep update/recovery actions reachable at the minimum window height.
         // The account and task area may scroll; it must not push the footer out
         // of the visible window when status messages wrap onto additional lines.
@@ -443,6 +451,12 @@ public sealed class MainWindow : Window
         };
         return button;
     }
+    private async Task CopyVersionAsync()
+    {
+        var owner = new WindowInteropHelper(this).Handle;
+        await ClipboardTextCopy.CopyAsync(WorkspaceBuild.CopyText, text => ClipboardTextCopy.Write(owner, text));
+        SetStatus($"{WorkspaceBuild.Label} 버전 정보를 복사했습니다.");
+    }
     private async Task CopyLogsAsync()
     {
         var text = _diagnostics.CopyText;
@@ -474,7 +488,7 @@ public sealed class MainWindow : Window
         => Menu(actions.Select(action => (action.Label, (Func<Task>)(() => action.Action(RequireContextProfile())))).ToArray());
     private async Task InitializeAsync()
     {
-        Log($"관리 앱 시작 · 창 이동·크기 조절 일체화 58 · IPC {ManagerProtocol.Version} · 로그: {_diagnostics.Path}");
+        Log($"관리 앱 시작 · {WorkspaceBuild.Label} · {WorkspaceBuild.Description} · 빌드 {WorkspaceBuild.BuildId} · IPC {ManagerProtocol.Version} · 로그: {_diagnostics.Path}");
         if (_responsiveness is not null) Log("응답 지연 상세 로그 · " + _responsiveness.Path);
         SetStatus("관리 서비스를 연결하고 있습니다…");
         _client = await ManagerClient.ConnectAsync(_root);
