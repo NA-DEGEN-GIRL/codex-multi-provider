@@ -21,7 +21,8 @@ try:
  print(json.dumps({'ok':True,'result':result}))
 except Exception as error:
  code=getattr(error,'code',None)
- if code not in ('remote_configuration_changed','remote_runtime_exited','remote_start_timeout'):
+ if code not in ('remote_configuration_changed','remote_runtime_exited','remote_start_timeout',
+                 'remote_idle_binding_missing','remote_listener_unavailable'):
   code='remote_maintenance_unverified'
  print(json.dumps({'ok':False,'code':code}))
  sys.exit(2)
@@ -55,6 +56,31 @@ class RemoteMaintenance:
         return any(alias not in bindings or not self.remote.binding_matches_settings(profile, bindings[alias])
                    for alias in inventory['hosts'])
 
+    def verify_settings(self, profile, binding):
+        """Backfill old bindings using read-only evidence from immutable config."""
+        if self.remote.binding_matches_settings(profile, binding) is True:
+            return True
+        if (binding.get('prepared') is not True or 'settings_fingerprint' in binding
+                or not re.fullmatch(r'[0-9a-f]{64}', binding.get('host_identity') or '')
+                or not isinstance(binding.get('runtime_bundle'), str)):
+            return False
+        files = self.remote.settings_files(profile, binding)
+        proof = self.request(binding, 'identity', expected_settings=files,
+                             expected_host_identity=binding.get('host_identity'),
+                             expected_runtime_bundle=binding.get('runtime_bundle'))
+        if proof.get('settings_match') is not True:
+            return False
+        fingerprint = self.remote._settings_fingerprint(binding, files)
+        def save(data):
+            current = self.store.profile(profile['id'], data)
+            saved = next((b for b in current.get('remote_bindings', []) if b.get('alias') == binding['alias']), None)
+            if (current.get('generation') != profile.get('generation') or saved != binding
+                    or self.remote.settings_files(current, binding) != files):
+                raise UpdateError('remote_generation_changed', '확인 중 SSH 실행 설정이 변경되었습니다.')
+            saved['settings_fingerprint'] = fingerprint
+        self.store.mutate(save)
+        return True
+
     def reuse_unchanged(self, profile, records):
         """Recover only a wholly unmodified preflight, never a partial restart."""
         if not records or any(r.get('state') != 'unobserved' or r.get('reinspect')
@@ -66,8 +92,9 @@ class RemoteMaintenance:
             binding = record.get('binding')
             if (not binding or binding != record.get('publication_binding')
                     or binding['alias'] not in saved
-                    or validate_binding(saved[binding['alias']], profile['id']) != binding
-                    or not self.remote.binding_matches_settings(profile, saved[binding['alias']])):
+                    or validate_binding(saved[binding['alias']], profile['id']) != binding):
+                return False
+            if not self.verify_settings(profile, saved[binding['alias']]):
                 return False
         # Matching settings do not certify inactivity. Verify identity only;
         # normal native reconnect/start still rechecks the exact descriptor.
@@ -150,6 +177,8 @@ class RemoteMaintenance:
                     'remote_configuration_changed': 'SSH 생성 설정 파일이 변경되어 시작하지 못했습니다. 프로필의 원격 설정 충돌을 확인하세요.',
                     'remote_runtime_exited': 'SSH 런타임이 준비되기 전에 종료되었습니다. 원격 프로필 실행 로그를 확인하세요.',
                     'remote_start_timeout': 'SSH 런타임이 제한 시간 안에 준비되지 않았습니다.',
+                    'remote_idle_binding_missing': '기존 SSH 작업의 안전한 종료 여부를 확인할 수 없어 적용을 기다립니다.',
+                    'remote_listener_unavailable': 'SSH 실행 프로세스는 남아 있지만 연결 소켓이 닫혔습니다. 종료 결과를 확인해야 합니다.',
                 }
                 if code in messages:
                     raise UpdateError(code, binding['alias'] + ' · ' + operation + ': ' + messages[code])
@@ -174,12 +203,22 @@ class RemoteMaintenance:
                   or process.get('revision') != actual['revision']):
                 raise ValueError()
             metadata = {}
+            if 'settings_match' in value:
+                if operation != 'identity' or 'expected_settings' not in params or type(value['settings_match']) is not bool:
+                    raise ValueError()
+                metadata['settings_match'] = value['settings_match']
+            if 'observation_code' in value:
+                if (operation != 'inspect' or params.get('observe_only') is not True
+                        or value['idle'] is not False or process is None
+                        or value['observation_code'] not in ('remote_idle_binding_missing', 'remote_listener_unavailable')):
+                    raise ValueError()
+                metadata['observation_code'] = value['observation_code']
             if 'runtime_bundle' in value:
                 if (process is None or not isinstance(value['runtime_bundle'], str)
                         or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', value['runtime_bundle'])
                         or not re.fullmatch(r'[0-9a-f]{64}', value.get('host_identity', ''))):
                     raise ValueError()
-                metadata = {key: value[key] for key in ('runtime_bundle', 'host_identity')}
+                metadata.update({key: value[key] for key in ('runtime_bundle', 'host_identity')})
             return {'binding': binding, 'process': process, 'idle': value['idle'], 'exited': value['exited'], **metadata,
                     **({'active_binding': actual} if actual != binding else {})}
         except (ValueError, KeyError, TypeError, ShimError):

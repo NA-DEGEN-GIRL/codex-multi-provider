@@ -132,6 +132,18 @@ class NativeMaintenanceTests(unittest.TestCase):
                     NATIVE._control_request(pipe, 2, "server/managedShutdown", {}, time.monotonic()+5)
                 self.assertEqual(pipe.send_json.call_count, 1)
 
+    def test_missing_immutable_root_binding_is_typed_without_leaking_rpc_text(self):
+        pipe = MagicMock()
+        pipe.receive_json.return_value = {'id': 2, 'error': {
+            'code': -32600, 'message': 'root actor has no immutable managed source binding'}}
+        with self.assertRaises(NATIVE.RemoteMaintenanceError) as raised:
+            NATIVE._control_request(pipe, 2, 'thread/managedIdleStatus', {}, time.monotonic() + 5)
+        self.assertEqual(raised.exception.code, 'remote_idle_binding_missing')
+        pipe.receive_json.return_value['error']['message'] = 'untrusted private response'
+        with self.assertRaises(RuntimeError) as raised:
+            NATIVE._control_request(pipe, 2, 'thread/managedIdleStatus', {}, time.monotonic() + 5)
+        self.assertNotIn('private response', str(raised.exception))
+
     def test_unverified_transport_reply_preserves_the_process(self):
         for error in (EOFError("truncated"), ValueError("oversized"), TimeoutError("late")):
             with self.subTest(error=error):
@@ -147,6 +159,10 @@ class NativeMaintenanceTests(unittest.TestCase):
         self.assertEqual(mocks[4].call_args.args[1:4], (2, "server/managedShutdown", {"processId":13579}))
         mocks[5].assert_called_once_with(13579)
         mocks[6].assert_called_once_with(self.profile)
+        receipt = json.loads((self.profile / 'native-shutdown.json').read_text())
+        self.assertEqual(receipt['process'], self.record)
+        self.assertTrue(receipt['shutdown_requested'])
+        self.assertTrue(receipt['writer_release_verified'])
 
     def test_changed_identity_prevents_the_shutdown_request(self):
         mocks = self.stop_patches()
@@ -164,6 +180,7 @@ class NativeMaintenanceTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "shutdown proof"):
                     NATIVE.stop(self.profile, self.revision)
                 mocks[5].assert_not_called()
+                self.assertFalse((self.profile / 'native-shutdown.json').exists())
 
     def test_exited_process_with_owned_profile_is_not_ready_for_update(self):
         mocks = self.stop_patches()
@@ -185,6 +202,7 @@ class NativeMaintenanceTests(unittest.TestCase):
         with patch.object(NATIVE.time, "monotonic", side_effect=[0, 91]):
             with self.assertRaisesRegex(RuntimeError, "remain pending"):
                 NATIVE.stop(self.profile, self.revision)
+        self.assertTrue((self.profile / 'native-shutdown.json').is_file())
 
     def test_missing_instance_lock_is_not_fabricated_as_release_evidence(self):
         with self.assertRaisesRegex(RuntimeError, "lock is unavailable"):

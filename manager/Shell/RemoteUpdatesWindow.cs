@@ -15,13 +15,13 @@ internal sealed class RemoteUpdatesWindow : Window
     private readonly DispatcherTimer poll = new() { Interval = TimeSpan.FromSeconds(2) };
     private readonly ComboBox hosts = new() { Name = "HostSelector", HorizontalContentAlignment = HorizontalAlignment.Stretch };
     private readonly CheckBox autoCheck = Toggle("AutoCheck", "새 버전 자동 확인", true);
-    private readonly CheckBox autoApply = Toggle("AutoApply", "관리 런타임을 작업 종료 후 자동 적용", false);
-    private readonly CheckBox stockConfirmation = Toggle("StockConfirmation", "기본 Codex 작업을 모두 마쳤으며, 서비스 재시작에 동의합니다", false);
-    private readonly Button check = Action("CheckNow", "지금 확인");
-    private readonly Button schedule = Action("ScheduleManaged", "작업 종료 후 업데이트");
+    private readonly CheckBox autoApply = Toggle("AutoApply", "작업공간 SSH 자동 업데이트 · 작업 종료 후 적용", false);
+    private readonly CheckBox stockConfirmation = Toggle("StockConfirmation", "이 서버의 터미널 Codex 작업을 모두 마쳤습니다", false);
+    private readonly Button check = Action("CheckNow", "다시 확인");
+    private readonly Button schedule = Action("ScheduleManaged", "작업 종료 후 적용 예약");
     private readonly Button cancel = Action("CancelManaged", "예약 취소");
-    private readonly Button stockUpdate = Action("StockUpdate", "기본 Codex 수동 업데이트");
-    private readonly Button prepare = Action("PrepareRemote", "이 프로필의 원격 실행 준비");
+    private readonly Button stockUpdate = Action("StockUpdate", "터미널 Codex 업데이트");
+    private readonly Button prepare = Action("PrepareRemote", "이 계정의 SSH 연결 준비");
     private readonly TextBlock managedActive = Version("ManagedActiveVersion");
     private readonly TextBlock managedPrepared = Version("ManagedPreparedVersion");
     private readonly TextBlock managedAvailable = Version("ManagedAvailableVersion");
@@ -30,10 +30,12 @@ internal sealed class RemoteUpdatesWindow : Window
     private readonly TextBlock managedState = Note("", "ManagedState");
     private readonly TextBlock stockState = Note("", "StockState");
     private readonly TextBlock jobState = Note("", "JobState");
-    private readonly TextBlock managedMessage = Note("");
-    private readonly TextBlock stockMessage = Note("");
+    private readonly TextBlock managedMessage = Note("", "ManagedGuidance");
+    private readonly TextBlock stockMessage = Note("", "StockGuidance");
+    private readonly TextBlock stockHint = Note("", "StockActionHint");
+    private readonly TextBlock diagnostics = Note("", "RemoteUpdateDiagnostics");
     private readonly TextBlock checkedAt = Note("");
-    private readonly TextBlock feedback = Note("연결을 선택하고 버전을 확인하세요.");
+    private readonly TextBlock feedback = Note("연결을 선택하고 버전을 확인하세요.", "RemoteUpdateFeedback");
     private JsonElement data;
     private int context, requestSerial;
     private bool busy, polling, closed;
@@ -51,7 +53,7 @@ internal sealed class RemoteUpdatesWindow : Window
         var layout = new DockPanel { Margin = new Thickness(24) };
         var header = new StackPanel { Margin = new Thickness(0, 0, 0, 16) };
         header.Children.Add(new TextBlock { Text = "SSH 업데이트", FontSize = 23, FontWeight = FontWeights.SemiBold });
-        header.Children.Add(Note("관리 런타임과 기본 Codex의 버전을 함께 확인합니다."));
+        header.Children.Add(Note("작업공간의 SSH 작업과 SSH 터미널의 Codex를 각각 관리합니다."));
         DockPanel.SetDock(header, Dock.Top); layout.Children.Add(header);
         var footer = new StackPanel { Margin = new Thickness(0, 8, 0, 0) };
         footer.Children.Add(new ScrollViewer { Content = feedback, MaxHeight = 96, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled });
@@ -74,26 +76,31 @@ internal sealed class RemoteUpdatesWindow : Window
         body.Children.Add(checkRow); body.Children.Add(checkedAt);
 
         var managed = new StackPanel();
-        managed.Children.Add(Heading("관리 SSH 런타임")); managed.Children.Add(managedState);
-        managed.Children.Add(Versions(("현재 실행", managedActive), ("준비된 버전", managedPrepared), ("사용 가능한 버전", managedAvailable)));
+        managed.Children.Add(Heading("작업공간에서 쓰는 Codex"));
+        managed.Children.Add(Note("이 앱에서 여는 SSH 프로젝트와 작업에 사용합니다.")); managed.Children.Add(managedState);
+        managed.Children.Add(Versions(("실행 중인 버전", managedActive), ("업데이트 대상", managedAvailable)));
         managed.Children.Add(managedMessage);
         managed.Children.Add(autoApply);
-        managed.Children.Add(Note("이 프로필에 연결된 SSH 호스트 전체를 작업 종료 후 업데이트합니다. 로컬 작업은 유지하며 원격 상태가 불명확하면 기다립니다."));
+        managed.Children.Add(Note("이 계정에 연결된 SSH 서버 전체에 적용합니다. PC에서 진행 중인 작업은 유지됩니다."));
         var managedActions = new WrapPanel { Margin = new Thickness(0, 7, 0, 0) };
         managedActions.Children.Add(schedule); managedActions.Children.Add(cancel); managed.Children.Add(managedActions);
         managed.Children.Add(jobState); body.Children.Add(Card(managed));
 
         var stock = new StackPanel();
-        stock.Children.Add(Heading("기본 Codex · 수동 업데이트")); stock.Children.Add(stockState);
-        stock.Children.Add(Versions(("설치된 CLI", stockCli), ("실행 중인 서비스", stockDaemon)));
+        stock.Children.Add(Heading("SSH 터미널에서 쓰는 Codex")); stock.Children.Add(stockState);
+        stock.Children.Add(Versions(("터미널에 설치됨", stockCli), ("백그라운드 실행 중", stockDaemon)));
         stock.Children.Add(stockMessage);
-        stock.Children.Add(Note("관리 런타임의 활동 상태만으로 기본 Codex의 작업 종료를 확인할 수 없습니다. 업데이트하면 서비스가 재시작되며 현재 작업이 중단될 수 있습니다."));
-        stock.Children.Add(stockConfirmation); stock.Children.Add(stockUpdate); body.Children.Add(Card(stock));
+        stock.Children.Add(Note("터미널 작업이 끝났는지는 자동으로 확인할 수 없습니다. 업데이트하면 백그라운드 실행이 다시 시작되며 진행 중인 작업이 중단될 수 있습니다."));
+        stock.Children.Add(stockConfirmation); stock.Children.Add(stockUpdate); stock.Children.Add(stockHint); body.Children.Add(Card(stock));
 
         var preparation = new StackPanel();
-        preparation.Children.Add(Note("현재 프로필의 로그인으로 SSH 실행을 준비합니다. 기본 Codex CLI와 공용 SSH 설정은 보존합니다."));
+        preparation.Children.Add(Note("현재 계정으로 작업공간의 SSH 연결을 준비합니다. 터미널용 Codex 업데이트는 위에서 별도로 진행하세요."));
         preparation.Children.Add(prepare);
-        body.Children.Add(new Expander { Header = "이 프로필의 SSH 연결 준비", Content = preparation, Margin = new Thickness(0, 3, 0, 0) });
+        body.Children.Add(new Expander { Header = "SSH 연결 준비", Content = preparation, Margin = new Thickness(0, 8, 0, 0) });
+        var details = new StackPanel();
+        details.Children.Add(Note("서버에 준비된 작업공간 버전 · 실행 중인 버전과 다를 수 있습니다."));
+        details.Children.Add(managedPrepared); details.Children.Add(diagnostics);
+        body.Children.Add(new Expander { Name = "RemoteUpdateDetails", Header = "설치·진단 정보", Content = details, Margin = new Thickness(0, 6, 0, 0) });
         layout.Children.Add(new ScrollViewer { Name = "RemoteUpdatesScroll", Content = body, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled });
         Content = layout;
 
@@ -177,26 +184,43 @@ internal sealed class RemoteUpdatesWindow : Window
         autoCheck.IsChecked = Boolean(data, "auto_check", true);
         autoApply.IsChecked = Boolean(data, "auto_apply", false);
         var managed = data.Get("managed"); var stock = data.Get("stock"); var job = data.Get("job");
-        managedActive.Text = DisplayVersion(managed.S("active_version"));
-        managedPrepared.Text = DisplayVersion(managed.S("prepared_version"));
-        managedAvailable.Text = DisplayVersion(managed.S("available_version"));
-        stockCli.Text = DisplayVersion(stock.S("cli_version"));
-        stockDaemon.Text = DisplayVersion(stock.S("daemon_version"));
+        managedActive.Text = RemoteUpdatesPresentation.Version(managed.S("active_version"));
+        managedPrepared.Text = RemoteUpdatesPresentation.Version(managed.S("prepared_version"));
+        managedAvailable.Text = RemoteUpdatesPresentation.Version(managed.S("available_version"));
+        stockCli.Text = RemoteUpdatesPresentation.Version(stock.S("cli_version"));
+        stockDaemon.Text = RemoteUpdatesPresentation.Version(stock.S("daemon_version"));
         SetState(managedState, managed.S("state"));
-        SetState(stockState, stock.S("state"), " · 서비스 " + StateLabel(stock.S("daemon_state")));
-        if (stock.S("state") == "current") stockState.Text = "CLI·서비스 버전 일치 · 서비스 " + StateLabel(stock.S("daemon_state"));
-        managedMessage.Text = managed.S("message"); stockMessage.Text = stock.S("message");
+        if (managed.S("state") is "" or "unknown" or "unavailable") managedState.Text = "실행 상태 확인 필요";
+        if (managed.S("observation_code") is { Length: > 0 })
+        {
+            managedState.Text = managed.S("observation_code") == "remote_listener_unavailable" ? "SSH 연결 복구 필요" : "작업 종료 여부 확인 필요";
+            managedState.Foreground = Brushes.Orange;
+        }
+        SetState(stockState, stock.S("state"));
+        if (stock.S("state") == "current") stockState.Text = "설치·실행 버전 일치";
+        if (stock.S("state") is "stopped" or "not_running") stockState.Text = "백그라운드 실행 상태 확인 필요";
+        managedMessage.Text = RemoteUpdatesPresentation.Managed(managed);
+        stockMessage.Text = RemoteUpdatesPresentation.Stock(stock);
         var stockJob = stock.Get("update_job");
         if (stockJob.ValueKind == JsonValueKind.Object)
         {
-            stockMessage.Text += (stockMessage.Text.Length > 0 ? "\n" : "") + "수동 업데이트 · " + StateLabel(stockJob.S("state"));
-            if (stockJob.S("message").Length > 0) stockMessage.Text += " · " + stockJob.S("message");
+            stockMessage.Text += "\n" + RemoteUpdatesPresentation.Job(stockJob, terminal: true);
         }
         var identity = string.Join("|", stock.S("cli_version"), stock.S("daemon_version"), stock.S("daemon_state"),
             stock.S("observation_id"), stock.S("host_identity"));
         if (identity != stockIdentity) { stockConfirmation.IsChecked = false; stockIdentity = identity; }
-        jobState.Text = job.ValueKind == JsonValueKind.Object ? StateLabel(job.S("state")) + (job.S("message").Length > 0 ? " · " + job.S("message") : "") : "예약된 업데이트 없음";
-        checkedAt.Text = data.B("checking") ? "새 버전을 확인하고 있습니다…" : data.S("checked_at").Length == 0 ? "아직 확인하지 않았습니다. 버전을 자동으로 확인하거나 ‘지금 확인’을 누르세요." : "마지막 확인 · " + DisplayTime(data.S("checked_at"));
+        jobState.Text = job.ValueKind == JsonValueKind.Object ? RemoteUpdatesPresentation.Job(job) : "예약된 업데이트 없음";
+        diagnostics.Text = string.Join("\n", new[] {
+            "작업공간 실행: " + managed.S("active_version", "미확인"),
+            "서버에 준비됨: " + managed.S("prepared_version", "미확인"),
+            "업데이트 대상: " + managed.S("available_version", "미확인"),
+            "작업공간 상태: " + managed.S("state", "unknown"),
+            managed.S("observation_code").Length > 0 ? "작업공간 진단: " + ManagerProtocol.SafeMessage(managed.S("observation_code")) : "",
+            "터미널 Codex 상태: " + stock.S("state", "unknown"),
+            "예약 상태: " + job.S("state", "없음"),
+            data.S("error").Length > 0 ? "진단 코드: " + ManagerProtocol.SafeMessage(data.S("error")) : ""
+        }.Where(line => line.Length > 0));
+        checkedAt.Text = data.B("checking") ? "버전과 연결 상태를 확인하고 있습니다…" : data.S("checked_at").Length == 0 ? "아직 확인하지 않았습니다. ‘다시 확인’을 눌러 주세요." : "마지막 확인 · " + DisplayTime(data.S("checked_at"));
         if (Alias.Length == 0) feedback.Text = "등록된 SSH 연결이 없습니다. Codex 설정에서 연결을 추가하세요.";
         else if (data.S("error").Length > 0) { statusError = true; ShowError(data.S("error")); }
         else if (statusError) { statusError = false; feedback.Text = ""; feedback.Foreground = Muted; }
@@ -211,18 +235,28 @@ internal sealed class RemoteUpdatesWindow : Window
         var jobStatus = job.S("state");
         bool queued = jobStatus is "queued" or "waiting" or "waiting_for_idle" or "waiting_for_work" or "pending" or "blocked" or "busy";
         bool running = queued || jobStatus is "running" or "updating" or "applying" or "preparing" or "checking" or "recovering";
-        bool stockRunning = stock.Get("update_job").S("state") is "starting" or "applying" or "dispatching" or "unknown";
+        bool stockRunning = stock.Get("update_job").S("state") is "starting" or "applying" or "dispatching" or "unknown" or "attention";
+        bool stockVerified = stock.S("state") is "current" or "update_needed" or "stopped" or "available" or "update_available";
         check.IsEnabled = available && !data.B("checking");
         prepare.IsEnabled = available && !running;
         autoCheck.IsEnabled = autoApply.IsEnabled = available && loaded;
         schedule.IsEnabled = available && loaded && managed.B("can_schedule") && !running && !data.B("checking") &&
             managed.S("state") is "update_available" or "available" or "stopped" or "unknown" or "busy" or "ready";
         cancel.IsEnabled = available && queued;
-        stockConfirmation.IsEnabled = available && loaded && stock.B("update_supported") && HasStockObservation(stock) && !running && !stockRunning;
+        stockConfirmation.IsEnabled = available && loaded && stockVerified && stock.B("update_supported") && HasStockObservation(stock) && !running && !stockRunning;
         stockUpdate.IsEnabled = stockConfirmation.IsEnabled && stockConfirmation.IsChecked == true && stock.S("state") is not ("updating" or "running" or "applying") && !data.B("checking");
+        stockHint.Text = stockRunning ? "앞선 업데이트 결과를 확인해야 다시 실행할 수 있습니다. ‘다시 확인’을 눌러 주세요."
+            : !stockVerified || !stock.B("update_supported") || !HasStockObservation(stock) ? "버전과 업데이트 지원 여부를 먼저 확인해야 합니다. ‘다시 확인’을 눌러 주세요."
+            : running ? "작업공간 SSH 업데이트가 끝난 뒤 진행할 수 있습니다."
+            : stockConfirmation.IsChecked == true ? "확인한 터미널 Codex에만 적용합니다." : "터미널 작업을 마친 뒤 확인란을 선택하면 업데이트할 수 있습니다.";
     }
 
-    private void ShowError(string message) { feedback.Foreground = Brushes.Orange; feedback.Text = "확인 필요 · " + message; }
+    private void ShowError(string message)
+    {
+        statusError = true; feedback.Foreground = Brushes.Orange; feedback.Text = RemoteUpdatesPresentation.Error(message);
+        var detail = "진단 코드: " + ManagerProtocol.SafeMessage(message);
+        if (!diagnostics.Text.Contains(detail, StringComparison.Ordinal)) diagnostics.Text += "\n" + detail;
+    }
     private static string PreparationSummary(JsonElement result)
     {
         var lines = new List<string> { Dialogs.ResultSummary(result) };
@@ -234,7 +268,6 @@ internal sealed class RemoteUpdatesWindow : Window
     private static bool Boolean(JsonElement value, string key, bool fallback) => value.Get(key).ValueKind is JsonValueKind.True or JsonValueKind.False ? value.Get(key).GetBoolean() : fallback;
     private static bool HasStockObservation(JsonElement stock) => stock.S("observation_id") is { Length: 64 } token &&
         token.All(character => character is >= '0' and <= '9' or >= 'a' and <= 'f');
-    private static string DisplayVersion(string value) => string.IsNullOrWhiteSpace(value) ? "확인되지 않음" : value;
     private static string DisplayTime(string value) => DateTimeOffset.TryParse(value, out var time) ? time.ToLocalTime().ToString("yyyy-MM-dd HH:mm") : value;
     private static void SetState(TextBlock target, string state, string suffix = "")
     {
@@ -245,7 +278,7 @@ internal sealed class RemoteUpdatesWindow : Window
     {
         "current" or "latest" or "up_to_date" => "최신 버전",
         "update_available" or "available" => "새 버전 있음",
-        "update_needed" => "CLI·서비스 버전 다름",
+        "update_needed" => "설치 버전과 실행 버전이 다릅니다",
         "busy" or "active" => "작업 중",
         "idle" => "대기 중",
         "ready" or "prepared" => "준비됨",

@@ -119,6 +119,7 @@ class WorkspaceTests(unittest.TestCase):
                         'hostname': None, 'sshPort': None, 'identity': None}
             donor = {'codex-managed-remote-connections': [connection(host) for host in hosts],
                      'remote-connection-auto-connect-by-host-id': dict.fromkeys(hosts, True)}
+            donor['remote-connection-auto-connect-by-host-id'].update(dict.fromkeys(hosts[:2], False))
             (source/'.codex-global-state.json').write_text(json.dumps(donor))
             prepared = {'build-host', 'render-host', 'dev-host'}
             prepare(target, source, ssh_ready_aliases=prepared)
@@ -139,10 +140,9 @@ class WorkspaceTests(unittest.TestCase):
             prepare(target, source, ssh_ready_aliases=prepared)
             healed = json.loads(state_path.read_text())
             by_alias = {v.get('alias'): v for v in healed['codex-managed-remote-connections']}
-            # Prepared managed aliases return; unprepared donor hosts stay out.
+            # Saved aliases return independently of runtime readiness.
             self.assertEqual({v['hostId'] for v in healed['codex-managed-remote-connections']},
-                {'remote-ssh-discovered:dev-host', 'remote-ssh-discovered:build-host',
-                 'remote-ssh-discovered:render-host', 'remote-ssh-managed:manual'})
+                set(hosts) | {'remote-ssh-managed:manual'})
             self.assertEqual(by_alias['dev-host']['connectionAnalyticsId'], 'profile-tracking')
             self.assertEqual(by_alias['dev-host']['displayName'], 'Dev host (local edit)')
             self.assertNotIn('connectionAnalyticsId', by_alias['build-host'])
@@ -151,11 +151,11 @@ class WorkspaceTests(unittest.TestCase):
             auto = healed['remote-connection-auto-connect-by-host-id']
             self.assertIs(auto['remote-ssh-discovered:build-host'], True)
             self.assertIs(auto['remote-ssh-discovered:render-host'], False)
-            # A surviving previously imported prepared alias regains the donor
+            # A surviving previously imported alias regains the donor
             # preference that the desktop save cleared; explicit False above stays.
             self.assertIs(auto['remote-ssh-discovered:dev-host'], True)
-            self.assertNotIn('remote-ssh-discovered:off-a', auto)
-            self.assertNotIn('remote-ssh-discovered:off-b', auto)
+            self.assertIs(auto['remote-ssh-discovered:off-a'], False)
+            self.assertIs(auto['remote-ssh-discovered:off-b'], False)
             # Repeated prepare is stable and does not duplicate healed entries.
             prepare(target, source, ssh_ready_aliases=prepared)
             repeated = json.loads(state_path.read_text())
@@ -170,6 +170,26 @@ class WorkspaceTests(unittest.TestCase):
             removed = json.loads(state_path.read_text())
             self.assertNotIn('build-host', {v.get('alias') for v in removed['codex-managed-remote-connections']})
             self.assertNotIn('remote-ssh-discovered:build-host', removed['remote-connection-auto-connect-by-host-id'])
+
+    def test_lost_ssh_declarations_heal_when_no_runtime_binding_is_ready(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source, target = (Path(temp) / name for name in ('source', 'target'))
+            source.mkdir()
+            hosts = ['remote-ssh-discovered:build-host', 'remote-ssh-discovered:dev-host']
+            donor = {'codex-managed-remote-connections': [
+                {'hostId': host, 'source': 'discovered', 'alias': host.split(':')[1], 'hostname': None}
+                for host in hosts], 'remote-connection-auto-connect-by-host-id': dict.fromkeys(hosts, True)}
+            (source/'.codex-global-state.json').write_text(json.dumps(donor))
+            prepare(target, source, ssh_ready_aliases={'build-host', 'dev-host'})
+            path = target/'.codex-global-state.json'
+            current = json.loads(path.read_text())
+            current['codex-managed-remote-connections'] = current['codex-managed-remote-connections'][1:]
+            current.pop('remote-connection-auto-connect-by-host-id')
+            path.write_text(json.dumps(current))
+            prepare(target, source, ssh_ready_aliases=set())
+            healed = json.loads(path.read_text())
+            self.assertEqual({item['hostId'] for item in healed['codex-managed-remote-connections']}, set(hosts))
+            self.assertEqual(healed['remote-connection-auto-connect-by-host-id'], dict.fromkeys(hosts, True))
 
     def test_legacy_folder_grouping_uses_deepest_root_and_respects_projectless(self):
         with tempfile.TemporaryDirectory() as temp:

@@ -190,20 +190,18 @@ def merge_workspace(current, original, owned, source, *, ssh_ready_aliases=None,
     # previously imported alias-backed discovered connection while the donor
     # still declares it; merge_entries reads "missing but previously imported"
     # as a profile edit, so the entry would stay lost forever. The same save
-    # clears the host's auto-connect value, so a surviving prepared alias can
-    # also be left without its donor preference. Prepared bindings are the only
-    # aliases the launcher can reconnect, so limit healing to them when known.
+    # clears the host's auto-connect value, so a surviving alias can also be
+    # left without its donor preference. Saved declarations and preferences do
+    # not depend on runtime readiness: first connect prepares missing bindings,
+    # and maintenance may temporarily leave no prepared aliases.
     # Manual hostname declarations, profile edits, explicit False values and
     # donor removals keep their existing merge semantics; no tombstone schema
     # is introduced.
-    prepared_aliases = None if ssh_ready_aliases is None else set(ssh_ready_aliases)
     healed, managed = {}, set()
     for host_id, value in connections.items():
         if host_id not in previous.get(key, {}):
             continue
         if value.get('source') != 'discovered' or not value.get('alias') or value.get('hostname') is not None:
-            continue
-        if prepared_aliases is not None and str(value['alias']).strip() not in prepared_aliases:
             continue
         managed.add(host_id)
         if host_id not in normalized:

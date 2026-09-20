@@ -7,6 +7,7 @@ from io import StringIO
 import os
 from pathlib import Path
 import shlex
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -403,6 +404,38 @@ class ManifestTests(unittest.TestCase):
 
 class ShimStartFailureTests(unittest.TestCase):
     """Startup failures after the manifest loads must land in the audit trail."""
+
+    def test_script_entrypoint_preserves_pending_settings_error(self):
+        # The desktop executes the script by filename, unlike imported unit
+        # tests. Helpers must see the same ShimError class as the entrypoint.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / 'work/control-center'
+            profile = state / 'profiles' / PROFILE
+            profile.mkdir(parents=True)
+            data = {**manifest(), 'generation': OTHER, 'inventory_root': str(root)}
+            path = profile / 'ssh-bindings.json'
+            path.write_text(json.dumps(data), encoding='utf-8')
+            (state / 'state.json').write_text(json.dumps({
+                'version': 1, 'revision': 0,
+                'profiles': [{'id': PROFILE, 'generation': OTHER}],
+                'ssh_maintenance': {PROFILE: {'generation': OTHER, 'state': 'attention'}},
+            }), encoding='utf-8')
+            environment = {key: value for key, value in os.environ.items()
+                           if not key.upper().startswith(('CODEX_MANAGER_', 'CODEX_RECORD_'))}
+            environment.update(CODEX_MANAGER_SSH_BINDINGS=str(path), PYTHONUTF8='1')
+            script = Path(__file__).resolve().parents[1] / 'scripts/manager_core/ssh_shim.py'
+            result = subprocess.run([sys.executable, '-X', 'utf8', str(script), '--',
+                                     'remote-dev', 'codex --version'], env=environment,
+                                    capture_output=True, encoding='utf-8', timeout=15)
+            self.assertEqual(result.returncode, 125)
+            self.assertIn('SSH 설정', result.stderr)
+            self.assertNotIn('could not start', result.stderr)
+            audit = [json.loads(line) for line in path.with_name('ssh-routing.jsonl').read_text().splitlines()]
+            self.assertEqual(len(audit), 1)
+            self.assertEqual(audit[0]['code'], 'ssh_settings_pending')
+            self.assertEqual(audit[0]['stage'], 'wait_for_settings')
+            self.assertEqual(result.stdout, '')
 
     def blocked_start(self, error):
         with tempfile.TemporaryDirectory() as directory:

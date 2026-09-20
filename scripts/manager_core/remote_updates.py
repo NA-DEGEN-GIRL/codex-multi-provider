@@ -195,7 +195,7 @@ class RemoteUpdates:
             managed.update(available_version=artifact['version'], available_bundle=artifact['bundle_id'],
                            prepared_bundle=(source or {}).get('runtime_bundle'))
             if source and source.get('prepared') is True:
-                actual = self.hooks.remote_maintenance.request(source, 'inspect', discover_active=True)
+                actual = self.hooks.remote_maintenance.request(source, 'inspect', discover_active=True, observe_only=True)
                 bundle = actual.get('runtime_bundle')
                 if actual.get('host_identity') and actual['host_identity'] != target['host_identity']:
                     raise UpdateError('ssh_host_changed', '실행 중인 SSH 호스트 식별 정보가 변경되었습니다.')
@@ -210,11 +210,21 @@ class RemoteUpdates:
                     state, message = ('current', '관리 SSH 런타임이 현재 제공되는 버전으로 실행 중입니다.')
                 else:
                     state, message = ('update_available', '이 프로필에 적용할 관리 SSH 업데이트가 있습니다.')
+                code = actual.get('observation_code')
+                if code:
+                    managed['observation_code'] = code
+                    managed['version_state'] = state
+                    if code == 'remote_listener_unavailable':
+                        state = 'attention'
+                        message = 'SSH 프로세스는 남아 있지만 연결이 닫혀 있습니다. 종료 결과 확인이 필요합니다.'
+                    else:
+                        message += ' 기존 작업의 종료 여부는 확인하지 못해 자동으로 중단하지 않습니다.'
             else:
                 state, message = ('not_prepared', '이 프로필을 SSH에 연결한 뒤 관리 업데이트를 예약해 주세요.')
             managed.update(state=state, message=message)
         except Exception as exception:
             error = getattr(exception, 'code', 'managed_observation_unavailable')
+            managed['observation_code'] = error
             if error == 'ssh_host_changed':
                 target = None
                 managed.update(state='attention', message='SSH 호스트 식별 정보가 변경되었습니다. 연결 대상을 확인해 주세요.')

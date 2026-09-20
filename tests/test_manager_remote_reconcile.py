@@ -1,4 +1,4 @@
-"""Background host preparation must not publish over newer foreground choices."""
+"""Startup only verifies existing SSH settings; installation stays explicit."""
 from copy import deepcopy
 from pathlib import Path
 import sys
@@ -28,14 +28,17 @@ class RemoteReconcileTests(unittest.TestCase):
         self.center.store.mutate(lambda d: self.center.store.profile(self.pid, d).update(
             generation=self.generation, remote_bindings=[deepcopy(self.binding)]))
         self.center.remote = Mock()
+        self.center.remote_maintenance = Mock()
         self.center.store.remote_source = Mock()
         self.result = dict(self.binding, revision='b' * 64)
         self.center.remote.prepare.return_value = self.result
 
-    def test_unchanged_profile_publishes_prepared_revision(self):
+    def test_startup_checks_old_settings_without_preparing_or_publishing_runtime(self):
         self.center._reconcile_remote_hosts()
-        self.assertEqual(self.center.store.profile(self.pid)['remote_bindings'], [self.result])
-        self.center.store.remote_source.assert_called_once()
+        self.assertEqual(self.center.store.profile(self.pid)['remote_bindings'], [self.binding])
+        self.center.remote_maintenance.verify_settings.assert_called_once()
+        self.center.remote.prepare.assert_not_called()
+        self.center.store.remote_source.assert_not_called()
 
     def test_new_generation_policy_or_foreground_binding_survives_late_preparation(self):
         changes = [dict(generation=str(uuid4())),
@@ -48,7 +51,7 @@ class RemoteReconcileTests(unittest.TestCase):
                 def prepare(*args, **kwargs):
                     self.center.store.mutate(lambda d: self.center.store.profile(self.pid, d).update(change))
                     return self.result
-                self.center.remote.prepare.side_effect = prepare
+                self.center.remote_maintenance.verify_settings.side_effect = prepare
                 self.center._reconcile_remote_hosts()
                 current = self.center.store.profile(self.pid)
                 self.assertEqual(current['remote_bindings'], change.get('remote_bindings', [self.binding]))
@@ -62,7 +65,7 @@ class RemoteReconcileTests(unittest.TestCase):
                 self.pid: dict(state='held', transaction_id=str(uuid4()))}))
             return self.result
         self.center.remote.prepare.side_effect = prepared
-        self.center._reconcile_remote_hosts()
+        self.center._prepare_remote(self.center.store.profile(self.pid), 'dev', [])
         self.assertEqual(self.center.store.profile(self.pid)['remote_bindings'], [self.binding])
         self.assertEqual(self.center.store.read()['ssh_inventory'][self.pid]['operations'], {})
         self.center.remote.prepare.reset_mock()
@@ -70,6 +73,13 @@ class RemoteReconcileTests(unittest.TestCase):
         with self.assertRaises(UpdateError):
             self.center._prepare_remote(profile, 'dev', [])
         self.center.remote.prepare.assert_not_called()
+
+    def test_startup_does_not_observe_or_change_profiles_with_unresolved_lifecycle_gate(self):
+        self.center.store.mutate(lambda data: data.setdefault('ssh_maintenance', {}).update({
+            self.pid: dict(state='attention', transaction_id=str(uuid4()))}))
+        self.center._reconcile_remote_hosts()
+        self.center.remote.prepare.assert_not_called()
+        self.center.remote_maintenance.verify_settings.assert_not_called()
 
 
 if __name__ == '__main__':

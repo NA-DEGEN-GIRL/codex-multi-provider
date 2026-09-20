@@ -1,7 +1,9 @@
 """Typed lifecycle inspection for one private SSH runtime; never reads auth."""
 from contextlib import contextmanager
 import fcntl
+import hashlib
 from pathlib import Path
+import re
 import socket
 import time
 
@@ -13,7 +15,10 @@ from ws_client import WebSocketPipe
 def connection(profile):
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
         sock.settimeout(5)
-        sock.connect(str(native.socket_path(profile)))
+        try:
+            sock.connect(str(native.socket_path(profile)))
+        except (FileNotFoundError, ConnectionRefusedError):
+            raise native.RemoteMaintenanceError('remote_listener_unavailable') from None
         sock.settimeout(None)
         with sock.makefile('rb', buffering=0) as reader, sock.makefile('wb') as writer:
             try:
@@ -50,6 +55,56 @@ def identity(profile, revision):
     if native._running(profile, revision) != process:
         raise RuntimeError('Runtime identity changed during observation.')
     return {'process': process, 'idle': False, 'exited': False, 'revision': revision}
+
+
+def settings_match(profile, revision, expected):
+    """Compare generated immutable config bytes, never auth or mutable user files."""
+    if (not isinstance(expected, dict) or not 1 <= len(expected) <= 128
+            or any(not isinstance(name, str) or not isinstance(digest, str)
+                   or not re.fullmatch(r'[0-9a-f]{64}', digest) for name, digest in expected.items())):
+        raise ValueError('Invalid settings digest request.')
+    directory = profile / 'definitions' / revision
+    descriptor = native._descriptor(profile, revision)
+    if (Path(descriptor['definition']) != directory or directory.is_symlink()
+            or directory.resolve() != directory or not directory.is_dir()):
+        raise ValueError('Immutable settings directory is unavailable.')
+    actual, size = {}, 0
+    for path in directory.rglob('*'):
+        if path.is_symlink():
+            raise ValueError('Immutable settings symlink.')
+        if path.is_dir():
+            continue
+        name = path.relative_to(directory).as_posix()
+        if not path.is_file() or name not in expected or path.suffix not in ('.toml', '.json'):
+            return False
+        size += path.stat().st_size
+        if size > 2 * 1024 * 1024:
+            raise ValueError('Immutable settings size limit.')
+        actual[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return actual == expected
+
+
+def observe(profile, revision, *, discover_active=False):
+    """Version observation cannot supply a missing idle/shutdown proof."""
+    try:
+        return inspect(profile, revision, discover_active=discover_active)
+    except native.RemoteMaintenanceError as error:
+        if error.code not in ('remote_idle_binding_missing', 'remote_listener_unavailable'):
+            raise
+        process = native._running(profile, revision, allow_other_revision=discover_active)
+        if process is None:
+            raise
+        actual_revision = process['revision']
+        descriptor = native._descriptor(profile, actual_revision)
+        # Socket-less processes have no RPC identity. Require exact executable
+        # and birth fingerprint before reporting their version, still never idle.
+        executable = Path('/proc') / str(process['pid']) / 'exe'
+        expected = Path(descriptor['runtime']) / 'codex'
+        if (executable.resolve(strict=True) != expected.resolve(strict=True)
+                or native._running(profile, actual_revision) != process):
+            raise RuntimeError('Runtime executable identity changed.') from None
+        return dict(process=process, idle=False, exited=False, revision=actual_revision,
+                    requested_revision=revision, observation_code=error.code)
 
 
 def inspect(profile, revision, *, discover_active=False):
@@ -129,9 +184,17 @@ def dispatch(payload):
     native._descriptor(profile, revision)
     operation = payload['operation']
     if operation == 'identity':
-        return identity(profile, revision)
+        result = identity(profile, revision)
+        if 'expected_settings' in payload:
+            descriptor = native._descriptor(profile, revision)
+            result['settings_match'] = (
+                descriptor['host_identity'] == payload.get('expected_host_identity')
+                and Path(descriptor['runtime']).name == payload.get('expected_runtime_bundle')
+                and settings_match(profile, revision, payload['expected_settings']))
+        return result
     if operation == 'inspect':
-        result = inspect(profile, revision, discover_active=payload.get('discover_active') is True)
+        inspect_fn = observe if payload.get('observe_only') is True else inspect
+        result = inspect_fn(profile, revision, discover_active=payload.get('discover_active') is True)
         if result['process'] is not None:
             actual = native._descriptor(profile, result['revision'])
             result['runtime_bundle'] = Path(actual['runtime']).name

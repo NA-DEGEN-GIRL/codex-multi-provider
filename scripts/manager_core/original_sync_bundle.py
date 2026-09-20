@@ -11,7 +11,7 @@ from .desktop_bundle import read_header, _entries, check_archive_support, _long_
 from .store import atomic_json
 
 PATCHES = {
-    b'getGlobalStateValue(e){return': b'getGlobalStateValue(e){globalThis.__codexWorkspaceSync?.register(this.globalState,this.windowManager);globalThis.__codexLocalWorkspaceSync?.register(this.globalState,this.windowManager);return',
+    b'getGlobalStateValue(e){return': b'getGlobalStateValue(e){globalThis.__codexWorkspaceSync?.register(this.globalState,this.windowManager,this.remoteConnectionsHandler);globalThis.__codexLocalWorkspaceSync?.register(this.globalState,this.windowManager);return',
     b'ensureProjectsReady(){if(this.disposed||!this.connected)':
         b'ensureProjectsReady(){globalThis.__codexLocalWorkspaceSync?.registerBackend(this);if(this.disposed||!this.connected)',
     b'if(s.type===`remote-hosted-pip-active-thread-changed`){':

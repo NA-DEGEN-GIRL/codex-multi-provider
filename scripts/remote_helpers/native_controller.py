@@ -26,6 +26,12 @@ class RemoteStartError(RuntimeError):
         super().__init__('Remote listener startup failed (' + code + ').')
 
 
+class RemoteMaintenanceError(RuntimeError):
+    def __init__(self, code):
+        self.code = code
+        super().__init__('Remote maintenance proof is unavailable (' + code + ').')
+
+
 def _start_failure(logfile, offset):
     """Classify only this launch's bounded output; never return arbitrary logs."""
     try:
@@ -191,6 +197,11 @@ def _control_request(pipe, request_id, method, params, deadline):
         if message.get("id") != request_id:
             continue
         if "error" in message:
+            error = message['error']
+            if (method == 'thread/managedIdleStatus' and isinstance(error, dict)
+                    and error.get('code') == -32600
+                    and error.get('message') == 'root actor has no immutable managed source binding'):
+                raise RemoteMaintenanceError('remote_idle_binding_missing')
             raise RuntimeError("The runtime could not verify maintenance; updates remain pending.")
         result = message.get("result")
         if not isinstance(result, dict):
@@ -261,6 +272,13 @@ def _stop_locked(profile, revision, *, expected_process=None):
                         response.get("shutdownRequested") is not True or
                         response.get("writerReleaseVerified") is not True):
                     raise RuntimeError("Remote runtime did not provide a graceful shutdown proof.")
+                # A closed listener is not proof of process exit. Preserve the
+                # narrower acknowledged fence even if later teardown hangs or
+                # this SSH connection drops; recovery still requires exit/lock.
+                import launch
+                launch._atomic(profile / 'native-shutdown.json', dict(schema=1,
+                    process=observed, shutdown_requested=True, writer_release_verified=True,
+                    acknowledged_at=time.time()))
             finally:
                 # Wake the reader before closing its file, including on timeout.
                 try:

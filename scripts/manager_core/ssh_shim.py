@@ -723,4 +723,7 @@ def _execute(executable, rewritten, args, manifest, path, event):
 
 if __name__ == '__main__':
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    raise SystemExit(main())
+    # Helpers import this module by its package name. Execute that same module
+    # so their ShimError is not mistaken for an unknown exception from __main__.
+    from manager_core.ssh_shim import main as package_main
+    raise SystemExit(package_main())

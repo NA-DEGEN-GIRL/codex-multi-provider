@@ -2,6 +2,7 @@
 from contextlib import contextmanager
 from copy import deepcopy
 import importlib.util
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -116,6 +117,36 @@ class RemoteMaintenanceTests(unittest.TestCase):
                 with self.assertRaises(UpdateError):
                     self.service.reuse_unchanged(self.profile, records)
 
+    def test_legacy_settings_backfill_requires_remote_bytes_and_stable_local_binding(self):
+        binding = dict(self.binding, prepared=True, runtime_bundle='old-runtime', host_identity='f' * 64)
+        self.profile['remote_bindings'] = [binding]
+        self.store.mutate(lambda data: self.store.profile(self.profile['id'], data).update(
+            generation=self.profile['generation'], remote_bindings=[deepcopy(binding)]))
+        self.service.remote = MagicMock()
+        self.service.remote.binding_matches_settings.return_value = False
+        self.service.remote.settings_files.return_value = {'config.toml': 'c' * 64}
+        self.service.remote._settings_fingerprint.return_value = 'd' * 64
+        self.service.request = MagicMock(return_value={'settings_match': False})
+        self.assertFalse(self.service.verify_settings(self.profile, binding))
+        self.assertNotIn('settings_fingerprint', self.store.profile(self.profile['id'])['remote_bindings'][0])
+        self.service.request.return_value = {'settings_match': True}
+        self.assertTrue(self.service.verify_settings(self.profile, binding))
+        self.assertEqual(self.store.profile(self.profile['id'])['remote_bindings'][0]['settings_fingerprint'], 'd' * 64)
+        self.service.request.assert_called_with(binding, 'identity', expected_settings={'config.toml': 'c' * 64},
+            expected_host_identity='f' * 64, expected_runtime_bundle='old-runtime')
+        self.service.remote.prepare.assert_not_called()
+        # A stale result cannot replace a newer foreground choice.
+        with self.assertRaises(UpdateError):
+            self.service.verify_settings(self.profile, binding)
+
+    def test_existing_settings_fingerprint_mismatch_never_backfills_over_config_change(self):
+        self.service.remote = MagicMock()
+        self.service.remote.binding_matches_settings.return_value = False
+        self.service.request = MagicMock()
+        self.assertFalse(self.service.verify_settings(self.profile,
+            dict(self.binding, prepared=True, settings_fingerprint='a' * 64)))
+        self.service.request.assert_not_called()
+
     def identity_helper(self, process):
         native = types.SimpleNamespace(_running=MagicMock(return_value=process),
                                        _instance_lock_released=MagicMock(return_value=True))
@@ -225,6 +256,73 @@ class RemoteMaintenanceTests(unittest.TestCase):
             self.service.remote._run.return_value.stdout = json.dumps(dict(ok=True, result={**value, **changes})).encode()
             with self.subTest(changes=changes), self.assertRaises(UpdateError):
                 self.service.request(self.binding, 'inspect', discover_active=True)
+
+    def test_observation_only_version_proof_cannot_be_used_as_idle_or_lifecycle_proof(self):
+        self.service.root = ROOT
+        self.service.remote = MagicMock()
+        process = dict(pid=12, process_start='34', boot_id='fixture', socket='/private.sock', revision='a' * 64)
+        value = dict(revision='a' * 64, process=process, idle=False, exited=False,
+                     runtime_bundle='old-runtime', host_identity='f' * 64,
+                     observation_code='remote_listener_unavailable')
+        self.service.remote._run.return_value = types.SimpleNamespace(returncode=0,
+            stdout=json.dumps(dict(ok=True, result=value)).encode())
+        result = self.service.request(self.binding, 'inspect', observe_only=True)
+        self.assertFalse(result['idle'])
+        self.assertEqual(result['runtime_bundle'], 'old-runtime')
+        with self.assertRaises(UpdateError):
+            self.service.request(self.binding, 'inspect')
+        value['idle'] = True
+        self.service.remote._run.return_value.stdout = json.dumps(dict(ok=True, result=value)).encode()
+        with self.assertRaises(UpdateError):
+            self.service.request(self.binding, 'inspect', observe_only=True)
+
+    def test_observation_fallback_requires_exact_executable_and_unchanged_birth_identity(self):
+        process = dict(pid=12, process_start='34', boot_id='fixture', socket='/private.sock', revision='a' * 64)
+        module, native = self.identity_helper(process)
+        class MaintenanceError(RuntimeError):
+            code = 'remote_listener_unavailable'
+        native.RemoteMaintenanceError = MaintenanceError
+        native._descriptor = MagicMock(return_value={'runtime': str(self.root / 'runtime')})
+        binary = self.root / 'runtime/codex'
+        binary.parent.mkdir()
+        binary.write_bytes(b'fixture')
+        resolve = Path.resolve
+        def resolved(path, *args, **kwargs):
+            return binary if str(path).replace('\\', '/') == '/proc/12/exe' else resolve(path, *args, **kwargs)
+        with patch.object(module, 'inspect', side_effect=MaintenanceError()), patch.object(module.Path, 'resolve', resolved):
+            result = module.observe(self.root, 'a' * 64)
+            self.assertFalse(result['idle'])
+            self.assertFalse(result['exited'])
+            self.assertEqual(result['observation_code'], 'remote_listener_unavailable')
+            native._running.side_effect = [process, dict(process, process_start='changed')]
+            with self.assertRaises(RuntimeError):
+                module.observe(self.root, 'a' * 64)
+        native._running.side_effect = None
+        with patch.object(module, 'inspect', side_effect=MaintenanceError()), patch.object(module.Path, 'resolve',
+                lambda path, **kw: self.root / ('wrong' if str(path).replace('\\', '/') == '/proc/12/exe' else 'right')):
+            with self.assertRaises(RuntimeError):
+                module.observe(self.root, 'a' * 64)
+
+    def test_immutable_settings_comparison_rejects_changed_missing_extra_and_escaped_files(self):
+        module, native = self.identity_helper(None)
+        directory = self.root / 'definitions' / ('a' * 64)
+        directory.mkdir(parents=True)
+        content = b'model = "fixture"\n'
+        (directory / 'config.toml').write_bytes(content)
+        native._descriptor = MagicMock(return_value={'definition': str(directory)})
+        expected = {'config.toml': hashlib.sha256(content).hexdigest()}
+        self.assertTrue(module.settings_match(self.root, 'a' * 64, expected))
+        (directory / 'config.toml').write_bytes(content + b'# changed')
+        self.assertFalse(module.settings_match(self.root, 'a' * 64, expected))
+        (directory / 'config.toml').write_bytes(content)
+        (directory / 'extra.json').write_text('{}')
+        self.assertFalse(module.settings_match(self.root, 'a' * 64, expected))
+        (directory / 'extra.json').unlink()
+        (directory / 'config.toml').unlink()
+        self.assertFalse(module.settings_match(self.root, 'a' * 64, expected))
+        native._descriptor.return_value = {'definition': str(self.root / 'outside')}
+        with self.assertRaises(ValueError):
+            module.settings_match(self.root, 'a' * 64, expected)
 
     def test_dispatch_reads_version_from_actual_descriptor_not_prepared_revision(self):
         native = types.SimpleNamespace(_descriptor=MagicMock(side_effect=lambda p, revision: dict(

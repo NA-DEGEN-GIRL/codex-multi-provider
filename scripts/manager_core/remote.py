@@ -321,6 +321,8 @@ class RemoteManager:
             valid = validate_binding(binding, profile['id'])
             if binding.get('prepared') is not True or not SHA256.fullmatch(binding.get('host_identity', '')):
                 return False
+            if 'settings_fingerprint' in binding:
+                return binding['settings_fingerprint'] == self.settings_fingerprint(profile, binding)
             artifact = None
             for arch in ('x86_64', 'aarch64'):
                 path = self.root / 'artifacts/remote' / ('linux-' + arch) / 'manifest.json'
@@ -342,6 +344,28 @@ class RemoteManager:
                 binding['host_identity'], legacy=artifact.get('mixed_source_catalog_present') is True)
         except (OSError, ValueError, KeyError, TypeError, RuntimeError):
             return False
+
+    def settings_files(self, profile, binding):
+        """Execution config only; replacing manager helpers is an explicit update."""
+        from .model_settings import render_options
+        from .ssh_shim import validate_binding
+        valid = validate_binding(binding, profile['id'])
+        models = profile['policy']['model_ids'] if profile['policy']['enabled'] else []
+        home = str(PurePosixPath(valid['remote_launcher']).parent / 'codex')
+        rendered = self._registry_instance().render_for_host(home, bool(models), models,
+            existing_config='[features]\ncode_mode_host = true\n', **render_options(profile))
+        return {name: hashlib.sha256(content.encode('utf-8')).hexdigest()
+                for name, content in rendered['files'].items()}
+
+    @staticmethod
+    def _settings_fingerprint(binding, files):
+        from .ssh_shim import validate_binding
+        inputs = dict(binding=validate_binding(binding, binding['profile_id']), files=files,
+                      host_identity=binding['host_identity'], runtime_bundle=binding['runtime_bundle'])
+        return hashlib.sha256(json.dumps(inputs, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+    def settings_fingerprint(self, profile, binding):
+        return self._settings_fingerprint(binding, self.settings_files(profile, binding))
 
     def prepare(self, alias: str, profile_id: str, profile_home: Path | str,
                 model_ids: list[str], *, primary_model_id=None, primary_settings=None, selection_mode='automatic', reuse_host_runtime=False) -> dict:
@@ -445,7 +469,7 @@ class RemoteManager:
         config_result = self._json_result(configured, "remote_credentials_failed")
         if config_result.get("status") != "configured":
             raise RemoteError("remote_credentials_failed", "런타임은 준비됐지만 원격 키 설정을 확인하지 못했습니다.")
-        return {"id": "ssh:" + alias, "alias": alias, "profile_id": profile_id,
+        result = {"id": "ssh:" + alias, "alias": alias, "profile_id": profile_id,
                 "status": "prepared_not_connected", "prepared": True, "native_gui_verified": False,
                 "runtime_bundle": artifact["bundle_id"], "revision": revision,
                 "runtime_reused": reused,
@@ -458,6 +482,9 @@ class RemoteManager:
                 "model_ids": list(model_ids), "authentication_required": not config_result.get("authenticated", False),
                 "blockers": ["native_gui_ssh_binding_unverified", "selected_account_verification_required"],
                 "message": "원격 파일 준비 완료. 원본 앱 연결과 선택한 GPT 계정 확인 전에는 사용 가능으로 표시하지 않습니다."}
+        result['settings_fingerprint'] = self._settings_fingerprint(result,
+            {name: hashlib.sha256(content.encode('utf-8')).hexdigest() for name, content in rendered['files'].items()})
+        return result
 
     def _select_runtime(self, alias, observed, artifact, reuse_host_runtime):
         candidates = [artifact]

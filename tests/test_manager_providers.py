@@ -266,7 +266,27 @@ class ProviderRegistryTests(unittest.TestCase):
         self.assertTrue(any(role.get('model', '').startswith('gpt-') for role in roles))
         for provider_id in allowlist:
             self.assertEqual(config['model_providers'][provider_id]['wire_api'], 'responses')
-            self.assertFalse(config['model_providers'][provider_id]['requires_openai_auth'])
+        self.assertFalse(config['model_providers'][provider_id]['requires_openai_auth'])
+
+    def test_key_change_invalidates_only_its_provider_configuration(self):
+        first = self.add_model('First provider', 'first-model')
+        second = self.add_model('Second provider', 'second-model')
+        models = [first['model']['id'], second['model']['id']]
+        before = self.registry.render_for_host(str(self.profile_home), True, models)
+        with patch.object(providers, '_protect_secret', return_value=b'opaque protected blob'), \
+                patch.object(providers, '_unprotect_secret') as decrypt:
+            self.registry.save_key(first['provider']['id'], 'synthetic-replacement-credential')
+            after = self.registry.render_for_host(str(self.profile_home), True, models)
+            decrypt.assert_not_called()
+        previous = {item['provider_id']: item for item in before['bindings']}
+        current = {item['provider_id']: item for item in after['bindings']}
+        changed = first['provider']['id']
+        self.assertEqual(current[changed]['provider_revision'], previous[changed]['provider_revision'] + 1)
+        self.assertNotEqual(current[changed]['runtime_provider_id'], previous[changed]['runtime_provider_id'])
+        self.assertEqual(current[second['provider']['id']], previous[second['provider']['id']])
+        self.assertNotEqual(before['files'], after['files'])
+        self.assertNotIn('synthetic-replacement-credential', json.dumps(after))
+        self.assertNotIn('synthetic-replacement-credential', json.dumps(self.registry.list()))
 
     def test_turning_external_models_off_clears_the_active_allowlist(self):
         saved = self.add_model()

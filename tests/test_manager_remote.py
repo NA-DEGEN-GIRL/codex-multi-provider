@@ -137,13 +137,13 @@ class RemoteTests(unittest.TestCase):
             self.assertTrue(manager.binding_matches_settings(profile, binding))
         self.assertEqual(self.calls, [])
 
-    def test_prepared_remote_definition_detects_helpers_models_bundle_and_host_changes(self):
+    def test_settings_fingerprint_preserves_old_runtime_but_detects_configuration_and_binding_changes(self):
         manager, profile, binding, artifact, helpers = self.prepared_settings_fixture()
         for path in helpers.glob('*.py'):
             original = path.read_bytes()
             with self.subTest(helper=path.name):
                 path.write_bytes(original + b'\n# changed remote helper\n')
-                self.assertFalse(manager.binding_matches_settings(profile, binding))
+                self.assertTrue(manager.binding_matches_settings(profile, binding))
                 path.write_bytes(original)
                 self.assertTrue(manager.binding_matches_settings(profile, binding))
         variants = []
@@ -170,6 +170,14 @@ class RemoteTests(unittest.TestCase):
         manifest = json.loads(path.read_text())
         manifest['version'] = '0.153.4-new'
         path.write_text(json.dumps(manifest))
+        self.assertTrue(manager.binding_matches_settings(profile, binding))
+        self.assertEqual(self.calls, [])
+
+    def test_legacy_binding_without_fingerprint_still_requires_exact_local_revision_or_remote_verification(self):
+        manager, profile, binding, _, helpers = self.prepared_settings_fixture()
+        binding.pop('settings_fingerprint')
+        self.assertTrue(manager.binding_matches_settings(profile, binding))
+        (helpers / 'launch.py').write_text('# different helper\n')
         self.assertFalse(manager.binding_matches_settings(profile, binding))
         self.assertEqual(self.calls, [])
 

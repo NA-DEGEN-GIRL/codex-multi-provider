@@ -153,13 +153,12 @@ class ControlCenter:
         return self.remote.prepare(alias, profile['id'], profile['home'], models, **options)
 
     def _reconcile_remote_hosts(self):
-        """Re-apply every remote binding once per start so helper updates land.
+        """Observe old bindings without installing a new runtime/helper release.
 
-        Uploading is content-addressed and skipped when nothing changed, so an
-        unchanged host costs a short SSH round trip and a drifted host is
-        repaired without the user pressing SSH connect first.
+        Startup may backfill exact settings evidence for legacy metadata. Runtime
+        updates belong to the managed update queue; configuration changes use the
+        existing explicit profile apply/SSH preparation path.
         """
-        from manager_core.model_settings import render_options
         try:
             state = self.store.read()
         except (ValueError, RuntimeError, OSError):
@@ -169,42 +168,12 @@ class ControlCenter:
                 continue
             if state.get('ssh_maintenance', {}).get(profile['id'], {}).get('state') not in (None, 'released'):
                 continue
-            models = list(profile['policy']['model_ids']) if profile.get('policy', {}).get('enabled') else []
-            options = render_options(profile)
             for binding in profile.get('remote_bindings') or []:
-                alias = binding.get('alias')
-                if not alias:
+                if not binding.get('alias') or binding.get('prepared') is not True:
                     continue
                 try:
-                    result = self._prepare_remote(profile, alias, models, reuse_host_runtime=True, **options)
+                    self.remote_maintenance.verify_settings(profile, binding)
                 except (ValueError, RuntimeError, OSError, KeyError):
-                    continue
-                if result.get('prepared') is not True or result.get('revision') == binding.get('revision'):
-                    continue
-
-                def save(data, profile_id=profile['id'], alias=alias, result=result,
-                         observed_binding=binding, generation=profile.get('generation'),
-                         selected=models, expected_options=options):
-                    item = self.store.profile(profile_id, data)
-                    current_models = list(item['policy']['model_ids']) if item.get('policy', {}).get('enabled') else []
-                    current_binding = next((b for b in item.get('remote_bindings', []) if b.get('alias') == alias), None)
-                    # Network preparation can outlive a policy edit, reconnect,
-                    # or profile restart. Never publish that stale snapshot over
-                    # the binding a foreground preparation just applied.
-                    if (item.get('removed_at') or item.get('view_only')
-                            or data.get('ssh_maintenance', {}).get(profile_id, {}).get('state') not in (None, 'released')
-                            or item.get('generation') != generation
-                            or sorted(current_models) != sorted(selected)
-                            or render_options(item) != expected_options
-                            or current_binding != observed_binding):
-                        return
-                    item['remote_bindings'] = [b for b in item.get('remote_bindings', [])
-                                               if b.get('alias') != alias] + [result]
-                    self.store.remote_source(data, result, item['alias'])
-
-                try:
-                    self.store.mutate(save)
-                except (ValueError, RuntimeError, OSError):
                     continue
 
     def state(self):

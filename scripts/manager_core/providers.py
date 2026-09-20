@@ -510,6 +510,9 @@ class ProviderRegistry:
             # Saving a new manager key never overwrites the legacy lab key.
             provider['credential_ref'] = 'dpapi:' + provider_id
             _atomic_bytes(self._secret_path(provider), encrypted)
+            # Pin a new credential generation without putting secret bytes (or
+            # their hashes) in generated settings or SSH compatibility checks.
+            provider['revision'] += 1
             state['revision'] += 1
             self._snapshot(state)
             self._write(state)
