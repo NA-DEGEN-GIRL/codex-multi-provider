@@ -10,7 +10,7 @@ async function check(renderer){
   let provider='openai',model='gpt-6-astra',sourceProvider='cc_deepseek',writes=[];
   const m={hostId:'local',threadStore:{threadsById:new Map()},requestClient:{async sendRequest(method,params){
     if(method==='config/read')return{config:{model_provider:provider,model,model_reasoning_effort:'high'}};
-    if(method==='thread/read')return{thread:{modelProvider:sourceProvider}};
+    if(method==='thread/read'){assert.equal(params.includeTurns,false);return{thread:{modelProvider:sourceProvider,model:'gpt-6-astra',reasoningEffort:'ultra'}};}
     writes.push([method,params]);return params;
   }}};
   context[renderer?'__codexRendererRecordSync':'__codexRecordSync'].register(m);
@@ -22,6 +22,30 @@ async function check(renderer){
   }
   sourceProvider='openai';const same=await m.requestClient.sendRequest('thread/resume',{threadId:id,model:'gpt-other',config:{model_reasoning_effort:'low'}});
   assert.equal(same.model,'gpt-other');assert.equal(same.config.model_reasoning_effort,'low');
+  for(const method of ['thread/resume','thread/fork']){
+    const ordinary=await m.requestClient.sendRequest(method,{threadId:id});
+    assert.equal(ordinary.modelProvider,'openai');
+    assert.equal(ordinary.model,'gpt-6-astra');
+    assert.equal(ordinary.config.model_reasoning_effort,'ultra','same-provider reopen must preserve the stored effort');
+    // A redundant provider is also an explicit model override to the native
+    // runtime, even without a model/effort. Restore the choice and enforce routing.
+    const supplied={threadId:id,modelProvider:'cc_stale',config:{model_provider:'cc_stale',web_search:'disabled'}};
+    const normalized=await m.requestClient.sendRequest(method,supplied);
+    assert.equal(normalized.modelProvider,'openai');
+    assert.equal(normalized.config.model_provider,'openai');
+    assert.equal(normalized.config.model_reasoning_effort,'ultra');
+    assert.equal(normalized.config.web_search,'disabled');assert.equal(supplied.modelProvider,'cc_stale');
+    assert.equal(supplied.config.model_provider,'cc_stale');
+  }
+  // A stale cache must neither reset a same-provider effort nor import a
+  // different provider's choice into this profile.
+  m.threadStore.threadsById.set(id,{modelProvider:'cc_stale'});
+  assert.equal((await m.requestClient.sendRequest('thread/resume',{threadId:id})).config.model_reasoning_effort,'ultra');
+  m.threadStore.threadsById.set(id,{modelProvider:'openai'});
+  sourceProvider='cc_changed';
+  assert.equal((await m.requestClient.sendRequest('thread/resume',{threadId:id})).config.model_reasoning_effort,'high');
+  sourceProvider='openai';
+  m.threadStore.threadsById.clear();
   provider='cc_second';model='second-api';
   const other=await m.requestClient.sendRequest('thread/resume',{threadId:id,model:'gpt-other'});
   assert.equal(other.modelProvider,'cc_second');assert.equal(other.model,'second-api');
