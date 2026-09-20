@@ -10,6 +10,7 @@ internal static class ResponsivenessSelfTest
     {
         var root = Path.Combine(Path.GetTempPath(), "codex-latency-fixture-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(root);
+        var profileOpenChecks = await ProfileOpenStatusSelfTest.RunAsync(root);
         NativeWindowLeaseSelfTest.Run(Path.Combine(root, "leases"));
         NativeProcessMetricsSelfTest.Run();
         var log = Path.Combine(root, "shell.log");
@@ -38,7 +39,7 @@ internal static class ResponsivenessSelfTest
             if (samples.Any(p => p.GetProperty("pid").GetInt32() == int.MaxValue || p.TryGetProperty("threads", out _)))
                 throw new InvalidOperationException("The fast sampler emitted a failed target or expensive thread count.");
             File.WriteAllText(report, JsonSerializer.Serialize(new { passed = true, trace = monitor.Path,
-                checks = new[] { "Lease visibility and bounds retry after a real sharing violation", "Native own-process memory, CPU and handle counters", "Known allocation and owned handle growth", "Invalid and exited process samples omitted", "Fast trace omits system-wide thread enumeration", "Stall written while dispatcher blocked", "Blocking stage and elapsed duration recorded", "Log-copy snapshot contains the event" } }));
+                checks = new[] { "Lease visibility and bounds retry after a real sharing violation", "Native own-process memory, CPU and handle counters", "Known allocation and owned handle growth", "Invalid and exited process samples omitted", "Fast trace omits system-wide thread enumeration", "Stall written while dispatcher blocked", "Blocking stage and elapsed duration recorded", "Log-copy snapshot contains the event" }.Concat(profileOpenChecks) }));
         }
         finally { foreach (var entry in events) entry.Dispose(); }
     }

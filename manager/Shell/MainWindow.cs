@@ -33,6 +33,7 @@ public sealed class MainWindow : Window
     private readonly ProfileOrdering _profileOrdering;
     private readonly ListBox _shortcuts = new();
     private readonly TextBlock _status = new() { TextWrapping = TextWrapping.Wrap, TextTrimming = TextTrimming.CharacterEllipsis, FontSize = 11, LineHeight = 16, Foreground = Muted, MaxHeight = 32 };
+    private string? _profileOpenNoticeProfile;
     private readonly TextBlock _identity = new() { FontSize = 12, FontWeight = FontWeights.SemiBold, Foreground = WorkspaceAppearance.Accent, TextTrimming = TextTrimming.CharacterEllipsis };
     private readonly TextBlock _taskIdentity = new() { FontSize = 18, FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 5, 0, 0), TextTrimming = TextTrimming.CharacterEllipsis };
     private readonly TextBlock _attention = new() { Foreground = Brushes.Orange, FontSize = 12, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 4, 0, 0), Visibility = Visibility.Collapsed };
@@ -93,6 +94,10 @@ public sealed class MainWindow : Window
     private JsonElement _viewerProfile;
     private string? _viewerRepresentative;
     private static readonly SolidColorBrush Muted = new(Color.FromRgb(159, 167, 183));
+    private sealed class ProfileOpenException(string profileId, Exception cause) : Exception(cause.Message, cause)
+    {
+        public string ProfileId { get; } = profileId;
+    }
     private sealed record WindowIdentity(nint Handle, int Pid, string Executable)
     {
         public string Marker { get; } = "Codex.ControlCenter.Parked." + Guid.NewGuid().ToString("N");
@@ -588,7 +593,12 @@ public sealed class MainWindow : Window
     private async Task Safe(Func<Task> action)
     {
         try { await action(); }
-        catch (Exception ex) { if (_closing) return; SetStatus(ex.Message, true); }
+        catch (Exception ex)
+        {
+            if (_closing) return;
+            SetStatus(ex.Message, true);
+            _profileOpenNoticeProfile = (ex as ProfileOpenException)?.ProfileId;
+        }
     }
     private async Task<JsonElement> Request(string command, object? args = null)
     {
@@ -930,7 +940,7 @@ public sealed class MainWindow : Window
             ++_stateRevision;
             await RefreshAsync();
         }
-        catch
+        catch (Exception error)
         {
             // Startup may acquire maintenance just after the state above was
             // read. Keep the user's selection and attach the replacement on the
@@ -947,6 +957,9 @@ public sealed class MainWindow : Window
                 }
             }
             if (ticket == _navigation) _embedRequested = false;
+            if (command == "profile.show" && ticket == _navigation &&
+                error is ManagerException { Code: "update_in_progress" or "profile_prepare_busy" })
+                throw new ProfileOpenException(id, error);
             throw;
         }
         finally { if (_profileRequestTicket == ticket) _profileRequestTicket = null; }
@@ -1159,11 +1172,16 @@ public sealed class MainWindow : Window
             if (!refreshPresentation && _host.Visibility == Visibility.Visible)
             {
                 _empty.Visibility = Visibility.Collapsed;
+                ResolveProfileOpenNotice(profile);
                 return;
             }
             _host.Visibility = Visibility.Visible;
             _host.UpdateLayout();
-            if (_host.SynchronizeLayout() && _host.IsAttached) _empty.Visibility = Visibility.Collapsed;
+            if (_host.SynchronizeLayout() && _host.IsAttached)
+            {
+                _empty.Visibility = Visibility.Collapsed;
+                ResolveProfileOpenNotice(profile);
+            }
             return;
         }
         var hwnd = (nint)profile.N("window_handle"); var pid = (int)profile.N("process_id");
@@ -1179,7 +1197,12 @@ public sealed class MainWindow : Window
         {
             _host.Visibility = Visibility.Visible;
             _host.UpdateLayout();
-            if (_host.SynchronizeLayout() && _host.IsAttached) _empty.Visibility = Visibility.Collapsed;
+            if (_host.SynchronizeLayout() && _host.IsAttached)
+            {
+                _empty.Visibility = Visibility.Collapsed;
+                if (_windowLaunches.TryGetValue(_host, out var attached) && attached.Matches(profile))
+                    ResolveProfileOpenNotice(profile);
+            }
             return;
         }
         AttachProfileWindow(profile, _host, selected: true);
@@ -1207,7 +1230,11 @@ public sealed class MainWindow : Window
             var host = _hostDeck.Ensure(id);
             if (host.IsTransitioning) continue;
             host.Visibility = Visibility.Hidden;
-            if (_windowLaunches.TryGetValue(host, out var retained) && retained.Retains(host, profile)) continue;
+            if (_windowLaunches.TryGetValue(host, out var retained) && retained.Retains(host, profile))
+            {
+                ResolveProfileOpenNotice(profile);
+                continue;
+            }
             AttachProfileWindow(profile, host, selected: false);
         }
     }
@@ -1266,7 +1293,11 @@ public sealed class MainWindow : Window
                 _closedWindow = 0;
                 _empty.Visibility = Visibility.Collapsed; SetStatus("선택한 프로필의 Codex 창을 연결했습니다.");
             }
-            else Log($"{profile.S("alias")} · 관리창 내부 연결 완료 · 프로필 선택 시 표시");
+            else
+            {
+                Log($"{profile.S("alias")} · 관리창 내부 연결 완료 · 프로필 선택 시 표시");
+                ResolveProfileOpenNotice(profile);
+            }
         }
         else
         {
@@ -1466,8 +1497,21 @@ public sealed class MainWindow : Window
     }
     private void SetStatus(string message, bool error = false)
     {
+        _profileOpenNoticeProfile = null;
         _status.Text = message; _status.ToolTip = message; _status.Foreground = error ? new SolidColorBrush(Color.FromRgb(245, 189, 121)) : Muted;
         if (_events.Count == 0 || !_events[^1].EndsWith(message, StringComparison.Ordinal)) Log((error ? "오류 · " : "") + message);
+    }
+    private void ResolveProfileOpenNotice(JsonElement profile)
+    {
+        // Called only after verifying the current native window's attachment.
+        // A different profile or a later unrelated error must keep its notice.
+        var id = profile.S("id");
+        if (_profileOpenNoticeProfile != id || profile.S("status") != "running" ||
+            profile.Get("restart").S("phase") is not ("" or "complete" or "superseded")) return;
+        foreach (var gate in new[] { _state.Get("update_maintenance"),
+            _state.Get("profile_maintenance").Get(id), _state.Get("ssh_maintenance").Get(id) })
+            if (gate.S("state") is not ("" or "released")) return;
+        SetStatus($"{profile.S("alias")} 프로필의 Codex 창이 준비되었습니다.");
     }
     private void Log(string message)
     {

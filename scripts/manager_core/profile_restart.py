@@ -5,6 +5,7 @@ from copy import deepcopy
 from contextlib import contextmanager
 import os
 import threading
+from time import monotonic
 from uuid import uuid4
 
 from .store import identifier, now
@@ -13,6 +14,8 @@ from .instances import process_identity
 from .update_hooks import _process_liveness
 
 TERMINAL = frozenset({'complete', 'attention', 'superseded'})
+_CLAIM_WAIT = 10.0
+_CLAIM_POLL = 0.05
 
 
 def supersede_previous_notice(data, profile):
@@ -25,8 +28,23 @@ def supersede_previous_notice(data, profile):
 
 
 @contextmanager
-def _claim(path):
-    lock = _lock_file(path)
+def _claim(path, stopping):
+    """Join this profile's preparation without holding the worker-state lock."""
+    deadline = monotonic() + _CLAIM_WAIT
+    while True:
+        if stopping.is_set():
+            raise UpdateError('service_stopped', '관리 앱이 종료 중입니다. 다시 연 뒤 적용하세요.')
+        try:
+            lock = _lock_file(path)
+            break
+        except UpdateError as error:
+            if error.code != 'update_in_progress':
+                raise
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                raise UpdateError('profile_prepare_busy',
+                    '이 프로필의 창과 연결을 준비하고 있습니다. 잠시 후 다시 열어 주세요.') from None
+            stopping.wait(min(_CLAIM_POLL, remaining))
     try:
         yield
     finally:
@@ -66,9 +84,11 @@ class ProfileRestarts:
 
     def schedule(self, profile_id, *, automatic_key=None, expected_generation=None, retry_failed=False):
         profile_id = identifier(profile_id)
-        with self.lock, _claim(self.store.directory / 'restarts' / (profile_id + '.lock')):
+        # Both entry points take the OS profile claim before self.lock. A
+        # waiter must not block the current opener from publishing its worker.
+        with _claim(self.store.directory / 'restarts' / (profile_id + '.lock'), self.stopping), self.lock:
             if self.stopping.is_set():
-                raise RuntimeError('관리 앱이 종료 중입니다. 다시 연 뒤 적용하세요.')
+                raise UpdateError('service_stopped', '관리 앱이 종료 중입니다. 다시 연 뒤 적용하세요.')
             profile = self.store.profile(profile_id)
             self.instances.paths(profile)
             if automatic_key and profile.get('generation') != expected_generation:
@@ -114,9 +134,9 @@ class ProfileRestarts:
     def open_local(self, profile_id):
         """Return the local window first; reconcile its SSH hosts independently."""
         profile_id = identifier(profile_id)
-        with _claim(self.store.directory / 'restarts' / (profile_id + '.lock')):
+        with _claim(self.store.directory / 'restarts' / (profile_id + '.lock'), self.stopping):
             if self.stopping.is_set():
-                raise RuntimeError('관리 앱이 종료 중입니다. 다시 연 뒤 적용하세요.')
+                raise UpdateError('service_stopped', '관리 앱이 종료 중입니다. 다시 연 뒤 적용하세요.')
             old = self.store.read().get('profile_restarts', {}).get(profile_id)
             with self.lock:
                 worker_active = profile_id in self.workers
