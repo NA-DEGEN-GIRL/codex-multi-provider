@@ -40,6 +40,7 @@ internal sealed class PersonalSkillsWindow : Window
         header.Children.Add(titleRow);
         header.Children.Add(new TextBlock { Text = "본앱 · 모든 프로필이 같은 설정을 사용합니다.", Foreground = Muted, Margin = new Thickness(0, 10, 0, 4) });
         header.Children.Add(new TextBlock { Text = "어느 앱에서 바꿔도 함께 반영됩니다. 기본 제공·플러그인·프로젝트 스킬은 이 목록에 포함하지 않습니다.", Foreground = Muted, TextWrapping = TextWrapping.Wrap, FontSize = 12 });
+        header.Children.Add(new TextBlock { Text = "지원하는 스킬은 SSH 작업에서도 사용할 수 있습니다.", Foreground = Muted, TextWrapping = TextWrapping.Wrap, FontSize = 12, Margin = new Thickness(0, 4, 0, 0) });
         header.Children.Add(new TextBlock { Text = "스킬 검색", Margin = new Thickness(0, 18, 0, 0) });
         header.Children.Add(search); header.Children.Add(count);
         DockPanel.SetDock(header, Dock.Top); layout.Children.Add(header);
@@ -85,6 +86,8 @@ internal sealed class PersonalSkillsWindow : Window
         {
             string id = skill.S("id"), name = skill.S("name"); bool enabled = skill.B("enabled");
             var row = new Grid { Margin = new Thickness(14) };
+            row.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            row.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
             row.ColumnDefinitions.Add(new ColumnDefinition());
             row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
@@ -100,6 +103,22 @@ internal sealed class PersonalSkillsWindow : Window
             var remove = new Button { Name = "DeleteSkill", Tag = id, Content = "삭제", Height = 34, Padding = new Thickness(10, 0, 10, 0), Margin = new Thickness(8, 0, 0, 0), VerticalAlignment = VerticalAlignment.Center, Background = Brushes.Transparent };
             remove.Click += async (_, _) => { if (confirm(name)) await RunAsync("skills.personal.delete", new { skill_id = id }); };
             Grid.SetColumn(remove, 2); row.Children.Add(remove);
+            var bridge = skill.Get("bridge");
+            bool bridgeSupported = bridge.B("supported"), bridgeEnabled = bridge.B("enabled");
+            var bridgeRow = new Grid { Margin = new Thickness(0, 12, 0, 0) };
+            bridgeRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            bridgeRow.ColumnDefinitions.Add(new ColumnDefinition());
+            var bridgeToggle = new Button { Name = "ToggleSkillBridge", Tag = id, Content = bridgeEnabled ? "SSH에서 사용 중" : "SSH에서 사용", Width = 128, Height = 32,
+                Padding = new Thickness(0), Margin = new Thickness(0, 0, 12, 0), IsEnabled = bridgeSupported, VerticalAlignment = VerticalAlignment.Top,
+                HorizontalContentAlignment = HorizontalAlignment.Center, VerticalContentAlignment = VerticalAlignment.Center,
+                Background = new SolidColorBrush(bridgeEnabled ? Color.FromRgb(44, 64, 96) : Color.FromRgb(40, 44, 52)),
+                ToolTip = bridgeSupported ? name + (bridgeEnabled ? " SSH 사용 끄기" : " SSH 사용 켜기") : "이 스킬은 SSH 사용을 지원하지 않습니다." };
+            bridgeToggle.Click += async (_, _) => await RunAsync("skills.bridge.set", new { id, enabled = !bridgeEnabled });
+            bridgeRow.Children.Add(bridgeToggle);
+            var bridgeStatus = new TextBlock { Name = "SkillBridgeStatus", Tag = id, Text = BridgeMessage(bridge), Foreground = Muted,
+                FontSize = 12, TextWrapping = TextWrapping.Wrap, VerticalAlignment = VerticalAlignment.Center };
+            Grid.SetColumn(bridgeStatus, 1); bridgeRow.Children.Add(bridgeStatus);
+            Grid.SetRow(bridgeRow, 1); Grid.SetColumnSpan(bridgeRow, 3); row.Children.Add(bridgeRow);
             cards.Children.Add(new Border { Child = row, CornerRadius = new CornerRadius(8), BorderThickness = new Thickness(1), BorderBrush = new SolidColorBrush(Color.FromRgb(49, 56, 68)), Background = new SolidColorBrush(Color.FromRgb(28, 32, 39)), Margin = new Thickness(0, 0, 8, 8) });
         }
         if (cards.Children.Count == 0) cards.Children.Add(new TextBlock { Text = "표시할 개인 스킬이 없습니다.", Margin = new Thickness(4, 18, 0, 0), Foreground = Muted });
@@ -110,5 +129,19 @@ internal sealed class PersonalSkillsWindow : Window
             button.Click += async (_, _) => await RunAsync("skills.personal.restore", new { deleted_id = id }); deleted.Children.Add(button);
         }
         restore.Header = $"삭제한 스킬 {deleted.Children.Count}개";
+    }
+
+    private static string BridgeMessage(JsonElement bridge)
+    {
+        var message = bridge.S("message");
+        if (message.Length > 0) return message;
+        if (!bridge.B("supported")) return "SSH 사용을 지원하지 않는 스킬입니다.";
+        if (!bridge.B("enabled")) return "SSH에서 사용하지 않습니다.";
+        return bridge.S("status") switch
+        {
+            "ready" or "connected" => "SSH에서 사용할 준비가 되었습니다.",
+            "error" or "unavailable" => "SSH 사용 상태를 확인해 주세요.",
+            _ => "SSH 연결을 기다리고 있습니다."
+        };
     }
 }

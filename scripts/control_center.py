@@ -1,4 +1,4 @@
-"""Codex Control Center backend. One JSON request/response per line; no HTTP port."""
+"""Codex Control Center backend. JSON RPC plus an opt-in loopback skill worker."""
 import argparse
 import json
 import os
@@ -68,6 +68,8 @@ class ControlCenter:
         self._request_gates={}
         self._request_gate_lock=threading.Lock()
         self.personal_skills=self.instances.personal_skills
+        from manager_core.skill_bridge import SkillBridge
+        self.skill_bridge=SkillBridge(self.root,self.store,self.personal_skills,self.remote)
         self.shared_plugins=self.instances.shared_plugins
         from manager_core.profile_warmup import ProfileWarmup
         self.profile_warmup=ProfileWarmup(self.store,self.instances,self._open_profile_locally)
@@ -276,10 +278,14 @@ class ControlCenter:
             refresh(self.root, self.store.read(), thread_id=args['task']['thread_id'])
             return dict(refreshed=True)
         if command=='state':return self.state()
-        if command=='skills.personal.list':return self.personal_skills.list()
-        if command=='skills.personal.set':return self.personal_skills.set(args['skill_id'],args['enabled'])
-        if command=='skills.personal.delete':return self.personal_skills.delete(args['skill_id'])
-        if command=='skills.personal.restore':return self.personal_skills.restore(args['deleted_id'])
+        if command=='skills.personal.list':return self.skill_bridge.decorate(self.personal_skills.list())
+        if command=='skills.bridge.set':return self.skill_bridge.set(args['id'],args['enabled'])
+        if command in ('skills.personal.set','skills.personal.delete','skills.personal.restore'):
+            if command=='skills.personal.set':result=self.personal_skills.set(args['skill_id'],args['enabled'])
+            elif command=='skills.personal.delete':result=self.personal_skills.delete(args['skill_id'])
+            else:result=self.personal_skills.restore(args['deleted_id'])
+            self.skill_bridge.refresh()
+            return self.skill_bridge.decorate(result)
         if command=='manager.startup':
             result=self.startup_updates.start(retry_failed=args.get('retry_failed') is True)
             if getattr(self.instances,'embed_windows',False):
@@ -584,6 +590,7 @@ def main():
     center=ControlCenter(args.root,supervisor_protocol=int(protocol) if protocol.isdecimal() else 0)
     if args.serve:
         center.personal_skills.start()
+        center.skill_bridge.start()
         center.shared_plugins.start()
         center.catalog_refresh.start(center.catalog_sources)
         center.source_catalog_refresh.start(center.native_catalog_sources)
@@ -617,6 +624,7 @@ def main():
         center.update_jobs.shutdown()
         center.restarts.shutdown()
         if args.serve:
+            center.skill_bridge.shutdown()
             center.shared_plugins.shutdown()
             center.personal_skills.shutdown()
             center.catalog_refresh.stop()

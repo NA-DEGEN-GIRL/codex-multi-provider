@@ -16,6 +16,7 @@ internal static class PersonalSkillsSelfTest
         void Require(bool value, string name) { if (!value) throw new InvalidOperationException(name); checks++; }
         var rows = new Dictionary<string, bool> { ["codex-handoff"] = true, ["3d-assets"] = true, ["game-audio"] = true, ["orient-repo"] = false };
         var deleted = new Dictionary<string, bool>();
+        var bridges = new Dictionary<string, bool> { ["3d-assets"] = false, ["game-audio"] = true };
         var descriptions = new Dictionary<string, string> { ["codex-handoff"] = "작업 진행 상황을 저장하고 다른 작업에서 이어갑니다.", ["3d-assets"] = "3D 에셋 생성 · 편집 · 리깅 · 애니메이션", ["game-audio"] = "게임용 음악과 효과음, 대사를 제작합니다.", ["orient-repo"] = "저장소 구조와 실행 방법을 확인합니다." };
         var requests = new List<string>();
         Task<JsonElement> Request(string command, object args)
@@ -25,8 +26,12 @@ internal static class PersonalSkillsSelfTest
             if (command == "skills.personal.set") rows[input.GetProperty("skill_id").GetString()!] = input.GetProperty("enabled").GetBoolean();
             if (command == "skills.personal.delete") { var id = input.GetProperty("skill_id").GetString()!; deleted[id] = rows[id]; rows.Remove(id); }
             if (command == "skills.personal.restore") { var id = input.GetProperty("deleted_id").GetString()!; rows[id] = deleted[id]; deleted.Remove(id); }
+            if (command == "skills.bridge.set") bridges[input.GetProperty("id").GetString()!] = input.GetProperty("enabled").GetBoolean();
             return Task.FromResult(JsonSerializer.SerializeToElement(new {
-                skills = rows.Select(r => new { id = r.Key, name = r.Key, enabled = r.Value, description = descriptions[r.Key], path = "fixture/" + r.Key }),
+                skills = rows.Select(r => new { id = r.Key, name = r.Key, enabled = r.Value, description = descriptions[r.Key], path = "fixture/" + r.Key,
+                    bridge = new { supported = bridges.ContainsKey(r.Key), enabled = bridges.GetValueOrDefault(r.Key),
+                        status = bridges.GetValueOrDefault(r.Key) ? "pending" : "disabled",
+                        message = r.Key == "game-audio" ? "SSH 연결을 기다리고 있습니다. 연결 후 이 Windows PC에서 사용할 수 있습니다." : "" } }),
                 deleted = deleted.Keys.Select(id => new { id, name = id }), sync = new { applied = 6, errors = Array.Empty<object>() } }));
         }
         var window = new PersonalSkillsWindow(Request, _ => true) { WindowStartupLocation = WindowStartupLocation.Manual, Left = -28000, Top = -28000, ShowInTaskbar = false, ShowActivated = false };
@@ -35,10 +40,20 @@ internal static class PersonalSkillsSelfTest
             window.Show(); await window.LoadAsync(); window.UpdateLayout();
             Button Action(string name, string id) => Descendants(window).OfType<Button>().Single(b => b.Name == name && Equals(b.Tag, id));
             Require(Descendants(window).OfType<Button>().Count(b => b.Name == "ToggleSkill") == 4, "personal skills show one toggle per row");
+            Require(Descendants(window).OfType<Button>().Count(b => b.Name == "ToggleSkillBridge" && b.IsEnabled) == 2, "SSH usage is available only for supported skills");
+            Require(!Action("ToggleSkillBridge", "codex-handoff").IsEnabled, "unsupported skill SSH control stays disabled");
+            Action("ToggleSkillBridge", "3d-assets").RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent));
+            Require(bridges["3d-assets"] && requests[^1] == "skills.bridge.set" && rows["3d-assets"], "SSH toggle sends the skill id without changing common enablement");
+            Action("ToggleSkillBridge", "3d-assets").RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent));
+            Require(!bridges["3d-assets"] && rows["3d-assets"], "SSH usage can be disabled independently");
+            Require(Descendants(window).OfType<TextBlock>().Single(t => t.Name == "SkillBridgeStatus" && Equals(t.Tag, "game-audio")).Text.StartsWith("SSH 연결을 기다리고 있습니다."), "bridge status message is visible");
             Action("ToggleSkill", "orient-repo").RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent));
             Require(rows["orient-repo"] && requests[^1] == "skills.personal.set", "disabled skill can be enabled");
             Action("ToggleSkill", "orient-repo").RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent));
             Require(!rows["orient-repo"], "enabled skill can be disabled");
+            Action("ToggleSkill", "game-audio").RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent));
+            Require(!rows["game-audio"] && bridges["game-audio"], "common enablement does not change the SSH preference");
+            Action("ToggleSkill", "game-audio").RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent));
             var search = Descendants(window).OfType<TextBox>().Single(t => t.Name == "SkillSearch");
             search.Text = "game-audio"; window.UpdateLayout();
             Require(Descendants(window).OfType<Button>().Count(b => b.Name == "ToggleSkill") == 1, "search filters skill cards");
@@ -49,7 +64,7 @@ internal static class PersonalSkillsSelfTest
             Action("RestoreSkill", "orient-repo").RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent));
             Require(rows.ContainsKey("orient-repo") && !rows["orient-repo"] && deleted.Count == 0, "restore keeps disabled state");
             window.Width = 560; window.UpdateLayout();
-            foreach (var button in Descendants(window).OfType<Button>().Where(b => b.Name is "ToggleSkill" or "DeleteSkill"))
+            foreach (var button in Descendants(window).OfType<Button>().Where(b => b.Name is "ToggleSkill" or "ToggleSkillBridge" or "DeleteSkill"))
             {
                 var point = button.TranslatePoint(new Point(), window);
                 Require(point.X >= 0 && point.X + button.ActualWidth < window.ActualWidth, "actions stay inside narrow window");

@@ -231,6 +231,7 @@ fn allowed(command: &str) -> bool {
         "profile.rename",
         "profile.move",
         "skills.personal.list",
+        "skills.bridge.set",
         "skills.personal.set",
         "skills.personal.delete",
         "skills.personal.restore",
