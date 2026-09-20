@@ -282,7 +282,7 @@ public sealed class NativeWindowHost : HwndHost
         _settleVersion++;
         _forceRepair = true;
         a.Lease?.SetInteractiveMove(true);
-        UpdateCaptureMirror(a, true);
+        UpdateCaptureMirror(a, true, force: true);
         SynchronizeZOrder(a);
         if (!park || a.Parked) return;
         if (!GetWindowRect(a.Hwnd, out var bounds)) return;
@@ -380,9 +380,9 @@ public sealed class NativeWindowHost : HwndHost
             throw new Win32Exception(Marshal.GetLastPInvokeError(), "Cannot change viewport visibility.");
     }
 
-    private void UpdateCaptureMirror(Attachment a, bool visible)
+    private void UpdateCaptureMirror(Attachment a, bool visible, bool force = false)
     {
-        int captureStatus = a.CaptureMirror.Update(GetAncestor(_container, GaRoot), a.Hwnd, _container, visible);
+        int captureStatus = a.CaptureMirror.Update(GetAncestor(_container, GaRoot), a.Hwnd, _container, visible, force);
         if (captureStatus != a.CaptureStatus)
         {
             a.CaptureStatus = captureStatus;

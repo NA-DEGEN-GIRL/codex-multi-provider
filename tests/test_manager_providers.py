@@ -59,7 +59,7 @@ class ProviderRegistryTests(unittest.TestCase):
         self.assertTrue(payload['stream'])
         self.assertFalse(payload['store'])
         nonce = re.search(r'value "([0-9a-f]{32})"', payload['input'][0]['content']).group(1)
-        if isinstance(payload['tool_choice'], dict):
+        if len(payload['input']) == 1:
             return {'output': [{'type': 'function_call', 'name': 'manager_probe',
                                 'call_id': 'synthetic-call',
                                 'arguments': json.dumps({'value': nonce})}]}
@@ -78,6 +78,46 @@ class ProviderRegistryTests(unittest.TestCase):
             result = self.registry.verify(saved['model']['id'])
         self.assertEqual(probe.call_count, 2)
         return result
+
+    def test_deepseek_probe_uses_auto_tools_with_configured_thinking_and_preserves_reasoning(self):
+        for effort in ('none', 'low', 'high', 'max'):
+            with self.subTest(effort=effort):
+                provider, model = self.definition('Thinking provider', 'deepseek-flash')
+                model['reasoning_effort'] = effort
+                saved = self.registry.save(provider, model)
+                self.prepare_probe_key(saved['provider']['id'])
+                reasoning_item = {'type': 'reasoning', 'id': 'synthetic-reasoning', 'encrypted_content': 'opaque-fixture'}
+
+                def thinking_probe(base_url, key, payload):
+                    self.assertEqual(payload['reasoning']['effort'], effort)
+                    if len(payload['input']) == 1:
+                        choice = {'type': 'function', 'name': 'manager_probe'} if effort == 'none' else 'auto'
+                        self.assertEqual(payload['tool_choice'], choice)
+                        response = self.successful_probe(base_url, key, payload)
+                        response['output'].insert(0, reasoning_item)
+                        return response
+                    self.assertEqual(payload['input'][1], reasoning_item)
+                    return self.successful_probe(base_url, key, payload)
+
+                with patch.object(providers, '_unprotect_secret', return_value=b'synthetic-probe-key'), \
+                        patch.object(providers, '_responses_probe', side_effect=thinking_probe) as probe:
+                    result = self.registry.verify(saved['model']['id'])
+                self.assertTrue(result['verified'])
+                self.assertEqual(probe.call_count, 2)
+
+    def test_auto_probe_still_requires_an_actual_tool_call_before_marking_verified(self):
+        provider, model = self.definition('Thinking provider', 'deepseek-flash')
+        saved = self.registry.save(provider, model)
+        self.prepare_probe_key(saved['provider']['id'])
+        before = self.registry.list()
+        with patch.object(providers, '_unprotect_secret', return_value=b'synthetic-probe-key'), \
+                patch.object(providers, '_responses_probe', return_value={'output': [
+                    {'type': 'message', 'content': [{'type': 'output_text', 'text': 'No tool call'}]}]}) as probe:
+            with self.assertRaisesRegex(providers.ProviderError, 'required synthetic tool call'):
+                self.registry.verify(saved['model']['id'])
+        self.assertEqual(probe.call_count, 1)
+        self.assertEqual(probe.call_args.args[2]['tool_choice'], 'auto')
+        self.assertEqual(self.registry.list(), before)
 
     def generated_config(self):
         return tomllib.loads((self.profile_home / 'config.toml').read_text(encoding='utf-8'))

@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -97,6 +97,44 @@ public static class NativeHostSelfTest
                 if (fixtureWindow == 0) await Task.Delay(50);
             }
             Require(fixtureWindow != 0, "Fixture did not create a visible primary window.");
+            using (var mirror = new NativeWindowHostCaptureMirror())
+            {
+                var mirrorRootHandle = new WindowInteropHelper(window).Handle;
+                Require(mirror.Update(mirrorRootHandle, fixtureWindow, host.ContainerHandle, true) == 0,
+                    "Cannot create the dedicated DWM source-resize fixture.");
+                var mirrorDestination = mirror.DestinationBounds;
+                // The destination stays fixed while the source changes later,
+                // matching async resize after notes/open panel layout. A cache
+                // of destination alone leaves the previous scaling in effect.
+                for (int step = 0; step < 4; step++)
+                {
+                    int before = mirror.UpdateCount;
+                    Require(mirror.Update(mirrorRootHandle, fixtureWindow, host.ContainerHandle, true) == 0 &&
+                        mirror.UpdateCount == before, "An unchanged DWM mapping was updated repeatedly.");
+                    SetWindowPos(fixtureWindow, 0, 0, 0, step % 2 == 0 ? 990 : 510, step % 2 == 0 ? 690 : 370,
+                        SwpNoActivate | SwpNoZOrder | SwpNoMove);
+                    await Task.Delay(70);
+                    Require(mirror.Update(mirrorRootHandle, fixtureWindow, host.ContainerHandle, true) == 0 &&
+                        mirror.UpdateCount > before && mirror.DestinationBounds.Equals(mirrorDestination),
+                        "Late source resize did not refresh DWM mapping at an unchanged destination.");
+                    var clientOrigin = new NativeWindowInterop.Point();
+                    Require(GetClientRect(fixtureWindow, out var actualClient) &&
+                        GetWindowRect(fixtureWindow, out var actualWindow) && ClientToScreen(fixtureWindow, ref clientOrigin) &&
+                        mirror.SourceBounds is { } crop && crop.Left == clientOrigin.X - actualWindow.Left &&
+                        crop.Top == clientOrigin.Y - actualWindow.Top && crop.Right - crop.Left == actualClient.Right &&
+                        crop.Bottom - crop.Top == actualClient.Bottom,
+                        "DWM source crop does not match the resized client pixels.");
+                }
+                int beforeDrag = mirror.UpdateCount;
+                Require(mirror.Update(mirrorRootHandle, fixtureWindow, host.ContainerHandle, true, force: true) == 0 &&
+                    mirror.UpdateCount == beforeDrag + 1, "Entering a drag did not refresh the mirror transform.");
+                Require(mirror.Update(mirrorRootHandle, fixtureWindow, host.ContainerHandle, false) == 0,
+                    "Could not hide the mirror fixture.");
+                int hidden = mirror.UpdateCount;
+                Require(mirror.Update(mirrorRootHandle, fixtureWindow, host.ContainerHandle, false) == 0 &&
+                    mirror.UpdateCount == hidden, "A hidden mirror kept updating its source.");
+            }
+            checks.Add("DWM mapping refreshes on four delayed source-only resizes at a fixed viewport; client crop is explicit, drag entry refreshes once and stable/hidden mappings do not repeat updates.");
             nint originalParent = GetParent(fixtureWindow);
             nint originalStyle = ReadStyle(fixtureWindow, GwlStyle);
             nint originalExStyle = ReadStyle(fixtureWindow, GwlExStyle);

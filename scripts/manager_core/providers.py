@@ -768,9 +768,15 @@ class ProviderRegistry:
         prompt = {'role': 'user', 'content': f'Call manager_probe exactly once with value "{nonce}". After its result, reply exactly "verified:{nonce}".'}
         common = {'model': model['wire_model_id'], 'stream': True, 'store': False, 'max_output_tokens': 2048,
                   'reasoning': {'effort': model['reasoning_effort']}, 'tools': [tool]}
+        # DeepSeek thinking accepts ordinary tool use but rejects a forced
+        # function selection with HTTP 400. Keep the configured reasoning level
+        # and require the same actual tool/nonce/follow-up results below; changing
+        # tool_choice must not turn this into a text-only connectivity check.
+        first_choice = ('auto' if model_settings.is_deepseek(model) and model['reasoning_effort'] != 'none'
+                        else {'type': 'function', 'name': 'manager_probe'})
         try:
             first = _responses_probe(provider['base_url'], key, {**common, 'input': [prompt],
-                                      'tool_choice': {'type': 'function', 'name': 'manager_probe'}})
+                                      'tool_choice': first_choice})
             if not isinstance(first, dict) or not isinstance(first.get('output'), list) or not all(isinstance(i, dict) for i in first['output']):
                 raise ProviderError('Provider returned a malformed synthetic tool response.')
             calls = [item for item in first.get('output', []) if item.get('type') == 'function_call']
