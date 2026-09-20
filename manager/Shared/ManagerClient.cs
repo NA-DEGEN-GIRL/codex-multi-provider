@@ -23,6 +23,8 @@ public sealed class ManagerClient : IAsyncDisposable
     }
 
     public bool IsConnected => !disposed && pipe.IsConnected;
+    public bool ServiceUpdateDeferred { get; private set; }
+    public bool PreservesBackgroundProfiles { get; private set; }
 
     public static async Task<ManagerClient> ConnectAsync(string root, CancellationToken cancellationToken = default)
     {
@@ -35,9 +37,23 @@ public sealed class ManagerClient : IAsyncDisposable
             try
             {
                 var status = await existing.RequestAsync("supervisor.status", cancellationToken: cancellationToken).ConfigureAwait(false);
-                if (status.TryGetProperty("service_revision", out var revision) && revision.GetString() == ManagerProtocol.ServiceRevision())
+                existing.ObserveService(status);
+                if (!existing.ServiceUpdateDeferred)
                     return existing;
-                await existing.RequestAsync("supervisor.retire", cancellationToken: cancellationToken).ConfigureAwait(false);
+                var state = await existing.RequestAsync("state", cancellationToken: cancellationToken).ConfigureAwait(false);
+                if (!ProfilesHaveExited(state))
+                {
+                    existing.ServiceUpdateDeferred = true;
+                    return existing;
+                }
+                try { await existing.RequestAsync("supervisor.retire", cancellationToken: cancellationToken).ConfigureAwait(false); }
+                catch (ManagerException error) when (error.Code == "backend_busy")
+                {
+                    // Same IPC: the new shell can use the older service while
+                    // a management operation drains. Never force its replacement.
+                    existing.ServiceUpdateDeferred = true;
+                    return existing;
+                }
                 await existing.DisposeAsync().ConfigureAwait(false);
                 // The service drains its own backend; no account process is stopped.
                 try
@@ -73,10 +89,40 @@ public sealed class ManagerClient : IAsyncDisposable
         {
             cancellationToken.ThrowIfCancellationRequested();
             var connection = await TryConnectAsync(pipeName, 650, cancellationToken).ConfigureAwait(false);
-            if (connection is not null) return new ManagerClient(connection);
+            if (connection is not null)
+            {
+                var client = new ManagerClient(connection);
+                try
+                {
+                    var status = await client.RequestAsync("supervisor.status", cancellationToken: cancellationToken).ConfigureAwait(false);
+                    client.ObserveService(status);
+                    return client;
+                }
+                catch { await client.DisposeAsync().ConfigureAwait(false); throw; }
+            }
             await Task.Delay(100, cancellationToken).ConfigureAwait(false);
         }
         throw new ManagerException("supervisor_unavailable", "관리 프로그램에 연결하지 못했습니다. Python 설치와 관리자 앱 파일을 확인해 주세요.");
+    }
+
+    private void ObserveService(JsonElement status)
+    {
+        if (!status.TryGetProperty("version", out var protocol) || !protocol.TryGetInt32(out var version) || version != ManagerProtocol.Version)
+            throw new ManagerException("service_protocol_update_required",
+                "실행 중인 작업은 유지했습니다. 이 업데이트는 관리 서비스와 호환되지 않아 기존 버전에서 완전 종료한 뒤 적용해야 합니다.");
+        PreservesBackgroundProfiles = status.TryGetProperty("preserves_background_profiles", out var background)
+            && background.ValueKind == JsonValueKind.True;
+        ServiceUpdateDeferred = !status.TryGetProperty("service_revision", out var revision)
+            || revision.GetString() != ManagerProtocol.ServiceRevision();
+    }
+
+    private static bool ProfilesHaveExited(JsonElement state)
+    {
+        if (!state.TryGetProperty("profiles", out var profiles) || profiles.ValueKind != JsonValueKind.Array) return false;
+        static bool Exited(JsonElement list) => list.ValueKind == JsonValueKind.Array && list.EnumerateArray().All(profile =>
+            profile.TryGetProperty("status", out var status) && (status.GetString() is "not_started" or "stopped" or "unprepared") &&
+            (!profile.TryGetProperty("process_id", out var pid) || pid.ValueKind == JsonValueKind.Null));
+        return Exited(profiles) && (!state.TryGetProperty("view_instances", out var viewers) || Exited(viewers));
     }
 
     private static async Task<NamedPipeClientStream?> TryConnectAsync(string name, int timeout, CancellationToken cancellationToken)

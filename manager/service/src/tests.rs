@@ -6,8 +6,24 @@ fn note_args() -> Value {
 }
 
 #[test]
-fn retirement_requires_known_idle_management_state_not_closed_apps() {
-    let mut response = json!({"ok":true,"result":{"profiles":[{"status":"running"}]}});
+fn retirement_requires_exited_profiles_and_known_idle_management_state() {
+    let mut response =
+        json!({"ok":true,"result":{"profiles":[{"status":"not_started","process_id":null}]}});
+    assert!(can_stop(&response));
+    for profile in [
+        json!({"status":"running","process_id":123}),
+        json!({"status":"running"}),
+        json!({"status":"unknown"}),
+        json!({}),
+        json!({"status":"not_started","process_id":123}),
+    ] {
+        response["result"]["profiles"] = json!([profile]);
+        assert!(!can_stop(&response));
+    }
+    response["result"]["profiles"] = json!([{"status":"not_started","process_id":null}]);
+    response["result"]["view_instances"] = json!([{"status":"running","process_id":456}]);
+    assert!(!can_stop(&response));
+    response["result"]["view_instances"] = json!([]);
     assert!(can_stop(&response));
     response["result"]["local_launches"] = json!({"active":1});
     assert!(!can_stop(&response));

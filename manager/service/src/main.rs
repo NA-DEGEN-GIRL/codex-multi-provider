@@ -49,6 +49,7 @@ impl Service {
             status["service_revision"] = json!(self.revision);
             status["engine"] = json!("rust");
             status["clients"] = json!(self.clients.load(Ordering::Relaxed));
+            status["preserves_background_profiles"] = json!(true);
             status["operations"] = json!(
                 self.operations
                     .lock()
@@ -85,7 +86,7 @@ impl Service {
                     return error(
                         id,
                         "backend_busy",
-                        "설정 적용이 끝난 뒤 관리 서비스를 바꿀 수 있습니다.",
+                        "실행 중인 프로필과 관리 작업을 유지합니다. 완전 종료 후 관리 서비스를 바꿀 수 있습니다.",
                     );
                 }
             }
@@ -272,6 +273,11 @@ fn can_stop(response: &Value) -> bool {
     let state = &response["result"];
     response["ok"] == true
         && state["profiles"].is_array()
+        // UI disconnection or a shell update must not retire the backend that
+        // owns SSH forwards, skill execution, pending requests and profile work.
+        // Unknown observations are not proof that an owned process has exited.
+        && profiles_exited(&state["profiles"])
+        && state.get("view_instances").is_none_or(profiles_exited)
         && state.get("local_launches").is_none_or(|launches| launches["active"] == 0)
         && ["updates", "startup_updates", "profile_warmup"].iter().all(|key| {
             state[key]
@@ -286,6 +292,17 @@ fn can_stop(response: &Value) -> bool {
                 })
             })
         })
+}
+
+fn profiles_exited(profiles: &Value) -> bool {
+    profiles.as_array().is_some_and(|profiles| {
+        profiles.iter().all(|profile| {
+            matches!(
+                profile["status"].as_str(),
+                Some("not_started" | "stopped" | "unprepared")
+            ) && profile.get("process_id").is_none_or(Value::is_null)
+        })
+    })
 }
 
 #[tokio::main]

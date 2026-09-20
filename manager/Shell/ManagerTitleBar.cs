@@ -12,7 +12,7 @@ namespace Codex.ControlCenter.Shell;
 // mouse-tracking loop. WindowChrome retains native drag, resize and double-click.
 internal static class ManagerTitleBar
 {
-    internal static FrameworkElement Wrap(Window window, UIElement content, Action<string> log)
+    internal static FrameworkElement Wrap(Window window, UIElement content, Action<string> log, string closeLabel = "닫기")
     {
         var chrome = new WindowChrome
         {
@@ -61,7 +61,7 @@ internal static class ManagerTitleBar
         }
         window.StateChanged += (_, _) => UpdateState();
         UpdateState();
-        Label(Make("ManagerClose", "\uE8BB", window.Close), "닫기");
+        Label(Make("ManagerClose", "\uE8BB", window.Close), closeLabel);
         root.Children.Add(title);
         Grid.SetRow(content, 1);
         root.Children.Add(content);

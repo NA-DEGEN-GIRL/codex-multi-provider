@@ -22,6 +22,12 @@ internal static class WindowControlsSelfTest
         void Require(bool condition, string message) { if (!condition) throw new InvalidOperationException(message); }
         Require(WindowChrome.GetWindowChrome(window) is { UseAeroCaptionButtons: false, CaptionHeight: 36 }, "Native caption tracking still owns buttons.");
         Require(buttons.Values.All(b => !b.Focusable && WindowChrome.GetIsHitTestVisibleInChrome(b)), "Caption buttons can steal editor focus or become drag area.");
+        Require(buttons["ManagerClose"].ToolTip?.ToString()?.Contains("작업은 계속") == true,
+            "Close does not disclose that live work continues.");
+        // This test never shows the window: ScrollViewer templates in the
+        // footer have not materialized their visual children yet.
+        Require(LogicalChildren((DependencyObject)window.Content).OfType<Button>().Any(b => b.Name == "ExitWorkspace"),
+            "Explicit full shutdown action is missing.");
         checks.Add("Manager owns accessible caption buttons without taking editor keyboard focus.");
         Require(ManagerTitleBar.MaximizedInsets(-12, -12, 3864, 2124, 0, 0, 3840, 2100, 1.5) == new Thickness(8), "Maximized border clipping was not compensated at 144 DPI.");
         Require(ManagerTitleBar.MaximizedInsets(-1920, 0, 1920, 1040, -1920, 0, 0, 1040, 1) == new Thickness(0), "Normal client bounds gained a spurious title offset.");
@@ -59,6 +65,8 @@ internal static class WindowControlsSelfTest
         window.Closed += (_, _) => closed = true;
         Click("ManagerClose");
         Require(closed, "Pending profile request blocked closing.");
+        Require(!(bool)typeof(MainWindow).GetField("_exitAllRequested", fields)!.GetValue(window)!,
+            "Caption close requested a full workspace shutdown.");
         Require(field.GetValue(window) is null && (int)navigation.GetValue(window)! > before, "Late profile response can reopen/attach a window.");
         checks.Add("Close finishes with a pending profile request and invalidates its late response.");
         File.WriteAllText(report, JsonSerializer.Serialize(new { passed = true, checks }, new JsonSerializerOptions { WriteIndented = true }));
@@ -104,8 +112,20 @@ internal static class WindowControlsSelfTest
             throw new InvalidOperationException("Post-close shortcut menu deleted the selected shortcut instead of the context target.");
         if (requests.Any(r => r.Args.S("profile_id") == "selected" || r.Args.S("shortcut_id") == "selected-link"))
             throw new InvalidOperationException("A context action reached the selected item.");
+        var beforeClose = requests.Count;
         window.Close();
+        if (requests.Skip(beforeClose).Any(r => r.Command is "profile.cleanup" or "supervisor.retire" or "manager.stop_warmup"))
+            throw new InvalidOperationException("Normal UI close dispatched a work-stopping request.");
         checks.Add("Real post-close WPF menu Click routes move, login status, restart, remove, prepare and shortcut deletion to the right-clicked item using an isolated RPC recorder.");
+    }
+
+    private static IEnumerable<DependencyObject> LogicalChildren(DependencyObject root)
+    {
+        foreach (var child in LogicalTreeHelper.GetChildren(root).OfType<DependencyObject>())
+        {
+            yield return child;
+            foreach (var descendant in LogicalChildren(child)) yield return descendant;
+        }
     }
 
     private static IEnumerable<DependencyObject> Children(DependencyObject root)

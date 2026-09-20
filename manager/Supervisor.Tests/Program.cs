@@ -3,6 +3,7 @@ using System.IO.Pipes;
 using System.Text;
 using System.Text.Json;
 using Codex.ControlCenter.Shared;
+using Codex.ControlCenter.Shell;
 
 // Real transport against a disposable, synthetic Python backend. No original Codex,
 // credentials, SSH connection, package updater, or actual manager state is touched.
@@ -16,6 +17,8 @@ internal static class Program
     {
         try
         {
+            if (args.Contains("--shell-lifetime-fixture"))
+                return await RunShellLifetimeFixtureAsync(args);
             if (args.Contains("--clipboard-isolated"))
             {
                 IsolatedClipboardTest.Run();
@@ -23,6 +26,7 @@ internal static class Program
             }
             await TestFramesAsync();
             TestSupportLog();
+            TestWorkspaceSession();
             await TestLogCopyAsync();
             var root = FixtureRoot();
             await TestConcurrentClientsAsync(root);
@@ -30,6 +34,7 @@ internal static class Program
             await TestProtocolRejectionAsync(root);
             await TestDisconnectDrainsAsync(root);
             await TestAppSurvivalAsync(root);
+            await TestCompatibleShellUpdateAsync(FixtureRoot(), args.Contains("--idle"));
             await TestServiceRetirementAsync(FixtureRoot());
             await TestBackendFaultAsync(FixtureRoot());
             if (args.Contains("--idle")) await TestIdleShutdownAsync(FixtureRoot());
@@ -42,6 +47,22 @@ internal static class Program
             return 1;
         }
         finally { foreach (var root in roots) await CleanupAsync(root); }
+    }
+
+    private static void TestWorkspaceSession()
+    {
+        var root = FixtureRoot();
+        Check(WorkspaceSession.Read(root) is null, "missing UI state starts cleanly");
+        var expected = new WorkspaceSession(1, Guid.NewGuid().ToString(), false);
+        expected.Save(root);
+        Check(WorkspaceSession.Read(root) == expected, "new shell restores the selected profile");
+        var file = Path.Combine(root, "work", "control-center", "workspace-session.json");
+        File.WriteAllText(file, "{");
+        Check(WorkspaceSession.Read(root) is null, "partial UI state cannot prevent reconnecting live work");
+        new WorkspaceSession(1, "not-a-profile", false).Save(root);
+        Check(WorkspaceSession.Read(root) is null, "malformed profile selection cannot reach launch");
+        new WorkspaceSession(999, expected.ProfileId, false).Save(root);
+        Check(WorkspaceSession.Read(root) is null, "future UI state is not interpreted as navigation");
     }
 
     private static void TestSupportLog()
@@ -164,11 +185,17 @@ internal static class Program
     private static async Task TestNotesBypassSlowRequestAsync(string root)
     {
         await using var client = await ManagerClient.ConnectAsync(root);
+        var task = new { host_id = "local", thread_id = Guid.NewGuid().ToString() };
+        var noteId = Guid.NewGuid().ToString();
+        // First access resolves fork ancestry through the backend. This test
+        // measures subsequent edits, after that one-time metadata lookup.
+        var initial = await client.RequestAsync("notes.save", new { task, note_id = noteId, revision = 0,
+            title = "연결 시험", kind = "checklist", body = "", items = Array.Empty<object>() });
+        var revision = initial.GetProperty("note").GetProperty("revision").GetInt32();
         var slow = client.RequestAsync("profile.add", new { token = "notes-parallel", delay = 1.2 });
         await WaitFileAsync(Path.Combine(root, "started-notes-parallel"));
         var timer = Stopwatch.StartNew();
-        var task = new { host_id = "local", thread_id = Guid.NewGuid().ToString() };
-        var saved = await client.RequestAsync("notes.save", new { task, note_id = Guid.NewGuid().ToString(), revision = 0, title = "연결 시험", kind = "checklist", body = "", items = new[] { new { id = Guid.NewGuid().ToString(), text = "같은 연결의 저장", done = true } } });
+        var saved = await client.RequestAsync("notes.save", new { task, note_id = noteId, revision, title = "연결 시험", kind = "checklist", body = "", items = new[] { new { id = Guid.NewGuid().ToString(), text = "같은 연결의 저장", done = true } } });
         Check(saved.GetProperty("note").GetProperty("items")[0].GetProperty("done").GetBoolean(), "out-of-order note response reaches its own request");
         Check(timer.Elapsed < TimeSpan.FromMilliseconds(800) && !slow.IsCompleted, "notes bypass a slow profile request on the same C# connection");
         Check((await client.RequestAsync("supervisor.status")).GetProperty("engine").GetString() == "rust", "Rust service reports its engine");
@@ -236,17 +263,90 @@ internal static class Program
         await using (var second = await ManagerClient.ConnectAsync(root))
             await ThrowsManagerAsync(() => client.RequestAsync("supervisor.retire"), "backend_busy", "active manager window must block retirement");
         await Task.Delay(150);
+        await ThrowsManagerAsync(() => client.RequestAsync("supervisor.retire"), "backend_busy", "running profiles must block retirement after the UI disconnects");
+        Check(Alive(childPid) && Alive(backendPid), "blocked retirement retains work and backend");
+        StopFixtureProcess(childPid);
+        File.Delete(Path.Combine(root, "child.pid"));
         Check((await client.RequestAsync("supervisor.retire")).GetProperty("retiring").GetBoolean(), "idle service accepts retirement");
         var deadline = Stopwatch.StartNew();
         while ((Alive(supervisorPid) || Alive(backendPid)) && deadline.Elapsed < TimeSpan.FromSeconds(6)) await Task.Delay(50);
         Check(!Alive(supervisorPid) && !Alive(backendPid), "retired service drains and exits its backend");
-        Check(Alive(childPid), "service replacement must not terminate a managed app");
+        Check(!Alive(childPid), "explicitly stopped fixture app remains stopped");
         await using var replacement = await ManagerClient.ConnectAsync(root);
         var next = await replacement.RequestAsync("supervisor.status");
         RegisterStatusProcesses(next);
         Check(next.GetProperty("supervisor_pid").GetInt32() != supervisorPid, "one fresh service takes over the same workspace endpoint");
-        Check(Alive(childPid), "replacement service leaves existing app alive");
-        Console.WriteLine("PASS: service replacement preserves running app and retires old backend");
+        Check(!Alive(childPid), "replacement service does not restart explicitly closed work");
+        Console.WriteLine("PASS: service replacement waits for explicit app exit and retires old backend");
+    }
+
+    private static async Task TestCompatibleShellUpdateAsync(string root, bool longWait)
+    {
+        var initial = await RunTransientShellAsync(root, launch: true);
+        var supervisorPid = initial.GetProperty("service").GetProperty("supervisor_pid").GetInt32();
+        var backendPid = initial.GetProperty("service").GetProperty("backend_pid").GetInt32();
+        var childPid = initial.GetProperty("child_pid").GetInt32();
+        RegisterStatusProcesses(initial.GetProperty("service"));
+        RegisterFixtureProcess(childPid);
+        Check(initial.GetProperty("preserves_work").GetBoolean(), "service advertises work-preserving disconnection");
+        var heartbeat = Path.Combine(root, "child-heartbeat.txt");
+        await Task.Delay(400);
+        var before = File.ReadAllText(heartbeat);
+        await Task.Delay(longWait ? 76000 : 600);
+        Check(Alive(supervisorPid) && Alive(backendPid) && Alive(childPid), "closed UI preserves its work and backend beyond idle grace");
+        Check(File.ReadAllText(heartbeat) != before, "work continues producing output while UI is absent");
+        // This is the test executable's private output folder, never a real
+        // installed release. Simulate a newer UI bundle with a different hash.
+        var manifest = Path.Combine(AppContext.BaseDirectory, "runtime-manifest.json");
+        var original = File.Exists(manifest) ? File.ReadAllBytes(manifest) : null;
+        try
+        {
+            File.WriteAllText(manifest, JsonSerializer.Serialize(new { service_revision = "fixture-new-ui-" + Guid.NewGuid() }));
+            var replacement = await RunTransientShellAsync(root, launch: false);
+            var status = replacement.GetProperty("service");
+            Check(replacement.GetProperty("service_deferred").GetBoolean(), "new UI defers service replacement while work is alive");
+            Check(status.GetProperty("supervisor_pid").GetInt32() == supervisorPid &&
+                status.GetProperty("backend_pid").GetInt32() == backendPid, "updated UI reconnects to the exact existing service and backend");
+            Check(replacement.GetProperty("child_pid").GetInt32() == childPid,
+                "updated UI sees the same live work without a new profile launch");
+        }
+        finally
+        {
+            if (original is null) File.Delete(manifest); else File.WriteAllBytes(manifest, original);
+        }
+        Console.WriteLine("PASS: UI exit/reopen across a bundle revision preserves live work and backend");
+    }
+
+    private static async Task<JsonElement> RunTransientShellAsync(string root, bool launch)
+    {
+        var start = new ProcessStartInfo(Path.Combine(AppContext.BaseDirectory, "Codex.ControlCenter.Supervisor.Tests.exe"))
+        { UseShellExecute = false, CreateNoWindow = true, WindowStyle = ProcessWindowStyle.Hidden };
+        start.ArgumentList.Add("--shell-lifetime-fixture");
+        start.ArgumentList.Add(root);
+        if (launch) start.ArgumentList.Add("--launch-work");
+        using var process = Process.Start(start) ?? throw new Exception("Could not start transient UI fixture.");
+        RegisterFixtureProcess(process.Id);
+        await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(25));
+        Check(process.ExitCode == 0, "transient UI connection process exits completely");
+        using var snapshot = JsonDocument.Parse(File.ReadAllText(Path.Combine(root, "ui-connection.json")));
+        return snapshot.RootElement.Clone();
+    }
+
+    private static async Task<int> RunShellLifetimeFixtureAsync(string[] args)
+    {
+        var root = Path.GetFullPath(args[Array.IndexOf(args, "--shell-lifetime-fixture") + 1]);
+        var fixtures = Path.GetFullPath(Path.Combine(Path.GetTempPath(), "CodexControlCenter.Tests")) + Path.DirectorySeparatorChar;
+        if (!root.StartsWith(fixtures, StringComparison.OrdinalIgnoreCase)) throw new InvalidOperationException("Expected isolated test root.");
+        await using var client = await ManagerClient.ConnectAsync(root);
+        if (args.Contains("--launch-work")) await client.RequestAsync("profile.show");
+        var state = await client.RequestAsync("state");
+        var status = await client.RequestAsync("supervisor.status");
+        File.WriteAllText(Path.Combine(root, "ui-connection.json"), JsonSerializer.Serialize(new
+        {
+            service = status, child_pid = state.GetProperty("profiles")[0].GetProperty("process_id").GetInt32(),
+            preserves_work = client.PreservesBackgroundProfiles, service_deferred = client.ServiceUpdateDeferred
+        }));
+        return 0; // Dispose the UI connection and actually exit this process.
     }
 
     private static async Task TestBackendFaultAsync(string root)
@@ -418,7 +518,8 @@ for line in sys.stdin:
         time.sleep(args.get('delay', 0))
     profiles = [{'process_id': None, 'status': 'not_started'}]
     if req['command'] == 'profile.show':
-        child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(240)'], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
+        script = 'import pathlib,time\np=pathlib.Path(' + repr(str(root / 'child-heartbeat.txt')) + ')\nfor n in range(2400):\n p.write_text(str(n));time.sleep(0.1)'
+        child = subprocess.Popen([sys.executable, '-c', script], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
         (root / 'child.pid').write_text(str(child.pid))
     if (root / 'child.pid').exists():
         profiles = [{'process_id': int((root / 'child.pid').read_text()), 'status': 'running'}]

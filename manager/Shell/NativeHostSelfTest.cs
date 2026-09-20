@@ -372,10 +372,20 @@ public static class NativeHostSelfTest
             background.DetachForClose();
             await Task.Delay(100);
             Require(!IsWindowVisible(fixtureWindow), "Detaching a managed hidden profile exposed a separate window.");
+            Require(!fixture.HasExited && !background.IsAttached && IsWindow(fixtureWindow),
+                "Closing a viewport destroyed its independent work process or retained the attachment.");
             checks.Add("Profile switches preserved independent ownership and kept background viewports hidden.");
-            Require(NativeWindowHost.SetWindowVisibility(fixtureWindow, fixture.Id, executable, true, out error), error);
-            Require(host.Attach(fixtureWindow, fixture.Id, executable, out error), error);
+            // A replacement shell sees a hidden, already running native window.
+            // Reattach without launching another app or navigating its task.
+            Require(host.Attach(fixtureWindow, fixture.Id, executable, out error, allowHidden: true), error);
+            await Task.Delay(100);
+            Require(host.IsAttached && !fixture.HasExited && IsWindowVisible(fixtureWindow),
+                "Reopening a viewport did not restore the same live hidden window.");
+            checks.Add("Close preserves a hidden independent process; a fresh viewport reconnects to its same HWND and PID.");
             host.Detach(); await Task.Delay(100);
+            // Detach restores the hidden state captured on reattachment. The
+            // following independent recovery case starts with a visible window.
+            Require(NativeWindowHost.SetWindowVisibility(fixtureWindow, fixture.Id, executable, true, out error), error);
             var leaseDirectory = Path.Combine(Path.GetTempPath(), "codex-viewport-test-" + Guid.NewGuid().ToString("N"));
             host.WindowStateDirectory = leaseDirectory;
             Require(host.Attach(fixtureWindow, fixture.Id, executable, out error), error);

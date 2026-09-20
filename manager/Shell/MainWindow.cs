@@ -14,6 +14,7 @@ namespace Codex.ControlCenter.Shell;
 public sealed class MainWindow : Window
 {
     private readonly string _root;
+    private readonly bool _fixture;
     private ManagerClient? _client;
     private readonly Func<string, object?, Task<JsonElement>>? _fixtureRequest;
     private readonly TaskNotesPanel _notes;
@@ -110,6 +111,7 @@ public sealed class MainWindow : Window
     {
         if (!fixture && fixtureRequest is not null) throw new ArgumentException("Request fixtures require an isolated fixture window.");
         _fixtureRequest = fixtureRequest;
+        _fixture = fixture;
         _root = Path.GetFullPath(root);
         _notes = new TaskNotesPanel(_root, async (command, args) =>
         {
@@ -280,6 +282,10 @@ public sealed class MainWindow : Window
         version.HorizontalContentAlignment = HorizontalAlignment.Left;
         version.Margin = new Thickness(0, 8, 0, 0);
         footer.Children.Add(version);
+        var exit = WorkspaceAppearance.Tool(Action("완전 종료…", ExitWorkspaceAsync,
+            "관리 중인 모든 Codex 작업을 끝내고 종료합니다. 제목줄의 X는 작업을 유지한 채 창만 닫습니다."), "ExitWorkspace", quiet: true);
+        exit.HorizontalAlignment = HorizontalAlignment.Left;
+        footer.Children.Add(exit);
         // Give the lists a finite viewport so each scrolls independently. Keep
         // expanded settings reachable without consuming the two list regions.
         sidebarFrame.Children.Add(sidebar);
@@ -393,7 +399,7 @@ public sealed class MainWindow : Window
         var logFrame = new Border { Background = WorkspaceAppearance.Canvas, BorderBrush = WorkspaceAppearance.Line, BorderThickness = new Thickness(0, 1, 0, 0), Child = logPanel };
         Grid.SetRow(logFrame, 2); right.Children.Add(logFrame);
         Grid.SetColumn(right, 1); layout.Children.Add(right);
-        Content = ManagerTitleBar.Wrap(this, layout, Log);
+        Content = ManagerTitleBar.Wrap(this, layout, Log, "창 닫기 · 작업은 계속 실행");
         if (!fixture) _taskContext = new TaskContextWatcher(_root, Dispatcher, task =>
         {
             _selectedTask = task;
@@ -583,12 +589,24 @@ public sealed class MainWindow : Window
         => Menu(actions.Select(action => (action.Label, (Func<Task>)(() => action.Action(RequireContextProfile())))).ToArray());
     private async Task InitializeAsync()
     {
+        int navigation = _navigation;
+        var session = WorkspaceSession.Read(_root);
         Log($"관리 앱 시작 · {WorkspaceBuild.Label} · {WorkspaceBuild.Description} · 빌드 {WorkspaceBuild.BuildId} · IPC {ManagerProtocol.Version} · 로그: {_diagnostics.Path}");
         if (_responsiveness is not null) Log("응답 지연 상세 로그 · " + _responsiveness.Path);
         SetStatus("관리 서비스를 연결하고 있습니다…");
         _client = await ManagerClient.ConnectAsync(_root);
+        if (_closing) { await _client.DisposeAsync(); return; }
         await CheckStartupUpdatesAsync();
-        await RefreshAsync(); _timer.Start(); SetStatus("프로필을 백그라운드에서 미리 열고 있습니다. 준비된 프로필은 선택하면 바로 표시됩니다.");
+        await RefreshAsync();
+        if (_closing) return;
+        _timer.Start();
+        if (_client.ServiceUpdateDeferred) Log("새 관리창을 기존 서비스에 연결했습니다. 작업을 유지하며 서비스 업데이트는 완전 종료 후 적용합니다.");
+        SetStatus("창을 닫아도 작업은 계속됩니다. 모두 끝내려면 완전 종료를 누르세요.");
+        if (_navigation == navigation && _pendingNotification is null && session is not null)
+        {
+            if (session.ViewingCatalog) await ShowCatalogAsync();
+            else if (session.ProfileId is { } id && ProfileExists(id)) await ShowProfileAsync(id);
+        }
     }
     private async Task ReconnectAsync()
     {
@@ -1383,15 +1401,35 @@ public sealed class MainWindow : Window
             if (!requested) Log("표시 영역 복구 요청을 다시 시도하고 있습니다. " + _host.LastError);
         }
     }
-    private bool _shutdownInProgress, _shutdownComplete;
+    private bool _shutdownInProgress, _shutdownComplete, _exitAllRequested;
+    private Task ExitWorkspaceAsync()
+    {
+        if (_shutdownInProgress || _closing) return Task.CompletedTask;
+        if (MessageBox.Show(this, "관리 중인 모든 Codex 프로필과 작업을 종료합니다.\n진행 중인 작업은 중단됩니다.\n\n창만 닫고 작업을 계속하려면 취소한 뒤 제목줄의 X를 누르세요.",
+            "작업 공간 완전 종료", MessageBoxButton.OKCancel, MessageBoxImage.Warning, MessageBoxResult.Cancel) != MessageBoxResult.OK)
+            return Task.CompletedTask;
+        _exitAllRequested = true;
+        Close();
+        return Task.CompletedTask;
+    }
     private async void OnClosing(object? sender, CancelEventArgs e)
     {
         if (_shutdownComplete) return;
         e.Cancel = true;
         if (_shutdownInProgress) return;
         Log("관리창 닫기 요청 수신");
+        if (!_exitAllRequested && _client is { PreservesBackgroundProfiles: false })
+        {
+            SetStatus("현재 연결된 구버전 서비스는 창 종료 후 작업 유지를 지원하지 않습니다. 최초 한 번은 작업을 마친 뒤 완전 종료하여 새 서비스를 적용해 주세요.", true);
+            return;
+        }
         try { _notes.PreserveDrafts(); }
         catch (Exception error) { e.Cancel = true; SetStatus("메모 초안을 저장하지 못했습니다: " + error.Message, true); return; }
+        if (!_fixture)
+        {
+            try { new WorkspaceSession(1, _selectedProfile, _viewingCatalog).Save(_root); }
+            catch (Exception error) { SetStatus("다시 열 작업 정보를 저장하지 못했습니다: " + error.Message, true); return; }
+        }
         // Invalidate asynchronous navigation instead of waiting for a backend
         // request. Its late response already checks this generation before it
         // attaches, selects or shows any window.
@@ -1403,6 +1441,19 @@ public sealed class MainWindow : Window
             host.DetachForClose();
             if (host.IsAttached) { e.Cancel = true; MessageBox.Show(this, "원본 창을 안전하게 분리하지 못해 관리창을 유지합니다.\n" + host.LastError, "창 분리 확인"); return; }
             if (_attachedWindows.Remove(host, out var attached)) _parked[attached.Handle] = attached;
+        }
+        if (!_exitAllRequested)
+        {
+            // Destroy this UI process, not the work. The independent Rust
+            // service and original native Codex instances retain their state.
+            // Releasing our HWND properties does not show or close any window.
+            foreach (var window in _parked.Values) window.ClearMarker();
+            _parked.Clear();
+            _closing = true; _shutdownComplete = true;
+            _timer.Stop(); _activityTimer.Stop();
+            Log("관리창만 종료 · Codex 작업과 SSH 연결 유지 · 다시 열면 실행 중인 작업에 연결합니다.");
+            e.Cancel = false;
+            return;
         }
         if (_parked.Count == 0 && _client is null)
         {
@@ -1445,7 +1496,7 @@ public sealed class MainWindow : Window
                 _state = await _client.RequestAsync("state", cancellationToken: stopWarmup.Token);
                 // Preloaded windows have never been attached or parked. Include
                 // their verified process/window identities in normal shutdown.
-                var hidden = _state.Arr("profiles").Where(p => p.S("status") == "running" &&
+                var hidden = _state.Arr("profiles").Concat(_state.Arr("view_instances")).Where(p => p.S("status") == "running" &&
                     p.N("window_handle") != 0 && !_parked.ContainsKey((nint)p.N("window_handle"))).ToArray();
                 await Task.WhenAll(hidden.Select(async profile =>
                 {
@@ -1472,7 +1523,8 @@ public sealed class MainWindow : Window
                 // child of the tracked window, so the graceful close above can
                 // leave ChatGPT processes behind. The service reaps every managed
                 // process that carries this profile's own --user-data-dir.
-                foreach (var profile in _state.Arr("profiles"))
+                var cleanupErrors = new List<string>();
+                foreach (var profile in _state.Arr("profiles").Concat(_state.Arr("view_instances")))
                 {
                     var id = profile.S("id");
                     if (id == "" || profile.S("process_id") == "") continue;
@@ -1484,18 +1536,32 @@ public sealed class MainWindow : Window
                             cancellationToken: stopDeadline.Token);
                         Log($"남은 Codex 프로세스 정리 · {profile.S("alias", id)}");
                     }
-                    catch (Exception error) { Log("프로세스 정리 건너뜀 · " + error.Message); }
+                    catch (Exception error)
+                    {
+                        cleanupErrors.Add(profile.S("alias", id));
+                        Log("프로세스 종료 확인 실패 · " + error.Message);
+                    }
                 }
+                if (cleanupErrors.Count > 0)
+                    throw new InvalidOperationException("일부 프로필의 종료를 확인하지 못해 관리창을 유지합니다: " + string.Join(", ", cleanupErrors));
             }
             if (_client?.IsConnected == true)
             {
                 try
                 {
-                    using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(4));
-                    await _client.RequestAsync("supervisor.retire", cancellationToken: deadline.Token);
+                    using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(8));
+                    while (true)
+                    {
+                        try { await _client.RequestAsync("supervisor.retire", cancellationToken: deadline.Token); break; }
+                        catch (ManagerException error) when (error.Code == "backend_busy")
+                        { await Task.Delay(200, deadline.Token); }
+                    }
                     Log("관리 서비스 종료 요청 완료");
                 }
-                catch (Exception error) { Log("관리 서비스는 남은 연결·작업 종료 후 자동 정리됩니다 · " + error.Message); }
+                catch (OperationCanceledException)
+                {
+                    throw new InvalidOperationException("남은 관리 작업의 종료를 확인하지 못했습니다. 진행 기록을 확인한 뒤 완전 종료를 다시 시도해 주세요.");
+                }
             }
             _shutdownComplete = true;
             Close();
@@ -1511,7 +1577,7 @@ public sealed class MainWindow : Window
                 }
                 catch (Exception resumeError) { Log("프로필 실행 재개 확인 · " + resumeError.Message); }
             }
-            _closing = false; _shutdownInProgress = false;
+            _closing = false; _shutdownInProgress = false; _exitAllRequested = false;
             IsEnabled = true;
             _timer.Start(); _activityTimer.Start();
             SetStatus(error.Message, true);
