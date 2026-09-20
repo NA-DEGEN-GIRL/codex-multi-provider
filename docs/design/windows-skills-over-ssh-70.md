@@ -36,9 +36,11 @@ bridge. An already running generation is not killed by toggling a setting.
 4. The installer publishes owned symlinks under `~/.agents/skills/`. An existing
    native skill in that directory or `~/.codex/skills/` is preserved, including
    dangling links. A conflict is reported instead of replacing another install.
-5. The skill's wrapper uses the private descriptor on non-Windows hosts. The
-   Windows route remains local; a native Linux runtime without a bridge retains
-   its existing local behavior.
+5. The wrapper supports explicit local/Windows execution. A separately registered
+   native Linux runtime takes priority in auto mode; without that registration,
+   the private descriptor preserves the original Windows bridge behavior.
+   Native environments live outside the managed projection. See the skill's
+   `references/execution-setup.md` for installation and job-host pinning.
 6. The portable client supports `catalog`, `read`, `upload`, `run`, `job` and
    `fetch`. See the skill's `references/windows-bridge.md` and English companion
    for the exact commands and the maintainer contract.
