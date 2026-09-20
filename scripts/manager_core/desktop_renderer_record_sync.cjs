@@ -10,6 +10,49 @@
   const signals=new Set(['thread/started','thread/name/updated','thread/settings/updated','thread/project/updated','thread/archived','thread/unarchived','thread/deleted','turn/started','turn/completed','item/started','item/completed','item/agentMessage/delta']);
   let running = false;
   let composing = false;
+  let inputBusyUntil = 0;
+  // Passive, bounded timing samples only. No keys, input text, DOM snapshots,
+  // task IDs or URLs leave the renderer through this diagnostic interface.
+  const inputSamples=[], longTasks=[], inputObservers=[];
+  let eventTiming=false;
+  const trimSamples=(samples,now)=>{
+    while(samples.length && (samples.length>256 || samples[0].at<now-30000))samples.shift();
+  };
+  const inputHealth=()=>{
+    const now=globalThis.performance?.now?.() ?? 0;
+    trimSamples(inputSamples,now);trimSamples(longTasks,now);
+    const durations=inputSamples.map(s=>s.duration).sort((a,b)=>a-b);
+    return {event_timing_supported:eventTiming,window_ms:30000,
+      slow_input_samples:inputSamples.length,
+      input_delay_max_ms:Math.round(Math.max(0,...inputSamples.map(s=>s.delay))),
+      input_duration_p95_ms:Math.round(durations[Math.max(0,Math.ceil(durations.length*.95)-1)]||0),
+      input_duration_max_ms:Math.round(Math.max(0,...durations)),
+      long_task_samples:longTasks.length,long_task_max_ms:Math.round(Math.max(0,...longTasks.map(s=>s.duration)))};
+  };
+  if(typeof PerformanceObserver==='function'){
+    const observe=(type,receive,options={})=>{
+      if(!PerformanceObserver.supportedEntryTypes?.includes(type))return false;
+      try{const observer=new PerformanceObserver(list=>receive(list.getEntries()));
+        observer.observe({type,...options});inputObservers.push(observer);return true;
+      }catch{return false;}
+    };
+    eventTiming=observe('event',entries=>{
+      for(const e of entries){
+        if(document.visibilityState==='hidden' || !['keydown','keyup','beforeinput','input','compositionstart','compositionupdate','compositionend'].includes(e.name) ||
+          !e.target?.closest?.('[data-codex-composer]'))continue;
+        const delay=e.processingStart-e.startTime;
+        if(!Number.isFinite(delay)||!Number.isFinite(e.duration)||!Number.isFinite(e.startTime))continue;
+        inputSamples.push({at:e.startTime,delay:Math.max(0,delay),duration:Math.max(0,e.duration)});
+      }
+      trimSamples(inputSamples,performance.now());
+    },{durationThreshold:16});
+    observe('longtask',entries=>{
+      if(document.visibilityState==='hidden')return;
+      for(const e of entries)if(Number.isFinite(e.startTime)&&Number.isFinite(e.duration))longTasks.push({at:e.startTime,duration:e.duration});
+      trimSamples(longTasks,performance.now());
+    });
+    window.addEventListener('pagehide',()=>{for(const observer of inputObservers)observer.disconnect();},{once:true});
+  }
   let refreshTimer, deltaTimer, cleanupTimer;
   const deltaPending=new Map(), lastPublished=new Map(), DELTA_INTERVAL=200;
   const post = (id,host,kind='changed') => {
@@ -71,8 +114,9 @@
     // Native transcript hydration can recreate the composer when its latest
     // turn changes. Defer that task's merge while the user owns an unsent draft;
     // do not copy/restore DOM text, which loses mentions, selections and IME.
+    if(composing || Date.now()<inputBusyUntil)return true;
     const editor=document.querySelector('[data-codex-composer]');
-    return composing || !!editor?.textContent?.trim();
+    return !!editor?.textContent?.trim();
   };
   const active = (m,id) => local.get(m)?.turns.has(id) || local.get(m)?.requests.has(id) || m.hasInFlightConversationResume(id);
   async function tick() {
@@ -145,10 +189,15 @@
     status(){return {...counters,managers:liveManagers().size,pending:pending.size,
       pendingNotifications:deltaPending.size,refreshScheduled:refreshTimer!==undefined,
       archived:archivedKeys.size,deleted:deletedKeys.size};},
-    tick
+    inputHealth,tick
   };
   window.addEventListener('compositionstart',event=>{if(event.target?.closest?.('[data-codex-composer]'))composing=true;});
-  window.addEventListener('compositionend',()=>{composing=false;});
+  window.addEventListener('compositionend',()=>{if(composing)inputBusyUntil=Date.now()+250;composing=false;});
+  // Reserve the first keystroke and deletion-to-empty too, before the editor's
+  // DOM has a draft to inspect. Never intercept keys or inspect input contents.
+  window.addEventListener('beforeinput',event=>{
+    if(event.target?.closest?.('[data-codex-composer]'))inputBusyUntil=Date.now()+250;
+  },{capture:true,passive:true});
   document.addEventListener?.('visibilitychange',()=>{scheduleRefresh();if(document.visibilityState!=='hidden')void tick();});
   window.addEventListener('message',event=>{
     const data=event.data;

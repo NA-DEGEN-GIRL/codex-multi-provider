@@ -22,7 +22,7 @@
     'item/started','item/completed','item/agentMessage/delta']);
   let sequence = 0, dirty = false;
   let catalog = null, running = false, stopped = false;
-  const counters = { scans: 0, listRefreshes: 0, historyRefreshes: 0, deferred: 0, unavailable: 0, failures: 0 };
+  const counters = { scans: 0, listRefreshes: 0, summaryRefreshes: 0, historyRefreshes: 0, deferred: 0, unavailable: 0, failures: 0 };
   let lastDiagnostic = 0;
   const active = (manager, id) => {
     // A hydrated status may describe a turn running in ANOTHER runtime. Using
@@ -119,7 +119,11 @@
             manager.threadStore.threadReadStates?.delete(id);
             await manager.threadStore.hydrateThreads([id], {
               addToRecentConversations: true,
-              includeTurns: true, maxTurns: 8,
+              // The main process owns the catalog, not the visible transcript.
+              // Read/validate its summary once. The renderer fetches turns only
+              // when visible and not typing; duplicating that work here builds
+              // large transcript graphs in every preloaded profile.
+              includeTurns: false,
               retainHistoryPagination: true, notifyAnyCallbacks: true, throwOnReadError: true
             });
             if (active(manager, id)) { deferred = true; continue; }
@@ -127,7 +131,7 @@
             if (!summary) { failed = true; counters.unavailable++; continue; }
             if (summary.name) manager.threadStore.applyThreadTitleUpdate(id, summary.name);
             available = true;
-            counters.historyRefreshes++;
+            counters.summaryRefreshes++;
           } catch (error) {
             failed = true;
             if (/thread not loaded|thread.*not found/i.test(String(error?.message || error))) counters.unavailable++;

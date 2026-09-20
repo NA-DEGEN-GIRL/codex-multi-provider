@@ -813,7 +813,7 @@ public sealed class MainWindow : Window
             {
                 if (p.Get("restart").S("phase") is "acquiring" or "closing" or "opening" or "releasing" or "waiting" or "recovering" or "connecting")
                     _attachDeadline = DateTime.UtcNow.AddSeconds(25);
-                TryAttach(p);
+                TryAttach(p, refreshPresentation: false);
             }
             using (_responsiveness?.Stage("shell.background_windows", 25)) ReconcileBackgroundWindows();
         }
@@ -1133,7 +1133,7 @@ public sealed class MainWindow : Window
         _empty.Text = "Codex 창 연결을 완료하지 못했습니다.\n아래 로그를 복사해 알려주세요.\n‘관리창 안에 표시’로 다시 시도할 수 있습니다.\n\n" + error;
         SetStatus(error, true);
     }
-    private void TryAttach(JsonElement profile)
+    private void TryAttach(JsonElement profile, bool refreshPresentation = true)
     {
         if (ProfileLoginPresentation.ShowRecovery(profile)) { ShowLoginRecovery(profile); return; }
         if (!_embedRequested || _host.IsTransitioning) return;
@@ -1152,6 +1152,15 @@ public sealed class MainWindow : Window
         _hostDeck.Select(profile.S("id"));
         if (_windowLaunches.TryGetValue(_host, out var retained) && retained.Retains(_host, profile))
         {
+            // State polls only verify the attached lifetime. UpdateLayout here
+            // flushes the entire dirty WPF tree after every metadata refresh.
+            // Native move/size events and the host's watchdog already maintain
+            // geometry; explicit selection/repair keeps its immediate path.
+            if (!refreshPresentation && _host.Visibility == Visibility.Visible)
+            {
+                _empty.Visibility = Visibility.Collapsed;
+                return;
+            }
             _host.Visibility = Visibility.Visible;
             _host.UpdateLayout();
             if (_host.SynchronizeLayout() && _host.IsAttached) _empty.Visibility = Visibility.Collapsed;

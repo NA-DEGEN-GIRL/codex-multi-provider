@@ -20,7 +20,7 @@ const manager={hostId:'local',getConversation:()=>state,hasInFlightConversationR
  threadStore:{threadsById:new Map([[id,{name:'title'}]]),isConversationActive:()=>true,
   applyThreadTitleUpdate:(id,title)=>calls.push(['title',id,title]),
   hydrateThreads:async(ids,options)=>{
-   calls.push(['read',...ids]);assert.equal(options.includeTurns,true);assert.equal(options.retainHistoryPagination,true);
+   calls.push(['read',...ids]);assert.equal(options.includeTurns,false,'catalog invalidations must not duplicate renderer history reads');assert.equal(options.retainHistoryPagination,true);
    if(whileReading)whileReading();
    if(sync.canApply(manager.threadStore))calls.push(['applied',...ids]);
   }}};

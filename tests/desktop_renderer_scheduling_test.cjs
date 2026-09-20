@@ -54,6 +54,15 @@ const invalidate=hostId=>events.message({data:{type:'manager-record-invalidated'
   failRead=true;invalidate('local');await settle();assert.equal(sync.status().refreshScheduled,true);
   const failedReads=reads;await advance(2000);assert.equal(reads,failedReads);
   await advance(500);assert.equal(reads,failedReads+1);assert.equal(sync.status().refreshScheduled,false);
+  const beforeInputReads=reads,composer={closest:()=>true};
+  events.beforeinput({target:composer});invalidate('local');await settle();
+  assert.equal(reads,beforeInputReads,'first key is protected before editor text reaches the DOM');
+  await advance(200);assert.equal(reads,beforeInputReads);
+  await advance(200);assert.equal(reads,beforeInputReads+1,'empty editor refreshes after the short input guard');
+  events.compositionstart({target:composer});invalidate('local');await advance(1000);
+  assert.equal(reads,beforeInputReads+1,'IME composition stays protected even while editor text is empty');
+  events.compositionend();await sync.tick();assert.equal(reads,beforeInputReads+1);
+  await advance(400);assert.equal(reads,beforeInputReads+2,'composition commit gets the same short input guard');
   assert.equal(local.dispose(),'native-result');assert.equal(nativeDisposes,1);
   const before=messages.length;sync.observe(local,'turn/started',{threadId:id});assert.equal(messages.length,before);
   remote.disposed=true;await advance(30000);

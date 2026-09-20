@@ -6,7 +6,7 @@ const promises={async stat(){return{size:100}},async readFile(){return JSON.stri
 const win={getNativeWindowHandle(){const b=Buffer.alloc(8);b.writeBigUInt64LE(123n);return b},isDestroyed:()=>false,
   once(event,fn){assert.equal(event,'closed');closed=fn},webContents:{
     once(event,fn){assert.equal(event,'did-finish-load');ready=fn},getOSProcessId:()=>43,
-    executeJavaScript(code,userGesture){assert.equal(code,'0');assert.equal(userGesture,false);probes++;return new Promise(r=>{finish=r})}}};
+    executeJavaScript(code,userGesture){assert.equal(code,'globalThis.__codexRendererRecordSync?.inputHealth?.() ?? null');assert.equal(userGesture,false);probes++;return new Promise(r=>{finish=r})}}};
 vm.runInNewContext(fs.readFileSync('scripts/manager_core/desktop_window_health.cjs','utf8'),{
   process:{platform:'win32',pid:42,env:{CODEX_MANAGER_ROOT:'fixture'}},Date:{now:()=>now},
   setInterval(fn,interval){assert.equal(interval,1000);tick=fn;return{unref(){}}},
@@ -17,8 +17,12 @@ vm.runInNewContext(fs.readFileSync('scripts/manager_core/desktop_window_health.c
   ready();now+=1000;await tick();assert.equal(probes,1);assert.equal(health.rendererPid,43);
   now+=3000;await tick();assert.equal(probes,1,'hung renderer cannot accumulate probes');
   assert.equal(health.renderer_pending_ms,3000);assert.equal(health.node_lag_ms,2000);
-  finish(0);await new Promise(r=>setImmediate(r));now+=1000;await tick();
+  finish({event_timing_supported:true,window_ms:30000,slow_input_samples:3,input_delay_max_ms:112.2,
+    input_duration_max_ms:NaN,long_task_max_ms:Infinity,keys:'PRIVATE_TEXT',title:'PRIVATE_TITLE'});
+  await new Promise(r=>setImmediate(r));now+=1000;await tick();
   assert.equal(health.renderer_roundtrip_ms,3000);assert.equal(probes,2);
+  assert.deepEqual(health.input,{event_timing_supported:true,window_ms:30000,slow_input_samples:3,input_delay_max_ms:112});
+  assert(!JSON.stringify(health).includes('PRIVATE_'),'renderer diagnostics only copy whitelisted numeric fields');
   lease.visible=false;now+=5000;await tick();assert.equal(probes,2,'hidden profiles are not probed');
   finish(0);await new Promise(r=>setImmediate(r));lease.visible=true;lease.hwnd='999';await tick();assert.equal(probes,2,'different HWND is untouched');
   lease.hwnd='123';closed();await tick();assert.equal(probes,2,'closed window released');
