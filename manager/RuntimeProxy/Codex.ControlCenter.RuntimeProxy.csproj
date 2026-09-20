@@ -5,5 +5,9 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AssemblyName>Codex.ControlCenter.RuntimeProxy</AssemblyName>
+    <!-- Service compatibility hashes executable content; unrelated commits
+         must not change these binaries through assembly or PDB metadata. -->
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+    <EnableSourceLink>false</EnableSourceLink>
   </PropertyGroup>
 </Project>

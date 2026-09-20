@@ -15,6 +15,7 @@ internal static class LayoutSelfTest
 {
     internal static async Task RunAsync(string root, string report)
     {
+        var compatibilityChecks = ManagerUpdateCompatibilitySelfTest.Run();
         // Synthetic labels only. This path never connects to the backend or opens Codex.
         var fixtureRoot = Path.Combine(Path.GetTempPath(), "codex-layout-fixture-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(fixtureRoot);
@@ -171,7 +172,7 @@ internal static class LayoutSelfTest
             zero_positive_unknown_credits_checked = true, malformed_credits_unknown = true, external_api_quota_hidden = true,
             long_alias_ellipsis = true, quota_and_reset_values_single_line = true, selection_retained = true,
             notes_open_close_checked = true, compact_notes_and_log_checked = true, wide_notes_resize_checked = true, many_note_tabs_accessible = true,
-            compatibility_states_and_refresh_reachable = true,
+            compatibility_states_and_refresh_reachable = true, compatibility_inspection_checks = compatibilityChecks,
             sidebar_drag_checked = true, independent_list_scrolling = true, sidebar_selection_preserved = true,
             sidebar_extremes_and_compact_settings_checked = true, sidebar_ratio_reloaded = true, sidebar_scroll_preserved_on_refresh = true,
             source = "synthetic WPF controls only; no live profile or Codex process", png, sidebar_png = sidebarPng, notes_png = notesPng, notes_detail_png = notesDetailPng, compact_png = narrowPng }, new JsonSerializerOptions { WriteIndented = true }));

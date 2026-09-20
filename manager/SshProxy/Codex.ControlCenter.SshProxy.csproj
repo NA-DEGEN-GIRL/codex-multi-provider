@@ -6,5 +6,8 @@
     <Nullable>enable</Nullable>
     <AssemblyName>ssh</AssemblyName>
     <RootNamespace>Codex.ControlCenter.SshProxy</RootNamespace>
+    <!-- Keep backend binary identity stable across unrelated GUI commits. -->
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+    <EnableSourceLink>false</EnableSourceLink>
   </PropertyGroup>
 </Project>
