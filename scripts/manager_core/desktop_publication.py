@@ -51,6 +51,13 @@ def publication_lock(parent):
 _hashes = OrderedDict()
 _hash_lock = threading.Lock()
 
+# A content stamp written inside the current system-clock tick can stay the same
+# when a rewrite keeps the size and restores mtime. Only stamps that are
+# conservatively older than the wall clock may be cached or reused. This avoids
+# reusing a digest across ordinary writes inside the same clock tick.
+_HASH_MIN_AGE_NS = 1_000_000_000
+_FILETIME_UNIX_EPOCH_100NS = 116_444_736_000_000_000
+
 
 def _content_stamp(stream):
     info = os.fstat(stream.fileno())
@@ -73,12 +80,44 @@ def _content_stamp(stream):
     return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, changed
 
 
+def _now_ns():
+    return time.time_ns()
+
+
+def _change_time_ns(stamp):
+    """Content-change time of a stamp as nanoseconds since the Unix epoch."""
+    try:
+        changed = stamp[4]
+    except (TypeError, IndexError, KeyError):
+        return None
+    if type(changed) is not int or changed <= 0:
+        return None
+    if os.name == 'nt':
+        # FILETIME counts 100 ns ticks from 1601-01-01; time_ns counts from 1970.
+        return (changed - _FILETIME_UNIX_EPOCH_100NS) * 100
+    return changed
+
+
+def _cache_eligible(stamp, *, now_ns=None):
+    """True only for settled stamps that may be cached or reused.
+
+    Unavailable, invalid and future stamps never qualify, and a fresh stamp is
+    refused for one conservative second after it was written.
+    """
+    changed = _change_time_ns(stamp)
+    if changed is None or changed <= 0:
+        return False
+    now = _now_ns() if now_ns is None else now_ns
+    return changed <= now - _HASH_MIN_AGE_NS
+
+
 def _hash(path):
     with path.open('rb') as stream:
         before = _content_stamp(stream)
         key = str(path.absolute()), before
+        eligible = _cache_eligible(before)
         with _hash_lock:
-            cached = _hashes.get(key) if before is not None else None
+            cached = _hashes.get(key) if eligible else None
             if cached is not None:
                 _hashes.move_to_end(key)
                 return cached
@@ -86,7 +125,7 @@ def _hash(path):
         after = _content_stamp(stream)
         if before != after:
             raise OSError('Desktop program changed while checking its content.')
-        if before is not None:
+        if _cache_eligible(after):
             with _hash_lock:
                 _hashes[key] = digest
                 while len(_hashes) > 64:

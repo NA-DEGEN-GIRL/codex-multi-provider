@@ -134,14 +134,13 @@ internal sealed class ResponsivenessMonitor : IDisposable
                 var processes = new List<object>();
                 foreach (int pid in targets.Select(t => t.Pid).Append(rendererPid).Prepend(Environment.ProcessId).Where(id => id > 0).Distinct())
                 {
-                    try
-                    {
-                        using var process = Process.GetProcessById(pid);
-                        processes.Add(new { pid, private_mb = process.PrivateMemorySize64 / 1048576,
-                            working_mb = process.WorkingSet64 / 1048576, handles = process.HandleCount,
-                            threads = process.Threads.Count, cpu_ms = (long)process.TotalProcessorTime.TotalMilliseconds });
-                    }
-                    catch (Exception e) when (e is ArgumentException or InvalidOperationException or System.ComponentModel.Win32Exception) { }
+                    if (!NativeProcessMetrics.TryRead(pid, out var metrics)) continue;
+                    // Thread counts are deliberately absent: Process.Threads
+                    // requires another system-wide snapshot for every sampled PID.
+                    // Failed/exited targets are omitted, never reported as zero.
+                    processes.Add(new { pid, private_mb = metrics.PrivateBytes / 1048576,
+                        working_mb = metrics.WorkingBytes / 1048576, handles = metrics.Handles,
+                        cpu_ms = metrics.CpuMilliseconds });
                 }
                 Record("sample", new { ui_lag_ms = lag, native, renderer, presentation, processes });
             }

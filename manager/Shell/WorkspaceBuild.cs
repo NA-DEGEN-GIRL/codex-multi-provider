@@ -8,8 +8,8 @@ namespace Codex.ControlCenter.Shell;
 // Identify the running executable, never a newer release in current.json.
 internal static class WorkspaceBuild
 {
-    internal const int Revision = 67;
-    internal const string Description = "입력 우선 처리·중복 대화 로딩 절감";
+    internal const int Revision = 68;
+    internal const string Description = "Windows 직접 계측·선택 작업 우선 로딩";
     internal static string Label => $"수정 {Revision}";
     internal static string Title => $"Codex 작업 공간 · {Label}";
     internal static string BuildId { get; } = RunningBuildId();

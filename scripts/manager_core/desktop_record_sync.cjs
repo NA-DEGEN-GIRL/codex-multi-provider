@@ -22,6 +22,8 @@
     'item/started','item/completed','item/agentMessage/delta']);
   let sequence = 0, dirty = false;
   let catalog = null, running = false, stopped = false;
+  let nextBackgroundRefresh = 0;
+  const BACKGROUND_REFRESH_MS = 2000;
   const counters = { scans: 0, listRefreshes: 0, summaryRefreshes: 0, historyRefreshes: 0, deferred: 0, unavailable: 0, failures: 0 };
   let lastDiagnostic = 0;
   const active = (manager, id) => {
@@ -37,6 +39,12 @@
     // must release them; merely skipping disposed entries retains those graphs.
     for (const manager of managers) if (manager.disposed) managers.delete(manager);
     return [...managers];
+  };
+  const hasVisibleWindow = () => {
+    try {
+      return require('electron').BrowserWindow.getAllWindows().some(win =>
+        !win.isDestroyed() && (typeof win.isVisible!=='function' || win.isVisible()));
+    } catch { return true; } // Unknown adapters retain the foreground behavior.
   };
   async function scan() {
     try { await files.scan((file,data)=>{
@@ -83,11 +91,19 @@
       await scan();
       const locals = localManagers();
       if (!locals.length) return;
+      // Preloaded accounts retain the latest invalidation for each task. They
+      // do not need to reread the catalog on every streaming delta. Selection
+      // bypasses this gate on the next tick; removals/restores bypass it always.
+      const foreground = hasVisibleWindow();
+      const refreshBackground = foreground || Date.now() >= nextBackgroundRefresh;
       const visible = key => {const e=pending.get(key);return locals.some(m => m.hostId===e.host && m.threadStore.isConversationActive(e.id));};
-      const ids = [...pending].filter(([, state]) => state.due <= Date.now() && locals.some(m=>m.hostId===state.host))
+      const ids = [...pending].filter(([, state]) => state.due <= Date.now() &&
+          (state.kind!=='changed' || refreshBackground) && locals.some(m=>m.hostId===state.host))
         .sort(([a], [b]) => Number(visible(b)) - Number(visible(a)))
         .slice(0, 8).map(([id]) => id);
       if (!ids.length) return;
+      if (!foreground && ids.some(key=>pending.get(key).kind==='changed'))
+        nextBackgroundRefresh = Date.now() + BACKGROUND_REFRESH_MS;
       const imports = new Map(), deletions = new Map(), archives = new Map(), restores = new Map();
       // Unpersisted/ephemeral IDs are not imports. Native import retries are
       // unbounded, so only publish a summary after its history read succeeds.

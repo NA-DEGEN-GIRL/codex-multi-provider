@@ -1,28 +1,33 @@
 """Quota-only verification with an access token held in a disposable process."""
-import hashlib,json,os,queue,shutil,subprocess,threading,time
+import json,os,queue,shutil,subprocess,threading,time
 from pathlib import Path
 from uuid import uuid4
+
+from .desktop_publication import _hash
 
 
 def verification_runtime(root,app):
     # MSIX binaries can be readable but not directly executable outside the
     # packaged app. Stage exactly the official CLI bytes for both private login
     # windows and quota-only probes. Credentials stay in their own CODEX_HOME.
+    # Digests come from desktop_publication's content-stamp cache, so unchanged
+    # source and staged copies are not re-read. The stamp covers file identity,
+    # size, mtime and NTFS ChangeTime: an edit that restores size and mtime is
+    # still re-hashed, an unavailable stamp disables reuse, and a stamp that
+    # changes mid-hash raises OSError instead of publishing a stale digest.
     source=Path(app['InstallLocation'])/'app/resources/codex.exe'
     destination=Path(root)/'artifacts/login-runtime'/app['Version']/'codex.exe'
-    with source.open('rb') as stream:expected=hashlib.file_digest(stream,'sha256').hexdigest()
+    expected=_hash(source)
     if not destination.exists():
         destination.parent.mkdir(parents=True,exist_ok=True)
         temporary=destination.with_name('codex.'+uuid4().hex+'.tmp')
         try:
             shutil.copyfile(source,temporary)
-            with temporary.open('rb') as stream:actual=hashlib.file_digest(stream,'sha256').hexdigest()
-            if expected!=actual:raise RuntimeError('설치된 CLI 검사본의 무결성을 확인하지 못했습니다.')
+            if expected!=_hash(temporary):raise RuntimeError('설치된 CLI 검사본의 무결성을 확인하지 못했습니다.')
             os.replace(temporary,destination)
         finally:
             if temporary.exists():temporary.unlink()
-    with destination.open('rb') as stream:actual=hashlib.file_digest(stream,'sha256').hexdigest()
-    if expected!=actual:raise RuntimeError('설치된 CLI 검사본의 무결성을 확인하지 못했습니다.')
+    if expected!=_hash(destination):raise RuntimeError('설치된 CLI 검사본의 무결성을 확인하지 못했습니다.')
     return destination
 
 

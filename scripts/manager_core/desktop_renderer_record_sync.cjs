@@ -1,12 +1,12 @@
 // The renderer owns the visible transcript. The main-process catalog is a
 // separate store: refreshing it alone never invalidates this store's readers.
 (() => {
-  const managers = new Set(), local = new WeakMap(), refreshing = new WeakMap();
+  const managers = new Set(), local = new WeakMap(), refreshing = new WeakMap(), histories = new WeakMap();
   const pending = new Map(), uuid = /^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i;
   const deletedKeys=new Set();
   const archivedKeys=new Set();
   const counters = {refreshes:0, failures:0, unavailable:0, deferred:0, draftDeferred:0,
-    ipcMessages:0,ipcCoalesced:0};
+    ipcMessages:0,ipcCoalesced:0,summaryRefreshes:0,historyRefreshes:0};
   const signals=new Set(['thread/started','thread/name/updated','thread/settings/updated','thread/project/updated','thread/archived','thread/unarchived','thread/deleted','turn/started','turn/completed','item/started','item/completed','item/agentMessage/delta']);
   let running = false;
   let composing = false;
@@ -53,7 +53,7 @@
     });
     window.addEventListener('pagehide',()=>{for(const observer of inputObservers)observer.disconnect();},{once:true});
   }
-  let refreshTimer, deltaTimer, cleanupTimer;
+  let refreshTimer, refreshDeadline=Infinity, deltaTimer, cleanupTimer;
   const deltaPending=new Map(), lastPublished=new Map(), DELTA_INTERVAL=200;
   const post = (id,host,kind='changed') => {
     window.electronBridge?.sendMessageFromView?.({type:'manager-record-changed',threadId:id,hostId:host,kind});
@@ -92,18 +92,87 @@
     post(id,host,({'thread/deleted':'deleted','thread/archived':'archived','thread/unarchived':'unarchived'})[method]||'changed');
   }
   function scheduleRefresh(){
-    if(!pending.size||document.visibilityState==='hidden'){
+    // Keep disconnected-host invalidations without polling forever or letting
+    // their older entries occupy the entire per-tick read budget.
+    const hosts=new Set([...managers].filter(m=>!m.disposed).map(m=>m.hostId));
+    const dueStates=[...pending.values()].filter(state=>hosts.has(state.host));
+    if(!dueStates.length||document.visibilityState==='hidden'){
       if(refreshTimer!==undefined){clearTimeout(refreshTimer);refreshTimer=undefined;}
+      refreshDeadline=Infinity;
       return;
     }
-    if(refreshTimer!==undefined||running)return;
-    const due=Math.min(...[...pending.values()].map(state=>state.due));
-    refreshTimer=setTimeout(()=>{refreshTimer=undefined;void tick();},Math.max(400,due-Date.now()));
+    if(running)return;
+    const now=Date.now(),due=Math.max(now+400,Math.min(...dueStates.map(state=>state.due)));
+    // A failed task can have a long retry timer when another cached task is
+    // activated. Advance that timer without changing either task's due time.
+    if(refreshTimer!==undefined){
+      if(refreshDeadline<=due)return;
+      clearTimeout(refreshTimer);
+    }
+    refreshDeadline=due;
+    refreshTimer=setTimeout(()=>{refreshTimer=undefined;refreshDeadline=Infinity;void tick();},due-now);
   }
   const liveManagers = () => {
-    for(const m of managers)if(m.disposed)managers.delete(m);
+    for(const m of managers)if(m.disposed)releaseManager(m);
     return managers;
   };
+  function releaseManager(m){
+    managers.delete(m);local.delete(m);
+    if(![...managers].some(other=>!other.disposed&&other.hostId===m.hostId)){
+      for(const [key,state] of pending)if(state.host===m.hostId&&state.historyOnly)pending.delete(key);
+      scheduleRefresh();
+    }
+    const store=m.threadStore,history=histories.get(store);
+    if(!history?.installed||[...managers].some(other=>!other.disposed&&other.threadStore===store))return;
+    // Other integrations may wrap this method too. Restore only our own
+    // current wrapper; retain dirty metadata weakly for a reused native store.
+    if(store.retainActiveConversation===history.wrapped){
+      try{store.retainActiveConversation=history.retain;}catch{}
+    }
+    history.installed=store.retainActiveConversation===history.wrapped;
+  }
+  const HISTORY_LIMIT=1024;
+  function dirtyHistory(store,key){
+    const history=histories.get(store);if(!history)return;
+    history.clean.delete(key);history.dirty.delete(key);history.dirty.set(key,true);
+    // Eviction must never make an already-cached transcript look current.
+    // A conservative generation makes unknown older entries refresh when
+    // activated, while both per-task maps remain bounded.
+    while(history.dirty.size>HISTORY_LIMIT){
+      history.dirty.delete(history.dirty.keys().next().value);history.generation++;
+    }
+  }
+  function cleanHistory(history,key){
+    history.dirty.delete(key);history.clean.delete(key);history.clean.set(key,history.generation);
+    while(history.clean.size>HISTORY_LIMIT)history.clean.delete(history.clean.keys().next().value);
+  }
+  function trackHistory(store){
+    if(!store||histories.get(store)?.installed||typeof store.isConversationActive!=='function'||
+      typeof store.retainActiveConversation!=='function')return;
+    const retain=store.retainActiveConversation;
+    const history=histories.get(store)??{dirty:new Map(),clean:new Map(),generation:0};
+    const wrapped=function(id,...args){
+      const result=Reflect.apply(retain,this,[id,...args]);
+      if(uuid.test(id||'')&&this.isConversationActive(id))for(const m of liveManagers()){
+        if(m.threadStore!==this)continue;
+        const key=m.hostId+'\0'+id;
+        if(deletedKeys.has(key)||archivedKeys.has(key)||
+          (!history.dirty.has(key)&&history.generation<=(history.clean.get(key)??0)))continue;
+        if(!pending.has(key))pending.set(key,{id,host:m.hostId,failures:0,due:Date.now(),historyOnly:true});
+        while(pending.size>1024)pending.delete(pending.keys().next().value);
+        // Native retention can run inside a React effect. Queue the read so
+        // activation never hydrates or changes the transcript synchronously.
+        scheduleRefresh();
+      }
+      return result;
+    };
+    try{store.retainActiveConversation=wrapped;}
+    catch{return;}
+    // Unknown/native read-only implementations retain the full-history path.
+    if(store.retainActiveConversation===wrapped){
+      history.retain=retain;history.wrapped=wrapped;history.installed=true;histories.set(store,history);
+    }
+  }
   function scheduleCleanup(){
     if(cleanupTimer!==undefined||!managers.size)return;
     // Some native owners mark themselves disposed without calling dispose().
@@ -126,7 +195,8 @@
     if(running || !pending.size || document.visibilityState==='hidden'){scheduleRefresh();return;}
     running = true;
     try {
-      for(const [key,state] of [...pending].filter(([,s])=>s.due<=Date.now()).slice(0,8)) {
+      const hosts=new Set([...managers].filter(m=>!m.disposed).map(m=>m.hostId));
+      for(const [key,state] of [...pending].filter(([,s])=>s.due<=Date.now()&&hosts.has(s.host)).slice(0,8)) {
         const {id,host,deleted}=state;
         if(deleted){for(const m of liveManagers())if(m.hostId===host)m.handleThreadDeletion([id]);pending.delete(key);continue;}
         let deferred=false, failed=false, applied=false;
@@ -135,13 +205,26 @@
           if(m.disposed || m.hostId!==host || !m.threadStore) continue;
           if(active(m,id)){deferred=true;counters.deferred++;continue;}
           const store=m.threadStore;
-          refreshing.set(store,{m,id});
+          // Registration is injected before some native constructors assign
+          // threadStore. Install lazily once that field becomes available.
+          trackHistory(store);
+          const tracked=histories.get(store),history=tracked?.installed?tracked:undefined;
+          const includeTurns=!history||store.isConversationActive(id);
+          if(state.historyOnly&&!includeTurns){applied=true;continue;}
+          dirtyHistory(store,key);
+          refreshing.set(store,{m,id,history,includeTurns});
           try {
             store.backgroundThreadLookups?.delete(id);
             store.threadReadStates?.delete(id);
-            await store.hydrateThreads([id],{addToRecentConversations:true,includeTurns:true,maxTurns:8,
+            await store.hydrateThreads([id],{addToRecentConversations:true,includeTurns,...includeTurns?{maxTurns:8}:{},
               retainHistoryPagination:true,notifyAnyCallbacks:true,throwOnReadError:true});
-            if(active(m,id)||hasDraft(id)){deferred=true;continue;}
+            if(m.disposed||!managers.has(m))continue;
+            if(active(m,id)||hasDraft(id)||
+              (history&&includeTurns!==store.isConversationActive(id))){deferred=true;continue;}
+            if(includeTurns){
+              counters.historyRefreshes++;
+              if(history&&pending.get(key)===state)cleanHistory(history,key);
+            }else counters.summaryRefreshes++;
             applied=true;counters.refreshes++;
           } catch(error) { failed=true;if(/thread not loaded|thread.*not found/i.test(String(error?.message||error)))counters.unavailable++;else counters.failures++; }
           finally {refreshing.delete(store);}
@@ -158,11 +241,12 @@
       liveManagers();
       if(m.disposed||managers.has(m))return;
       managers.add(m);local.set(m,{turns:new Map(),requests:new Map()});
+      trackHistory(m.threadStore);
       scheduleCleanup();
       const dispose=m.dispose;
       if(typeof dispose==='function')m.dispose=function(...args){
         try{return Reflect.apply(dispose,this,args);}
-        finally{managers.delete(m);local.delete(m);}
+        finally{releaseManager(m);}
       };
       const client=m.requestClient,send=client.sendRequest;
       client.sendRequest=async function(method,params,...rest){
@@ -173,6 +257,9 @@
         try{return await Reflect.apply(send,this,[method,params,...rest]);}
         finally{if(track){const count=state.requests.get(id)-1;if(count)state.requests.set(id,count);else state.requests.delete(id);}}
       };
+      // Retained invalidations resume when their native host reconnects. The
+      // deferred timer also allows constructors to finish assigning threadStore.
+      scheduleRefresh();
     },
     observe(m,method,params) {
       const state=local.get(m),id=params?.thread?.id||params?.threadId,turn=params?.turn?.id||params?.turnId;
@@ -185,7 +272,7 @@
       if(method==='turn/completed'&&(!turn||state.turns.get(id)===turn))state.turns.delete(id);
       if(['thread/closed','thread/deleted'].includes(method)||(method==='thread/status/changed'&&params?.status?.type==='idle'))state.turns.delete(id);
     },
-    canApply(store){const r=refreshing.get(store);return !r||(!deletedKeys.has(r.m.hostId+'\0'+r.id)&&!archivedKeys.has(r.m.hostId+'\0'+r.id)&&!active(r.m,r.id)&&!hasDraft(r.id));},
+    canApply(store){const r=refreshing.get(store);return !r||(managers.has(r.m)&&!r.m.disposed&&!deletedKeys.has(r.m.hostId+'\0'+r.id)&&!archivedKeys.has(r.m.hostId+'\0'+r.id)&&!active(r.m,r.id)&&!hasDraft(r.id)&&(!r.history||!r.includeTurns||store.isConversationActive(r.id)));},
     status(){return {...counters,managers:liveManagers().size,pending:pending.size,
       pendingNotifications:deltaPending.size,refreshScheduled:refreshTimer!==undefined,
       archived:archivedKeys.size,deleted:deletedKeys.size};},
@@ -215,7 +302,11 @@
       archivedKeys.delete(host+'\0'+id);
       for(const m of liveManagers())if(m.hostId===host)m.handleThreadUnarchived(id);
     }
-    for(const id of data.threadIds.slice(0,32))if(uuid.test(id)&&!deletedKeys.has(host+'\0'+id)&&!archivedKeys.has(host+'\0'+id))pending.set(host+'\0'+id,{id,host,failures:0,due:Date.now()});
+    for(const id of data.threadIds.slice(0,32))if(uuid.test(id)&&!deletedKeys.has(host+'\0'+id)&&!archivedKeys.has(host+'\0'+id)){
+      const key=host+'\0'+id;
+      for(const m of liveManagers())if(m.hostId===host)dirtyHistory(m.threadStore,key);
+      pending.set(key,{id,host,failures:0,due:Date.now()});
+    }
     for(const id of (data.deletedThreadIds||[]).slice(0,256))if(uuid.test(id)){deletedKeys.add(host+'\0'+id);pending.set(host+'\0'+id,{id,host,deleted:true,due:Date.now()});}
     while(deletedKeys.size>4096)deletedKeys.delete(deletedKeys.values().next().value);
     while(archivedKeys.size>4096)archivedKeys.delete(archivedKeys.values().next().value);
