@@ -13532,12 +13532,21 @@ index 2f08b0fdc831d6c3d057e906468455fbc47d38b8..6c6d5e9c965203f91b5a6722c3532c32
  [target.'cfg(windows)'.dependencies]
  codex-windows-sandbox = { workspace = true }
 diff --git a/codex-rs/app-server/README.md b/codex-rs/app-server/README.md
-index a0aa92b7fcef8ee5fcc5c1810d7f2459429c8aad..a9a81d0d059fffe56433de87f583e2d25932868d 100644
+index a0aa92b7fcef8ee5fcc5c1810d7f2459429c8aad..2988be73d49b7af9c190a19b1d3c60879394d05c 100644
 --- a/codex-rs/app-server/README.md
 +++ b/codex-rs/app-server/README.md
-@@ -1,5 +1,44 @@
+@@ -1,5 +1,53 @@
  # codex-app-server
  
++Manager SSH shared editing can opt into `CODEX_MANAGER_SHARED_ROUTES`, an
++absolute path to a private source-selection file. When legacy record homes
++contain the same task ID, their unselected copies retain distinct projection
++IDs. Opening a projection with `thread/resume` atomically selects its registered
++source for that task. Other profiles and saved aliases then use the same source;
++source records and credentials are not copied or deleted. A missing selected
++source fails closed instead of reviving an older copy. Explicit read-only
++catalog instances remain read-only and do not create selections.
++
 +## Manager record catalog experiment
 +
 +The patched runtime accepts `CODEX_MANAGER_RECORD_CATALOG`, an absolute path to
@@ -13580,7 +13589,7 @@ index a0aa92b7fcef8ee5fcc5c1810d7f2459429c8aad..a9a81d0d059fffe56433de87f583e2d2
  `codex app-server` is the interface Codex uses to power rich interfaces such as the [Codex VS Code extension](https://marketplace.visualstudio.com/items?itemName=openai.chatgpt).
  
  ## Table of Contents
-@@ -434,6 +473,8 @@ Parent-owned Multi-Agent V2 children are an exception: `thread/resume` ignores c
+@@ -434,6 +482,8 @@ Parent-owned Multi-Agent V2 children are an exception: `thread/resume` ignores c
  
  By default, `thread/resume` includes the reconstructed turn history in `thread.turns`. Full-history hydration is deprecated for paginated threads and emits `deprecationNotice`; clients should pass `excludeTurns: true` to return only thread metadata and live resume state, then page with `thread/turns/list` and `thread/items/list`. A cold paginated resume can still replay persisted `thread/tokenUsage/updated` when it can identify the corresponding stored turn; resuming an already-loaded thread waits for the next live update.
  
@@ -13589,7 +13598,7 @@ index a0aa92b7fcef8ee5fcc5c1810d7f2459429c8aad..a9a81d0d059fffe56433de87f583e2d2
  Paginated threads keep the same resume contract as legacy threads. A default resume materializes the full projected history into `thread.turns`; `excludeTurns: true` keeps that array empty and includes `turnsBackwardsCursor` and `itemsBackwardsCursor` for the durable history visible at the resume boundary. Pass each cursor directly to its matching list API with `sortDirection: "desc"`; the first page includes the row identified by the cursor, while newer records arrive through live notifications. Either cursor is `null` when there is no durable row yet.
  
  Only one app-server process can hold a paginated thread open for writing at a time. If another process already owns the thread, `thread/resume`, `thread/archive`, and `thread/delete` fail with JSON-RPC error `-32600`. Archive and deletion also fail if another process owns any spawned descendant. Read-only requests remain available without resuming the thread.
-@@ -630,6 +671,231 @@ Gauges register when first used. Depending on process activity, the snapshot can
+@@ -630,6 +680,231 @@ Gauges register when first used. Depending on process activity, the snapshot can
  }
  ```
  
@@ -17077,10 +17086,10 @@ index 0000000000000000000000000000000000000000..b742e959e5cb67eda149bb39a80ef3cc
 +}
 diff --git a/codex-rs/app-server/src/manager_catalog_list_watch.rs b/codex-rs/app-server/src/manager_catalog_list_watch.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..9a9a34d3fc414bbb09d278d15b1b4d69f59f4dbd
+index 0000000000000000000000000000000000000000..95aa0e760f8c251227ee450241e261efca03ec0f
 --- /dev/null
 +++ b/codex-rs/app-server/src/manager_catalog_list_watch.rs
-@@ -0,0 +1,271 @@
+@@ -0,0 +1,274 @@
 +//! Publish common-record membership through native notifications after listing.
 +//!
 +//! Notifications use the same identity and input rules as the list response:
@@ -17149,6 +17158,9 @@ index 0000000000000000000000000000000000000000..9a9a34d3fc414bbb09d278d15b1b4d69
 +    };
 +    let mut result = BTreeMap::new();
 +    for source in catalog.entries.iter() {
++        if !catalog.shared_routes.includes(source) {
++            continue;
++        }
 +        if native_home.as_ref().is_some_and(|home| {
 +            catalog
 +                .canonical_homes
@@ -17158,7 +17170,7 @@ index 0000000000000000000000000000000000000000..9a9a34d3fc414bbb09d278d15b1b4d69
 +        }) {
 +            continue;
 +        }
-+        let id = if super::execution::enabled() {
++        let id = if super::execution::enabled() && !catalog.shared_routes.projects(source) {
 +            source.thread_id
 +        } else {
 +            source.projection_thread_id
@@ -17236,7 +17248,7 @@ index 0000000000000000000000000000000000000000..9a9a34d3fc414bbb09d278d15b1b4d69
 +                        let stored = catalog.summary(&source).await?;
 +                        let archived = stored.archived_at.is_some();
 +                        let (mut thread, _) = thread_from_stored_thread(stored, "openai", cwd);
-+                        if !super::execution::enabled() {
++                        if !super::execution::enabled() || catalog.shared_routes.projects(&source) {
 +                            thread.can_accept_direct_input = Some(false);
 +                            thread.path = None;
 +                            thread.extra = Some(source.origin());
@@ -17354,7 +17366,7 @@ index 0000000000000000000000000000000000000000..9a9a34d3fc414bbb09d278d15b1b4d69
 +}
 diff --git a/codex-rs/app-server/src/manager_catalog_metadata.rs b/codex-rs/app-server/src/manager_catalog_metadata.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..f7d4981ab86240ba38d7831ca2b4bbc93b1fd860
+index 0000000000000000000000000000000000000000..04d8db109f89ae15cf18f729d2292a2febd0fe1d
 --- /dev/null
 +++ b/codex-rs/app-server/src/manager_catalog_metadata.rs
 @@ -0,0 +1,97 @@
@@ -17406,7 +17418,7 @@ index 0000000000000000000000000000000000000000..f7d4981ab86240ba38d7831ca2b4bbc9
 +        mut stored: StoredThread,
 +    ) -> StoredThread {
 +        self.project_aliases.apply(source, &mut stored);
-+        if self.is_shared() && super::execution::enabled() {
++        if self.is_shared() && super::execution::enabled() && !self.shared_routes.projects(source) {
 +            return stored;
 +        }
 +        let project = |id| {
@@ -18149,10 +18161,10 @@ index 0000000000000000000000000000000000000000..623cae2dc21a981e66e18d84a09db354
 +}
 diff --git a/codex-rs/app-server/src/manager_catalog_sources.rs b/codex-rs/app-server/src/manager_catalog_sources.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..87410ef1a69060d8b5264506369de9afcdbbc71b
+index 0000000000000000000000000000000000000000..8c153deee69dd09ffe9cdd88b503e35b35f2db4a
 --- /dev/null
 +++ b/codex-rs/app-server/src/manager_catalog_sources.rs
-@@ -0,0 +1,423 @@
+@@ -0,0 +1,424 @@
 +//! Resolve registered managed source homes inside the native remote runtime.
 +//!
 +//! Discovery uses read-only state pages; it never initializes a database, scans
@@ -18290,6 +18302,7 @@ index 0000000000000000000000000000000000000000..87410ef1a69060d8b5264506369de9af
 +        read_only_stores: Mutex::new(Default::default()),
 +        history_projections,
 +        project_aliases: Default::default(),
++        shared_routes: Default::default(),
 +    })
 +}
 +
@@ -18759,10 +18772,10 @@ index 0000000000000000000000000000000000000000..11617751130df8eb2878976c473c2f4d
 +}
 diff --git a/codex-rs/app-server/src/manager_record_catalog.rs b/codex-rs/app-server/src/manager_record_catalog.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..5789c105a9c935c5dfd32b495ab6a94718446d82
+index 0000000000000000000000000000000000000000..3af176b3f4870881741581fa91a4a0736b638355
 --- /dev/null
 +++ b/codex-rs/app-server/src/manager_record_catalog.rs
-@@ -0,0 +1,1274 @@
+@@ -0,0 +1,1282 @@
 +//! Opt-in, read-only native viewer for explicitly mapped canonical records.
 +//!
 +//! This is not a writable federated ThreadStore. No foreign state database is
@@ -18886,6 +18899,9 @@ index 0000000000000000000000000000000000000000..5789c105a9c935c5dfd32b495ab6a947
 +#[path = "manager_shared_execution.rs"]
 +pub(crate) mod execution;
 +
++#[path = "manager_shared_routes.rs"]
++mod shared_routes;
++
 +#[derive(Default, PartialEq)]
 +enum CatalogMode {
 +    #[default]
@@ -18918,6 +18934,8 @@ index 0000000000000000000000000000000000000000..5789c105a9c935c5dfd32b495ab6a947
 +    history_projections: Arc<Mutex<HistoryProjections>>,
 +    #[serde(skip)]
 +    project_aliases: projects::ProjectAliases,
++    #[serde(skip)]
++    shared_routes: shared_routes::SharedRoutes,
 +}
 +
 +#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -19058,7 +19076,7 @@ index 0000000000000000000000000000000000000000..5789c105a9c935c5dfd32b495ab6a947
 +        }
 +        let version: serde_json::Value = serde_json::from_slice(&bytes)
 +            .map_err(|err| invalid_request(format!("invalid record catalog: {err}")))?;
-+        let catalog: Self = if matches!(
++        let mut catalog: Self = if matches!(
 +            version.get("version").and_then(serde_json::Value::as_u64),
 +            Some(2 | 3)
 +        ) {
@@ -19069,6 +19087,9 @@ index 0000000000000000000000000000000000000000..5789c105a9c935c5dfd32b495ab6a947
 +        };
 +        catalog.validate()?;
 +        catalog.validated_homes().await?;
++        catalog.shared_routes =
++            shared_routes::SharedRoutes::load(Arc::clone(&catalog.entries)).await?;
++        catalog.revision.push_str(&catalog.shared_routes.revision());
 +        Ok(catalog)
 +    }
 +
@@ -20278,10 +20299,10 @@ index 0000000000000000000000000000000000000000..7f347eaef5be3948c5b251511d166265
 +}
 diff --git a/codex-rs/app-server/src/manager_record_catalog_listing.rs b/codex-rs/app-server/src/manager_record_catalog_listing.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..cd32bffd3a23b12e0b81ed4a2366e550ad056aab
+index 0000000000000000000000000000000000000000..9a980160d16dee23c94cc7fb9c0a00ae7153de1b
 --- /dev/null
 +++ b/codex-rs/app-server/src/manager_record_catalog_listing.rs
-@@ -0,0 +1,327 @@
+@@ -0,0 +1,330 @@
 +//! Shared native and foreign record listing, with one bounded cursor.
 +
 +use super::*;
@@ -20481,6 +20502,9 @@ index 0000000000000000000000000000000000000000..cd32bffd3a23b12e0b81ed4a2366e550
 +        loop {
 +            while records.len() < RECORD_READ_CONCURRENCY {
 +                let Some(source) = sources.next() else { break };
++                if !self.shared_routes.includes(source) {
++                    continue;
++                }
 +                records.push(async move {
 +                    if let Some(native_home) = native_home
 +                        && self.validated_home(source).await? == native_home
@@ -20541,7 +20565,7 @@ index 0000000000000000000000000000000000000000..cd32bffd3a23b12e0b81ed4a2366e550
 +            if !cwd_matches {
 +                continue;
 +            }
-+            if !super::execution::enabled() {
++            if !super::execution::enabled() || self.shared_routes.projects(source) {
 +                thread.can_accept_direct_input = Some(false);
 +                thread.extra = Some(source.origin());
 +                thread.path = None;
@@ -22410,10 +22434,10 @@ index 0000000000000000000000000000000000000000..a43126d6455418ae6be3cf502f1666f5
 +}
 diff --git a/codex-rs/app-server/src/manager_shared_execution.rs b/codex-rs/app-server/src/manager_shared_execution.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..b30577be8ab05beda54f3205e547785d82273525
+index 0000000000000000000000000000000000000000..4a398039e6cfaf010790d13959c3a02b76fcda41
 --- /dev/null
 +++ b/codex-rs/app-server/src/manager_shared_execution.rs
-@@ -0,0 +1,376 @@
+@@ -0,0 +1,399 @@
 +//! Direct shared editing selected by the manager. Storage routing is independent
 +//! of the active account: only registered record homes are opened here. Auth,
 +//! config, MCP, permissions and model requests remain with the selected profile.
@@ -22453,6 +22477,10 @@ index 0000000000000000000000000000000000000000..b30577be8ab05beda54f3205e547785d
 +    if !enabled() {
 +        return Ok(request);
 +    }
++    let selecting_source = matches!(
++        request,
++        ClientRequest::ThreadResume { .. } | ClientRequest::TurnStart { .. }
++    );
 +    let mut value = serde_json::to_value(&request).map_err(|e| invalid_request(e.to_string()))?;
 +    let Some(params) = value
 +        .get_mut("params")
@@ -22474,8 +22502,20 @@ index 0000000000000000000000000000000000000000..b30577be8ab05beda54f3205e547785d
 +    let Some(catalog) = RecordCatalog::from_environment().await? else {
 +        return Ok(request);
 +    };
++    if selecting_source
++        && let Some(source) = params
++            .get("threadId")
++            .and_then(serde_json::Value::as_str)
++            .and_then(|id| catalog.source(id).ok())
++    {
++        catalog.validated_home(source).await?;
++        catalog.stored(source, /*include_turns*/ false).await?;
++        catalog.shared_routes.select(source).await?;
++    }
 +    let convert = |value: &mut serde_json::Value| {
-+        if let Some(source) = value.as_str().and_then(|id| catalog.source(id).ok()) {
++        if let Some(source) = value.as_str().and_then(|id| catalog.source(id).ok())
++            && (selecting_source || !catalog.shared_routes.projects(source))
++        {
 +            *value = source.thread_id.to_string().into();
 +        }
 +    };
@@ -22543,8 +22583,15 @@ index 0000000000000000000000000000000000000000..b30577be8ab05beda54f3205e547785d
 +        let mut matches = catalog
 +            .entries
 +            .iter()
-+            .filter(|source| source.thread_id == id);
++            .filter(|source| source.thread_id == id && catalog.shared_routes.includes(source));
 +        let Some(source) = matches.next() else {
++            if catalog.shared_routes.has_selection(id) {
++                return Err(ThreadStoreError::Conflict {
++                    message:
++                        "The selected source record is unavailable; no other copy was substituted."
++                            .into(),
++                });
++            }
 +            let store = self.default_store().await?;
 +            routes.insert(id, Arc::clone(&store));
 +            return Ok(store);
@@ -22957,6 +23004,278 @@ index 0000000000000000000000000000000000000000..07d2d62bb72421396a5f057685d7e1aa
 +        std::fs::read(source_home.join("config.toml")).unwrap(),
 +        b"source-config-sentinel"
 +    );
++}
+diff --git a/codex-rs/app-server/src/manager_shared_routes.rs b/codex-rs/app-server/src/manager_shared_routes.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..f4d7e22677f41913822d2430ae43e7a95cef60ee
+--- /dev/null
++++ b/codex-rs/app-server/src/manager_shared_routes.rs
+@@ -0,0 +1,171 @@
++//! Keep an explicitly opened source stable when legacy accounts contain copies
++//! with the same task ID. Selection changes routing only, never source records.
++use super::*;
++use std::collections::BTreeMap;
++use std::io::Read;
++use std::io::Write;
++
++const ROUTES_ENV: &str = "CODEX_MANAGER_SHARED_ROUTES";
++const MAX_BYTES: u64 = 4 * 1024 * 1024;
++
++#[derive(Default)]
++pub(super) struct SharedRoutes {
++    path: Option<PathBuf>,
++    selected: BTreeMap<String, String>,
++    ambiguous: HashSet<ThreadId>,
++}
++
++fn read(path: &Path) -> Result<BTreeMap<String, String>, JSONRPCErrorError> {
++    if !path.exists() {
++        return Ok(BTreeMap::new());
++    }
++    let metadata = std::fs::symlink_metadata(path).map_err(|e| invalid_request(e.to_string()))?;
++    if !metadata.is_file() || metadata.len() > MAX_BYTES {
++        return Err(invalid_request("invalid shared record route file"));
++    }
++    let file = std::fs::File::open(path).map_err(|e| invalid_request(e.to_string()))?;
++    let mut bytes = Vec::new();
++    file.take(MAX_BYTES + 1)
++        .read_to_end(&mut bytes)
++        .map_err(|e| invalid_request(e.to_string()))?;
++    if bytes.len() as u64 > MAX_BYTES {
++        return Err(invalid_request("shared record route size limit"));
++    }
++    let routes: BTreeMap<String, String> = serde_json::from_slice(&bytes)
++        .map_err(|_| invalid_request("invalid shared record routes"))?;
++    if routes.len() > 4096
++        || routes.iter().any(|(id, source)| {
++            ThreadId::from_string(id).is_err()
++                || source.is_empty()
++                || source.len() > 256
++                || source.chars().any(char::is_control)
++        })
++    {
++        return Err(invalid_request("invalid shared record route identity"));
++    }
++    Ok(routes)
++}
++
++impl SharedRoutes {
++    pub(super) async fn load(entries: Arc<Vec<RecordSource>>) -> Result<Self, JSONRPCErrorError> {
++        let path = execution::enabled()
++            .then(|| std::env::var_os(ROUTES_ENV))
++            .flatten()
++            .map(PathBuf::from);
++        Self::load_path(path, entries).await
++    }
++
++    pub(super) async fn load_path(
++        path: Option<PathBuf>,
++        entries: Arc<Vec<RecordSource>>,
++    ) -> Result<Self, JSONRPCErrorError> {
++        let Some(path) = path else {
++            return Ok(Self::default());
++        };
++        if !path.is_absolute() {
++            return Err(invalid_request(
++                "shared record routes require an absolute path",
++            ));
++        }
++        tokio::task::spawn_blocking(move || {
++            let selected = read(&path)?;
++            let mut homes = HashMap::new();
++            let mut ambiguous = HashSet::new();
++            for source in entries.iter() {
++                if homes
++                    .insert(source.thread_id, &source.codex_home)
++                    .is_some_and(|home| home != &source.codex_home)
++                {
++                    ambiguous.insert(source.thread_id);
++                }
++            }
++            Ok(Self {
++                path: Some(path),
++                selected,
++                ambiguous,
++            })
++        })
++        .await
++        .map_err(|e| invalid_request(e.to_string()))?
++    }
++
++    pub(super) fn includes(&self, source: &RecordSource) -> bool {
++        self.selected
++            .get(&source.thread_id.to_string())
++            .is_none_or(|selected| selected == &source.source_store_id)
++    }
++
++    pub(super) fn has_selection(&self, id: ThreadId) -> bool {
++        self.selected.contains_key(&id.to_string())
++    }
++
++    pub(super) fn projects(&self, source: &RecordSource) -> bool {
++        self.path.is_some()
++            && self.ambiguous.contains(&source.thread_id)
++            && !self.selected.contains_key(&source.thread_id.to_string())
++    }
++
++    pub(super) fn revision(&self) -> String {
++        format!(
++            "{:x}",
++            sha2::Sha256::digest(serde_json::to_vec(&self.selected).unwrap_or_default())
++        )
++    }
++
++    pub(super) async fn select(&self, source: &RecordSource) -> Result<(), JSONRPCErrorError> {
++        let Some(path) = self.path.clone() else {
++            return Ok(());
++        };
++        if !self.ambiguous.contains(&source.thread_id) {
++            return Ok(());
++        }
++        let id = source.thread_id.to_string();
++        let source_id = source.source_store_id.clone();
++        tokio::task::spawn_blocking(move || {
++            let parent = path
++                .parent()
++                .ok_or_else(|| invalid_request("shared route directory missing"))?;
++            std::fs::create_dir_all(parent).map_err(|e| invalid_request(e.to_string()))?;
++            let lock_path = path.with_extension("lock");
++            if std::fs::symlink_metadata(&lock_path).is_ok_and(|m| !m.is_file()) {
++                return Err(invalid_request("invalid shared route lock"));
++            }
++            let lock = std::fs::OpenOptions::new()
++                .read(true)
++                .write(true)
++                .create(true)
++                .truncate(false)
++                .open(lock_path)
++                .map_err(|e| invalid_request(e.to_string()))?;
++            lock.lock().map_err(|e| invalid_request(e.to_string()))?;
++            let mut routes = read(&path)?;
++            if routes.contains_key(&id) {
++                return Ok(()); // All profiles and older aliases keep the first explicit selection.
++            }
++            if routes.len() >= 4096 {
++                return Err(invalid_request("shared record route limit"));
++            }
++            routes.insert(id, source_id);
++            let bytes = serde_json::to_vec(&routes).map_err(|e| invalid_request(e.to_string()))?;
++            let mut temporary = tempfile::NamedTempFile::new_in(parent)
++                .map_err(|e| invalid_request(e.to_string()))?;
++            temporary
++                .write_all(&bytes)
++                .map_err(|e| invalid_request(e.to_string()))?;
++            temporary
++                .as_file()
++                .sync_all()
++                .map_err(|e| invalid_request(e.to_string()))?;
++            temporary
++                .persist(&path)
++                .map_err(|e| invalid_request(e.to_string()))?;
++            Ok(())
++        })
++        .await
++        .map_err(|e| invalid_request(e.to_string()))?
++    }
++}
++
++#[cfg(test)]
++#[path = "manager_shared_routes_tests.rs"]
++mod tests;
+diff --git a/codex-rs/app-server/src/manager_shared_routes_tests.rs b/codex-rs/app-server/src/manager_shared_routes_tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..c9020a2386ae3512bc1ce83c5419ea29532f6a80
+--- /dev/null
++++ b/codex-rs/app-server/src/manager_shared_routes_tests.rs
+@@ -0,0 +1,89 @@
++use super::*;
++use pretty_assertions::assert_eq;
++
++fn sources(root: &Path) -> Arc<Vec<RecordSource>> {
++    let id = ThreadId::new();
++    Arc::new(
++        ["first", "second"]
++            .into_iter()
++            .map(|name| RecordSource {
++                projection_thread_id: ThreadId::new(),
++                thread_id: id,
++                host_id: "local".into(),
++                source_store_id: name.into(),
++                codex_home: root.join(name),
++                rollout_path: root.join(name).join("session.jsonl"),
++            })
++            .collect(),
++    )
++}
++
++#[tokio::test]
++async fn explicit_source_selection_survives_reopen_and_other_profile_aliases() {
++    let temp = tempfile::tempdir().unwrap();
++    let entries = sources(temp.path());
++    let path = temp.path().join("routes.json");
++    let routes = SharedRoutes::load_path(Some(path.clone()), Arc::clone(&entries))
++        .await
++        .unwrap();
++    assert!(
++        entries
++            .iter()
++            .all(|source| routes.projects(source) && routes.includes(source))
++    );
++    routes.select(&entries[1]).await.unwrap();
++    let selected = SharedRoutes::load_path(Some(path.clone()), Arc::clone(&entries))
++        .await
++        .unwrap();
++    assert_eq!(
++        entries
++            .iter()
++            .map(|s| (selected.projects(s), selected.includes(s)))
++            .collect::<Vec<_>>(),
++        vec![(false, false), (false, true)]
++    );
++    assert_ne!(selected.revision(), routes.revision());
++    routes.select(&entries[0]).await.unwrap();
++    assert_eq!(read(&path).unwrap(), selected.selected);
++    let missing = SharedRoutes::load_path(Some(path), Arc::new(vec![entries[0].clone()]))
++        .await
++        .unwrap();
++    assert!(missing.has_selection(entries[0].thread_id));
++    assert!(!missing.includes(&entries[0]));
++}
++
++#[tokio::test]
++async fn concurrent_source_choices_publish_one_complete_stable_mapping() {
++    let temp = tempfile::tempdir().unwrap();
++    let entries = sources(temp.path());
++    let path = temp.path().join("routes.json");
++    let a = SharedRoutes::load_path(Some(path.clone()), Arc::clone(&entries))
++        .await
++        .unwrap();
++    let b = SharedRoutes::load_path(Some(path.clone()), Arc::clone(&entries))
++        .await
++        .unwrap();
++    let (first, second) = tokio::join!(a.select(&entries[0]), b.select(&entries[1]));
++    first.unwrap();
++    second.unwrap();
++    let stored = read(&path).unwrap();
++    assert_eq!(stored.len(), 1);
++    assert!(
++        entries
++            .iter()
++            .any(|s| stored.get(&s.thread_id.to_string()) == Some(&s.source_store_id))
++    );
++}
++
++#[tokio::test]
++async fn malformed_route_state_preserves_the_original_file() {
++    let temp = tempfile::tempdir().unwrap();
++    let entries = sources(temp.path());
++    let path = temp.path().join("routes.json");
++    let routes = SharedRoutes::load_path(Some(path.clone()), entries.clone())
++        .await
++        .unwrap();
++    std::fs::write(&path, b"partial-json").unwrap();
++    assert!(routes.select(&entries[0]).await.is_err());
++    assert_eq!(std::fs::read(&path).unwrap(), b"partial-json");
 +}
 diff --git a/codex-rs/app-server/src/message_processor.rs b/codex-rs/app-server/src/message_processor.rs
 index 8e78c929e14b65fa7189d8597ed7a077c805003e..84f692a1181ad8994ac30f581a9464fb648f6816 100644

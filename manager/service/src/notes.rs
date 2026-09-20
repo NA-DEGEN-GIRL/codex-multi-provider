@@ -24,7 +24,7 @@ impl TaskKey {
             thread_id: protocol::uuid(task, "thread_id")?,
         })
     }
-    fn path(&self, root: &Path) -> PathBuf {
+    pub(crate) fn path(&self, root: &Path) -> PathBuf {
         let hash = format!("{:x}", Sha256::digest(serde_json::to_vec(self).unwrap()));
         root.join("work/control-center/notes")
             .join(format!("{hash}.json"))
@@ -38,12 +38,20 @@ pub struct Item {
     pub done: bool,
 }
 #[derive(Clone, Serialize, Deserialize)]
+pub struct Image {
+    pub id: String,
+    pub width: u32,
+    pub height: u32,
+}
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Note {
     pub id: String,
     pub title: String,
     pub kind: String,
     pub body: String,
     pub items: Vec<Item>,
+    #[serde(default)]
+    pub images: Vec<Image>,
     pub revision: u64,
     pub deleted: bool,
     pub updated_at: u64,
@@ -113,7 +121,7 @@ fn read_document(path: &Path, task: &TaskKey) -> Result<Option<Document>, String
     let bytes = std::fs::read(path).map_err(|_| "메모 파일을 읽지 못했습니다.")?;
     let value: Document = serde_json::from_slice(&bytes)
         .map_err(|_| "메모 파일이 손상되었습니다. 원본은 보존되었습니다.")?;
-    if value.version != 1 && value.version != 2 {
+    if ![1, 2, 3].contains(&value.version) {
         return Err("메모 형식을 확인할 수 없습니다. 원본은 보존되었습니다.".into());
     }
     if &value.task != task {
@@ -137,7 +145,7 @@ fn read_group(root: &Path, group_id: &str) -> Result<Group, String> {
     let bytes = std::fs::read(&path).map_err(|_| "메모 그룹을 읽지 못했습니다.")?;
     let value: Group = serde_json::from_slice(&bytes)
         .map_err(|_| "메모 그룹이 손상되었습니다. 원본은 보존되었습니다.")?;
-    if value.version != 1 || value.group_id != group_id {
+    if ![1, 2].contains(&value.version) || value.group_id != group_id {
         return Err("메모 그룹 형식이 다릅니다. 원본은 보존되었습니다.".into());
     }
     Ok(value)
@@ -147,7 +155,15 @@ fn write_group(root: &Path, group: &Group) -> Result<(), String> {
     if !valid_group_id(&group.group_id) {
         return Err("메모 그룹 형식이 다릅니다. 원본은 보존되었습니다.".into());
     }
-    let bytes = serde_json::to_vec_pretty(group).map_err(|_| "메모를 저장하지 못했습니다.")?;
+    let mut value = serde_json::to_value(group).map_err(|_| "메모를 저장하지 못했습니다.")?;
+    // Old services must refuse image documents rather than silently dropping
+    // unknown attachment fields during a later text-only save.
+    value["version"] = json!(if group.notes.iter().any(|n| !n.images.is_empty()) {
+        2
+    } else {
+        1
+    });
+    let bytes = serde_json::to_vec_pretty(&value).map_err(|_| "메모를 저장하지 못했습니다.")?;
     if bytes.len() > 4 * 1024 * 1024 {
         return Err("작업 메모 용량을 초과했습니다.".into());
     }
@@ -156,7 +172,11 @@ fn write_group(root: &Path, group: &Group) -> Result<(), String> {
 }
 
 fn write_document(root: &Path, document: &Document) -> Result<(), String> {
-    let bytes = serde_json::to_vec_pretty(document).map_err(|_| "메모를 저장하지 못했습니다.")?;
+    let mut value = serde_json::to_value(document).map_err(|_| "메모를 저장하지 못했습니다.")?;
+    if document.notes.iter().any(|n| !n.images.is_empty()) {
+        value["version"] = json!(3);
+    }
+    let bytes = serde_json::to_vec_pretty(&value).map_err(|_| "메모를 저장하지 못했습니다.")?;
     if bytes.len() > 4 * 1024 * 1024 {
         return Err("작업 메모 용량을 초과했습니다.".into());
     }
@@ -181,6 +201,7 @@ fn clone_notes(notes: &[Note]) -> Vec<Note> {
                     done: item.done,
                 })
                 .collect(),
+            images: note.images.clone(),
             revision: 0,
             deleted: note.deleted,
             updated_at: note.updated_at,
@@ -216,7 +237,11 @@ fn move_notes_into_group(root: &Path, source: &mut Document) -> Result<String, S
 
 pub fn needs_fork_refresh(root: &Path, args: &Value) -> bool {
     TaskKey::parse(args)
-        .map(|task| task.host_id == "local" && !task.path(root).exists())
+        .and_then(|task| crate::note_aliases::resolve(root, task))
+        .map(|task| {
+            (task.host_id == "local" || crate::note_aliases::is_remote(&task.host_id))
+                && !task.path(root).exists()
+        })
         .unwrap_or(false)
 }
 
@@ -270,7 +295,7 @@ fn load_task(
 }
 
 pub fn execute(root: &Path, command: &str, args: &Value) -> Result<Value, String> {
-    let task = TaskKey::parse(args)?;
+    let task = crate::note_aliases::resolve(root, TaskKey::parse(args)?)?;
     let mut document = load_task(root, task, &mut HashSet::new())?;
 
     if command == "notes.fork" {
@@ -298,7 +323,7 @@ pub fn execute(root: &Path, command: &str, args: &Value) -> Result<Value, String
     if command == "notes.list" {
         return Ok(
             json!({"task": document.task, "notes": resolved_notes(root, &document)?,
-                         "shared": document.group_id.is_some()}),
+                         "shared": document.group_id.is_some(), "image_attachments_version": 1}),
         );
     }
     let id = protocol::uuid(args, "note_id")?;
@@ -315,6 +340,7 @@ pub fn execute(root: &Path, command: &str, args: &Value) -> Result<Value, String
         kind: "text".into(),
         body: String::new(),
         items: vec![],
+        images: vec![],
         revision: 0,
         deleted: false,
         updated_at: 0,
@@ -350,6 +376,12 @@ pub fn execute(root: &Path, command: &str, args: &Value) -> Result<Value, String
                     return Err("????? ??? ??? ???.".into());
                 }
             }
+            if let Some(value) = args.get("images") {
+                let images: Vec<Image> = serde_json::from_value(value.clone())
+                    .map_err(|_| "이미지 첨부 형식을 확인해 주세요.".to_string())?;
+                validate_images(root, &images, &note.images)?;
+                note.images = images;
+            }
         }
         "notes.delete" if index.is_some() => note.deleted = true,
         "notes.restore" if index.is_some() => note.deleted = false,
@@ -367,6 +399,63 @@ pub fn execute(root: &Path, command: &str, args: &Value) -> Result<Value, String
     }
     store_notes(root, &mut document, notes)?;
     Ok(json!({"state": "saved", "note": note}))
+}
+
+fn validate_images(root: &Path, images: &[Image], previous: &[Image]) -> Result<(), String> {
+    use std::io::Read;
+    if images.len() > 24 {
+        return Err("한 메모에는 이미지를 24개까지 첨부할 수 있습니다.".into());
+    }
+    let mut ids = HashSet::new();
+    for image in images {
+        if image.id.len() != 64
+            || !image
+                .id
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || !ids.insert(&image.id)
+            || image.width == 0
+            || image.height == 0
+            || u64::from(image.width) * u64::from(image.height) > 40_000_000
+        {
+            return Err("이미지 첨부 정보가 올바르지 않습니다.".into());
+        }
+        // Immutable content-addressed assets are checked once when attached,
+        // never rehashed for every text keystroke/autosave.
+        if previous
+            .iter()
+            .any(|p| p.id == image.id && p.width == image.width && p.height == image.height)
+        {
+            continue;
+        }
+        let path = root
+            .join("work/control-center/note-images")
+            .join(format!("{}.png", image.id));
+        let file = std::fs::File::open(path)
+            .map_err(|_| "이미지 원본을 찾지 못했습니다. 다시 첨부해 주세요.")?;
+        let size = file
+            .metadata()
+            .map_err(|_| "이미지 파일을 확인하지 못했습니다.")?
+            .len();
+        if size > 16 * 1024 * 1024 || size < 24 {
+            return Err("이미지 한 장은 16MB 이하여야 합니다.".into());
+        }
+        let mut bytes = Vec::new();
+        file.take(16 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| "이미지를 읽지 못했습니다.")?;
+        if bytes.len() > 16 * 1024 * 1024
+            || bytes.len() < 24
+            || &bytes[..8] != b"\x89PNG\r\n\x1a\n"
+            || &bytes[12..16] != b"IHDR"
+            || u32::from_be_bytes(bytes[16..20].try_into().unwrap()) != image.width
+            || u32::from_be_bytes(bytes[20..24].try_into().unwrap()) != image.height
+            || format!("{:x}", Sha256::digest(&bytes)) != image.id
+        {
+            return Err("이미지 원본이 손상되었거나 변경되었습니다. 다시 첨부해 주세요.".into());
+        }
+    }
+    Ok(())
 }
 
 fn resolved_notes(root: &Path, document: &Document) -> Result<Vec<Note>, String> {

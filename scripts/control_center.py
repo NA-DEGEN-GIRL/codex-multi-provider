@@ -274,6 +274,10 @@ class ControlCenter:
     def dispatch(self,command,args):
         if not isinstance(args,dict):raise ValueError('명령 인수가 올바르지 않습니다.')
         if command=='notes.refresh_forks':
+            if args['task'].get('host_id', 'local').startswith(('ssh:', 'remote-ssh-discovered:')):
+                from manager_core.note_aliases import refresh
+                refresh(self.root, args['task'])
+                return dict(refreshed=True)
             from manager_core.note_forks import refresh
             refresh(self.root, self.store.read(), thread_id=args['task']['thread_id'])
             return dict(refreshed=True)

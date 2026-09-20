@@ -8,7 +8,7 @@ using Codex.ControlCenter.Shared;
 
 namespace Codex.ControlCenter.Shell;
 
-internal sealed class TaskNotesPanel : Border
+internal sealed partial class TaskNotesPanel : Border
 {
     private readonly Func<string, object, Task<JsonElement>> request;
     private readonly NoteDrafts recovery;
@@ -85,6 +85,7 @@ internal sealed class TaskNotesPanel : Border
         DockPanel.SetDock(footer, Dock.Bottom); layout.Children.Add(footer);
         var textArea = new Grid(); textArea.Children.Add(editor); textArea.Children.Add(placeholder);
         var document = new StackPanel { Margin = new Thickness(14, 10, 14, 14) }; document.Children.Add(textArea); document.Children.Add(checklist);
+        InitializeImages(root, document);
         noteScroll = new ScrollViewer { Content = document, VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
             HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled, Background = Brushes.Transparent, Visibility = Visibility.Collapsed };
         empty.Children.Add(new TextBlock { Text = "생각과 할 일을 한곳에", TextAlignment = TextAlignment.Center, FontSize = 14, FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 0, 0, 8) });
@@ -123,6 +124,7 @@ internal sealed class TaskNotesPanel : Border
             if (selection != ticket || task is null) return;
             var value = await request("notes.list", new { task = task.Task.Wire });
             if (selection != ticket) return;
+            SetImageCapabilities(value);
             notes.AddRange(value.GetProperty("notes").Deserialize<List<TaskNote>>(NoteDrafts.Json) ?? []);
             shared = value.TryGetProperty("shared", out var sharedFlag) && sharedFlag.ValueKind == JsonValueKind.True;
             foreach (var recovered in recovery.Recover(task.Task))
@@ -163,6 +165,7 @@ internal sealed class TaskNotesPanel : Border
         {
             var value = await request("notes.list", new { task = task.Task.Wire });
             if (ticket != selection || version != contentVersion || Busy()) return;
+            SetImageCapabilities(value);
             var incoming = value.GetProperty("notes").Deserialize<List<TaskNote>>(NoteDrafts.Json) ?? [];
             shared = value.B("shared"); UpdateSharing();
             if (JsonSerializer.Serialize(incoming, NoteDrafts.Json) == JsonSerializer.Serialize(notes, NoteDrafts.Json)) return;
@@ -242,6 +245,7 @@ internal sealed class TaskNotesPanel : Border
             empty.Visibility = editing is null ? Visibility.Visible : Visibility.Collapsed;
             editor.Text = editing?.Note.Body ?? "";
             RenderChecklist();
+            RenderImages();
             noteScroll.ScrollToTop();
             UpdateStatus();
         }
@@ -306,13 +310,17 @@ internal sealed class TaskNotesPanel : Border
                 long version = draft.Changed;
                 var snapshot = JsonSerializer.Deserialize<TaskNote>(JsonSerializer.Serialize(draft.Note, NoteDrafts.Json),NoteDrafts.Json)!;
                 await Task.Run(() => recovery.Write(draft.Task, snapshot, version));
+                if (snapshot.Images.Count > 0 && !imageAttachmentsSupported)
+                    throw new IOException("이미지가 포함된 초안은 새 관리 서비스 적용 후 저장할 수 있습니다.");
                 var result = await request("notes.save", new { task = draft.Task.Wire, note_id = snapshot.Id, revision = snapshot.Revision,
-                    title = snapshot.Title, kind = snapshot.Kind, body = snapshot.Body, items = snapshot.Items.Select(i => new { id = i.Id, text = i.Text, done = i.Done }) });
+                    title = snapshot.Title, kind = snapshot.Kind, body = snapshot.Body, images = snapshot.Images,
+                    items = snapshot.Items.Select(i => new { id = i.Id, text = i.Text, done = i.Done }) });
                 if (result.S("state") == "conflict")
                 {
                     var remote = result.Get("current").Deserialize<TaskNote>(NoteDrafts.Json);
                     if (remote is not null && !remote.Deleted && remote.Title == snapshot.Title && remote.Kind == snapshot.Kind && remote.Body == snapshot.Body &&
-                        JsonSerializer.Serialize(remote.Items, NoteDrafts.Json) == JsonSerializer.Serialize(snapshot.Items, NoteDrafts.Json))
+                        JsonSerializer.Serialize(remote.Items, NoteDrafts.Json) == JsonSerializer.Serialize(snapshot.Items, NoteDrafts.Json) &&
+                        JsonSerializer.Serialize(remote.Images, NoteDrafts.Json) == JsonSerializer.Serialize(snapshot.Images, NoteDrafts.Json))
                     {
                         // The previous response may have been lost after an atomic save.
                         draft.Note.Revision = remote.Revision; draft.Saved = version;
@@ -390,6 +398,7 @@ internal sealed class TaskNotesPanel : Border
     internal async Task FlushAsync()
     {
         autosave.Stop();
+        while (importingImage) await Task.Delay(10);
         foreach (var draft in drafts.Values.Where(d => d.Changed != d.Saved).ToArray())
         {
             while (draft.Saving) await Task.Delay(10);

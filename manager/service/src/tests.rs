@@ -6,6 +6,179 @@ fn note_args() -> Value {
 }
 
 #[test]
+fn remote_note_aliases_share_existing_revisions_and_preserve_independent_documents() {
+    let root = tempdir().unwrap();
+    let mut original = note_args();
+    original["task"]["host_id"] = json!("ssh:fixture");
+    let saved = notes::execute(root.path(), "notes.save", &original).unwrap();
+    let mut canonical = original.clone();
+    canonical["task"]["thread_id"] = json!(uuid::Uuid::new_v4().to_string());
+    let key = format!(
+        "ssh:fixture\0{}",
+        canonical["task"]["thread_id"].as_str().unwrap()
+    );
+    let alias_path = root.path().join("work/control-center/note-aliases.json");
+    std::fs::write(
+        &alias_path,
+        serde_json::to_vec(&json!({&key: original["task"]["thread_id"]})).unwrap(),
+    )
+    .unwrap();
+    assert!(!notes::needs_fork_refresh(root.path(), &canonical));
+    assert_eq!(
+        notes::execute(root.path(), "notes.list", &canonical).unwrap()["notes"][0],
+        saved["note"]
+    );
+    canonical["revision"] = json!(1);
+    canonical["body"] = json!("edited through canonical task");
+    let edited = notes::execute(root.path(), "notes.save", &canonical).unwrap();
+    assert_eq!(
+        notes::execute(root.path(), "notes.list", &original).unwrap()["notes"][0],
+        edited["note"]
+    );
+    assert_eq!(
+        notes::execute(root.path(), "notes.save", &original).unwrap()["state"],
+        "conflict"
+    );
+    // An existing independent canonical document always wins over an old alias.
+    std::fs::write(&alias_path, b"{}").unwrap();
+    canonical["revision"] = json!(0);
+    canonical["body"] = json!("independent canonical note");
+    let independent = notes::execute(root.path(), "notes.save", &canonical).unwrap();
+    std::fs::write(
+        &alias_path,
+        serde_json::to_vec(&json!({key: original["task"]["thread_id"]})).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        notes::execute(root.path(), "notes.list", &canonical).unwrap()["notes"][0],
+        independent["note"]
+    );
+    let mut unresolved = canonical.clone();
+    unresolved["task"]["thread_id"] = json!(uuid::Uuid::new_v4().to_string());
+    let unresolved_key = format!(
+        "ssh:fixture\0{}",
+        unresolved["task"]["thread_id"].as_str().unwrap()
+    );
+    std::fs::write(
+        &alias_path,
+        serde_json::to_vec(&json!({unresolved_key: "../invalid"})).unwrap(),
+    )
+    .unwrap();
+    assert!(notes::execute(root.path(), "notes.list", &unresolved).is_err());
+}
+
+fn note_image(root: &std::path::Path) -> Value {
+    use sha2::{Digest, Sha256};
+    // Known 1x1 PNG; the shell separately tests real WPF decoding/encoding.
+    let hex = "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000b49444154789c636000020000050001a5f645400000000049454e44ae426082";
+    let bytes: Vec<u8> = (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+        .collect();
+    let id = format!("{:x}", Sha256::digest(&bytes));
+    let directory = root.join("work/control-center/note-images");
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(directory.join(format!("{id}.png")), bytes).unwrap();
+    json!({"id":id,"width":1,"height":1})
+}
+
+#[test]
+fn note_images_survive_old_clients_shared_forks_and_independent_removal() {
+    let root = tempdir().unwrap();
+    let image = note_image(root.path());
+    let mut parent = note_args();
+    parent["images"] = json!([image]);
+    notes::execute(root.path(), "notes.save", &parent).unwrap();
+    let disk: Value =
+        serde_json::from_slice(&std::fs::read(note_document_path(root.path(), &parent)).unwrap())
+            .unwrap();
+    assert_eq!(disk["version"], 3); // Old services fail closed instead of erasing images.
+    assert_eq!(
+        note_list(root.path(), &parent)["image_attachments_version"],
+        1
+    );
+    parent.as_object_mut().unwrap().remove("images");
+    parent["revision"] = json!(1);
+    parent["body"] = json!("text-only older client edit");
+    let saved = notes::execute(root.path(), "notes.save", &parent).unwrap();
+    assert_eq!(saved["note"]["images"], json!([image]));
+    let child = note_args();
+    note_fork_map(
+        root.path(),
+        json!({child["task"]["thread_id"].as_str().unwrap():parent["task"]["thread_id"]}),
+    );
+    assert_eq!(
+        note_list(root.path(), &child)["notes"][0]["images"],
+        json!([image])
+    );
+    let group = std::fs::read_dir(root.path().join("work/control-center/note-groups"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let group_data: Value = serde_json::from_slice(&std::fs::read(group).unwrap()).unwrap();
+    assert_eq!(group_data["version"], 2);
+    let split = notes::execute(root.path(), "notes.fork", &child).unwrap();
+    let copied = &split["notes"][0];
+    assert_eq!(copied["images"], json!([image]));
+    let mut change = json!({"task":child["task"],"note_id":copied["id"],"revision":0,
+                           "title":"split","body":"","items":[],"images":[]});
+    notes::execute(root.path(), "notes.save", &change).unwrap();
+    assert_eq!(
+        note_list(root.path(), &parent)["notes"][0]["images"],
+        json!([image])
+    );
+    assert_eq!(
+        note_list(root.path(), &child)["notes"][0]["images"],
+        json!([])
+    );
+    change["revision"] = json!(1);
+    change["images"] = json!([image]);
+    notes::execute(root.path(), "notes.save", &change).unwrap();
+    change["revision"] = json!(2);
+    notes::execute(root.path(), "notes.delete", &change).unwrap();
+    change["revision"] = json!(3);
+    assert_eq!(
+        notes::execute(root.path(), "notes.restore", &change).unwrap()["note"]["images"],
+        json!([image])
+    );
+}
+
+#[test]
+fn invalid_note_images_never_overwrite_the_saved_note() {
+    let root = tempdir().unwrap();
+    let image = note_image(root.path());
+    let mut args = note_args();
+    notes::execute(root.path(), "notes.save", &args).unwrap();
+    args["revision"] = json!(1);
+    let before = note_list(root.path(), &args);
+    for images in [
+        json!([{"id":"../secret","width":1,"height":1}]),
+        json!([{"id":"a".repeat(64),"width":1,"height":1}]),
+        json!([{"id":image["id"],"width":2,"height":1}]),
+        json!([{"id":image["id"],"width":40000001,"height":1}]),
+        json!([image.clone(), image.clone()]),
+        json!(vec![image.clone(); 25]),
+        json!(null),
+    ] {
+        args["images"] = images;
+        assert!(notes::execute(root.path(), "notes.save", &args).is_err());
+        assert_eq!(note_list(root.path(), &args), before);
+    }
+    let path = root
+        .path()
+        .join("work/control-center/note-images")
+        .join(format!("{}.png", image["id"].as_str().unwrap()));
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes.push(1);
+    std::fs::write(path, bytes).unwrap();
+    args["images"] = json!([image]);
+    assert!(notes::execute(root.path(), "notes.save", &args).is_err());
+    assert_eq!(note_list(root.path(), &args), before);
+}
+
+#[test]
 fn retirement_requires_exited_profiles_and_known_idle_management_state() {
     let mut response =
         json!({"ok":true,"result":{"profiles":[{"status":"not_started","process_id":null}]}});

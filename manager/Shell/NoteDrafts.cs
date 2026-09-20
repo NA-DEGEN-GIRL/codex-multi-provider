@@ -18,6 +18,7 @@ internal sealed class TaskNote
     public string Kind { get; set; } = "text";
     public string Body { get; set; } = "";
     public List<ChecklistEntry> Items { get; set; } = [];
+    public List<NoteImage> Images { get; set; } = [];
     public long Revision { get; set; }
     public bool Deleted { get; set; }
     public long UpdatedAt { get; set; }

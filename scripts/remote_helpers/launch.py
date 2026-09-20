@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import mmap
 import os
 from pathlib import Path
 import re
@@ -284,6 +285,29 @@ def acquire_instance_lock(profile, lock, fcntl, runtime):
     raise ValueError("a previous Codex instance still holds this profile")
 
 
+def shared_execution_environment(runtime, profile_id):
+    """Opt a supported worker into editing registered, host-local source records.
+
+    Catalog support alone predates shared editing. Inspect the installed binary,
+    already pinned by the descriptor, so old catalog runtimes stay read-only.
+    Never inherit this authority or a writer identity from the SSH client.
+    """
+    from uuid import UUID
+    if str(UUID(profile_id)) != profile_id:
+        raise ValueError('canonical profile identifier required')
+    with (runtime / 'codex').open('rb') as stream:
+        if os.fstat(stream.fileno()).st_size == 0:
+            return {}
+        with mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ) as binary:
+            if any(binary.find(marker) < 0 for marker in (
+                    b'CODEX_MANAGER_SHARED_EXECUTION', b'CODEX_MANAGER_SHARED_WRITER_ID',
+                    b'CODEX_MANAGER_SHARED_ROUTES')):
+                return {}
+    return {'CODEX_MANAGER_SHARED_EXECUTION': '1',
+            'CODEX_MANAGER_SHARED_WRITER_ID': profile_id,
+            'CODEX_RECORD_SHARED_APPEND': '1'}
+
+
 def run(profile, revision, argv, *, managed_socket=None):
     import fcntl
     import common
@@ -382,6 +406,14 @@ def run(profile, revision, argv, *, managed_socket=None):
                 shared_catalog=shared_catalog, legacy_discovery=mixed_catalog))
             if shared_catalog:
                 env['CODEX_MANAGER_SHARED_CATALOG'] = str(base / ('catalog-mixed-sources.json' if mixed_catalog else 'catalog-sources.json'))
+                env.update(shared_execution_environment(runtime, profile.name))
+                if env.get('CODEX_MANAGER_SHARED_EXECUTION') == '1':
+                    env['CODEX_MANAGER_SHARED_ROUTES'] = str(base / 'shared-record-routes.json')
+                    # Match the desktop shared-record worker: record routing is
+                    # authorized by the source catalog, not the older exclusive
+                    # ownership/handoff manifest. Mixing both modes rejects
+                    # otherwise valid canonical resumes from another profile.
+                    env.pop('CODEX_MANAGER_MANAGED_SOURCES', None)
         protected_sandbox = protected_bwrap_directory(runtime)
         if protected_sandbox is not None:
             env["PATH"] = str(protected_sandbox) + os.pathsep + env.get("PATH", "/usr/bin:/bin")

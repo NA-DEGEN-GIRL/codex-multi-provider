@@ -121,13 +121,80 @@ internal static class NotesSelfTest
             await VerifySplitSaveAsync(root);
             await VerifySplitRestoreAsync(root);
             await VerifyStaleRefreshAsync(root);
-            File.WriteAllText(report, JsonSerializer.Serialize(new { passed = true, checks, root, png, service = "Rust named pipe + real WPF controls; no account or original app access" }));
+            await VerifyImagesAsync(root, client, panel, window, Path.ChangeExtension(report, ".images.png"));
+            File.WriteAllText(report, JsonSerializer.Serialize(new { passed = true, checks, root, png, images_png = Path.ChangeExtension(report, ".images.png"), service = "Rust named pipe + real WPF controls; no account or original app access" }));
         }
         finally
         {
             await client.RequestAsync("supervisor.retire", cancellationToken: deadline.Token);
             window.Close(); await client.DisposeAsync();
         }
+    }
+    private static async Task VerifyImagesAsync(string root, ManagerClient client, TaskNotesPanel panel, Window window, string screenshot)
+    {
+        var task = new SelectedTask(new("local", Guid.NewGuid().ToString()), "작업 화면 기록");
+        var other = new SelectedTask(new("local", Guid.NewGuid().ToString()), "이미지 없는 작업");
+        SeedEmptyNotes(root, task.Task); SeedEmptyNotes(root, other.Task);
+        await panel.SelectTaskAsync(task);
+        Click(Descendants(panel).OfType<Button>().Single(b => b.Name == "AddNote"));
+        NoteBody(panel).Text = "검토할 화면을 작게 모아 두었습니다.\n사진을 클릭하면 크게 보고, 이미지 복사로 채팅에 다시 붙여넣을 수 있습니다.";
+        static BitmapSource Fixture(int width, int height, Color color)
+        {
+            var drawing = new DrawingVisual();
+            using (var dc = drawing.RenderOpen())
+            {
+                dc.DrawRectangle(new SolidColorBrush(Color.FromRgb(29, 35, 49)), null, new Rect(0, 0, width, height));
+                dc.DrawRoundedRectangle(new SolidColorBrush(color), null, new Rect(width * .06, height * .1, width * .88, height * .16), 8, 8);
+                for (int i = 0; i < 3; i++)
+                    dc.DrawRoundedRectangle(new SolidColorBrush(Color.FromRgb(63, 73, 94)), null, new Rect(width * .06 + i * width * .31, height * .35, width * .26, height * .5), 8, 8);
+            }
+            var bitmap = new RenderTargetBitmap(width, height, 96, 96, PixelFormats.Pbgra32); bitmap.Render(drawing); bitmap.Freeze(); return bitmap;
+        }
+        var first = Fixture(1600, 900, Color.FromRgb(151, 168, 251));
+        await panel.AttachImageAsync(first);
+        await panel.AttachImageAsync(Fixture(600, 1200, Color.FromRgb(112, 195, 161)));
+        await panel.AttachImageAsync(first);
+        var value = await client.RequestAsync("notes.list", new { task = task.Task.Wire });
+        var note = value.GetProperty("notes")[0].Deserialize<TaskNote>(NoteDrafts.Json)!;
+        Require(note.Images.Count == 2 && note.Body == NoteBody(panel).Text, "image paste persists text and deduplicates repeated screenshots");
+        var store = new NoteImageStore(root);
+        var thumbnail = store.Load(note.Images[1], 240);
+        Require(thumbnail.PixelHeight <= 240 && thumbnail.PixelWidth <= 240, "portrait thumbnails decode within their bounded preview size");
+        var data = NoteImageStore.CopyData(store.ReadClipboardImage(note.Images[0]));
+        Require(data.GetDataPresent(DataFormats.Bitmap) && data.GetDataPresent("PNG") && data.GetImage() is { PixelWidth: 1600 },
+            "copy payload offers original-resolution PNG and Windows bitmap without changing the user's clipboard");
+        using (var pngData = (Stream)data.GetData("PNG")!)
+        {
+            var decoded = BitmapDecoder.Create(pngData, BitmapCreateOptions.None, BitmapCacheOption.OnLoad);
+            Require(decoded.Frames[0].PixelWidth == 1600 && decoded.Frames[0].PixelHeight == 900, "clipboard PNG reopens at original resolution");
+        }
+        var recovery = new NoteDrafts(root); recovery.Write(task.Task, note, 1);
+        Require(recovery.Recover(task.Task).Single().Images.Select(i => i.Id).SequenceEqual(note.Images.Select(i => i.Id)), "image references survive crash draft recovery");
+        recovery.Remove(task.Task, note.Id);
+        await panel.SelectTaskAsync(other); await panel.SelectTaskAsync(task);
+        await WaitUntilAsync(() => Descendants(panel).OfType<Image>().Count(i => i.Source is not null) == 2);
+        panel.Width = 360; window.UpdateLayout();
+        Require(Descendants(panel).OfType<Button>().Where(b => b.Name == "NoteImageThumbnail").All(b => b.ActualWidth <= 114 && b.ActualHeight <= 108), "large screenshots remain compact tiles in a narrow notes panel");
+        var viewer = panel.CreateImageViewer(window, store.Load(note.Images[0]), note.Images[0], "이미지 검수");
+        var viewerBody = (FrameworkElement)viewer.Content;
+        viewerBody.Measure(new Size(900, 620)); viewerBody.Arrange(new Rect(0, 0, 900, 620));
+        Require(Descendants(viewerBody).OfType<Image>().Single().Source is BitmapSource { PixelWidth: 1600 }, "expanded viewer uses the full-resolution original");
+        var originalSize = Descendants(viewerBody).OfType<CheckBox>().Single(); originalSize.IsChecked = true;
+        originalSize.RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent));
+        Require(Descendants(viewerBody).OfType<Image>().Single().Width == 1600 && Descendants(viewerBody).OfType<ScrollViewer>().Single().HorizontalScrollBarVisibility == ScrollBarVisibility.Auto,
+            "expanded viewer offers scrollable original-size inspection");
+        viewer.Close();
+        var visual = new DrawingVisual();
+        using (var dc = visual.RenderOpen()) dc.DrawRectangle(new VisualBrush(panel), null, new Rect(0, 0, panel.ActualWidth, panel.ActualHeight));
+        var rendered = new RenderTargetBitmap((int)Math.Ceiling(panel.ActualWidth), (int)Math.Ceiling(panel.ActualHeight), 96, 96, PixelFormats.Pbgra32); rendered.Render(visual);
+        using (var file = File.Create(screenshot)) { var encoder = new PngBitmapEncoder(); encoder.Frames.Add(BitmapFrame.Create(rendered)); encoder.Save(file); }
+        var tile = Descendants(panel).OfType<Button>().First(b => b.Name == "NoteImageThumbnail");
+        tile.ContextMenu!.Items.OfType<MenuItem>().Last().RaiseEvent(new RoutedEventArgs(MenuItem.ClickEvent));
+        await panel.FlushAsync();
+        var remaining = (await client.RequestAsync("notes.list", new { task = task.Task.Wire })).GetProperty("notes")[0].Deserialize<TaskNote>(NoteDrafts.Json)!;
+        Require(remaining.Images.Count == 1 && store.Load(note.Images[0]).PixelWidth == 1600,
+            "removing an attachment preserves original bytes for shared notes, split copies and restore");
+        panel.Width = double.NaN;
     }
     private static void SeedEmptyNotes(string root, NoteTask task)
     {

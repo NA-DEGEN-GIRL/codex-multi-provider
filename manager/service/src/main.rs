@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod backend;
+mod note_aliases;
 mod notes;
 mod processes;
 mod protocol;
