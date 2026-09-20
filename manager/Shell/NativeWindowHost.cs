@@ -669,11 +669,21 @@ public sealed class NativeWindowHost : HwndHost
         int insetX = origin.X - bounds.Left, insetY = origin.Y - bounds.Top;
         int outerWidth = width + (bounds.Right - bounds.Left - client.Right);
         int outerHeight = height + (bounds.Bottom - bounds.Top - client.Bottom);
-        a.Lease?.SetBounds(target.Left - insetX, target.Top - insetY, outerWidth, outerHeight, GetDpiForWindow(_container));
         bool moved = a.Left != target.Left || a.Top != target.Top;
         bool matches = origin.X == target.Left && origin.Y == target.Top && client.Right == width && client.Bottom == height;
         bool clipChanged = a.ClipX != insetX || a.ClipY != insetY || a.Width != width || a.Height != height;
         bool dimensionsChanged = a.Width != width || a.Height != height;
+        // WPF splitters, expanders and heading reflow change the viewport without
+        // ENTER/EXITSIZEMOVE. An asynchronous Win32 request is not an applied
+        // resize: keep the source behind the manager until bounds AND region
+        // have been observed at the new allocation, just as after a window drag.
+        // In particular, the old wide source must not cover the notes panel.
+        if (a.Shown && a.Width > 0 && a.Height > 0 && (moved || dimensionsChanged))
+        {
+            BeginViewportSettlement(park: false);
+            _settleWatch.Start();
+        }
+        a.Lease?.SetBounds(target.Left - insetX, target.Top - insetY, outerWidth, outerHeight, GetDpiForWindow(_container));
         bool forceRepair = _forceRepair;
         bool resize = a.ResizePolicy.Request(width, height, frameChanged || moved || clipChanged || forceRepair,
             matches, ResizeClock(), out var report);

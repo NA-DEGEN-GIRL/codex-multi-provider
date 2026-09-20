@@ -18,6 +18,7 @@ public sealed class MainWindow : Window
     private ManagerClient? _client;
     private readonly Func<string, object?, Task<JsonElement>>? _fixtureRequest;
     private readonly TaskNotesPanel _notes;
+    private readonly ManagerUpdatePanel _managerUpdates;
     private TaskContextWatcher? _taskContext;
     private SelectedTask? _selectedTask;
     private readonly ColumnDefinition _notesColumn = new() { Width = new GridLength(340), MinWidth = 280, MaxWidth = 620 };
@@ -282,6 +283,14 @@ public sealed class MainWindow : Window
         version.HorizontalContentAlignment = HorizontalAlignment.Left;
         version.Margin = new Thickness(0, 8, 0, 0);
         footer.Children.Add(version);
+        _managerUpdates = new ManagerUpdatePanel(_root, async cancellation =>
+        {
+            var client = _client;
+            return client?.IsConnected == true
+                ? await client.RequestAsync("supervisor.status", cancellationToken: cancellation)
+                : (JsonElement?)null;
+        }, fixture);
+        footer.Children.Add(_managerUpdates);
         var exit = WorkspaceAppearance.Tool(Action("완전 종료…", ExitWorkspaceAsync,
             "관리 중인 모든 Codex 작업을 끝내고 종료합니다. 제목줄의 X는 작업을 유지한 채 창만 닫습니다."), "ExitWorkspace", quiet: true);
         exit.HorizontalAlignment = HorizontalAlignment.Left;
@@ -427,7 +436,7 @@ public sealed class MainWindow : Window
             }
 
         };
-        Closed += async (_, _) => { _notificationNavigation?.Cancel(); _workspaceActivation?.Dispose(); _responsiveness?.Dispose(); _taskContext?.Dispose(); _notificationActivation?.Dispose(); _timer.Stop(); _activityTimer.Stop(); if (_client is not null) await _client.DisposeAsync(); };
+        Closed += async (_, _) => { _managerUpdates.Dispose(); _notificationNavigation?.Cancel(); _workspaceActivation?.Dispose(); _responsiveness?.Dispose(); _taskContext?.Dispose(); _notificationActivation?.Dispose(); _timer.Stop(); _activityTimer.Stop(); if (_client is not null) await _client.DisposeAsync(); };
     }
 
     private bool ProfileExists(string id) => _state.Arr("profiles").Any(p => p.S("id") == id);
@@ -601,6 +610,7 @@ public sealed class MainWindow : Window
         if (_closing) return;
         _timer.Start();
         if (_client.ServiceUpdateDeferred) Log("새 관리창을 기존 서비스에 연결했습니다. 작업을 유지하며 서비스 업데이트는 완전 종료 후 적용합니다.");
+        _ = _managerUpdates.RefreshAsync();
         SetStatus("창을 닫아도 작업은 계속됩니다. 모두 끝내려면 완전 종료를 누르세요.");
         if (_navigation == navigation && _pendingNotification is null && session is not null)
         {
@@ -616,6 +626,7 @@ public sealed class MainWindow : Window
         await Request("supervisor.reconnect");
         await CheckStartupUpdatesAsync();
         await RefreshAsync(); _timer.Start(); SetStatus("관리 서비스에 다시 연결했습니다. 이전 변경 요청은 다시 실행하지 않았습니다.");
+        _ = _managerUpdates.RefreshAsync();
     }
     private async Task CheckStartupUpdatesAsync()
     {

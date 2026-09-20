@@ -27,6 +27,7 @@ internal static class Program
             await TestFramesAsync();
             TestSupportLog();
             TestWorkspaceSession();
+            TestUpdateCompatibility();
             await TestLogCopyAsync();
             var root = FixtureRoot();
             await TestConcurrentClientsAsync(root);
@@ -47,6 +48,55 @@ internal static class Program
             return 1;
         }
         finally { foreach (var root in roots) await CleanupAsync(root); }
+    }
+
+    private static void TestUpdateCompatibility()
+    {
+        var root = FixtureRoot();
+        var releases = Path.Combine(root, "artifacts", "manager", "releases");
+        var oldShell = Path.Combine(releases, "current", "Codex.ControlCenter.exe");
+        var newShell = Path.Combine(releases, "next", "Codex.ControlCenter.exe");
+        var pointer = Path.Combine(root, "artifacts", "manager", "current.json");
+        var manifest = Path.Combine(Path.GetDirectoryName(newShell)!, "runtime-manifest.json");
+        Directory.CreateDirectory(Path.GetDirectoryName(newShell)!);
+        File.WriteAllBytes(newShell, []); // Data fixture only; never executed.
+        void Select(string path) => File.WriteAllText(pointer, JsonSerializer.Serialize(new { shell = path }));
+        void Metadata(int revision = 75, int protocol = 27, int version = 1) => File.WriteAllText(manifest,
+            JsonSerializer.Serialize(new { version = 1, service_revision = "next-service", shell_compatibility = new { version, revision, service_protocol = protocol } }));
+        var live = JsonSerializer.SerializeToElement(new { version = 27, service_revision = "old-service", preserves_background_profiles = true });
+        ManagerUpdateState Inspect(JsonElement? status = null, bool current = false) =>
+            ManagerUpdateCompatibility.Inspect(root, current ? newShell : oldShell, 74, status ?? live).State;
+        Check(Inspect() == ManagerUpdateState.Unknown, "missing release pointer cannot promise work-preserving update");
+        Select(newShell);
+        Check(Inspect() == ManagerUpdateState.Unknown, "legacy release without metadata cannot be guessed compatible");
+        Metadata();
+        Check(Inspect() == ManagerUpdateState.Ready, "same IPC and work-preserving service allow newer UI with a different service hash");
+        Metadata(protocol: 28);
+        Check(Inspect() == ManagerUpdateState.NeedsStop, "different IPC is announced before closing the current UI");
+        Metadata();
+        Check(Inspect(JsonSerializer.SerializeToElement(new { version = 27, service_revision = "old-service" })) == ManagerUpdateState.NeedsStop,
+            "legacy service requires first-time shutdown");
+        Check(Inspect(JsonSerializer.SerializeToElement(new { version = 27, service_revision = "old-service", preserves_background_profiles = false })) == ManagerUpdateState.NeedsStop,
+            "service explicitly lacking background support cannot promise a safe close");
+        Check(Inspect(JsonSerializer.SerializeToElement(new { version = 27, service_revision = "old-service", preserves_background_profiles = "true" })) == ManagerUpdateState.Unknown,
+            "malformed capability cannot certify compatibility");
+        Check(ManagerUpdateCompatibility.Inspect(root, oldShell, 74, null).State == ManagerUpdateState.Unknown,
+            "lost service connection invalidates the previous green result");
+        Metadata(revision: 74);
+        Check(Inspect(current: true) == ManagerUpdateState.Deferred, "latest UI reports deferred service separately from update availability");
+        Check(Inspect(JsonSerializer.SerializeToElement(new { version = 27, service_revision = "next-service", preserves_background_profiles = true }), current: true) == ManagerUpdateState.Current,
+            "matching installed UI and service report current");
+        Metadata(version: 2);
+        Check(Inspect() == ManagerUpdateState.Unknown, "future compatibility schema fails closed");
+        Metadata(revision: 73);
+        Check(Inspect() == ManagerUpdateState.Unknown, "older release pointer does not advertise an update");
+        File.WriteAllText(manifest, "{");
+        Check(Inspect() == ManagerUpdateState.Unknown, "partial manifest cannot retain a safe-to-update label");
+        Select(Path.Combine(root, "untrusted", "Codex.ControlCenter.exe"));
+        Check(Inspect() == ManagerUpdateState.Unknown, "release outside installed releases is rejected");
+        Select(newShell); Metadata(); File.Delete(newShell);
+        Check(Inspect() == ManagerUpdateState.Unknown, "missing target executable invalidates a previously compatible update");
+        Console.WriteLine("PASS: read-only update compatibility, missing metadata, legacy services and deferred service updates");
     }
 
     private static void TestWorkspaceSession()

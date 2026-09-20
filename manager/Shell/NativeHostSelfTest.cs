@@ -224,6 +224,53 @@ public static class NativeHostSelfTest
             await Settled();
             Require(GetClientRect(host.ContainerHandle, out parentRect), "Cannot refresh settled fixture dimensions.");
             checks.Add("Native size/move hook survives GC; removed clipping and exhausted budgets recover; eight live drag frames retain one parked independent source and unchanged lease before verified settlement.");
+            // Notes and expanders change WPF allocation without a native drag
+            // loop. Exercise them with a real asynchronous, separate HWND.
+            var notesWidth = new System.Windows.Controls.ColumnDefinition { Width = new GridLength(280) };
+            var detailsHeight = new System.Windows.Controls.RowDefinition { Height = new GridLength(50) };
+            surface.ColumnDefinitions.Add(new System.Windows.Controls.ColumnDefinition());
+            surface.ColumnDefinitions.Add(notesWidth);
+            surface.RowDefinitions.Add(detailsHeight);
+            surface.RowDefinitions.Add(new System.Windows.Controls.RowDefinition());
+            System.Windows.Controls.Grid.SetRow(host, 1);
+            var layoutForeground = GetForegroundWindow();
+            for (int step = 0; step < 8; step++)
+            {
+                var settlementVersion = typeof(NativeWindowHost).GetField("_settleVersion", BindingFlags.Instance | BindingFlags.NonPublic)!;
+                int beforeLayout = (int)settlementVersion.GetValue(host)!;
+                window.Width = step % 2 == 0 ? 820 : 1040;
+                notesWidth.Width = new GridLength(step % 3 == 0 ? 360 : 280);
+                detailsHeight.Height = new GridLength(step % 2 == 0 ? 160 : 50);
+                window.UpdateLayout();
+                host.SynchronizeLayout();
+                await window.Dispatcher.InvokeAsync(() => { }, DispatcherPriority.ApplicationIdle);
+                Require((int)settlementVersion.GetValue(host)! > beforeLayout,
+                    $"Notes/expander layout {step} skipped verified placement before exposing native input.");
+                await Settled();
+                var clip = CreateRectRgn(0, 0, 0, 0);
+                try
+                {
+                    var clientOrigin = new NativeWindowInterop.Point();
+                    Require(GetWindowRect(fixtureWindow, out var nativeBounds) &&
+                        ClientToScreen(fixtureWindow, ref clientOrigin) &&
+                        GetClientRect(host.ContainerHandle, out var viewportSize) &&
+                        GetWindowRgn(fixtureWindow, clip) == 2 && GetRgnBox(clip, out var clipped) == 2 &&
+                        nativeBounds.Left + clipped.Left == clientOrigin.X &&
+                        nativeBounds.Top + clipped.Top == clientOrigin.Y &&
+                        clipped.Right - clipped.Left == viewportSize.Right &&
+                        clipped.Bottom - clipped.Top == viewportSize.Bottom,
+                        "Notes/expander resize left an old native region protruding outside the viewport.");
+                }
+                finally { DeleteObject(clip); }
+                Require(GetForegroundWindow() == layoutForeground && host.HasLiveAttachment,
+                    "Layout settlement changed input focus or disconnected the editor.");
+            }
+            surface.ColumnDefinitions.Clear(); surface.RowDefinitions.Clear();
+            System.Windows.Controls.Grid.SetRow(host, 0);
+            window.UpdateLayout(); host.SynchronizeLayout();
+            await Settled();
+            Require(GetClientRect(host.ContainerHandle, out parentRect), "Cannot refresh notes-settled fixture dimensions.");
+            checks.Add("Eight compact notes/expander layout changes verify asynchronous native geometry and exact clipping before showing input, without toggling notes, detaching or taking focus.");
             Require(host.RestoreViewport(), "Cannot start hidden-settlement fixture.");
             host.Visibility = Visibility.Hidden;
             typeof(NativeWindowHost).GetField("_settleStarted", BindingFlags.Instance | BindingFlags.NonPublic)!

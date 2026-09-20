@@ -9,6 +9,24 @@ public partial class App : Application
     protected override async void OnStartup(StartupEventArgs e)
     {
         base.OnStartup(e);
+        if (e.Args.Contains("--write-shell-compatibility"))
+        {
+            // Build-time metadata comes from the actual compiled shell. No
+            // workspace/service connection or UI is created on this path.
+            ShutdownMode = ShutdownMode.OnExplicitShutdown;
+            try
+            {
+                using var output = new FileStream(Path.Combine(AppContext.BaseDirectory, "shell-compatibility.json"), FileMode.CreateNew);
+                System.Text.Json.JsonSerializer.Serialize(output, new
+                {
+                    version = 1, revision = WorkspaceBuild.Revision,
+                    service_protocol = Codex.ControlCenter.Shared.ManagerProtocol.Version
+                });
+                Shutdown(0);
+            }
+            catch { Shutdown(1); }
+            return;
+        }
         if (e.Args.Contains("--personal-skills-self-test"))
         {
             ShutdownMode = ShutdownMode.OnExplicitShutdown;

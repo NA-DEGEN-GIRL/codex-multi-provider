@@ -28,6 +28,10 @@ internal static class WindowControlsSelfTest
         // footer have not materialized their visual children yet.
         Require(LogicalChildren((DependencyObject)window.Content).OfType<Button>().Any(b => b.Name == "ExitWorkspace"),
             "Explicit full shutdown action is missing.");
+        Require(window.Title == "Codex 작업 공간" && WorkspaceBuild.CopyText.Contains(WorkspaceBuild.Label),
+            "The caption must contain only the app name while version copying retains the release label.");
+        Require(LogicalChildren((DependencyObject)window.Content).OfType<ManagerUpdatePanel>().Any(),
+            "Pre-restart update compatibility indicator is missing.");
         checks.Add("Manager owns accessible caption buttons without taking editor keyboard focus.");
         Require(ManagerTitleBar.MaximizedInsets(-12, -12, 3864, 2124, 0, 0, 3840, 2100, 1.5) == new Thickness(8), "Maximized border clipping was not compensated at 144 DPI.");
         Require(ManagerTitleBar.MaximizedInsets(-1920, 0, 1920, 1040, -1920, 0, 0, 1040, 1) == new Thickness(0), "Normal client bounds gained a spurious title offset.");

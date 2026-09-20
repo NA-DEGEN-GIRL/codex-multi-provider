@@ -95,6 +95,11 @@ internal static class LayoutSelfTest
         AssertScrollContentReachable(update, layout);
         settings.IsExpanded = false;
         window.UpdateLayout();
+        var compatibility = Descendants(layout).OfType<ManagerUpdatePanel>().Single();
+        compatibility.Present(new(ManagerUpdateState.Ready, "작업 유지하며 업데이트 가능",
+            "새 관리창이 준비되었습니다. X로 창만 닫고 다시 실행하세요."));
+        window.UpdateLayout();
+        AssertScrollContentReachable(compatibility, layout);
         var png = Path.ChangeExtension(report, ".png");
         var sidebarPng = Path.Combine(Path.GetDirectoryName(report)!, Path.GetFileNameWithoutExtension(report) + "-sidebar.png");
         SaveImage(layout, png);
@@ -120,6 +125,17 @@ internal static class LayoutSelfTest
         AssertProfileCards(layout);
         AssertNotesLayout(layout, notesPanel);
         var logToggle = Descendants(layout).OfType<Button>().Single(button => button.Name == "ToggleWorkspaceLog");
+        foreach (var notice in new[] {
+            new ManagerUpdateNotice(ManagerUpdateState.NeedsStop, "작업 종료 후 적용 필요", "새 버전과 실행 중인 서비스가 호환되지 않습니다. 작업을 마친 뒤 완전 종료하세요."),
+            ManagerUpdateNotice.Unknown("업데이트 정보를 읽지 못했습니다."),
+            new ManagerUpdateNotice(ManagerUpdateState.Deferred, "관리창 최신 · 서비스 적용 대기", "작업은 계속됩니다. 서비스 업데이트는 완전 종료 후 적용됩니다.") })
+        {
+            compatibility.Present(notice); window.UpdateLayout();
+            AssertScrollContentReachable(compatibility, layout);
+            var refresh = Descendants(compatibility).OfType<Button>().Single();
+            AssertScrollContentReachable(refresh, layout);
+            refresh.RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent));
+        }
         logToggle.RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent));
         window.UpdateLayout();
         AssertVisible(Descendants(layout).OfType<TextBox>().Single(box => box.Name == "WorkspaceLogOutput"), layout);
@@ -155,6 +171,7 @@ internal static class LayoutSelfTest
             zero_positive_unknown_credits_checked = true, malformed_credits_unknown = true, external_api_quota_hidden = true,
             long_alias_ellipsis = true, quota_and_reset_values_single_line = true, selection_retained = true,
             notes_open_close_checked = true, compact_notes_and_log_checked = true, wide_notes_resize_checked = true, many_note_tabs_accessible = true,
+            compatibility_states_and_refresh_reachable = true,
             sidebar_drag_checked = true, independent_list_scrolling = true, sidebar_selection_preserved = true,
             sidebar_extremes_and_compact_settings_checked = true, sidebar_ratio_reloaded = true, sidebar_scroll_preserved_on_refresh = true,
             source = "synthetic WPF controls only; no live profile or Codex process", png, sidebar_png = sidebarPng, notes_png = notesPng, notes_detail_png = notesDetailPng, compact_png = narrowPng }, new JsonSerializerOptions { WriteIndented = true }));

@@ -25,14 +25,20 @@ class ReleaseBundleTests(unittest.TestCase):
         (release / 'Codex.ControlCenter.RuntimeProxy.dll').write_bytes(b'bridge')
         (release / 'ssh/ssh.dll').write_bytes(b'ssh bridge')
         (release / 'codex-workspace-service.exe').write_bytes(b'rust service')
+        (release / 'shell-compatibility.json').write_text(json.dumps(
+            dict(version=1, revision=74, service_protocol=27)), encoding='utf-8')
         return release
 
     def test_ui_only_release_and_different_directory_do_not_change_runtime_revision(self):
         first, second = self.release('one'), self.release('two')
         (first / 'Codex.ControlCenter.dll').write_bytes(b'old UI')
         (second / 'Codex.ControlCenter.dll').write_bytes(b'new UI')
+        (second / 'shell-compatibility.json').write_text(json.dumps(
+            dict(version=1, revision=75, service_protocol=27)), encoding='utf-8')
         one, two = stage(self.root, first), stage(self.root, second)
         self.assertEqual(one['runtime_revision'], two['runtime_revision'])
+        self.assertEqual(one['service_revision'], two['service_revision'])
+        self.assertEqual(two['shell_compatibility']['revision'], 75)
         self.assertEqual(runtime_revision(second / 'Codex.ControlCenter.RuntimeProxy.exe'), two['runtime_revision'])
 
     def test_existing_runtime_cannot_load_later_workspace_edits(self):
@@ -58,6 +64,20 @@ class ReleaseBundleTests(unittest.TestCase):
         (release / 'ssh/ssh.dll').unlink()
         with self.assertRaises(RuntimeError): stage(self.root, release)
         self.assertFalse((release / 'runtime-manifest.json').exists())
+
+    def test_missing_or_invalid_compatibility_cannot_publish_a_release(self):
+        for index, info in enumerate((None, {}, [], dict(version=1, revision=True, service_protocol=27),
+                                      dict(version=2, revision=74, service_protocol=27),
+                                      dict(version=1, revision=74, service_protocol='27'))):
+            with self.subTest(info=info):
+                release = self.release(str(index))
+                metadata = release / 'shell-compatibility.json'
+                if info is None:
+                    metadata.unlink()
+                else:
+                    metadata.write_text(json.dumps(info), encoding='utf-8')
+                with self.assertRaises(RuntimeError): stage(self.root, release)
+                self.assertFalse((release / 'runtime-manifest.json').exists())
 
     def test_private_window_adapter_is_frozen_and_part_of_revision(self):
         source = self.root / 'scripts/manager_core/desktop_window_host.cjs'

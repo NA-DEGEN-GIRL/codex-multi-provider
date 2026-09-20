@@ -11,6 +11,14 @@ def stage(root, release):
     target = release / 'scripts'
     if target.exists() or (release / 'runtime-manifest.json').exists():
         raise RuntimeError('A frozen release must never be overwritten.')
+    info_path = release / 'shell-compatibility.json'
+    if not info_path.is_file() or info_path.stat().st_size > 4096:
+        raise RuntimeError('Missing compiled shell compatibility metadata.')
+    info = json.loads(info_path.read_text(encoding='utf-8'))
+    if (not isinstance(info, dict) or type(info.get('version')) is not int or info['version'] != 1
+            or type(info.get('revision')) is not int or info['revision'] <= 0
+            or type(info.get('service_protocol')) is not int or info['service_protocol'] <= 0):
+        raise RuntimeError('Invalid compiled shell compatibility metadata.')
     for source in sorted([*(root / 'scripts').rglob('*.py'), *(root / 'scripts/manager_core').glob('*.cjs')]):
         if '__pycache__' in source.parts or source.is_symlink():
             continue
@@ -33,7 +41,8 @@ def stage(root, release):
             service_hashes[name] = hashlib.sha256((release / name).read_bytes()).hexdigest()
     service_revision = hashlib.sha256(json.dumps(service_hashes, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
     (release / 'python-path.txt').write_text(sys.executable, encoding='utf-8')
-    value = dict(version=1, runtime_revision=revision, service_revision=service_revision, files=hashes)
+    value = dict(version=1, runtime_revision=revision, service_revision=service_revision,
+                 shell_compatibility=info, files=hashes)
     (release / 'runtime-manifest.json').write_text(json.dumps(value, indent=2) + '\n', encoding='utf-8')
     return value
 

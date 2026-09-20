@@ -56,6 +56,10 @@ if (Test-Path -LiteralPath $sshProject) {
     if ($LASTEXITCODE -ne 0) { throw 'Build failed: SSH bootstrap' }
 }
 Copy-Item -LiteralPath (Join-Path $repoRoot 'manager\service\target\release\codex-workspace-service.exe') -Destination $outputPath
+$compatibility = Start-Process -FilePath (Join-Path $outputPath 'Codex.ControlCenter.exe') -ArgumentList '--write-shell-compatibility' -WindowStyle Hidden -PassThru
+if (-not $compatibility.WaitForExit(10000) -or $compatibility.ExitCode -ne 0) {
+    throw 'Reading compiled shell compatibility failed; current release is unchanged.'
+}
 Write-Output "Manager built: $outputPath"
 $bundlePython = (Get-Command python.exe -ErrorAction Stop).Source
 & $bundlePython -X utf8 (Join-Path $repoRoot 'scripts\prepare_manager_desktop.py') $repoRoot
