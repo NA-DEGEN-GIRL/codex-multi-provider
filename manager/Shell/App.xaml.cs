@@ -27,6 +27,14 @@ public partial class App : Application
             catch { Shutdown(1); }
             return;
         }
+        if (e.Args.Contains("--remote-updates-self-test"))
+        {
+            ShutdownMode = ShutdownMode.OnExplicitShutdown;
+            var report = Argument(e.Args, "--report") ?? throw new ArgumentException("--report is required.");
+            try { await RemoteUpdatesSelfTest.RunAsync(report); Shutdown(0); }
+            catch (Exception error) { File.WriteAllText(report, System.Text.Json.JsonSerializer.Serialize(new { passed = false, error = error.ToString() })); Shutdown(1); }
+            return;
+        }
         if (e.Args.Contains("--personal-skills-self-test"))
         {
             ShutdownMode = ShutdownMode.OnExplicitShutdown;

@@ -7,7 +7,7 @@ import sys
 import threading
 import time
 
-from manager_core.store import Store, identifier, label
+from manager_core.store import Store, identifier, label, now
 from manager_core.accounts import Accounts
 from manager_core.catalog import list_catalog, sort_conversations
 from manager_core.catalog_pages import page as catalog_page, legacy_view as catalog_legacy_view
@@ -25,6 +25,7 @@ from manager_core.profile_lifecycle import ProfileLifecycle, account_alias
 from manager_core.profile_restart import ProfileRestarts
 from manager_core.ssh_inventory import SshInventory
 from manager_core.remote_maintenance import RemoteMaintenance
+from manager_core.remote_updates import RemoteUpdates
 
 ROOT=Path(__file__).resolve().parents[1]
 
@@ -54,6 +55,7 @@ class ControlCenter:
         self.startup_updates=StartupUpdates(self.root,self.store,self.instances,self.restarts)
         self.updates=UpdateManager(self.root,**self.update_hooks.callbacks())
         self.update_jobs=UpdateJobs(self.updates)
+        self.remote_updates=RemoteUpdates(self.root,self.store,self.remote,self.update_hooks)
         self.catalog_refresh=self.instances.catalog_refresh
         self.source_catalog_refresh=self.instances.source_catalog_refresh
         self.handoffs=HandoffManager(self.root,self.store,self.instances)
@@ -78,6 +80,10 @@ class ControlCenter:
         profile=self.store.profile(profile_id)
         observed=self.instances.observe(profile)
         ssh_gate=self.store.read().get('ssh_maintenance',{}).get(profile_id,{})
+        if ssh_gate.get('remote_update') and ssh_gate.get('state') != 'released':
+            if observed.get('status')=='running':
+                return dict(profile_id=profile_id,profile={**profile,**observed},state='existing')
+            return self.instances.show(profile_id,reopen_existing=False)
         if ssh_gate.get('state') not in (None,'released') or (
                 observed.get('status')!='running' and self.remote_maintenance.pending_on_open(profile)):
             return self.restarts.open_local(profile_id)
@@ -126,6 +132,26 @@ class ControlCenter:
             if self.instances.observe(profile)['status']!='running':break
             time.sleep(.25)
 
+    def _prepare_remote(self, profile, alias, models, **options):
+        """Enroll preparation so an SSH update's atomic gate can wait for it."""
+        generation = profile.get('generation')
+        with self.store.locked():
+            state = self.store.read()
+            gate = state.get('ssh_maintenance', {}).get(profile['id'], {})
+            if gate.get('state') not in (None, 'released'):
+                from manager_core.updates import UpdateError
+                raise UpdateError('ssh_settings_pending', 'SSH 업데이트가 진행 중입니다. 완료 후 연결 설정을 준비해 주세요.')
+            if generation and not state.get('ssh_inventory', {}).get(profile['id']):
+                # Use this Store's reentrant transaction; the inventory owns a
+                # different Store object and cannot reacquire this file lock.
+                self.store.mutate(lambda data: data.setdefault('ssh_inventory', {}).update({profile['id']:
+                    dict(generation=generation, adapter='tracked-ssh-v1', hosts=[], operations={},
+                         unclassified=False, updated_at=now())}))
+        if generation:
+            with self.ssh_inventory.execution(profile['id'], generation, dict(operation='prepare', alias=alias)):
+                return self.remote.prepare(alias, profile['id'], profile['home'], models, **options)
+        return self.remote.prepare(alias, profile['id'], profile['home'], models, **options)
+
     def _reconcile_remote_hosts(self):
         """Re-apply every remote binding once per start so helper updates land.
 
@@ -141,6 +167,8 @@ class ControlCenter:
         for profile in state.get('profiles', []):
             if profile.get('removed_at') or profile.get('view_only'):
                 continue
+            if state.get('ssh_maintenance', {}).get(profile['id'], {}).get('state') not in (None, 'released'):
+                continue
             models = list(profile['policy']['model_ids']) if profile.get('policy', {}).get('enabled') else []
             options = render_options(profile)
             for binding in profile.get('remote_bindings') or []:
@@ -148,8 +176,7 @@ class ControlCenter:
                 if not alias:
                     continue
                 try:
-                    result = self.remote.prepare(alias, profile['id'], profile['home'], models,
-                                                 reuse_host_runtime=True, **options)
+                    result = self._prepare_remote(profile, alias, models, reuse_host_runtime=True, **options)
                 except (ValueError, RuntimeError, OSError, KeyError):
                     continue
                 if result.get('prepared') is not True or result.get('revision') == binding.get('revision'):
@@ -165,6 +192,7 @@ class ControlCenter:
                     # or profile restart. Never publish that stale snapshot over
                     # the binding a foreground preparation just applied.
                     if (item.get('removed_at') or item.get('view_only')
+                            or data.get('ssh_maintenance', {}).get(profile_id, {}).get('state') not in (None, 'released')
                             or item.get('generation') != generation
                             or sorted(current_models) != sorted(selected)
                             or render_options(item) != expected_options
@@ -203,6 +231,7 @@ class ControlCenter:
             pass
         state['profile_restarts']=self.restarts.status()
         state['startup_updates']=self.startup_updates.status()
+        state['remote_updates']=self.remote_updates.status_all()
         state['profile_warmup']=self.profile_warmup.status()
         state['local_launches']=self.instances.launch_status()
         registry=self.providers.list()
@@ -548,15 +577,29 @@ class ControlCenter:
                             message='백그라운드 업데이트를 지원하는 새 관리 앱 실행 파일이 필요합니다. 관리 앱을 새 빌드로 다시 열어 주세요.')
             return self.update_jobs.schedule()
         if command=='remote.list':return dict(hosts=self.remote.list_hosts())
+        if command.startswith('remote.updates.'):
+            profile_id,alias=args['profile_id'],args['alias']
+            if command=='remote.updates.status':return self.remote_updates.status(profile_id,alias)
+            if command=='remote.updates.check':return self.remote_updates.check(profile_id,alias)
+            if command=='remote.updates.settings':return self.remote_updates.settings(profile_id,alias,
+                auto_check=args.get('auto_check'),auto_apply=args.get('auto_apply'))
+            if command=='remote.updates.schedule':return self.remote_updates.schedule(profile_id,alias)
+            if command=='remote.updates.cancel':return self.remote_updates.cancel(profile_id,alias)
+            if command=='remote.updates.stock_update':return self.remote_updates.update_stock(profile_id,alias,
+                confirmed=args.get('confirmed') is True,observation_id=args.get('observation_id'))
         if command=='remote.inspect':return self.remote.inspect(args['alias'])
         if command=='remote.prepare':
             p=self.store.profile(args['profile_id'])
             from manager_core.model_settings import render_options
-            result=self.remote.prepare(args['alias'],p['id'],p['home'],p['policy']['model_ids'] if p['policy']['enabled'] else [],
+            result=self._prepare_remote(p,args['alias'],p['policy']['model_ids'] if p['policy']['enabled'] else [],
                 **render_options(p))
             if result.get('prepared'):
                 def bind_remote(data):
                     profile=self.store.profile(p['id'],data)
+                    if (profile.get('generation') != p.get('generation')
+                            or profile['policy']['desired_revision'] != p['policy']['desired_revision']
+                            or data.get('ssh_maintenance',{}).get(p['id'],{}).get('state') not in (None,'released')):
+                        return
                     bindings=[b for b in profile.get('remote_bindings',[]) if b.get('alias')!=args['alias']]
                     bindings.append(result);profile['remote_bindings']=bindings
                     self.store.remote_source(data,result,profile['alias'])
@@ -593,6 +636,7 @@ def main():
     protocol=os.environ.get('CODEX_MANAGER_PROTOCOL_VERSION','0')
     center=ControlCenter(args.root,supervisor_protocol=int(protocol) if protocol.isdecimal() else 0)
     if args.serve:
+        center.remote_updates.start()
         center.personal_skills.start()
         center.skill_bridge.start()
         center.shared_plugins.start()
@@ -623,6 +667,7 @@ def main():
             if args.once:break
     finally:
         center.profile_warmup.shutdown()
+        center.remote_updates.shutdown()
         if executor is not None:executor.shutdown(wait=True)
         center.startup_updates.shutdown()
         center.update_jobs.shutdown()

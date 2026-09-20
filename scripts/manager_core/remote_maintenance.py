@@ -3,6 +3,7 @@ from .release_code import script_path
 from copy import deepcopy
 import json
 from pathlib import Path
+import re
 import shlex
 
 from .ssh_shim import ShimError, validate_binding
@@ -172,7 +173,14 @@ class RemoteMaintenance:
                              ('process_start', 'boot_id', 'socket'))
                   or process.get('revision') != actual['revision']):
                 raise ValueError()
-            return {'binding': binding, 'process': process, 'idle': value['idle'], 'exited': value['exited'],
+            metadata = {}
+            if 'runtime_bundle' in value:
+                if (process is None or not isinstance(value['runtime_bundle'], str)
+                        or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', value['runtime_bundle'])
+                        or not re.fullmatch(r'[0-9a-f]{64}', value.get('host_identity', ''))):
+                    raise ValueError()
+                metadata = {key: value[key] for key in ('runtime_bundle', 'host_identity')}
+            return {'binding': binding, 'process': process, 'idle': value['idle'], 'exited': value['exited'], **metadata,
                     **({'active_binding': actual} if actual != binding else {})}
         except (ValueError, KeyError, TypeError, ShimError):
             stage = {'identity': '기존 실행 확인', 'inspect': '작업 상태 확인',

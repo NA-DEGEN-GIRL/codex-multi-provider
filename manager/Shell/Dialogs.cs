@@ -303,24 +303,10 @@ internal static partial class Dialogs
 
     public static Task RemoteAsync(Window owner, string profileId, JsonElement data, Func<string, object?, Task<JsonElement>> request)
     {
-        var window = Create(owner, "SSH 연결 준비", 740, 700); var body = Body(window);
-        body.Children.Add(Note("원본 Codex의 SSH 프로젝트 화면을 사용합니다. 현재 프로필의 로그인으로 연결하며 llm-usage 설치나 계정 등록은 필요하지 않습니다."));
-        var records = data.ValueKind == JsonValueKind.Array ? data.Items() : data.Arr("hosts");
-        var hosts = Choices(body, "SSH 설정에 등록된 연결", records.Select(h => new Choice(h.S("alias", h.S("id")), h.S("alias", h.S("name", h.S("id"))), h)));
-        var output = new TextBox { IsReadOnly = true, TextWrapping = TextWrapping.Wrap, Height = 280, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, Text = "연결을 선택하고 상태 확인을 누르세요." }; body.Children.Add(output);
-        string Alias() => (hosts.SelectedItem as Choice)?.Id ?? throw new InvalidOperationException("SSH 연결이 없습니다. 원본 Codex 설정에서 연결을 추가하세요.");
-        AsyncButton(window, body, "선택한 SSH 상태 확인", async () => { output.Text = "원격 상태를 확인하고 있습니다…"; var result = await request("remote.inspect", new { alias = Alias() }); output.Text = RemoteSummary(result); });
-        AsyncButton(window, body, "이 프로필의 원격 실행 준비", async () => { output.Text = "원격 실행 구성요소를 준비하고 있습니다…"; var result = await request("remote.prepare", new { alias = Alias(), profile_id = profileId }); output.Text = RemoteSummary(result); });
-        body.Children.Add(Note("원격 준비는 이 버튼을 누른 연결에만 수행합니다. 이미 설치된 기본 Codex CLI와 공용 SSH 설정은 보존합니다. GUI 연결·호환 확인이 끝나지 않은 상태는 준비 완료로 표시하지 않습니다."));
-        Button(body, "닫기", window.Close); window.ShowDialog(); return Task.CompletedTask;
-    }
-    private static string RemoteSummary(JsonElement result)
-    {
-        var lines = new List<string> { result.Message("상태 조회를 완료했습니다.") };
-        foreach (var key in new[] { "status", "alias", "os", "platform", "arch", "architecture", "cli_version", "runtime_version", "runtime_path", "profile_home", "remote_profile_home", "remote_launcher", "gui_integration", "reason" }) if (result.S(key) != "") lines.Add($"{key}: {result.S(key)}");
-        if (result.B("authentication_required")) lines.Add("원격 프로필에서 선택한 GPT 계정의 인증이 필요합니다.");
-        foreach (var item in result.Arr("notices").Concat(result.Arr("blockers"))) if (item.ValueKind == JsonValueKind.String) lines.Add(item.GetString()!);
-        return string.Join("\n\n", lines);
+        var window = new RemoteUpdatesWindow(profileId, data, request) { Owner = owner };
+        window.Loaded += async (_, _) => await window.LoadAsync();
+        window.ShowDialog();
+        return Task.CompletedTask;
     }
     internal static string ResultSummary(JsonElement result)
     {

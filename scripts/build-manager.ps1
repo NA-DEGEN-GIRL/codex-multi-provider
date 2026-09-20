@@ -119,6 +119,11 @@ if ($SelfTest) {
     if (-not $skillsTest.WaitForExit(15000)) { throw 'Personal skills self-test timed out. Current release is unchanged.' }
     if ($skillsTest.ExitCode -ne 0) { throw "Personal skills self-test failed. Review $skillsReport" }
     Get-Content -LiteralPath $skillsReport
+    $remoteUpdatesReport = Join-Path $repoRoot 'work\control-center-remote-updates-test.json'
+    $remoteUpdatesTest = Start-Process -FilePath (Join-Path $outputPath 'Codex.ControlCenter.exe') -ArgumentList ('--remote-updates-self-test --report "' + $remoteUpdatesReport + '"') -WindowStyle Hidden -PassThru
+    if (-not $remoteUpdatesTest.WaitForExit(15000)) { throw 'Remote updates self-test timed out. Current release is unchanged.' }
+    if ($remoteUpdatesTest.ExitCode -ne 0) { throw "Remote updates self-test failed. Review $remoteUpdatesReport" }
+    Get-Content -LiteralPath $remoteUpdatesReport
 }
 $temporaryPointer = Join-Path $managerPath ('current.' + [guid]::NewGuid().ToString('N') + '.tmp')
 [System.IO.File]::WriteAllText($temporaryPointer, ($currentBuild | ConvertTo-Json), (New-Object System.Text.UTF8Encoding($false)))

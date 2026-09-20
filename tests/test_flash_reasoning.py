@@ -23,12 +23,17 @@ class FlashPolicyTests(unittest.TestCase):
                 for mode in ('upstream', 'runtime'):
                     home = root / 'profiles' / mode
                     role_path = home / 'agents/deepseek.toml'
-                    role = tomllib.loads(role_path.read_text(encoding='utf-8'))
-                    self.assertEqual(role['model_reasoning_effort'], 'max')
                     catalog = json.loads((home / 'deepseek-models.json').read_text(encoding='utf-8'))['models'][0]
                     self.assertEqual([p['effort'] for p in catalog['supported_reasoning_levels']], ['max'])
-                    self.assertEqual(tomllib.loads((home / 'config.toml').read_text())['model_reasoning_effort'], 'low')
-                    role_path.write_text(role_path.read_text(encoding='utf-8').replace('"max"', '"low"'), encoding='utf-8')
+                    config = tomllib.loads((home / 'config.toml').read_text(encoding='utf-8'))
+                    self.assertEqual(config['model_reasoning_effort'], 'low')
+                    if mode == 'upstream':
+                        self.assertFalse(role_path.exists())
+                        self.assertNotIn('deepseek', config['agents'])
+                    else:
+                        role = tomllib.loads(role_path.read_text(encoding='utf-8'))
+                        self.assertEqual(role['model_reasoning_effort'], 'max')
+                        role_path.write_text(role_path.read_text(encoding='utf-8').replace('"max"', '"low"'), encoding='utf-8')
                 prepare_profiles.prepare()
                 self.assertEqual(tomllib.loads((root / 'profiles/runtime/agents/deepseek.toml').read_text())['model_reasoning_effort'], 'max')
 

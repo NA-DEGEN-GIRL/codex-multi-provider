@@ -208,6 +208,43 @@ class RemoteMaintenanceTests(unittest.TestCase):
                     stdout=json.dumps(dict(ok=True, result={**base, **change})).encode())
                 self.service.snapshot(self.profile, self.coverage)
 
+    def test_version_metadata_belongs_to_observed_running_revision(self):
+        self.service.root = ROOT
+        self.service.remote = MagicMock()
+        process = dict(pid=12, process_start='34', boot_id='fixture', socket='/private.sock', revision='b' * 64)
+        value = dict(revision='b' * 64, requested_revision='a' * 64, process=process,
+                     idle=False, exited=False, runtime_bundle='1.0-abcdef0123456789', host_identity='f' * 64)
+        self.service.remote._run.return_value = types.SimpleNamespace(returncode=0,
+            stdout=json.dumps(dict(ok=True, result=value)).encode())
+        actual = self.service.request(self.binding, 'inspect', discover_active=True)
+        self.assertEqual(actual['runtime_bundle'], value['runtime_bundle'])
+        self.assertEqual(actual['host_identity'], 'f' * 64)
+        self.assertEqual(actual['active_binding']['revision'], 'b' * 64)
+        for changes in (dict(runtime_bundle='../outside'), dict(host_identity='bad'),
+                        dict(process=None, exited=True, revision='a' * 64)):
+            self.service.remote._run.return_value.stdout = json.dumps(dict(ok=True, result={**value, **changes})).encode()
+            with self.subTest(changes=changes), self.assertRaises(UpdateError):
+                self.service.request(self.binding, 'inspect', discover_active=True)
+
+    def test_dispatch_reads_version_from_actual_descriptor_not_prepared_revision(self):
+        native = types.SimpleNamespace(_descriptor=MagicMock(side_effect=lambda p, revision: dict(
+            runtime='/private/runtime/' + ('old-1234567890abcdef' if revision == 'b' * 64 else 'new-1234567890abcdef'),
+            host_identity='f' * 64)))
+        spec = importlib.util.spec_from_file_location('maintenance_version_fixture', ROOT / 'scripts/remote_helpers/maintenance.py')
+        module = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, {'native_controller': native,
+                'ws_client': types.SimpleNamespace(WebSocketPipe=MagicMock()),
+                'fcntl': types.SimpleNamespace(LOCK_EX=2, LOCK_NB=4, flock=MagicMock())}):
+            spec.loader.exec_module(module)
+        directory = self.root / '.local/share/codex-control-center/profiles' / self.profile['id']
+        directory.mkdir(parents=True)
+        binding = dict(self.binding, remote_launcher=str(directory / 'launch.py'))
+        actual = dict(process={'pid': 12, 'revision': 'b' * 64}, idle=False, exited=False, revision='b' * 64)
+        with patch.object(module.Path, 'home', return_value=self.root), patch.object(module, 'inspect', return_value=actual):
+            result = module.dispatch(dict(binding=binding, operation='inspect', discover_active=True))
+        self.assertEqual(result['runtime_bundle'], 'old-1234567890abcdef')
+        self.assertEqual(native._descriptor.call_args.args[1], 'b' * 64)
+
     def test_start_failure_surfaces_only_allowlisted_diagnostic_code(self):
         self.service.root = ROOT
         self.service.remote = MagicMock()

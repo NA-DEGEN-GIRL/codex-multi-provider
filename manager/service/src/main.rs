@@ -267,6 +267,12 @@ fn allowed(command: &str) -> bool {
         "remote.list",
         "remote.inspect",
         "remote.prepare",
+        "remote.updates.status",
+        "remote.updates.check",
+        "remote.updates.settings",
+        "remote.updates.schedule",
+        "remote.updates.cancel",
+        "remote.updates.stock_update",
     ]
     .contains(&command)
 }
@@ -280,7 +286,7 @@ fn can_stop(response: &Value) -> bool {
         && profiles_exited(&state["profiles"])
         && state.get("view_instances").is_none_or(profiles_exited)
         && state.get("local_launches").is_none_or(|launches| launches["active"] == 0)
-        && ["updates", "startup_updates", "profile_warmup"].iter().all(|key| {
+        && ["updates", "startup_updates", "profile_warmup", "remote_updates"].iter().all(|key| {
             state[key]
                 .get("worker_active")
                 .is_none_or(|active| active == false)

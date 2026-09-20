@@ -41,6 +41,8 @@ internal sealed class SupervisorHost(string root, string pipeName)
         "shortcut.add", "shortcut.move", "shortcut.rename", "shortcut.delete", "shortcut.undo", "conversation.open", "conversation.continue", "conversation.navigate", "handoff.preview", "catalog.list", "catalog.show", "catalog.resolve",
         "policy.set", "profile.model_settings", "profile.restart", "profile.recover", "providers.list", "providers.save", "providers.key", "providers.verify", "updates.check", "updates.prepare", "updates.apply",
         "remote.list", "remote.inspect", "remote.prepare",
+        "remote.updates.status", "remote.updates.check", "remote.updates.settings",
+        "remote.updates.schedule", "remote.updates.cancel", "remote.updates.stock_update",
     };
     private readonly object lifecycle = new();
     private readonly CancellationTokenSource shutdown = new();
@@ -218,6 +220,9 @@ internal sealed class SupervisorHost(string root, string pipeName)
             if (value.GetProperty("result").TryGetProperty("startup_updates", out var startup)
                 && startup.TryGetProperty("worker_active", out var startupActive)
                 && startupActive.ValueKind != JsonValueKind.False) return false;
+            if (value.GetProperty("result").TryGetProperty("remote_updates", out var remoteUpdates)
+                && remoteUpdates.TryGetProperty("worker_active", out var remoteUpdatesActive)
+                && remoteUpdatesActive.ValueKind != JsonValueKind.False) return false;
             if (value.GetProperty("result").TryGetProperty("profile_restarts", out var restarts))
             {
                 if (restarts.ValueKind != JsonValueKind.Object) return false;

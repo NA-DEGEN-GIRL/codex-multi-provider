@@ -262,7 +262,7 @@ public sealed class MainWindow : Window
         var settings = new StackPanel();
         settings.Children.Add(Action("공통 개인 스킬", PersonalSkillsAsync));
         settings.Children.Add(Action("하위 에이전트 · API 공급자", ProvidersAsync));
-        settings.Children.Add(Action("SSH 연결 준비", RemoteAsync));
+        settings.Children.Add(Action("SSH 업데이트 · 연결 준비", RemoteAsync));
         settings.Children.Add(Action("전체 프로필 업데이트", ProfileUpdatesAsync));
         settings.Children.Add(_profileUpdateStatus);
         _updateButton = Action("Codex 앱 버전 확인", UpdatesAsync);
@@ -647,7 +647,7 @@ public sealed class MainWindow : Window
     {
         if (_fixtureRequest is not null) return await _fixtureRequest(command, args);
         if (_client is null) throw new InvalidOperationException("관리 서비스 연결을 기다려 주세요.");
-        var tracked = command is not ("state" or "conversation.navigate");
+        var tracked = command is not ("state" or "conversation.navigate" or "remote.updates.status");
         using var timing = _responsiveness?.Time("rpc." + command, tracked ? 0 : 500);
         var actionId = Guid.NewGuid();
         if (tracked) { _pendingActions[actionId] = (CommandLabel(command), DateTime.UtcNow); RenderActivity(); _activityTimer.Start(); }
@@ -681,7 +681,10 @@ public sealed class MainWindow : Window
         "catalog.list" => "대화 목록 읽기", "catalog.show" => "원본 Codex 전체 기록 열기", "conversation.open" => "지정 계정에서 대화 열기", "policy.set" => "모델 조합 적용",
         "providers.verify" => "모델 API 연결 시험", "providers.key" => "API 키 저장", "providers.save" => "모델 연결 등록",
         "updates.check" => "공식 업데이트 확인", "updates.prepare" => "공식 패키지 다운로드·확인", "updates.apply" => "업데이트 준비·실행",
-        "remote.inspect" => "SSH 상태 확인", "remote.prepare" => "SSH 런타임·연결 준비", _ => "관리 요청 처리"
+        "remote.inspect" => "SSH 상태 확인", "remote.prepare" => "SSH 런타임·연결 준비",
+        "remote.updates.status" => "SSH 업데이트 상태", "remote.updates.check" => "SSH 버전 확인",
+        "remote.updates.settings" => "SSH 업데이트 설정", "remote.updates.schedule" => "SSH 업데이트 예약",
+        "remote.updates.cancel" => "SSH 업데이트 예약 취소", "remote.updates.stock_update" => "기본 Codex 수동 업데이트", _ => "관리 요청 처리"
     };
     private void RenderActivity()
     {
@@ -1882,7 +1885,10 @@ public sealed class MainWindow : Window
     }
     private async Task RemoteAsync()
     {
-        var hosts = await Request("remote.list"); await Dialogs.RemoteAsync(this, RequireProfile(), hosts, Request); await RefreshAsync();
+        var profileId = RequireProfile();
+        var hosts = await Request("remote.list");
+        await Dialogs.RemoteAsync(this, profileId, hosts, Request);
+        await RefreshAsync();
     }
     private async Task ProfileUpdatesAsync()
     {

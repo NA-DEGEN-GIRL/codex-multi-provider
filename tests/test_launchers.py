@@ -18,12 +18,12 @@ class ExplorerLauncherTests(unittest.TestCase):
         self.env['PATH'] = str(Path(os.environ['SystemRoot']) / 'System32')
         self.cmd = str(Path(os.environ['SystemRoot']) / 'System32/cmd.exe')
 
-    def run_entry(self, entry, *arguments):
+    def run_entry(self, entry, *arguments, timeout=45):
         # Explorer does not promise the project directory as the starting directory.
         with tempfile.TemporaryDirectory(prefix='codex launcher ') as directory:
             result = subprocess.run([self.cmd, '/d', '/c', str(ROOT / entry), *arguments],
                                     cwd=directory, env=self.env, capture_output=True,
-                                    text=True, encoding='utf-8', errors='replace', timeout=45,
+                                    text=True, encoding='utf-8', errors='replace', timeout=timeout,
                                     creationflags=subprocess.CREATE_NO_WINDOW)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return result
@@ -50,7 +50,9 @@ class ExplorerLauncherTests(unittest.TestCase):
     def test_lab_entry_reaches_live_gui_and_python_child(self):
         evidence = ROOT / 'work/manager-stream-observed.json'
         started = time.time()
-        self.run_entry('Open-Lab.cmd', '-SmokeScenario', 'stream', '-Wait')
+        # Existing report discovery and GUI bootstrap can exceed 45 seconds.
+        # The live-child observation and stream-completion assertions stay strict.
+        self.run_entry('Open-Lab.cmd', '-SmokeScenario', 'stream', '-Wait', timeout=120)
         self.assertGreaterEqual(evidence.stat().st_mtime, started - 1)
         self.assertTrue(json.loads(evidence.read_text())['observed_before_exit'])
         log = (ROOT / 'work/manager-smoke-stream.log').read_text(encoding='utf-8')

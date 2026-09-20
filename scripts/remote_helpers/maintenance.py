@@ -131,7 +131,12 @@ def dispatch(payload):
     if operation == 'identity':
         return identity(profile, revision)
     if operation == 'inspect':
-        return inspect(profile, revision, discover_active=payload.get('discover_active') is True)
+        result = inspect(profile, revision, discover_active=payload.get('discover_active') is True)
+        if result['process'] is not None:
+            actual = native._descriptor(profile, result['revision'])
+            result['runtime_bundle'] = Path(actual['runtime']).name
+            result['host_identity'] = actual['host_identity']
+        return result
     if operation == 'stop':
         observed = payload['expected_process']
         if not isinstance(observed, dict) or observed.get('revision') != revision:
