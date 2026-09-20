@@ -277,8 +277,9 @@ class ProfileRestarts:
                 phase = 'closing'
                 self._write(profile_id, job_id, phase=phase,
                             message='이 프로필의 Codex를 정상 종료하고 있습니다.')
-                closed = (self.hooks.close_instance(snapshot[0], finish_idle_exit=True)
-                          if job.get('automatic_key') else self.hooks.close_instance(snapshot[0]))
+                # Explicit policy changes also need to finish a drained Electron
+                # process when WM_CLOSE only hides its window in the tray.
+                closed = self.hooks.close_instance(snapshot[0], finish_idle_exit=True)
                 if not closed:
                     raise UpdateError('normal_exit_pending', 'Codex의 정상 종료 확인이 필요합니다. 강제 종료하지 않았습니다.')
             phase = 'opening'

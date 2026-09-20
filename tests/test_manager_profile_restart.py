@@ -176,6 +176,7 @@ class RestartTests(unittest.TestCase):
         self.hooks.idle = True
         self.pending.pop()()
         self.assertEqual(self.restarts.status()[self.profile['id']]['phase'], 'complete')
+        self.assertTrue(self.hooks.idle_exit_requested, 'manual policy application must finish a verified drained tray process')
         self.assertEqual([name for name, _ in self.hooks.calls],
                          ['snapshot', 'snapshot', 'acquire', 'close', 'restore', 'release'])
         self.assertTrue(all(self.peer['id'] not in str(value) for _, value in self.hooks.calls))

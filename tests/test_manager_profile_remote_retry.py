@@ -67,6 +67,96 @@ class ProfileRemoteRetryTests(unittest.TestCase):
         self.hooks.guard_launch(self.profile['id'])
         self.hooks.guard_launch(self.peer['id'])
 
+    def leave_drained_close_pending(self):
+        """Reproduce the journal left by the older WM_CLOSE-only policy worker."""
+        self.store.mutate(lambda data: self.store.profile(self.profile['id'], data)['policy'].update(
+            desired_revision=1, launched_revision=0))
+        self.hooks.native_close = lambda profile: self.fixture.closes.append(profile['id'])
+        snapshots = self.hooks.snapshot_instances(profile_ids=[self.profile['id']])
+        transaction_id = str(uuid4())
+        lease = self.hooks.acquire_maintenance(snapshots, transaction_id=transaction_id,
+                                              profile_scope=[self.profile['id']])
+        self.assertFalse(self.hooks.close_instance(snapshots[0]))
+        with self.assertRaises(UpdateError) as caught:
+            self.hooks.release_maintenance(lease)
+        self.assertEqual(caught.exception.code, 'maintenance_release_pending')
+        self.store.mutate(lambda data: data.setdefault('profile_restarts', {}).update({self.profile['id']: dict(
+            id=str(uuid4()), phase='attention', generation=self.profile['generation'],
+            transaction_id=transaction_id, requested_revision=1, code='maintenance_release_pending')}))
+        return transaction_id
+
+    def finish_drained_profile(self, profile, verify):
+        self.assertTrue(verify())
+        self.assertEqual(profile['id'], self.profile['id'])
+        self.assertFalse(self.fixture.admin.parentage)
+        self.assertIsNotNone(self.fixture.admin.owner)
+        self.fixture.instances.close(profile)
+        return {'state': 'stopped'}
+
+    def test_manual_policy_apply_waits_for_work_then_finishes_tray_exit_without_touching_peer(self):
+        self.fixture.instances.show_calls.append(self.peer['id'])
+        self.fixture.instances.start(self.peer['id'])
+        peer = deepcopy(self.fixture.instances.running[self.peer['id']])
+        self.store.mutate(lambda data: self.store.profile(self.profile['id'], data)['policy'].update(
+            desired_revision=1, launched_revision=0))
+        self.hooks.native_close = lambda profile: self.fixture.closes.append(profile['id'])
+        self.hooks.idle_stop = self.finish_drained_profile
+        self.fixture.admin.busy = True
+        job = self.restarts.schedule(self.profile['id'])
+        self.assertFalse(self.restarts.step(self.profile['id'], job['id']))
+        self.assertFalse(self.fixture.closes)
+        self.assertFalse(any(call[0] == 'stop' for call in self.fleet.calls))
+        self.assertIsNone(self.fixture.admin.owner)
+        self.fixture.admin.busy = False
+        self.pending.pop()()
+        self.assert_completed_without_second_close(self.restarts.status()[self.profile['id']])
+        self.assertEqual(self.store.profile(self.profile['id'])['policy']['launched_revision'], 1)
+        self.assertEqual(self.fixture.instances.running[self.peer['id']], peer)
+
+    def test_retry_finishes_previous_drained_close_and_restores_ssh_without_replaying_close(self):
+        transaction_id = self.leave_drained_close_pending()
+        self.hooks.idle_stop = self.finish_drained_profile
+        self.assert_completed_without_second_close(self.apply())
+        self.assertEqual(self.show_count, 1)
+        self.assertEqual(self.store.profile(self.profile['id'])['policy']['launched_revision'], 1)
+        saved = json.loads(self.hooks._lease_path(transaction_id).read_text())
+        self.assertTrue(saved['profiles'][0]['idle_exit_finished'])
+        self.assertEqual(saved['state'], 'released')
+
+    def test_retry_preserves_pending_close_when_active_work_or_new_thread_appears(self):
+        self.leave_drained_close_pending()
+        self.hooks.idle_stop = lambda *_: self.fail('new work must preserve the existing runtime')
+        self.fixture.admin.active_processes = 1
+        self.assertEqual(self.apply()['phase'], 'attention')
+        self.fixture.admin.active_processes = 0
+        self.fixture.admin.parentage[fixtures.ROOT_THREAD] = None
+        self.assertEqual(self.apply()['code'], 'runtime_inventory_changed')
+        self.assertEqual(self.fixture.closes, [self.profile['id']])
+        self.assertEqual(self.show_count, 0)
+        self.assertIn(self.profile['id'], self.fixture.instances.running)
+        self.hooks.guard_launch(self.peer['id'])
+
+    def test_retry_does_not_finish_replaced_runtime_with_same_profile_generation(self):
+        self.leave_drained_close_pending()
+        self.hooks.idle_stop = lambda *_: self.fail('changed process lifetime must preserve the runtime')
+        runtime_pid = self.profile['process_id'] + 2
+        self.fixture.instances.live_pids[runtime_pid]['process_created'] += 1
+        self.assertEqual(self.apply()['code'], 'runtime_identity_changed')
+        self.assertEqual(self.fixture.closes, [self.profile['id']])
+        self.assertEqual(self.show_count, 0)
+        self.hooks.guard_launch(self.peer['id'])
+
+    def test_retry_cannot_finish_another_transactions_pending_close(self):
+        self.leave_drained_close_pending()
+        other_transaction = str(uuid4())
+        self.store.mutate(lambda data: data['profile_maintenance'][self.profile['id']].update(
+            transaction_id=other_transaction))
+        self.hooks.idle_stop = lambda *_: self.fail('another maintenance owner must be preserved')
+        self.assertEqual(self.apply()['phase'], 'attention')
+        self.assertEqual(self.store.read()['profile_maintenance'][self.profile['id']]['transaction_id'], other_transaction)
+        self.assertEqual(self.fixture.closes, [self.profile['id']])
+        self.assertEqual(self.show_count, 0)
+
     def test_button_retry_reuses_both_daemons_after_lost_reply(self):
         self.fleet.lose_start = 'fixture-b'
         first = self.apply()

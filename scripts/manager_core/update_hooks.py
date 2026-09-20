@@ -923,26 +923,51 @@ class UpdateHooks:
                 return True
             self.sleep(.1)
         if finish_idle_exit:
-            # WM_CLOSE may only hide Electron in the tray. Automatic replacement
-            # can finish this already drained process, but never infer idle from
-            # silence or kill a runtime whose lease/readiness cannot be proved.
-            def verify_quiescence():
-                if not _same_process(self._live(self._profile(profile_id)), entry['process']):
-                    raise UpdateError('instance_changed', '자동 적용 중 실행 프로필이 변경되었습니다.')
-                self._lease_status(admin, lease, entry)
-                if self._loaded(admin):
-                    raise UpdateError('runtime_inventory_changed', '새 작업이 있어 자동 종료를 중단했습니다.')
-                return True
-            verify_quiescence()
-            stopped = self.idle_stop(profile, verify_quiescence)
-            if (stopped.get('state') in ('stopped', 'already_stopped')
-                    and not self._endpoint_alive({'pid': current['process_id'], 'created': current['process_created']})
-                    and not any(self._endpoint_alive(v) for v in entry['identities'].values()
-                                if isinstance(v, dict) and 'pid' in v)):
-                entry.update(state='closed', closed_verified=True, idle_exit_finished=True)
-                self._save_lease(lease)
-                return True
+            return self._finish_requested_idle_exit(profile, lease, entry)
         # Ordinary manual update callers retain their existing close semantics.
+        return False
+
+    def _finish_requested_idle_exit(self, profile, lease, entry):
+        """Finish one already requested close only while its saved proof still holds."""
+        if (entry.get('state') != 'native_close_requested' or entry.get('writer_release_verified') is not True
+                or entry.get('profile_id') != profile['id']
+                or any(remote.get('state') != 'closed' for remote in entry.get('remotes', []))):
+            raise UpdateError('writer_release_unverified', '이전 프로필의 작업 저장과 종료 확인이 필요합니다.')
+        admin = self.admin_factory(profile)
+
+        def verify_quiescence():
+            selected = self._profile(profile['id'])
+            gate = self._maintenance_for(profile['id'])
+            if (not gate or gate.get('state') != 'held'
+                    or gate.get('transaction_id') != lease['transaction_id']):
+                raise UpdateError('maintenance_lost', '프로필 작업 잠금의 소유자가 변경되었습니다.')
+            current = self._live(selected)
+            if (selected.get('generation') != entry['generation']
+                    or not _same_process(current, entry['process'])
+                    or not self._observer_ready(selected, current) or not self._host_coverage(selected)):
+                raise UpdateError('instance_changed', '설정 적용 중 실행 프로필이 변경되었습니다.')
+            identities = admin.identities()
+            if (identities.get('generation') != entry['generation'] or any(
+                    {key: identities.get(kind, {}).get(key) for key in ('pid', 'created')}
+                    != entry['identities'].get(kind) for kind in ('proxy', 'runtime'))):
+                raise UpdateError('runtime_identity_changed', '종료를 요청한 런타임의 실행 정보가 변경되었습니다.')
+            self._lease_status(admin, lease, entry)
+            if self._loaded(admin):
+                raise UpdateError('runtime_inventory_changed', '새 작업이 있어 프로필 종료를 중단했습니다.')
+            return True
+
+        # WM_CLOSE can leave Electron resident. Recheck the held gate, empty
+        # runtime and exact process lifetimes again inside the stop operation.
+        verify_quiescence()
+        stopped = self.idle_stop(profile, verify_quiescence)
+        if (stopped.get('state') in ('stopped', 'already_stopped')
+                and not self._endpoint_alive({'pid': entry['process']['process_id'],
+                                             'created': entry['process']['process_created']})
+                and not any(self._endpoint_alive(value) for value in entry['identities'].values()
+                            if isinstance(value, dict) and 'pid' in value)):
+            entry.update(state='closed', closed_verified=True, idle_exit_finished=True)
+            self._save_lease(lease)
+            return True
         return False
 
     def _close_remotes(self, lease, entry, *, lifecycle_guard=None):
@@ -1065,6 +1090,14 @@ class UpdateHooks:
             raise UpdateError('restart_scope_changed', '이전 재시작 기록의 계정 범위가 일치하지 않습니다.')
         entry = entries[0]
         profile = self._profile(profile_id)
+        if (entry.get('state') == 'native_close_requested' and entry.get('process')
+                and self._endpoint_alive({'pid': entry['process']['process_id'],
+                                          'created': entry['process']['process_created']})):
+            # A prior WM_CLOSE can leave the same drained app resident. Reuse its
+            # strict writer-release proof; never replay WM_CLOSE or close tasks.
+            self._begin_global(transaction_id, profile_scope=[profile_id])
+            if not self._finish_requested_idle_exit(profile, lease, entry):
+                raise UpdateError('normal_exit_pending', '이전 프로필의 종료 확인을 기다리고 있습니다.')
         remotes = entry.get('remotes', [])
         resume = (entry.get('closed_verified') is True
                   and profile['policy']['desired_revision'] == revision
