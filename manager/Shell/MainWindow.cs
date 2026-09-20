@@ -158,9 +158,13 @@ public sealed class MainWindow : Window
         sidebarFrame.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         var sidebar = new Grid { Background = new SolidColorBrush(Color.FromRgb(32, 34, 40)), Margin = new Thickness(0, 0, 1, 0) };
         sidebar.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-        sidebar.RowDefinitions.Add(new RowDefinition { Height = new GridLength(3, GridUnitType.Star), MinHeight = 160 });
+        var profileRow = new RowDefinition { MinHeight = 96 };
+        var shortcutRow = new RowDefinition { MinHeight = 112 };
+        sidebar.RowDefinitions.Add(profileRow);
         sidebar.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-        sidebar.RowDefinitions.Add(new RowDefinition { Height = new GridLength(4, GridUnitType.Star), MinHeight = 120 });
+        sidebar.RowDefinitions.Add(shortcutRow);
+        var sidebarSplit = new SidebarSectionSplit(_root, profileRow, shortcutRow, Log);
+        Grid.SetRow(sidebarSplit.Divider, 2); sidebar.Children.Add(sidebarSplit.Divider);
         var heading = new StackPanel { Margin = new Thickness(18, 22, 18, 8) };
         heading.Children.Add(new TextBlock { Text = "Codex 작업 공간", FontSize = 20, FontWeight = FontWeights.SemiBold });
         heading.Children.Add(new TextBlock { Text = "계정과 작업을 한곳에서", Foreground = Muted, FontSize = 11, Margin = new Thickness(0, 5, 0, 20) });
@@ -175,6 +179,9 @@ public sealed class MainWindow : Window
             SidebarIcon(profileMenu, "ProfileActions", "⋯", "선택한 프로필 관리")));
         sidebar.Children.Add(heading);
         _profiles.Margin = new Thickness(8, 0, 8, 8);
+        ScrollViewer.SetVerticalScrollBarVisibility(_profiles, ScrollBarVisibility.Auto);
+        ScrollViewer.SetHorizontalScrollBarVisibility(_profiles, ScrollBarVisibility.Disabled);
+        VirtualizingPanel.SetScrollUnit(_profiles, ScrollUnit.Pixel);
         _profiles.ItemTemplate = ProfileOrdering.Template();
         _profiles.ItemContainerStyle = ProfileCards.ContainerStyle();
         _profileOrdering = new ProfileOrdering(_profiles, move => Safe(() => MoveProfileAsync(move)));
@@ -207,14 +214,20 @@ public sealed class MainWindow : Window
         };
         _profiles.ContextMenu.Closed += (_, _) => _contextProfile = null;
         Grid.SetRow(_profiles, 1); sidebar.Children.Add(_profiles);
-        var tasks = new StackPanel { Margin = new Thickness(18, 16, 18, 5) };
-        tasks.Children.Add(new Border { Height = 1, Background = new SolidColorBrush(Color.FromRgb(48, 53, 63)), Margin = new Thickness(0, 0, 0, 12) });
+        var shortcutSection = new Grid();
+        shortcutSection.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        shortcutSection.RowDefinitions.Add(new RowDefinition());
+        Grid.SetRow(shortcutSection, 3); sidebar.Children.Add(shortcutSection);
+        var tasks = new StackPanel { Margin = new Thickness(18, 5, 18, 5) };
         tasks.Children.Add(SidebarSection("작업 바로가기", null,
             SidebarIcon(Action("＋", AddShortcutAsync), "AddShortcut", "＋", "작업 찾아서 바로가기 추가"),
             SidebarIcon(MenuButton("바로가기 관리", ("지금 열린 작업 추가", CaptureShortcutAsync), ("삭제한 링크 복구", UndoShortcutAsync)), "ShortcutActions", "⋯", "바로가기 관리")));
         tasks.Children.Add(new TextBlock { Text = "모든 프로필에서 함께 사용", Foreground = Muted, FontSize = 11, Margin = new Thickness(0, 2, 0, 5) });
-        Grid.SetRow(tasks, 2); sidebar.Children.Add(tasks);
+        shortcutSection.Children.Add(tasks);
         _shortcuts.Margin = new Thickness(8, 0, 8, 8);
+        ScrollViewer.SetVerticalScrollBarVisibility(_shortcuts, ScrollBarVisibility.Auto);
+        ScrollViewer.SetHorizontalScrollBarVisibility(_shortcuts, ScrollBarVisibility.Disabled);
+        VirtualizingPanel.SetScrollUnit(_shortcuts, ScrollUnit.Pixel);
         _shortcuts.ItemTemplate = ShortcutCards.Create(async (sender, e) =>
         {
             e.Handled = true;
@@ -237,7 +250,7 @@ public sealed class MainWindow : Window
             _shortcuts.ContextMenu.PlacementTarget = _shortcuts; _shortcuts.ContextMenu.Placement = System.Windows.Controls.Primitives.PlacementMode.MousePoint; _shortcuts.ContextMenu.IsOpen = true;
         };
         _shortcuts.ContextMenu.Closed += (_, _) => _contextShortcut = null;
-        Grid.SetRow(_shortcuts, 3); sidebar.Children.Add(_shortcuts);
+        Grid.SetRow(_shortcuts, 1); shortcutSection.Children.Add(_shortcuts);
         var footer = new StackPanel { Margin = new Thickness(18, 8, 18, 12) };
         footer.Children.Add(new Border { Height = 1, Background = new SolidColorBrush(Color.FromRgb(48, 53, 63)), Margin = new Thickness(0, 0, 0, 8) });
         var allRecords = Action("전체 기록", ShowCatalogAsync, "대표 계정으로 전체 작업 기록 보기");
@@ -254,7 +267,7 @@ public sealed class MainWindow : Window
         settings.Children.Add(_updateStatus);
         settings.Children.Add(Action("관리 서비스 다시 연결", ReconnectAsync));
         footer.Children.Add(new Expander { Header = "설정 및 관리", Margin = new Thickness(0, 8, 0, 0),
-            Content = new ScrollViewer { Content = settings, MaxHeight = 330, VerticalScrollBarVisibility = ScrollBarVisibility.Auto } });
+            Content = settings });
         _status.Margin = new Thickness(0, 10, 0, 0); footer.Children.Add(_status);
         var version = Action($"{WorkspaceBuild.Label} · 버전 복사", CopyVersionAsync,
             WorkspaceBuild.CopyText + "\n\n현재 실행 중인 작업공간앱 버전입니다. 클릭하면 버전 정보가 복사됩니다.");
@@ -267,13 +280,14 @@ public sealed class MainWindow : Window
         version.HorizontalContentAlignment = HorizontalAlignment.Left;
         version.Margin = new Thickness(0, 8, 0, 0);
         footer.Children.Add(version);
-        // Keep update/recovery actions reachable at the minimum window height.
-        // The account and task area may scroll; it must not push the footer out
-        // of the visible window when status messages wrap onto additional lines.
-        sidebarFrame.Children.Add(new ScrollViewer { Content = sidebar,
+        // Give the lists a finite viewport so each scrolls independently. Keep
+        // expanded settings reachable without consuming the two list regions.
+        sidebarFrame.Children.Add(sidebar);
+        var footerViewport = new ScrollViewer { Content = footer, MaxHeight = 400,
             VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
-            HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled });
-        Grid.SetRow(footer, 1); sidebarFrame.Children.Add(footer);
+            HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled };
+        sidebarFrame.SizeChanged += (_, e) => footerViewport.MaxHeight = Math.Max(160, e.NewSize.Height * 0.45);
+        Grid.SetRow(footerViewport, 1); sidebarFrame.Children.Add(footerViewport);
         layout.Children.Add(sidebarFrame);
         var right = new Grid { Background = WorkspaceAppearance.Canvas };
         right.ColumnDefinitions.Add(new ColumnDefinition());
@@ -833,7 +847,15 @@ public sealed class MainWindow : Window
     {
         var items = values.ToArray();
         var old = box.Items.OfType<Choice>().ToArray();
-        if (!old.Select(x => (x.Id, x.Label, x.Hint, x.AgentBadge, x.AgentHint, x.Card)).SequenceEqual(items.Select(x => (x.Id, x.Label, x.Hint, x.AgentBadge, x.AgentHint, x.Card))))
+        static object Appearance(Choice x) => (x.Id, x.Label, x.Hint, x.AgentBadge, x.AgentHint, x.Card);
+        if (old.Select(x => x.Id).SequenceEqual(items.Select(x => x.Id)))
+        {
+            // Status/usage refreshes must not reset the virtualized panel's
+            // measured card heights and shift the user's scroll position.
+            for (var index = 0; index < items.Length; index++)
+                if (!Equals(Appearance(old[index]), Appearance(items[index]))) box.Items[index] = items[index];
+        }
+        else
         {
             box.Items.Clear(); foreach (var value in items) box.Items.Add(value);
         }

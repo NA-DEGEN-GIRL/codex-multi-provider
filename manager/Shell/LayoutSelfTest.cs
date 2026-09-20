@@ -16,6 +16,8 @@ internal static class LayoutSelfTest
     internal static async Task RunAsync(string root, string report)
     {
         // Synthetic labels only. This path never connects to the backend or opens Codex.
+        var fixtureRoot = Path.Combine(Path.GetTempPath(), "codex-layout-fixture-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(fixtureRoot);
         using var fixture = JsonDocument.Parse("""
         {
           "profiles":[
@@ -44,9 +46,14 @@ internal static class LayoutSelfTest
                 new() { Text = "공유 메모와 체크 항목 유지" }] },
             new TaskNote { Title = "아이디어" }
         };
-        var window = new MainWindow(root, fixture: true, fixtureRequest: (command, _) => command == "notes.list"
-            ? Task.FromResult(JsonSerializer.SerializeToElement(new { notes = fixtureNotes, shared = true }, NoteDrafts.Json))
-            : throw new InvalidOperationException("Unexpected fixture request: " + command)) { WindowState = WindowState.Normal, Width = 1440, Height = 960,
+        var unexpectedRequests = new List<string>();
+        Task<JsonElement> FixtureRequest(string command, object? args)
+        {
+            if (command == "notes.list") return Task.FromResult(JsonSerializer.SerializeToElement(new { notes = fixtureNotes, shared = true }, NoteDrafts.Json));
+            unexpectedRequests.Add(command);
+            throw new InvalidOperationException("Unexpected fixture request: " + command);
+        }
+        var window = new MainWindow(fixtureRoot, fixture: true, fixtureRequest: FixtureRequest) { WindowState = WindowState.Normal, Width = 1440, Height = 960,
             Left = -28000, Top = -28000, ShowInTaskbar = false, ShowActivated = false };
         window.UseFixture(fixture.RootElement.Clone());
         window.Show();
@@ -57,10 +64,6 @@ internal static class LayoutSelfTest
             && grid.ColumnDefinitions[0].Width == new GridLength(304)).Children.OfType<Grid>().First();
         if (Math.Abs(sidebar.ActualWidth - 304) > 0.5) throw new InvalidOperationException("Sidebar width does not match its 304-DIP layout.");
         var controls = Descendants(layout).ToArray();
-        var badges = controls.OfType<TextBlock>().Where(block => block.Text.StartsWith("하위 에이전트 · ")).ToArray();
-        if (badges.Length != 2 || !badges.Any(b => b.Text == "하위 에이전트 · 혼합") || !badges.Any(b => b.Text == "하위 에이전트 · 외부 전용 · 대기"))
-            throw new InvalidOperationException("Profile policy badges were not rendered by the real list template.");
-        foreach (var badge in badges) AssertVisible(badge, layout);
         AssertActionsReachable(layout);
         AssertProfileCards(layout);
         // Exercise real bindings after a count-only refresh; all these values are
@@ -73,7 +76,7 @@ internal static class LayoutSelfTest
             window.UpdateLayout();
             var unknown = Card(layout, "fixture-01");
             var text = Descendants(unknown).OfType<TextBlock>().Single(block => block.Text == "리딤 확인 안 됨");
-            AssertVisible(text, layout);
+            AssertScrollContentReachable(text, layout);
             if (Descendants(unknown).OfType<TextBlock>().Any(block => block.IsVisible && block.Text == "리딤 0회"))
                 throw new InvalidOperationException("An unknown reset-credit count was displayed as zero.");
         }
@@ -89,7 +92,7 @@ internal static class LayoutSelfTest
         settings.IsExpanded = true;
         window.UpdateLayout();
         var update = Descendants(layout).OfType<Button>().Single(button => Equals(button.Content, "전체 프로필 업데이트"));
-        AssertVisible(update, layout);
+        AssertScrollContentReachable(update, layout);
         settings.IsExpanded = false;
         window.UpdateLayout();
         var png = Path.ChangeExtension(report, ".png");
@@ -143,16 +146,178 @@ internal static class LayoutSelfTest
             throw new InvalidOperationException("Closing notes did not return the space to the workspace.");
         settings.IsExpanded = true;
         window.UpdateLayout();
-        AssertVisible(update, layout);
-        foreach (var badge in Descendants(layout).OfType<TextBlock>().Where(block => block.Text.StartsWith("하위 에이전트 · ")))
-            AssertVisible(badge, layout);
+        AssertScrollContentReachable(update, layout);
+        AssertProfileCards(layout);
+        await AssertSidebarSplitAsync(window, fixtureRoot, fixture.RootElement, FixtureRequest);
+        if (unexpectedRequests.Count != 0) throw new InvalidOperationException("Layout interactions issued backend requests: " + string.Join(", ", unexpectedRequests));
         File.WriteAllText(report, JsonSerializer.Serialize(new { ok = true, width = layout.ActualWidth, height = layout.ActualHeight, sidebar_dip = sidebar.ActualWidth,
             grouped_actions_reachable = true, secondary_panels_collapsed = true, minimum_window_checked = true,
             zero_positive_unknown_credits_checked = true, malformed_credits_unknown = true, external_api_quota_hidden = true,
             long_alias_ellipsis = true, quota_and_reset_values_single_line = true, selection_retained = true,
             notes_open_close_checked = true, compact_notes_and_log_checked = true, wide_notes_resize_checked = true, many_note_tabs_accessible = true,
+            sidebar_drag_checked = true, independent_list_scrolling = true, sidebar_selection_preserved = true,
+            sidebar_extremes_and_compact_settings_checked = true, sidebar_ratio_reloaded = true, sidebar_scroll_preserved_on_refresh = true,
             source = "synthetic WPF controls only; no live profile or Codex process", png, sidebar_png = sidebarPng, notes_png = notesPng, notes_detail_png = notesDetailPng, compact_png = narrowPng }, new JsonSerializerOptions { WriteIndented = true }));
         window.Close();
+    }
+
+    private static async Task AssertSidebarSplitAsync(MainWindow window, string fixtureRoot, JsonElement baseline,
+        Func<string, object?, Task<JsonElement>> fixtureRequest)
+    {
+        var layout = (FrameworkElement)window.Content;
+        var settings = Descendants(layout).OfType<Expander>().Single(expander => Equals(expander.Header, "설정 및 관리"));
+        settings.IsExpanded = false;
+        window.Width = 1440; window.Height = 960;
+        var crowded = JsonNode.Parse(baseline.GetRawText())!;
+        var profileRows = (JsonArray)crowded["profiles"]!;
+        for (int index = 4; index <= 24; index++)
+        {
+            var profile = profileRows[0]!.DeepClone();
+            profile["id"] = $"fixture-{index:00}";
+            profile["alias"] = $"{index:00} · 스크롤 검증 계정";
+            profileRows.Add(profile);
+        }
+        var shortcutRows = (JsonArray)crowded["shortcuts"]!;
+        for (int index = 4; index <= 36; index++)
+            shortcutRows.Add(new JsonObject { ["id"] = $"task-{index:00}", ["alias"] = $"검토 작업 {index}", ["profile_id"] = "fixture-01", ["host_id"] = "local" });
+        var state = JsonSerializer.SerializeToElement(crowded);
+        window.UseFixture(state);
+        await Settle(window);
+        var profiles = List(layout, "fixture-01");
+        var shortcuts = List(layout, "task-01");
+        shortcuts.SelectedIndex = 1;
+        var selectedProfile = ((Choice)profiles.SelectedItem).Id;
+        var selectedShortcut = ((Choice)shortcuts.SelectedItem).Id;
+        int profileSelectionChanges = 0, shortcutSelectionChanges = 0;
+        profiles.SelectionChanged += (_, _) => profileSelectionChanges++;
+        shortcuts.SelectionChanged += (_, _) => shortcutSelectionChanges++;
+        var splitter = Splitter(layout);
+        if (splitter.ResizeDirection != GridResizeDirection.Rows || splitter.ResizeBehavior != GridResizeBehavior.PreviousAndNext)
+            throw new InvalidOperationException("Sidebar divider does not resize the adjacent sections vertically.");
+        AssertVisible(splitter, layout);
+        var profileHeight = profiles.ActualHeight;
+        var shortcutHeight = shortcuts.ActualHeight;
+        await Drag(-100);
+        if (profiles.ActualHeight >= profileHeight - 50 || shortcuts.ActualHeight <= shortcutHeight + 50)
+            throw new InvalidOperationException("Raising the real divider did not allocate more height to task shortcuts.");
+        var savedRatio = Ratio(splitter);
+        var profileScroll = Descendants(profiles).OfType<ScrollViewer>().Single();
+        var shortcutScroll = Descendants(shortcuts).OfType<ScrollViewer>().Single();
+        if (profileScroll.ScrollableHeight <= 0 || shortcutScroll.ScrollableHeight <= 0)
+            throw new InvalidOperationException("Crowded profile and shortcut lists do not have independent scroll ranges.");
+        var shortcutOffset = shortcutScroll.VerticalOffset;
+        profileScroll.ScrollToBottom();
+        await Settle(window);
+        if (profileScroll.VerticalOffset <= 0 || Math.Abs(shortcutScroll.VerticalOffset - shortcutOffset) > .01)
+            throw new InvalidOperationException("Scrolling profiles changed the shortcut viewport or did not reach later accounts.");
+        var profileOffset = profileScroll.VerticalOffset;
+        shortcutScroll.ScrollToBottom();
+        await Settle(window);
+        if (shortcutScroll.VerticalOffset <= 0 || Math.Abs(profileScroll.VerticalOffset - profileOffset) > .01)
+            throw new InvalidOperationException("Scrolling shortcuts changed the profile viewport or did not reach later tasks.");
+        if (profileSelectionChanges != 0 || shortcutSelectionChanges != 0 ||
+            ((Choice)profiles.SelectedItem).Id != selectedProfile || ((Choice)shortcuts.SelectedItem).Id != selectedShortcut)
+            throw new InvalidOperationException("Divider dragging or list scrolling changed the selected profile or task.");
+
+        // Test an unpinned viewport: bottom anchoring could conceal a jump.
+        profileScroll.ScrollToVerticalOffset(profileScroll.ScrollableHeight * .6);
+        shortcutScroll.ScrollToVerticalOffset(shortcutScroll.ScrollableHeight * .6);
+        await Settle(window);
+        var profileOffsetBeforeRefresh = profileScroll.VerticalOffset;
+        var shortcutOffsetBeforeRefresh = shortcutScroll.VerticalOffset;
+        var profileAnchorBeforeRefresh = VisibleAnchor(profiles);
+        var shortcutAnchorBeforeRefresh = VisibleAnchor(shortcuts);
+        var refreshed = JsonNode.Parse(state.GetRawText())!;
+        refreshed["profiles"]![0]!["usage"]!["windows"]![1]!["remaining_percent"] = 45;
+        const string refreshedAlias = "이름이 갱신된 작업 바로가기";
+        refreshed["shortcuts"]![0]!["alias"] = refreshedAlias;
+        window.UseFixture(JsonSerializer.SerializeToElement(refreshed));
+        await Settle(window);
+        if (!profiles.Items.OfType<Choice>().Single(choice => choice.Id == "fixture-01").Label.Contains("45%") ||
+            !shortcuts.Items.OfType<Choice>().Single(choice => choice.Id == "task-01").Label.StartsWith(refreshedAlias, StringComparison.Ordinal))
+            throw new InvalidOperationException("The scroll-retention fixture did not update actual profile and shortcut card text.");
+        var profileAnchorAfterRefresh = VisibleAnchor(profiles);
+        var shortcutAnchorAfterRefresh = VisibleAnchor(shortcuts);
+        if (profileAnchorBeforeRefresh.Id != profileAnchorAfterRefresh.Id || Math.Abs(profileAnchorBeforeRefresh.Y - profileAnchorAfterRefresh.Y) > 1 ||
+            shortcutAnchorBeforeRefresh.Id != shortcutAnchorAfterRefresh.Id || Math.Abs(shortcutAnchorBeforeRefresh.Y - shortcutAnchorAfterRefresh.Y) > 1)
+            throw new InvalidOperationException($"Periodic card refresh moved visible content: profiles {profileAnchorBeforeRefresh} -> {profileAnchorAfterRefresh}, shortcuts {shortcutAnchorBeforeRefresh} -> {shortcutAnchorAfterRefresh}; offsets {profileOffsetBeforeRefresh:F1} -> {profileScroll.VerticalOffset:F1}, {shortcutOffsetBeforeRefresh:F1} -> {shortcutScroll.VerticalOffset:F1}.");
+        if (((Choice)profiles.SelectedItem).Id != selectedProfile || ((Choice)shortcuts.SelectedItem).Id != selectedShortcut)
+            throw new InvalidOperationException("Periodic card refresh changed the selected profile or task.");
+        // Render may replace item collections internally; subsequent gesture
+        // checks count only changes made after that refresh has settled.
+        profileSelectionChanges = shortcutSelectionChanges = 0;
+
+        // A separate constructor must read the drag result from disk, with no
+        // production workspace preferences or service involved.
+        var reopened = new MainWindow(fixtureRoot, fixture: true, fixtureRequest: fixtureRequest)
+        { WindowState = WindowState.Normal, Width = 1440, Height = 960, Left = -28000, Top = -28000, ShowInTaskbar = false, ShowActivated = false };
+        try
+        {
+            reopened.UseFixture(state);
+            reopened.Show();
+            await Settle(reopened);
+            var restoredRatio = Ratio(Splitter((FrameworkElement)reopened.Content));
+            if (Math.Abs(restoredRatio - savedRatio) > .01)
+                throw new InvalidOperationException($"The next window did not restore the saved sidebar ratio ({savedRatio:F3} -> {restoredRatio:F3}).");
+        }
+        finally { reopened.Close(); }
+
+        // Oversized drags must keep both sections and the footer usable even
+        // when settings take space at the minimum supported window size.
+        window.Width = 1024; window.Height = 840;
+        settings.IsExpanded = true;
+        await Settle(window);
+        foreach (var direction in new[] { -10000d, 10000d })
+        {
+            await Drag(direction);
+            if (profiles.ActualHeight < 40 || shortcuts.ActualHeight < 16)
+                throw new InvalidOperationException("A divider drag collapsed one of the list viewports.");
+            AssertActionsReachable(layout);
+            AssertVisible(splitter, layout);
+            foreach (var label in new[] { "전체 프로필 업데이트", "관리 서비스 다시 연결" })
+                AssertScrollContentReachable(Descendants(layout).OfType<Button>().Single(button => Equals(button.Content, label)), layout);
+            AssertScrollContentReachable(Descendants(layout).OfType<Button>().Single(button => button.Name == "WorkspaceVersion"), layout);
+        }
+        if (profileSelectionChanges != 0 || shortcutSelectionChanges != 0)
+            throw new InvalidOperationException("Compact resize or extreme dragging changed list selection.");
+
+        async Task Drag(double vertical)
+        {
+            splitter.RaiseEvent(new DragStartedEventArgs(0, 0) { RoutedEvent = Thumb.DragStartedEvent });
+            splitter.RaiseEvent(new DragDeltaEventArgs(0, vertical) { RoutedEvent = Thumb.DragDeltaEvent });
+            window.UpdateLayout();
+            splitter.RaiseEvent(new DragCompletedEventArgs(0, vertical, false) { RoutedEvent = Thumb.DragCompletedEvent });
+            await Settle(window);
+        }
+        static ListBox List(FrameworkElement parent, string id) => Descendants(parent).OfType<ListBox>()
+            .Single(list => list.Items.OfType<Choice>().Any(choice => choice.Id == id));
+        static GridSplitter Splitter(FrameworkElement parent) => Descendants(parent).OfType<GridSplitter>()
+            .Single(control => control.Name == "SidebarSectionSplitter");
+        static (string Id, double Y) VisibleAnchor(ListBox list)
+        {
+            var viewport = Descendants(list).OfType<ScrollContentPresenter>().Single();
+            var visible = Descendants(list).OfType<ListBoxItem>()
+                .Where(item => item.IsVisible && item.DataContext is Choice)
+                .Select(item => (Id: ((Choice)item.DataContext).Id,
+                    Bounds: item.TransformToAncestor(viewport).TransformBounds(new Rect(item.RenderSize))))
+                .Where(item => item.Bounds.Bottom > .5 && item.Bounds.Top < viewport.ActualHeight - .5)
+                .OrderBy(item => item.Bounds.Top).ToArray();
+            if (visible.Length == 0) throw new InvalidOperationException("A scrolled list has no visible card anchor.");
+            return (visible[0].Id, visible[0].Bounds.Top);
+        }
+        static double Ratio(GridSplitter divider)
+        {
+            var grid = (Grid)divider.Parent;
+            var row = Grid.GetRow(divider);
+            var top = grid.RowDefinitions[row - 1].ActualHeight;
+            var bottom = grid.RowDefinitions[row + 1].ActualHeight;
+            return top / (top + bottom);
+        }
+        static async Task Settle(Window target)
+        {
+            await target.Dispatcher.InvokeAsync(() => { }, DispatcherPriority.ApplicationIdle);
+            target.UpdateLayout();
+        }
     }
 
     private static void AssertActionsReachable(FrameworkElement layout)
@@ -195,6 +360,8 @@ internal static class LayoutSelfTest
     {
         var list = Descendants(layout).OfType<ListBox>().Single(box => box.Items.OfType<Choice>().Any(choice => choice.Id == id));
         var choice = list.Items.OfType<Choice>().Single(item => item.Id == id);
+        list.ScrollIntoView(choice);
+        list.UpdateLayout();
         return list.ItemContainerGenerator.ContainerFromItem(choice) as ListBoxItem
             ?? throw new InvalidOperationException("Profile card was not realized: " + id);
     }
@@ -206,7 +373,7 @@ internal static class LayoutSelfTest
             var card = Card(layout, id);
             var blocks = Descendants(card).OfType<TextBlock>().ToArray();
             foreach (var expected in new[] { "주간 남음", percent, redeem })
-                AssertVisible(blocks.Single(block => block.Text == expected), layout);
+                AssertScrollContentReachable(blocks.Single(block => block.Text == expected), layout);
             var meter = Descendants(card).OfType<ProgressBar>().Single();
             if (!meter.IsVisible || meter.ActualWidth <= 0 || meter.Value != (id == "fixture-01" ? 46 : 81))
                 throw new InvalidOperationException("The quota meter does not represent the displayed weekly percentage.");
@@ -215,7 +382,7 @@ internal static class LayoutSelfTest
             {
                 if (block.TextWrapping != TextWrapping.NoWrap)
                     throw new InvalidOperationException("A quota or reset value can wrap within its text: " + block.Text);
-                AssertVisible(block, layout);
+                AssertScrollContentReachable(block, layout);
             }
         }
         var selected = Card(layout, "fixture-01");
@@ -224,7 +391,8 @@ internal static class LayoutSelfTest
         if (name.TextTrimming != TextTrimming.CharacterEllipsis || name.TextWrapping != TextWrapping.NoWrap || name.ActualWidth <= 0
             || name.ToolTip?.ToString() != name.Text)
             throw new InvalidOperationException("A long profile alias does not retain a single-line ellipsis and full tooltip.");
-        AssertVisible(name, layout);
+        AssertScrollContentReachable(name, layout);
+        AssertScrollContentReachable(Descendants(selected).OfType<TextBlock>().Single(block => block.Text == "하위 에이전트 · 혼합"), layout);
         var external = Card(layout, "fixture-03");
         var externalBlocks = Descendants(external).OfType<TextBlock>().Where(block => block.IsVisible).ToArray();
         if (!externalBlocks.Any(block => block.Text == "API") || !externalBlocks.Any(block => block.Text == "Example Model")
@@ -232,6 +400,22 @@ internal static class LayoutSelfTest
             throw new InvalidOperationException("An external API card exposes native quota or reset-credit information.");
         if (Descendants(external).OfType<ProgressBar>().Any(meter => meter.IsVisible))
             throw new InvalidOperationException("An external API card exposes a native quota meter.");
+        AssertScrollContentReachable(Descendants(external).OfType<TextBlock>().Single(block => block.Text == "하위 에이전트 · 외부 전용 · 대기"), layout);
+        if (!Card(layout, "fixture-01").IsSelected) throw new InvalidOperationException("Scrolling profile cards changed the selected account.");
+    }
+
+    private static void AssertScrollContentReachable(FrameworkElement control, FrameworkElement layout)
+    {
+        control.BringIntoView();
+        layout.UpdateLayout();
+        AssertVisible(control, layout);
+        for (DependencyObject? parent = VisualTreeHelper.GetParent(control); parent is not null; parent = VisualTreeHelper.GetParent(parent))
+        {
+            if (parent is not ScrollContentPresenter viewport) continue;
+            var bounds = control.TransformToAncestor(viewport).TransformBounds(new Rect(control.RenderSize));
+            if (bounds.Top < -1 || bounds.Bottom > viewport.ActualHeight + 1)
+                throw new InvalidOperationException("Sidebar content cannot be scrolled into its viewport: " + (control is ContentControl content ? content.Content : control.GetType().Name));
+        }
     }
 
     private static void SaveImage(FrameworkElement element, string path)
