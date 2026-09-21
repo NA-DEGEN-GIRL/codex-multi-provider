@@ -11,6 +11,18 @@ import native_controller as native
 from ws_client import WebSocketPipe
 
 
+# The runtime can refuse the idle/shutdown proof while the process itself is
+# healthy: a listener started without the exclusive managed source manifest has
+# no idle inventory, and its socket can outlive a closed connection. These are
+# read-only observations: they may report the exact process but never idle or a
+# completed exit, and they never authorize a restart.
+UNAVAILABLE_OBSERVATIONS = (
+    'remote_idle_binding_missing',
+    'remote_idle_status_unavailable',
+    'remote_listener_unavailable',
+)
+
+
 @contextmanager
 def connection(profile):
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
@@ -84,25 +96,38 @@ def settings_match(profile, revision, expected):
     return actual == expected
 
 
+def _read_only_identity(profile, revision, *, discover_active=False):
+    """Prove the running process from its record, executable and birth id only.
+
+    This is the strongest evidence available when the runtime cannot answer the
+    idle inventory RPC. It never opens a connection and never claims idle.
+    """
+    process = native._running(profile, revision, allow_other_revision=discover_active)
+    if process is None:
+        return None
+    actual_revision = process['revision']
+    descriptor = native._descriptor(profile, actual_revision)
+    # Socket-less processes have no RPC identity. Require exact executable
+    # and birth fingerprint before reporting their version.
+    executable = Path('/proc') / str(process['pid']) / 'exe'
+    expected = Path(descriptor['runtime']) / 'codex'
+    if (executable.resolve(strict=True) != expected.resolve(strict=True)
+            or native._running(profile, actual_revision) != process):
+        raise RuntimeError('Runtime executable identity changed.') from None
+    return process, actual_revision
+
+
 def observe(profile, revision, *, discover_active=False):
     """Version observation cannot supply a missing idle/shutdown proof."""
     try:
         return inspect(profile, revision, discover_active=discover_active)
     except native.RemoteMaintenanceError as error:
-        if error.code not in ('remote_idle_binding_missing', 'remote_listener_unavailable'):
+        if error.code not in UNAVAILABLE_OBSERVATIONS:
             raise
-        process = native._running(profile, revision, allow_other_revision=discover_active)
-        if process is None:
+        observed = _read_only_identity(profile, revision, discover_active=discover_active)
+        if observed is None:
             raise
-        actual_revision = process['revision']
-        descriptor = native._descriptor(profile, actual_revision)
-        # Socket-less processes have no RPC identity. Require exact executable
-        # and birth fingerprint before reporting their version, still never idle.
-        executable = Path('/proc') / str(process['pid']) / 'exe'
-        expected = Path(descriptor['runtime']) / 'codex'
-        if (executable.resolve(strict=True) != expected.resolve(strict=True)
-                or native._running(profile, actual_revision) != process):
-            raise RuntimeError('Runtime executable identity changed.') from None
+        process, actual_revision = observed
         return dict(process=process, idle=False, exited=False, revision=actual_revision,
                     requested_revision=revision, observation_code=error.code)
 
@@ -211,7 +236,21 @@ def dispatch(payload):
         return result
     if operation == 'start':
         native.start(profile, revision)
-        result = inspect(profile, revision)
+        try:
+            result = inspect(profile, revision)
+        except native.RemoteMaintenanceError as error:
+            # A listener without the exclusive managed source manifest cannot
+            # inventory idle work, so a start is verified by exact process and
+            # revision identity instead. This is what lets an unchanged
+            # connection reuse the listener it already has; it never reports
+            # idle, and a restart that needs an exit proof still fails closed.
+            if error.code != 'remote_idle_status_unavailable':
+                raise
+            observed = _read_only_identity(profile, revision)
+            if observed is None:
+                raise RuntimeError('Remote startup remains unverified.') from None
+            process, actual_revision = observed
+            result = dict(process=process, idle=False, exited=False, revision=actual_revision)
         if result['process'] is None:
             raise RuntimeError('Remote startup remains unverified.')
         return result

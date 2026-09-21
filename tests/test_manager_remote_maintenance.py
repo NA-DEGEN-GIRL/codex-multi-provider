@@ -5,14 +5,17 @@ import importlib.util
 import hashlib
 import json
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import types
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 from uuid import uuid4
 
-from manager_core.remote_maintenance import RemoteMaintenance
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+
+from manager_core.remote_maintenance import ALLOWED_REMOTE_CODES, BOOTSTRAP, RemoteMaintenance
 from manager_core.store import Store, atomic_json
 from manager_core.updates import UpdateError
 
@@ -117,6 +120,58 @@ class RemoteMaintenanceTests(unittest.TestCase):
                 with self.assertRaises(UpdateError):
                     self.service.reuse_unchanged(self.profile, records)
 
+    def test_another_live_revision_hands_the_cohort_to_the_equivalence_path(self):
+        records = self.unchanged_records()
+        self.service.request.side_effect = UpdateError('remote_revision_conflict', 'fixture conflict')
+        self.assertIs(self.service.reuse_unchanged(self.profile, records), False)
+        self.service.request.side_effect = UpdateError('fixture_transport', 'fixture transport failure')
+        with self.assertRaises(UpdateError):
+            self.service.reuse_unchanged(self.profile, records)
+
+    def test_bootstrap_keeps_only_typed_maintenance_codes(self):
+        cases = [(code, code) for code in ALLOWED_REMOTE_CODES]
+        cases.append(('private text from remote', 'remote_maintenance_unverified'))
+        for code, expected in cases:
+            with self.subTest(code=code):
+                source = ('def dispatch(request):\n e=RuntimeError("boom")\n e.code='
+                          + repr(code) + '\n raise e\n')
+                payload = {'modules': {'launch': '', 'ws_client': '', 'native_controller': '',
+                                       'maintenance': source}, 'request': {}}
+                result = subprocess.run([sys.executable, '-c', BOOTSTRAP], input=json.dumps(payload).encode(),
+                                        capture_output=True, check=False)
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(json.loads(result.stdout), {'ok': False, 'code': expected})
+
+    def test_typed_maintenance_codes_survive_the_response_boundary(self):
+        self.service.root = ROOT
+        self.service.remote = MagicMock()
+        for code in ('remote_idle_status_unavailable', 'remote_shutdown_unavailable',
+                     'remote_revision_conflict'):
+            with self.subTest(code=code):
+                self.service.remote._run.return_value = types.SimpleNamespace(returncode=2,
+                    stdout=json.dumps(dict(ok=False, code=code, detail='secret-value')).encode())
+                with self.assertRaises(UpdateError) as raised:
+                    self.service.request(self.binding, 'inspect')
+                self.assertEqual(raised.exception.code, code)
+                self.assertNotIn('SSH 실행 상태를 확인하지 못해', str(raised.exception))
+                self.assertNotIn('secret-value', str(raised.exception))
+
+    def test_idle_status_observation_is_accepted_without_claiming_idle_or_exit(self):
+        self.service.root = ROOT
+        self.service.remote = MagicMock()
+        process = dict(pid=12, process_start='34', boot_id='fixture', socket='/private.sock',
+                       revision='a' * 64)
+        value = dict(revision='a' * 64, process=process, idle=False, exited=False,
+                     runtime_bundle='fixture-bundle-0123456789abcdef', host_identity='f' * 64,
+                     observation_code='remote_idle_status_unavailable')
+        self.service.remote._run.return_value = types.SimpleNamespace(returncode=0,
+            stdout=json.dumps(dict(ok=True, result=value)).encode())
+        result = self.service.request(self.binding, 'inspect', observe_only=True)
+        self.assertFalse(result['idle'])
+        self.assertEqual(result['observation_code'], 'remote_idle_status_unavailable')
+        with self.assertRaises(UpdateError):
+            self.service.request(self.binding, 'inspect')
+
     def test_legacy_settings_backfill_requires_remote_bytes_and_stable_local_binding(self):
         binding = dict(self.binding, prepared=True, runtime_bundle='old-runtime', host_identity='f' * 64)
         self.profile['remote_bindings'] = [binding]
@@ -146,6 +201,139 @@ class RemoteMaintenanceTests(unittest.TestCase):
         self.assertFalse(self.service.verify_settings(self.profile,
             dict(self.binding, prepared=True, settings_fingerprint='a' * 64)))
         self.service.request.assert_not_called()
+
+    def equivalent_fixture(self, *, settings_match=True, live_revision='b' * 64, published_revision=None):
+        saved = dict(self.binding, prepared=True, runtime_bundle='fixture-bundle-0123456789abcdef',
+                     host_identity='f' * 64)
+        self.profile['remote_bindings'] = [deepcopy(saved)]
+        self.store.mutate(lambda data: self.store.profile(self.profile['id'], data).update(
+            generation=self.profile['generation'], remote_bindings=[deepcopy(saved)]))
+        if published_revision is not None:
+            atomic_json(self.path, dict(profile_id=self.profile['id'], generation=self.profile['generation'],
+                bindings=[dict(self.binding, revision=published_revision)]))
+        self.service.remote = MagicMock()
+        self.service.remote.binding_matches_settings.return_value = False
+        self.service.remote.settings_files.return_value = {'config.toml': 'c' * 64}
+        self.service.remote._settings_fingerprint.return_value = 'd' * 64
+        process = dict(pid=12, process_start='34', boot_id='fixture', socket='/private.sock',
+                       revision=live_revision)
+        live = dict(self.binding, revision=live_revision)
+        def request(binding, operation, **params):
+            if operation == 'inspect':
+                return dict(binding=deepcopy(binding), process=deepcopy(process), idle=False, exited=False,
+                            revision=live_revision, requested_revision=binding['revision'],
+                            runtime_bundle=saved['runtime_bundle'], host_identity=saved['host_identity'],
+                            observation_code='remote_idle_status_unavailable',
+                            **({'active_binding': deepcopy(live)} if live_revision != binding['revision'] else {}))
+            return dict(binding=deepcopy(live), process=deepcopy(process), idle=False, exited=False,
+                        settings_match=settings_match)
+        self.service.request = MagicMock(side_effect=request)
+        return saved
+
+    def equivalent_records(self, binding):
+        return [dict(binding=deepcopy(binding), alias=binding['alias'],
+                     publication_binding=deepcopy(binding), state='unobserved')]
+
+    def test_equivalent_live_revision_is_adopted_and_published_without_lifecycle_requests(self):
+        saved = self.equivalent_fixture()
+        records = self.equivalent_records(self.binding)
+        self.assertEqual(self.service.reuse_equivalent(self.profile, records), {'remote-dev': 'b' * 64})
+        self.assertEqual([call.args[1] for call in self.service.request.call_args_list], ['inspect', 'identity'])
+        self.assertEqual(self.service.request.call_args_list[0].kwargs,
+                         dict(discover_active=True, observe_only=True))
+        self.assertEqual(self.service.request.call_args_list[1].args[0]['revision'], 'b' * 64)
+        stored = self.store.profile(self.profile['id'])['remote_bindings'][0]
+        self.assertEqual(stored['revision'], 'b' * 64)
+        self.assertEqual(stored['settings_fingerprint'], 'd' * 64)
+        self.assertEqual(stored['runtime_bundle'], saved['runtime_bundle'])
+        self.assertEqual([b['revision'] for b in json.loads(self.path.read_text())['bindings']], ['b' * 64])
+        self.service.remote.prepare.assert_not_called()
+
+    def test_equivalent_reuse_of_the_prepared_revision_needs_settings_evidence_only(self):
+        self.equivalent_fixture(live_revision=self.binding['revision'])
+        self.service.remote.binding_matches_settings.return_value = True
+        records = self.equivalent_records(self.binding)
+        self.assertEqual(self.service.reuse_equivalent(self.profile, records), {})
+        self.assertEqual([call.args[1] for call in self.service.request.call_args_list], ['inspect'])
+        self.assertEqual(json.loads(self.path.read_text())['bindings'][0]['revision'], self.binding['revision'])
+        self.assertEqual(self.store.profile(self.profile['id'])['remote_bindings'][0]['revision'],
+                         self.binding['revision'])
+
+    def test_changed_settings_are_never_adopted_or_republished(self):
+        self.equivalent_fixture(settings_match=False)
+        records = self.equivalent_records(self.binding)
+        manifest = self.path.read_bytes()
+        self.assertIsNone(self.service.reuse_equivalent(self.profile, records))
+        self.assertEqual(self.store.profile(self.profile['id'])['remote_bindings'][0]['revision'], 'a' * 64)
+        self.assertEqual(self.path.read_bytes(), manifest)
+
+    def test_equivalent_reuse_rejects_partial_journals_before_observation(self):
+        self.equivalent_fixture()
+        clean = self.equivalent_records(self.binding)[0]
+        for change in (dict(state='observed'), dict(reinspect=True), dict(exit_proof={}), dict(started={}),
+                       dict(process={'pid': 1}), dict(next_binding=self.binding)):
+            with self.subTest(change=change):
+                self.assertIsNone(self.service.reuse_equivalent(self.profile, [{**clean, **change}]))
+        self.assertIsNone(self.service.reuse_equivalent(self.profile, []))
+        self.service.request.assert_not_called()
+
+    def test_equivalent_reuse_repoints_a_stale_publication_at_the_verified_binding(self):
+        self.equivalent_fixture(live_revision=self.binding['revision'], published_revision='b' * 64)
+        self.service.remote.binding_matches_settings.return_value = True
+        published = dict(self.binding, revision='b' * 64)
+        records = [dict(binding=deepcopy(published), alias=published['alias'],
+                        publication_binding=deepcopy(published), state='unobserved')]
+        self.assertEqual(self.service.reuse_equivalent(self.profile, records),
+                         {published['alias']: self.binding['revision']})
+        self.assertEqual([call.args[1] for call in self.service.request.call_args_list], ['inspect'])
+        self.assertEqual(json.loads(self.path.read_text())['bindings'][0]['revision'], self.binding['revision'])
+        stored = self.store.profile(self.profile['id'])['remote_bindings'][0]
+        self.assertEqual(stored['revision'], self.binding['revision'])
+        self.assertEqual(stored['settings_fingerprint'], 'd' * 64)
+        self.service.remote.prepare.assert_not_called()
+
+    def test_equivalent_reuse_never_releases_a_host_the_manifest_does_not_publish(self):
+        self.equivalent_fixture()
+        records = self.equivalent_records(self.binding)
+        variants = [dict(bindings=[]),
+                    dict(bindings=[], pending_policy_hosts=[self.binding['alias']]),
+                    dict(bindings=[dict(self.binding, revision='c' * 64)]),
+                    dict(bindings=[self.binding, self.binding])]
+        for variant in variants:
+            with self.subTest(variant=variant):
+                manifest = dict(profile_id=self.profile['id'], generation=self.profile['generation'])
+                manifest.update(variant)
+                atomic_json(self.path, manifest)
+                before = self.path.read_bytes()
+                self.assertIsNone(self.service.reuse_equivalent(self.profile, records))
+                self.assertEqual(self.path.read_bytes(), before)
+                self.assertEqual(self.store.profile(self.profile['id'])['remote_bindings'][0]['revision'], 'a' * 64)
+        self.service.remote.prepare.assert_not_called()
+
+    def test_equivalent_reuse_fails_closed_on_a_concurrent_settings_change(self):
+        self.equivalent_fixture()
+        records = self.equivalent_records(self.binding)
+        verified = dict(self.service.remote.settings_files.return_value)
+        for files_changed in (False, True):
+            with self.subTest(files_changed=files_changed):
+                self.store.mutate(lambda data: self.store.profile(self.profile['id'], data)['policy'].update(
+                    desired_revision=self.profile['policy']['desired_revision']))
+                manifest = self.path.read_bytes()
+                saved = deepcopy(self.store.profile(self.profile['id'])['remote_bindings'])
+                calls = []
+                def settings_files(profile, binding, *, changed=files_changed, calls=calls):
+                    calls.append(binding['alias'])
+                    if len(calls) == 2:
+                        self.store.mutate(lambda data: self.store.profile(
+                            self.profile['id'], data)['policy'].update(desired_revision=5))
+                    return dict(verified, config_toml='e' * 64) if changed else dict(verified)
+                self.service.remote.settings_files = MagicMock(side_effect=settings_files)
+                with self.assertRaises(UpdateError) as raised:
+                    self.service.reuse_equivalent(self.profile, records)
+                self.assertEqual(raised.exception.code, 'policy_changed')
+                self.assertEqual(self.store.profile(self.profile['id'])['remote_bindings'], saved)
+                self.assertEqual(self.path.read_bytes(), manifest)
+                self.service.remote.prepare.assert_not_called()
 
     def identity_helper(self, process):
         native = types.SimpleNamespace(_running=MagicMock(return_value=process),
@@ -366,6 +554,23 @@ class RemoteMaintenanceTests(unittest.TestCase):
         self.service.reconcile(entry)
         self.assertEqual(entry['state'], 'closed')
         self.assertEqual([c.args[1] for c in self.service.request.call_args_list], ['inspect', 'inspect'])
+
+    def test_lost_start_reply_settles_on_exact_read_only_identity_without_idle(self):
+        self.service.request = MagicMock(return_value=dict(
+            binding=deepcopy(self.binding), process={'pid': 12, 'revision': self.binding['revision']},
+            idle=False, exited=False, runtime_bundle='fixture-bundle-0123456789abcdef',
+            host_identity='f' * 64, observation_code='remote_idle_status_unavailable'))
+        entry = dict(state='start_requested', binding=self.binding, next_binding=deepcopy(self.binding))
+        self.service.reconcile(entry)
+        self.assertEqual(entry['state'], 'started')
+        self.assertFalse(entry['started']['idle'])
+        self.assertEqual(self.service.request.call_args,
+                         call(self.binding, 'inspect', discover_active=True, observe_only=True))
+        self.service.request.return_value = dict(self.service.request.return_value,
+                                                 active_binding=dict(self.binding, revision='c' * 64))
+        other = dict(state='start_requested', binding=self.binding, next_binding=deepcopy(self.binding))
+        self.service.reconcile(other)
+        self.assertEqual(other['state'], 'start_requested')
 
     def test_unused_diagnostic_gauges_are_optional_but_current_request_is_required(self):
         native = types.SimpleNamespace(_running=MagicMock(return_value={'pid': 12}),

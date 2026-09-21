@@ -274,12 +274,205 @@ class RemoteUpdateTests(unittest.TestCase):
         self.drain()
         self.assertEqual(self.status()['job']['state'], 'cancelled')
 
-    def test_generation_change_fences_stale_job(self):
+    def test_generation_change_supersedes_job_before_any_lifecycle(self):
         self.schedule()
         self.store.mutate(lambda data: self.store.profile(self.profile_id, data).update(generation=str(uuid4())))
         self.drain()
+        job = self.status()['job']
+        self.assertEqual(job['state'], 'cancelled')
+        self.assertEqual(job['code'], 'ssh_generation_superseded')
+        # No lifecycle ran, so no gate was ever created for this reservation.
+        gate = self.store.read().get('ssh_maintenance', {}).get(self.profile_id)
+        self.assertIn(None if gate is None else gate['state'], (None, 'released'))
+        self.assertFalse(any(op in ('stop', 'prepare', 'start') for op, _ in self.fleet.calls))
+
+    def test_relaunch_rearms_auto_apply_for_the_current_generation(self):
+        request = self.fleet.request
+        self.fleet.request = lambda *a, **k: {**request(*a, **k), 'idle': False}
+        self.service.settings(self.profile_id, 'fixture-a', auto_apply=True)
+        self.schedule()
+        self.drain()
+        self.assertEqual(self.status()['job']['state'], 'waiting')
+        generation = str(uuid4())
+        self.store.mutate(lambda data: self.store.profile(self.profile_id, data).update(generation=generation))
+        self.service.tick()
+        self.drain()
+        value = self.service._read(self.profile_id, 'fixture-a')
+        # The stale reservation is retired and the same automatic update is
+        # re-queued against the relaunched generation instead of leaving a gate.
+        self.assertEqual(value['job']['state'], 'queued')
+        self.assertEqual(value['_job']['generation'], generation)
+        self.assertTrue(value['auto_apply'])
+        self.assertEqual(self.store.read()['ssh_maintenance'][self.profile_id]['state'], 'released')
+
+    def test_relaunch_keeps_gate_when_a_start_was_already_dispatched(self):
+        self.fleet.lose_start = 'fixture-a'
+        self.schedule()
+        self.drain()
+        self.assertEqual(self.records()[0]['state'], 'start_requested')
+        self.store.mutate(lambda data: self.store.profile(self.profile_id, data).update(generation=str(uuid4())))
+        self.service.tick()
+        self.drain()
+        self.assertFalse(self.service.retirement(self.profile_id, 'fixture-a')['eligible'])
         self.assertEqual(self.status()['job']['state'], 'attention')
-        self.assertEqual(self.fleet.calls, [])
+        self.assertEqual(self.store.read()['ssh_maintenance'][self.profile_id]['state'], 'attention')
+        self.assertEqual(self.records()[0]['state'], 'start_requested')
+
+    def test_scheduler_recovers_a_gate_left_by_an_older_generation(self):
+        # Production shape: the reservation flipped to attention when the
+        # profile relaunched and nothing can step it any more.
+        request = self.fleet.request
+        self.fleet.request = lambda *a, **k: {**request(*a, **k), 'idle': False}
+        self.schedule()
+        self.drain()
+        value = self.service._read(self.profile_id, 'fixture-a')
+        transaction = value['_job']['transaction_id']
+        self.store.mutate(lambda data: self.store.profile(self.profile_id, data).update(generation=str(uuid4())))
+        self.service._job_state(self.profile_id, 'fixture-a', 'attention',
+                                'SSH 업데이트 결과 확인이 필요합니다.', code='ssh_generation_changed')
+        self.hooks.remote_open_failed(self.profile_id, transaction, 'ssh_generation_changed')
+        self.service.tick()
+        self.drain()
+        job = self.status()['job']
+        self.assertEqual(job['state'], 'cancelled')
+        self.assertEqual(job['code'], 'ssh_generation_superseded')
+        self.assertEqual(self.store.read()['ssh_maintenance'][self.profile_id]['state'], 'released')
+        self.assertFalse(any(op in ('stop', 'prepare', 'start') for op, _ in self.fleet.calls))
+
+    def test_retirement_without_a_journal_keeps_the_gate_and_asks_for_review(self):
+        request = self.fleet.request
+        self.fleet.request = lambda *a, **k: {**request(*a, **k), 'idle': False}
+        self.schedule()
+        self.drain()
+        transaction = self.service._read(self.profile_id, 'fixture-a')['_job']['transaction_id']
+        self.store.mutate(lambda data: self.store.profile(self.profile_id, data).update(generation=str(uuid4())))
+        self.service.hooks._lease_path(transaction).unlink()
+        report = self.service.retirement(self.profile_id, 'fixture-a')
+        self.assertFalse(report['eligible'])
+        self.assertEqual(report['reason'], 'journal_missing')
+        self.service.tick()
+        self.drain()
+        self.assertEqual(self.status()['job']['state'], 'attention')
+        self.assertEqual(self.store.read()['ssh_maintenance'][self.profile_id]['state'], 'attention')
+
+    def test_recover_releases_only_an_unmoved_stale_reservation(self):
+        request = self.fleet.request
+        self.fleet.request = lambda *a, **k: {**request(*a, **k), 'idle': False}
+        self.service.settings(self.profile_id, 'fixture-a', auto_apply=True)
+        self.schedule()
+        self.drain()
+        self.assertEqual(self.service.recover(self.profile_id, 'fixture-a')['reason'], 'generation_current')
+        self.assertEqual(self.store.read()['ssh_maintenance'][self.profile_id]['state'], 'held')
+        self.store.mutate(lambda data: self.store.profile(self.profile_id, data).update(generation=str(uuid4())))
+        report = self.service.recover(self.profile_id, 'fixture-a', observe=True)
+        self.assertTrue(report['released'], report)
+        self.assertTrue(report['gate_released'])
+        self.assertTrue(report['journal_released'])
+        self.assertEqual(report['reason'], None)
+        self.assertEqual(self.store.read()['ssh_maintenance'][self.profile_id]['state'], 'released')
+        current = self.status()
+        self.assertTrue(current['auto_apply'])
+        self.assertEqual(current['job']['state'], 'queued')
+        self.assertEqual(self.service._read(self.profile_id, 'fixture-a')['_job']['generation'],
+                         self.store.profile(self.profile_id)['generation'])
+        self.assertFalse(any(op in ('stop', 'prepare') for op, _ in self.fleet.calls))
+        # The freshly re-queued reservation pins the current generation and is
+        # therefore never retired by a later recovery call.
+        self.assertEqual(self.service.recover(self.profile_id, 'fixture-a')['reason'], 'generation_current')
+
+    def test_recover_refuses_a_dispatched_lifecycle(self):
+        self.fleet.lose_start = 'fixture-a'
+        self.schedule()
+        self.drain()
+        self.store.mutate(lambda data: self.store.profile(self.profile_id, data).update(generation=str(uuid4())))
+        report = self.service.recover(self.profile_id, 'fixture-a')
+        self.assertFalse(report['released'])
+        self.assertEqual(report['reason'], 'lifecycle_pending')
+        self.assertEqual(self.records()[0]['state'], 'start_requested')
+        self.assertEqual(self.store.read()['ssh_maintenance'][self.profile_id]['state'], 'held')
+
+    def stale_after_relaunch(self):
+        """Hold a real gate and journal, then relaunch the profile under it."""
+        request = self.fleet.request
+        self.fleet.request = lambda *a, **k: {**request(*a, **k), 'idle': False}
+        self.schedule()
+        self.drain()
+        transaction = self.service._read(self.profile_id, 'fixture-a')['_job']['transaction_id']
+        self.store.mutate(lambda data: self.store.profile(self.profile_id, data).update(generation=str(uuid4())))
+        return transaction
+
+    def test_retirement_refuses_a_journal_owned_by_another_transaction(self):
+        transaction = self.stale_after_relaunch()
+        path = self.hooks._lease_path(transaction)
+        foreign = {**json.loads(path.read_text(encoding='utf-8')), 'transaction_id': str(uuid4())}
+        atomic_json(path, foreign)
+        self.assertEqual(self.service.retirement(self.profile_id, 'fixture-a')['reason'], 'journal_unverified')
+        report = self.service.recover(self.profile_id, 'fixture-a')
+        self.assertFalse(report['released'])
+        self.assertFalse(report['journal_released'])
+        self.assertEqual(json.loads(path.read_text(encoding='utf-8'))['state'], 'held')
+        self.assertEqual(self.store.read()['ssh_maintenance'][self.profile_id]['state'], 'held')
+
+    def test_retirement_refuses_a_journal_bound_to_another_generation(self):
+        transaction = self.stale_after_relaunch()
+        path = self.hooks._lease_path(transaction)
+        adopted = json.loads(path.read_text(encoding='utf-8'))
+        adopted['profiles'][0]['generation'] = self.store.profile(self.profile_id)['generation']
+        atomic_json(path, adopted)
+        report = self.service.recover(self.profile_id, 'fixture-a')
+        self.assertEqual(report['reason'], 'journal_generation_changed')
+        self.assertFalse(report['released'])
+        self.assertEqual(json.loads(path.read_text(encoding='utf-8'))['state'], 'held')
+        self.assertEqual(self.store.read()['ssh_maintenance'][self.profile_id]['state'], 'held')
+
+    def test_retirement_refuses_a_gate_reclaimed_by_another_generation(self):
+        self.stale_after_relaunch()
+        generation = self.store.profile(self.profile_id)['generation']
+        self.store.mutate(lambda data: data['ssh_maintenance'][self.profile_id].update(generation=generation))
+        report = self.service.recover(self.profile_id, 'fixture-a')
+        self.assertEqual(report['reason'], 'gate_generation_changed')
+        self.assertFalse(report['released'])
+        self.assertEqual(self.service._read(self.profile_id, 'fixture-a')['job']['state'], 'waiting')
+        self.assertEqual(self.store.read()['ssh_maintenance'][self.profile_id]['state'], 'held')
+
+    def test_retirement_refuses_a_journal_that_already_stopped_a_host(self):
+        transaction = self.stale_after_relaunch()
+        path = self.hooks._lease_path(transaction)
+        stopped = json.loads(path.read_text(encoding='utf-8'))
+        stopped['profiles'][0]['remotes'][0].update(state='closed', exit_proof=dict(exited=True, idle=True))
+        atomic_json(path, stopped)
+        report = self.service.retirement(self.profile_id, 'fixture-a')
+        self.assertEqual(report['reason'], 'lifecycle_pending')
+        self.assertFalse(report['eligible'])
+        self.assertEqual(self.store.read()['ssh_maintenance'][self.profile_id]['state'], 'held')
+
+    def test_retirement_keeps_the_gate_when_the_journal_cannot_be_persisted(self):
+        transaction = self.stale_after_relaunch()
+        path = self.hooks._lease_path(transaction)
+        before = path.read_bytes()
+        def broken(lease):
+            raise OSError('simulated journal write failure')
+        self.hooks._save_lease = broken
+        report = self.service.recover(self.profile_id, 'fixture-a')
+        self.assertEqual(report['reason'], 'unavailable')
+        self.assertFalse(report['released'])
+        self.assertFalse(report['journal_released'])
+        self.assertEqual(self.store.read()['ssh_maintenance'][self.profile_id]['state'], 'held')
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_recover_reports_busy_while_another_controller_holds_the_claim(self):
+        self.schedule()
+        transaction = self.service._read(self.profile_id, 'fixture-a')['_job']['transaction_id']
+        self.hooks.begin_remote_reconcile(self.profile_id, ensure_local=False,
+            force_runtime_update=True, transaction_id=transaction)
+        self.store.mutate(lambda data: self.store.profile(self.profile_id, data).update(generation=str(uuid4())))
+        report = self.make_service().recover(self.profile_id, 'fixture-a')
+        self.assertEqual(report['reason'], 'busy')
+        self.assertFalse(report['released'])
+        self.assertEqual(self.store.read()['ssh_maintenance'][self.profile_id]['state'], 'held')
+        self.drain()
+        self.assertEqual(self.status()['job']['state'], 'cancelled')
+        self.assertEqual(self.store.read()['ssh_maintenance'][self.profile_id]['state'], 'released')
 
     def test_host_identity_change_prevents_runtime_mutations(self):
         self.probe.return_value['managed_host_identity'] = 'c' * 64

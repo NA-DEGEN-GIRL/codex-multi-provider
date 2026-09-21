@@ -240,6 +240,27 @@ class ProfileRemoteRetryTests(unittest.TestCase):
         self.assertEqual(self.store.read()['profile_maintenance'][self.profile['id']]['transaction_id'], transaction)
         self.hooks.guard_launch(self.peer['id'])
 
+    def test_ssh_background_attention_is_not_recovered_as_a_restart_journal(self):
+        transaction = str(uuid4())
+        atomic_json(self.hooks._lease_path(transaction), dict(
+            transaction_id=transaction, ssh_only=True, state='released', profile_scope=[self.profile['id']],
+            target_revision=self.profile['policy']['desired_revision'],
+            profiles=[dict(profile_id=self.profile['id'], generation=self.profile['generation'],
+                           remote_only=True, state='released', remotes=[])]))
+        gate = dict(state='attention', transaction_id=transaction, generation=self.profile['generation'],
+                    remote_update=False, target_revision=self.profile['policy']['desired_revision'])
+        self.store.mutate(lambda data: (data.setdefault('ssh_maintenance', {}).update({self.profile['id']: gate}),
+            data.setdefault('profile_restarts', {}).update({self.profile['id']: dict(
+                id=str(uuid4()), phase='attention', remote_background=True,
+                generation=self.profile['generation'], transaction_id=transaction,
+                requested_revision=self.profile['policy']['desired_revision'],
+                code='remote_maintenance_unverified')})))
+        job = self.restarts.schedule(self.profile['id'])
+        self.assertNotIn('recovery_transaction_id', job)
+        self.assertNotEqual(job.get('transaction_id'), transaction)
+        self.assertEqual(self.store.read()['ssh_maintenance'][self.profile['id']], gate)
+        self.assertEqual(json.loads(self.hooks._lease_path(transaction).read_text())['state'], 'released')
+
     def test_changed_settings_take_a_fresh_idle_snapshot_instead_of_resuming_old_policy(self):
         self.fleet.lose_start = 'fixture-b'
         self.assertEqual(self.apply()['phase'], 'attention')

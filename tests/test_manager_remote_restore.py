@@ -16,6 +16,13 @@ class Fleet(RemoteMaintenance):
         self.calls = []
         self.fail_prepare = self.lose_start = self.empty_start = None
         self.next_pid = 100
+        # Shared-catalog listeners publish no idle inventory. They still answer
+        # observation-only identity, exactly like the typed remote helper.
+        self.idle_evidence = True
+        self.settings_evidence = True
+        self.observation_code = 'remote_idle_status_unavailable'
+        self.runtime_bundle = 'fixture-bundle-0123456789abcdef'
+        self.host_identity = 'f' * 64
         self.bindings_by_alias = {alias: self.binding(profile, alias, 'a' * 64)
                                   for alias in ('fixture-a', 'fixture-b')}
         self.running = {alias: self.process(binding) for alias, binding in self.bindings_by_alias.items()}
@@ -49,7 +56,15 @@ class Fleet(RemoteMaintenance):
             if operation == 'inspect' and params.get('discover_active') is True:
                 active = dict(binding, revision=process['revision'])
             else:
-                raise UpdateError('fixture_revision_mismatch', 'fixture daemon is running a different revision')
+                raise UpdateError('remote_revision_conflict', 'fixture daemon is running a different revision')
+        if process is not None and operation == 'inspect' and not self.idle_evidence:
+            if params.get('observe_only') is not True:
+                raise UpdateError(self.observation_code, 'fixture listener publishes no idle inventory')
+            return dict(binding=deepcopy(binding), process=deepcopy(process), idle=False, exited=False,
+                        revision=process['revision'], requested_revision=binding['revision'],
+                        runtime_bundle=self.runtime_bundle, host_identity=self.host_identity,
+                        observation_code=self.observation_code,
+                        **({'active_binding': active} if active else {}))
         if operation == 'stop':
             if params['expected_process'] != process:
                 raise UpdateError('fixture_process_mismatch', 'fixture stop identity changed')
@@ -60,8 +75,11 @@ class Fleet(RemoteMaintenance):
             if alias == self.lose_start:
                 self.lose_start = None
                 raise OSError('fixture start reply lost after process creation')
-        return dict(binding=deepcopy(binding), process=deepcopy(process), idle=True, exited=process is None,
-                    **({'active_binding': active} if active else {}))
+        result = dict(binding=deepcopy(binding), process=deepcopy(process), idle=True, exited=process is None,
+                      **({'active_binding': active} if active else {}))
+        if 'expected_settings' in params:
+            result['settings_match'] = self.settings_evidence
+        return result
 
 
 class RemoteRestoreTests(unittest.TestCase):

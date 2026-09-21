@@ -115,9 +115,12 @@ class ProfileRestarts:
                        created_at=now(), updated_at=now(), worker_pid=os.getpid(),
                        worker_created=(process_identity(os.getpid()) or {}).get('process_created'),
                        requested_revision=profile['policy']['desired_revision'])
-            if old and old['phase'] == 'attention' and old.get('transaction_id'):
+            if (old and old['phase'] == 'attention' and old.get('transaction_id')
+                    and not old.get('remote_background')):
                 # All remote inspection/recovery runs in the worker, not while
-                # the UI request holds the scheduling lock.
+                # the UI request holds the scheduling lock. An SSH-only journal
+                # belongs to its own gate and is reconciled by the SSH open
+                # path; recovery must not release it as a restart record.
                 job.update(recovery_transaction_id=old['transaction_id'], transaction_id=old['transaction_id'],
                            recovery_revision=old.get('attempt_revision', old.get('recovery_revision', old.get('requested_revision'))),
                            message='이전 설정 적용 결과를 확인하고 필요한 단계부터 계속합니다.')

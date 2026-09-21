@@ -144,6 +144,61 @@ class NativeMaintenanceTests(unittest.TestCase):
             NATIVE._control_request(pipe, 2, 'thread/managedIdleStatus', {}, time.monotonic() + 5)
         self.assertNotIn('private response', str(raised.exception))
 
+    def test_shared_catalog_listener_reports_typed_idle_unavailability(self):
+        pipe = MagicMock()
+        pipe.receive_json.return_value = {'id': 2, 'error': {
+            'code': -32600, 'message': 'managed idle status is not enabled for this instance'}}
+        with self.assertRaises(NATIVE.RemoteMaintenanceError) as raised:
+            NATIVE._control_request(pipe, 2, 'thread/managedIdleStatus', {}, time.monotonic() + 5)
+        self.assertEqual(raised.exception.code, 'remote_idle_status_unavailable')
+        # The same text on another method is not an idle statement and must stay
+        # unclassified instead of becoming a proof of anything.
+        with self.assertRaises(RuntimeError) as other:
+            NATIVE._control_request(pipe, 2, 'server/managedShutdown', {}, time.monotonic() + 5)
+        self.assertNotIsInstance(other.exception, NATIVE.RemoteMaintenanceError)
+
+    def test_managed_shutdown_without_managed_sources_is_typed_unavailable(self):
+        pipe = MagicMock()
+        pipe.receive_json.return_value = {'id': 2, 'error': {
+            'code': -32600, 'message': 'managed shutdown requires the exact managed process'}}
+        with self.assertRaises(NATIVE.RemoteMaintenanceError) as raised:
+            NATIVE._control_request(pipe, 2, 'server/managedShutdown', {'processId': 1},
+                                    time.monotonic() + 5)
+        self.assertEqual(raised.exception.code, 'remote_shutdown_unavailable')
+
+    def test_live_other_revision_is_typed_instead_of_a_generic_failure(self):
+        previous = dict(self.record, revision='b' * 64)
+        (self.profile / 'native-instance.json').write_text(json.dumps(previous), encoding='utf-8')
+        original = Path.read_text
+        def read_text(path, *args, **kwargs):
+            if str(path).replace('\\', '/').endswith('/proc/sys/kernel/random/boot_id'):
+                return 'fixture-boot'
+            return original(path, *args, **kwargs)
+        with patch.object(NATIVE, '_process_start', return_value='1234'), \
+                patch.object(Path, 'read_text', read_text):
+            with self.assertRaises(NATIVE.RemoteRevisionConflict) as raised:
+                NATIVE._running(self.profile, self.revision)
+            self.assertEqual(raised.exception.code, 'remote_revision_conflict')
+            self.assertEqual(NATIVE._running(self.profile, self.revision, allow_other_revision=True), previous)
+
+    def test_reused_listener_without_a_socket_is_not_reported_as_a_start_timeout(self):
+        mocks = self.start_patches(self.record)
+        mocks[6].return_value = False
+        with patch.object(NATIVE.time, 'monotonic', side_effect=[0, 21]), \
+                patch.object(NATIVE.time, 'sleep'):
+            with self.assertRaises(NATIVE.RemoteStartError) as raised:
+                NATIVE.start(self.profile, self.revision)
+        self.assertEqual(raised.exception.code, 'remote_listener_unavailable')
+        mocks[5].assert_not_called()
+
+    def test_proxy_without_a_ready_listener_reports_listener_unavailable(self):
+        with patch.object(NATIVE, '_descriptor', return_value={'runtime': str(self.profile / 'runtime')}), \
+                patch.object(NATIVE, 'socket_path', return_value=self.profile / 'control.sock'), \
+                patch.object(NATIVE, '_ready', return_value=False):
+            with self.assertRaises(NATIVE.RemoteStartError) as raised:
+                NATIVE.main(self.profile, self.revision, 'native-proxy')
+        self.assertEqual(raised.exception.code, 'remote_listener_unavailable')
+
     def test_unverified_transport_reply_preserves_the_process(self):
         for error in (EOFError("truncated"), ValueError("oversized"), TimeoutError("late")):
             with self.subTest(error=error):
@@ -208,6 +263,100 @@ class NativeMaintenanceTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "lock is unavailable"):
             NATIVE._instance_lock_released(self.profile)
         self.assertFalse((self.profile / "instance.lock").exists())
+
+
+class RemoteHelperMaintenanceTests(unittest.TestCase):
+    """Read-only reuse of a listener that can answer neither idle nor shutdown."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.profile_id = '3f677cd8-12ce-4721-b090-66d1a5111598'
+        self.revision = 'a' * 64
+        self.process = dict(pid=4242, process_start='77', boot_id='fixture',
+                            revision=self.revision, socket=str(self.root / 'control.sock'))
+
+    @staticmethod
+    def maintenance_error(code):
+        class MaintenanceError(RuntimeError):
+            pass
+        MaintenanceError.code = code
+        return MaintenanceError
+
+    def fixture(self, native):
+        """Load the remote helper against a fixture native controller."""
+        spec = importlib.util.spec_from_file_location(
+            'remote_maintenance_helper_test', ROOT / 'scripts/remote_helpers/maintenance.py')
+        module = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, {'native_controller': native,
+                'ws_client': types.SimpleNamespace(WebSocketPipe=MagicMock()),
+                'fcntl': types.SimpleNamespace(LOCK_EX=2, LOCK_NB=4, flock=MagicMock())}):
+            spec.loader.exec_module(module)
+        return module
+
+    def runtime_identity(self, module, runtime='runtime'):
+        """Resolve /proc/<pid>/exe to a fixture bundle without a Linux host."""
+        binary = self.root / runtime / 'codex'
+        binary.parent.mkdir(parents=True, exist_ok=True)
+        binary.write_bytes(b'fixture')
+        original = Path.resolve
+        def resolved(path, *args, **kwargs):
+            if str(path).replace('\\', '/') == '/proc/4242/exe':
+                return binary
+            return original(path, *args, **kwargs)
+        self.enterContext(patch.object(module.Path, 'resolve', resolved))
+
+    def helper(self, code, *, process='default', runtime='runtime'):
+        error = self.maintenance_error(code)
+        native = types.SimpleNamespace(RemoteMaintenanceError=error, start=MagicMock(),
+            _running=MagicMock(return_value=self.process if process == 'default' else process),
+            _descriptor=MagicMock(return_value={'runtime': str(self.root / runtime)}))
+        module = self.fixture(native)
+        self.runtime_identity(module, runtime)
+        return module, native, error
+
+    def test_idle_status_unavailable_observes_the_process_without_idle(self):
+        module, _, error = self.helper('remote_idle_status_unavailable')
+        with patch.object(module, 'inspect', side_effect=error()):
+            result = module.observe(self.root, self.revision)
+        self.assertEqual(result, dict(process=self.process, idle=False, exited=False,
+            revision=self.revision, requested_revision=self.revision,
+            observation_code='remote_idle_status_unavailable'))
+
+    def test_unknown_failures_are_never_downgraded_to_an_observation(self):
+        for code in ('remote_maintenance_unverified', 'remote_configuration_changed',
+                     'remote_shutdown_unavailable'):
+            with self.subTest(code=code):
+                module, native, error = self.helper(code)
+                with patch.object(module, 'inspect', side_effect=error()):
+                    with self.assertRaises(error):
+                        module.observe(self.root, self.revision)
+                native._running.assert_not_called()
+
+    def test_start_reuses_the_exact_listener_without_claiming_idle(self):
+        module, native, error = self.helper('remote_idle_status_unavailable')
+        directory = self.root / '.local/share/codex-control-center/profiles' / self.profile_id
+        directory.mkdir(parents=True, exist_ok=True)
+        binding = dict(alias='fixture-host', profile_id=self.profile_id, revision=self.revision,
+                       remote_python='/usr/bin/python3', remote_launcher=str(directory / 'launch.py'))
+        with patch.object(module.Path, 'home', return_value=self.root), \
+                patch.object(module, 'inspect', side_effect=error()):
+            result = module.dispatch(dict(binding=binding, operation='start'))
+        native.start.assert_called_once_with(directory, self.revision)
+        self.assertEqual(result, dict(process=self.process, idle=False, exited=False, revision=self.revision))
+        self.assertNotIn('observation_code', result)
+
+    def test_start_remains_unverified_when_the_exact_process_is_gone(self):
+        module, _, error = self.helper('remote_idle_status_unavailable', process=None)
+        directory = self.root / '.local/share/codex-control-center/profiles' / self.profile_id
+        directory.mkdir(parents=True, exist_ok=True)
+        binding = dict(alias='fixture-host', profile_id=self.profile_id, revision=self.revision,
+                       remote_python='/usr/bin/python3', remote_launcher=str(directory / 'launch.py'))
+        with patch.object(module.Path, 'home', return_value=self.root), \
+                patch.object(module, 'inspect', side_effect=error()):
+            with self.assertRaisesRegex(RuntimeError, 'unverified'):
+                module.dispatch(dict(binding=binding, operation='start'))
 
 
 if __name__ == "__main__":

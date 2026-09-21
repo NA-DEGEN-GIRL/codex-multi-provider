@@ -23,13 +23,38 @@ from ws_client import WebSocketPipe
 class RemoteStartError(RuntimeError):
     def __init__(self, code):
         self.code = code
-        super().__init__('Remote listener startup failed (' + code + ').')
+        super().__init__('Remote managed listener startup failed (' + code + ').')
 
 
 class RemoteMaintenanceError(RuntimeError):
     def __init__(self, code):
         self.code = code
         super().__init__('Remote maintenance proof is unavailable (' + code + ').')
+
+
+class RemoteRevisionConflict(RuntimeError):
+    """An exact-revision start cannot proceed while another revision is live."""
+
+    code = 'remote_revision_conflict'
+
+    def __init__(self):
+        super().__init__('A different revision is still running; wait for its jobs to finish.')
+
+
+# Exact runtime answers that mean "this instance cannot provide that proof".
+# They are typed instead of generic so a shared-catalog listener is never
+# mistaken for a busy instance, a transport failure, or a completed exit.
+MAINTENANCE_ERROR_CODES = {
+    ('thread/managedIdleStatus', -32600, 'root actor has no immutable managed source binding'):
+        'remote_idle_binding_missing',
+    # A shared-catalog listener is launched without CODEX_MANAGER_MANAGED_SOURCES
+    # (launch.py drops it so record routing stays catalog-owned), so the runtime
+    # reports that the idle proof does not exist in this mode at all.
+    ('thread/managedIdleStatus', -32600, 'managed idle status is not enabled for this instance'):
+        'remote_idle_status_unavailable',
+    ('server/managedShutdown', -32600, 'managed shutdown requires the exact managed process'):
+        'remote_shutdown_unavailable',
+}
 
 
 def _start_failure(logfile, offset):
@@ -105,7 +130,7 @@ def _running(profile, revision, *, allow_other_revision=False):
             data.get("boot_id") != Path("/proc/sys/kernel/random/boot_id").read_text().strip()):
         return None
     if data.get("revision") != revision and not allow_other_revision:
-        raise RuntimeError("A different revision is still running; wait for its jobs to finish.")
+        raise RemoteRevisionConflict()
     return data
 
 
@@ -174,6 +199,11 @@ def start(profile, revision):
             if process is not None and process.poll() is not None:
                 raise RemoteStartError(_start_failure(logfile, log_offset))
             time.sleep(0.1)
+        if process is None:
+            # The exact revision is recorded as running and was never relaunched,
+            # so a missing/unconnectable private socket is not a launch timeout.
+            # Report the listener state itself; the proxy cannot attach to it.
+            raise RemoteStartError('remote_listener_unavailable')
         raise RemoteStartError('remote_start_timeout')
 
 
@@ -198,10 +228,10 @@ def _control_request(pipe, request_id, method, params, deadline):
             continue
         if "error" in message:
             error = message['error']
-            if (method == 'thread/managedIdleStatus' and isinstance(error, dict)
-                    and error.get('code') == -32600
-                    and error.get('message') == 'root actor has no immutable managed source binding'):
-                raise RemoteMaintenanceError('remote_idle_binding_missing')
+            if isinstance(error, dict):
+                classified = MAINTENANCE_ERROR_CODES.get((method, error.get('code'), error.get('message')))
+                if classified is not None:
+                    raise RemoteMaintenanceError(classified)
             raise RuntimeError("The runtime could not verify maintenance; updates remain pending.")
         result = message.get("result")
         if not isinstance(result, dict):
@@ -314,7 +344,7 @@ def main(profile, revision, operation):
     if operation == "native-proxy":
         path = socket_path(profile)
         if not _ready(profile, revision, path):
-            raise RuntimeError("Remote managed listener is not ready.")
+            raise RemoteStartError('remote_listener_unavailable')
         _forward_agent(profile)
         env = {key: value for key, value in os.environ.items() if not key.startswith("CODEX_")}
         env["CODEX_HOME"] = str(profile / "codex")

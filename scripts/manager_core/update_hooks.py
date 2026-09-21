@@ -304,6 +304,8 @@ class UpdateHooks:
                     if (any(profile.get(key) != observed_profile.get(key) for key in lifetime)
                             or _read_json(self._lease_path(prior['transaction_id'])) != old_lease):
                         raise UpdateError('restoration_changed', '이전 설정 적용 기록이 변경되었습니다.')
+                transaction_id = requested_transaction_id or str(uuid4())
+                lease = None
                 existing = data.get('ssh_maintenance', {}).get(profile_id)
                 if existing and existing.get('state') != 'released':
                     if existing.get('remote_update'):
@@ -311,11 +313,15 @@ class UpdateHooks:
                     if not ensure_local:
                         raise UpdateError('ssh_maintenance', 'Another SSH operation owns this profile.')
                     transaction_id = identifier(existing['transaction_id'])
-                    lease = _read_json(self._lease_path(transaction_id))
-                    if not lease.get('ssh_only') or lease.get('profile_scope') != [profile_id]:
+                    saved = _read_json(self._lease_path(transaction_id))
+                    if not saved.get('ssh_only') or saved.get('profile_scope') != [profile_id]:
                         raise UpdateError('restart_scope_changed', 'SSH 준비 기록의 계정 범위가 다릅니다.')
-                else:
-                    transaction_id = requested_transaction_id or str(uuid4())
+                    # A journal another lifecycle path retired stays retired: a
+                    # reopen rebuilds this generation's cohort from the saved
+                    # bindings instead of trusting revoked records as evidence.
+                    if saved.get('state') == 'held':
+                        lease = saved
+                if lease is None:
                     records = copy.deepcopy(old_lease['profiles'][0].get('remotes', [])) if old_lease else []
                     for record in records:
                         record['reinspect'] = True
@@ -409,6 +415,11 @@ class UpdateHooks:
         if not lease.get('ssh_only') or lease.get('profile_scope') != [profile_id]:
             raise UpdateError('restart_scope_changed', 'SSH 준비 범위가 다릅니다.')
         entry = lease['profiles'][0]
+        if lease.get('state') != 'held' or entry.get('state') != 'held':
+            # A journal another lifecycle path retired is never evidence for a
+            # new adoption: a fresh hold must rebuild this generation's cohort
+            # from the saved bindings before anything is released as reused.
+            raise UpdateError('ssh_generation_changed', 'SSH 적용 기록이 이미 종료되어 다시 준비해야 합니다.')
         def current():
             profile = self._profile(profile_id)
             gate = self.store.read().get('ssh_maintenance', {}).get(profile_id, {})
@@ -435,6 +446,15 @@ class UpdateHooks:
         reusable = getattr(self.remote_maintenance, 'reuse_unchanged', None)
         reused = (not lease.get('force_runtime_update') and callable(reusable)
                   and reusable(current(), records) is True)
+        adopted = None
+        if not reused and not lease.get('force_runtime_update'):
+            # An unchanged reconnect keeps a live listener even when that
+            # listener publishes no idle inventory. Only a verified settings
+            # change may enter the exit-verified lifecycle below.
+            equivalent = getattr(self.remote_maintenance, 'reuse_equivalent', None)
+            if callable(equivalent):
+                adopted = equivalent(current(), records)
+                reused = adopted is not None
         for record in ([] if reused else records):
             current()
             if record.get('state') == 'unobserved' or record.get('reinspect'):
@@ -483,6 +503,8 @@ class UpdateHooks:
         self.store.mutate(release)
         if reused:
             lease['reused_unchanged'] = True
+            if adopted:
+                lease['reused_revisions'] = adopted
         lease['state'] = 'released'
         self._save_lease(lease)
         return True
@@ -1116,6 +1138,10 @@ class UpdateHooks:
             self.guard_launch(profile_id)
             return {'status': 'restart'}
         lease = _read_json(path)
+        if lease.get('ssh_only'):
+            # An SSH cohort journal is released by its own gate, never by a
+            # restart recovery: a fresh attempt re-checks the SSH gate instead.
+            return {'status': 'restart'}
         entries = lease.get('profiles', [])
         if (lease.get('transaction_id') != transaction_id or lease.get('profile_scope') != [profile_id]
                 or len(entries) != 1 or entries[0].get('profile_id') != profile_id):

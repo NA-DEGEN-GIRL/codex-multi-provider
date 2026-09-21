@@ -11,6 +11,15 @@ from .store import atomic_json, identifier
 from .updates import UpdateError
 
 
+# Only these codes may cross the SSH boundary; the helper never returns raw text.
+ALLOWED_REMOTE_CODES = ('remote_configuration_changed', 'remote_runtime_exited', 'remote_start_timeout',
+                        'remote_idle_binding_missing', 'remote_idle_status_unavailable',
+                        'remote_listener_unavailable', 'remote_shutdown_unavailable',
+                        'remote_revision_conflict')
+# Typed answers that describe a live listener without claiming an idle proof.
+IDLE_OBSERVATIONS = ('remote_idle_binding_missing', 'remote_idle_status_unavailable',
+                     'remote_listener_unavailable')
+
 BOOTSTRAP = '''import json,sys,types
 try:
  p=json.loads(sys.stdin.buffer.read(262145))
@@ -21,8 +30,7 @@ try:
  print(json.dumps({'ok':True,'result':result}))
 except Exception as error:
  code=getattr(error,'code',None)
- if code not in ('remote_configuration_changed','remote_runtime_exited','remote_start_timeout',
-                 'remote_idle_binding_missing','remote_listener_unavailable'):
+ if code not in ''' + repr(ALLOWED_REMOTE_CODES) + ''':
   code='remote_maintenance_unverified'
  print(json.dumps({'ok':False,'code':code}))
  sys.exit(2)
@@ -94,12 +102,26 @@ class RemoteMaintenance:
                     or binding['alias'] not in saved
                     or validate_binding(saved[binding['alias']], profile['id']) != binding):
                 return False
-            if not self.verify_settings(profile, saved[binding['alias']]):
+            try:
+                verified = self.verify_settings(profile, saved[binding['alias']])
+            except UpdateError as error:
+                # Another descriptor revision is running. That is not an
+                # unverified failure: the equivalence path below may still prove
+                # the live descriptor carries exactly the desired settings.
+                if error.code != 'remote_revision_conflict':
+                    raise
+                return False
+            if not verified:
                 return False
         # Matching settings do not certify inactivity. Verify identity only;
         # normal native reconnect/start still rechecks the exact descriptor.
         for record in records:
-            self.request(record['binding'], 'identity')
+            try:
+                self.request(record['binding'], 'identity')
+            except UpdateError as error:
+                if error.code != 'remote_revision_conflict':
+                    raise
+                return False
         path = self.store.directory / 'profiles' / identifier(profile['id']) / 'ssh-bindings.json'
         if path.is_symlink() or path.stat().st_size > 256000:
             raise UpdateError('remote_binding_unknown', 'SSH 연결 설정을 확인해야 합니다.')
@@ -113,6 +135,201 @@ class RemoteMaintenance:
                 or any(published.count(r['binding']) != 1 for r in records)):
             raise UpdateError('remote_binding_changed', 'SSH 연결 설정이 확인 중 변경되었습니다.')
         return True
+
+    def observe_live(self, binding):
+        """Read-only identity of the live revision; no idle proof is required.
+
+        A shared-catalog listener answers this typed observation instead of
+        managed idle inventory. Its process is live work and is never stopped
+        from this path.
+        """
+        return self.request(binding, 'inspect', discover_active=True, observe_only=True)
+
+    def reuse_equivalent(self, profile, records):
+        """Repoint this generation at live revisions carrying the desired settings.
+
+        An unchanged reconnect must not demand an idle proof, and a live
+        descriptor of another revision may still hold exactly the desired
+        immutable settings. Only read-only identity evidence is used, and only
+        the current generation's binding is repointed at that live revision.
+        A genuine settings change returns None so the strict lifecycle path and
+        its exit verification stay in charge. Returns the adopted revisions.
+        """
+        if not records or any(record.get('state') != 'unobserved' or record.get('reinspect')
+                              or any(key in record for key in ('next_binding', 'exit_proof', 'started', 'process'))
+                              for record in records):
+            return None
+        saved = {item['alias']: item for item in profile.get('remote_bindings', [])
+                 if item.get('prepared') is True}
+        # published is the manifest baseline this journal record was built from;
+        # saved_baseline is the exact stored descriptor the settings were
+        # verified against. Both are revalidated under the state lock.
+        adopted, published, saved_baseline, verified, expected = {}, {}, {}, {}, {}
+        for record in records:
+            alias = record.get('alias')
+            prepared = saved.get(alias)
+            if (not isinstance(record.get('binding'), dict) or not isinstance(prepared, dict)
+                    or record['binding'].get('alias') != alias
+                    or not re.fullmatch(r'[0-9a-f]{64}', prepared.get('host_identity') or '')
+                    or not isinstance(prepared.get('runtime_bundle'), str)):
+                return None
+            current = validate_binding(record['binding'], profile['id'])
+            trimmed = validate_binding(prepared, profile['id'])
+            publication = record.get('publication_binding')
+            if (current != {**trimmed, 'revision': current['revision']}
+                    or (publication is not None
+                        and validate_binding(publication, profile['id']) not in (trimmed, current))):
+                return None
+            observed = self.observe_live(trimmed)
+            live = observed['process']['revision'] if observed['process'] is not None else None
+            files = self.remote.settings_files(profile, prepared)
+            if live is None or live == trimmed['revision']:
+                # Nothing is running, or the live descriptor already is the
+                # saved binding: immutable settings evidence alone decides
+                # reuse. A publication that still names another revision is
+                # repointed at the verified binding instead of being released.
+                if not self.verify_settings(profile, prepared):
+                    return None
+                prepared = self.stored_binding(profile, alias)
+                if prepared is None or validate_binding(prepared, profile['id']) != trimmed:
+                    return None
+                # Keep the full stored descriptor (prepared flag, runtime
+                # bundle, host identity, status); only the core comparison
+                # below is normalized.
+                replacement = prepared
+            else:
+                # Read-only identity of the live revision with the exact
+                # immutable settings expected for this host. A settings change
+                # that an existing descriptor cannot prove returns None here.
+                proof = self.request({**prepared, 'revision': live}, 'identity', expected_settings=files,
+                                     expected_host_identity=prepared.get('host_identity'),
+                                     expected_runtime_bundle=prepared.get('runtime_bundle'))
+                if proof.get('settings_match') is not True:
+                    return None
+                replacement = {**prepared, 'revision': live}
+            # Compare core descriptors only: the saved metadata (prepared flag,
+            # status, fingerprint) must not force a republish of an unchanged
+            # publication.
+            expected[alias] = current
+            if current != validate_binding(replacement, profile['id']):
+                adopted[alias] = {**replacement,
+                                  'settings_fingerprint': self.remote._settings_fingerprint(replacement, files)}
+                published[alias] = current
+                saved_baseline[alias] = deepcopy(prepared)
+                verified[alias] = files
+        # Every cohort member must already be published under its alias. A host
+        # this manifest dropped (policy-pending or rewritten) cannot be released
+        # as reused: the native SSH cohort would still miss it. Fail closed and
+        # let the strict lifecycle path own that host.
+        path = self.store.directory / 'profiles' / identifier(profile['id']) / 'ssh-bindings.json'
+        try:
+            if path.is_symlink() or path.resolve() != path or path.stat().st_size > 256000:
+                return None
+            manifest = json.loads(path.read_text(encoding='utf-8'))
+            listed = [validate_binding(item, profile['id']) for item in manifest.get('bindings', [])]
+        except (OSError, ValueError, TypeError, ShimError):
+            return None
+        if (manifest.get('generation') != profile.get('generation')
+                or manifest.get('profile_id') != profile['id']
+                or len({item['alias'] for item in listed}) != len(listed)):
+            return None
+        if manifest.get('pending_policy_hosts'):
+            # An alias waitlisted by policy keeps the whole cohort on the
+            # strict lifecycle path, exactly like reuse_unchanged requires.
+            return None
+        for alias, baseline in expected.items():
+            if [item for item in listed if item['alias'] == alias] != [baseline]:
+                return None
+        if adopted:
+            self.publish_reused(profile, adopted, published, saved_baseline, verified)
+        return {alias: binding['revision'] for alias, binding in adopted.items()}
+
+    def stored_binding(self, profile, alias):
+        """Exact stored descriptor for one alias, or None when it is gone."""
+        current = self.store.profile(profile['id'])
+        for item in current.get('remote_bindings', []):
+            if item.get('alias') == alias:
+                return deepcopy(item)
+        return None
+
+    def publish_reused(self, profile, adopted, published, saved_baseline, verified):
+        """Repoint only bindings that still match the verified settings.
+
+        Every claim is revalidated under the state lock before a file is
+        written: the generation, the policy revision, the rendered settings
+        that were verified, the exact stored descriptor, and the manifest
+        baseline this journal record was built from. A concurrent settings save
+        or manifest rewrite stops this publication instead of overwriting newer
+        state. No lifecycle request is issued.
+        """
+        path = self.store.directory / 'profiles' / identifier(profile['id']) / 'ssh-bindings.json'
+        with self.store.locked():
+            current = self.store.profile(profile['id'], self.store.read())
+            if current.get('generation') != profile.get('generation'):
+                raise UpdateError('remote_generation_changed', 'SSH 연결 설정이 확인 중 변경되었습니다.')
+            if current.get('policy', {}).get('desired_revision') != profile.get('policy', {}).get('desired_revision'):
+                raise UpdateError('policy_changed', 'SSH 연결 설정을 반영하기 전에 모델 설정이 변경되었습니다.')
+            for alias in sorted(adopted):
+                if self.remote.settings_files(current, adopted[alias]) != verified[alias]:
+                    raise UpdateError('policy_changed', 'SSH 연결 설정을 반영하기 전에 모델 설정이 변경되었습니다.')
+            if path.is_symlink() or path.resolve() != path or path.stat().st_size > 256000:
+                raise UpdateError('remote_binding_unknown', '실행 중인 SSH 연결 설정을 확인해야 합니다.')
+            manifest = json.loads(path.read_text(encoding='utf-8'))
+            if manifest.get('generation') != profile['generation'] or manifest.get('profile_id') != profile['id']:
+                raise UpdateError('remote_generation_changed', 'SSH 실행 설정이 변경되어 적용을 기다립니다.')
+            bindings = [validate_binding(item, profile['id']) for item in manifest.get('bindings', [])]
+            if len({item['alias'] for item in bindings}) != len(bindings):
+                raise UpdateError('remote_binding_unknown', 'SSH 연결 설정이 중복되었습니다.')
+            changed = False
+            for alias in sorted(adopted):
+                matches = [index for index, item in enumerate(bindings) if item['alias'] == alias]
+                replacement = validate_binding(adopted[alias], profile['id'])
+                if not matches:
+                    # A dropped host keeps the whole cohort on the strict path;
+                    # this check must never release a manifest that misses it.
+                    raise UpdateError('remote_binding_unknown', '실행 설정에 없는 SSH 서버의 연결 정보를 확인해야 합니다.')
+                if len(matches) != 1 or bindings[matches[0]] not in (published[alias], replacement):
+                    raise UpdateError('remote_binding_changed', 'SSH 연결 설정이 별도로 변경되었습니다.')
+                if bindings[matches[0]] != replacement:
+                    bindings[matches[0]] = replacement
+                    changed = True
+            stored = {}
+            for item in current.get('remote_bindings', []):
+                alias = item.get('alias')
+                if alias in adopted:
+                    stored[alias] = deepcopy(item)
+            if set(stored) != set(adopted):
+                raise UpdateError('remote_binding_unknown', '저장된 SSH 연결 설정을 확인해야 합니다.')
+            for alias, item in stored.items():
+                if saved_baseline[alias] != item:
+                    raise UpdateError('remote_binding_changed', 'SSH 연결 설정이 별도로 변경되었습니다.')
+
+            def save(data):
+                latest = self.store.profile(profile['id'], data)
+                if latest.get('generation') != profile['generation']:
+                    raise UpdateError('remote_generation_changed', 'SSH 연결 설정이 확인 중 변경되었습니다.')
+                if latest.get('policy', {}).get('desired_revision') != profile.get('policy', {}).get('desired_revision'):
+                    raise UpdateError('policy_changed', 'SSH 연결 설정을 반영하기 전에 모델 설정이 변경되었습니다.')
+                merged, replaced = [], set()
+                for item in latest.get('remote_bindings', []):
+                    alias = item.get('alias')
+                    if alias in adopted:
+                        if (saved_baseline[alias] != item
+                                or self.remote.settings_files(latest, adopted[alias]) != verified[alias]):
+                            raise UpdateError('remote_binding_changed', 'SSH 연결 설정이 별도로 변경되었습니다.')
+                        merged.append(deepcopy(adopted[alias]))
+                        replaced.add(alias)
+                    else:
+                        merged.append(deepcopy(item))
+                if replaced != set(adopted):
+                    raise UpdateError('remote_binding_unknown', '저장된 SSH 연결 설정을 확인해야 합니다.')
+                latest['remote_bindings'] = merged
+            self.store.mutate(save)
+            # The state store is the verified claim; the manifest is the
+            # publication. One torn write stays detectable and is repaired by
+            # the next attempt; it never releases the gate on its own.
+            if changed:
+                atomic_json(path, {**manifest, 'bindings': bindings})
 
     def bindings(self, profile, coverage):
         """Use the running generation's manifest, never newly saved settings."""
@@ -178,7 +395,10 @@ class RemoteMaintenance:
                     'remote_runtime_exited': 'SSH 런타임이 준비되기 전에 종료되었습니다. 원격 프로필 실행 로그를 확인하세요.',
                     'remote_start_timeout': 'SSH 런타임이 제한 시간 안에 준비되지 않았습니다.',
                     'remote_idle_binding_missing': '기존 SSH 작업의 안전한 종료 여부를 확인할 수 없어 적용을 기다립니다.',
+                    'remote_idle_status_unavailable': '공유 카탈로그 모드의 SSH 실행은 작업 상태 자동 확인을 제공하지 않습니다. 설정이 같은 연결은 그대로 유지하고, 변경된 설정은 적용을 보류합니다.',
                     'remote_listener_unavailable': 'SSH 실행 프로세스는 남아 있지만 연결 소켓이 닫혔습니다. 종료 결과를 확인해야 합니다.',
+                    'remote_shutdown_unavailable': '공유 카탈로그 모드의 SSH 실행은 관리 종료 증명을 지원하지 않아 종료 결과를 확인할 수 없습니다. 실행 중인 원격 작업은 그대로 유지합니다.',
+                    'remote_revision_conflict': '다른 SSH 실행 버전이 아직 작업 중입니다. 그 작업이 끝난 뒤 다시 시도해 주세요.',
                 }
                 if code in messages:
                     raise UpdateError(code, binding['alias'] + ' · ' + operation + ': ' + messages[code])
@@ -210,7 +430,7 @@ class RemoteMaintenance:
             if 'observation_code' in value:
                 if (operation != 'inspect' or params.get('observe_only') is not True
                         or value['idle'] is not False or process is None
-                        or value['observation_code'] not in ('remote_idle_binding_missing', 'remote_listener_unavailable')):
+                        or value['observation_code'] not in IDLE_OBSERVATIONS):
                     raise ValueError()
                 metadata['observation_code'] = value['observation_code']
             if 'runtime_bundle' in value:
@@ -240,8 +460,11 @@ class RemoteMaintenance:
             if proof['exited'] and proof['idle']:
                 entry.update(state='closed', exit_proof=proof)
         elif entry.get('state') == 'start_requested':
-            proof = self.request(entry['next_binding'], 'inspect')
-            if proof['process'] is not None:
+            # A lost start reply is settled by read-only identity of exactly the
+            # requested revision. A shared-catalog listener proves that without
+            # idle inventory, and this never claims exit or idle either.
+            proof = self.observe_live(entry['next_binding'])
+            if proof['process'] is not None and proof.get('active_binding') is None:
                 entry.update(state='started', started=proof)
 
     def prepare_and_start(self, profile, entries, save_journal, *, lifecycle_guard=None):

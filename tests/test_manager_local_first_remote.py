@@ -258,6 +258,113 @@ class LocalFirstRemoteTests(unittest.TestCase):
         self.assertEqual(self.fleet.calls, [('identity', 'fixture-a'), ('identity', 'fixture-b')])
         self.assertEqual(self.fixture.closes, [])
 
+    def equivalent_live_cohort(self, *, settings_match=True, live_revision='0' * 64):
+        """A cohort whose live listeners publish no idle inventory."""
+        self.fleet.idle_evidence = False
+        self.fleet.settings_evidence = settings_match
+        self.fleet.settings_files = lambda profile, binding: {'config.toml': 'c' * 64}
+        self.fleet._settings_fingerprint = lambda binding, files: 'e' * 64
+        extras = dict(runtime_bundle=self.fleet.runtime_bundle, host_identity=self.fleet.host_identity)
+        for binding in self.fleet.bindings_by_alias.values():
+            binding.update(extras)
+        self.store.mutate(lambda data: self.store.profile(self.profile['id'], data).update(
+            remote_bindings=[dict(binding, prepared=True) for binding in self.fleet.bindings_by_alias.values()]))
+        for process in self.fleet.running.values():
+            process['revision'] = live_revision
+
+    def test_equivalent_live_revisions_release_the_gate_without_stopping_their_work(self):
+        self.equivalent_live_cohort()
+        live = deepcopy(self.fleet.running)
+        shown = self.open()
+        self.assertEqual(self.fleet.calls, [])
+        self.pending.pop()()
+        self.assertEqual(self.job()['phase'], 'complete')
+        self.assertEqual(self.gate()['state'], 'released')
+        self.assertEqual(self.fixture.closes, [])
+        self.assertEqual(self.fleet.running, live)
+        self.assertEqual([call for call in self.fleet.calls if call[0] not in ('inspect', 'identity')], [])
+        self.assertEqual(self.instances.show_calls, [self.profile['id']])
+        self.assertEqual(self.store.profile(self.profile['id'])['generation'], shown['profile']['generation'])
+        stored = {b['alias']: b for b in self.store.profile(self.profile['id'])['remote_bindings']}
+        self.assertEqual({b['revision'] for b in stored.values()}, {'0' * 64})
+        self.assertTrue(all('settings_fingerprint' in b for b in stored.values()))
+        self.assertEqual({b['revision'] for b in json.loads(self.manifest.read_text())['bindings']}, {'0' * 64})
+        lease = json.loads(self.hooks._lease_path(self.gate()['transaction_id']).read_text())
+        self.assertEqual(lease['reused_revisions'], {'fixture-a': '0' * 64, 'fixture-b': '0' * 64})
+
+    def test_changed_settings_keep_the_strict_path_and_never_touch_live_work(self):
+        self.equivalent_live_cohort(settings_match=False)
+        live = deepcopy(self.fleet.running)
+        self.open()
+        manifest = self.manifest.read_bytes()
+        saved = deepcopy(self.store.profile(self.profile['id'])['remote_bindings'])
+        self.pending.pop()()
+        self.assertEqual(self.job()['code'], 'remote_idle_status_unavailable')
+        self.assertEqual(self.gate()['state'], 'attention')
+        self.assertEqual(self.fleet.running, live)
+        self.assertEqual(self.fixture.closes, [])
+        self.assertEqual(self.store.profile(self.profile['id'])['remote_bindings'], saved)
+        self.assertEqual(self.manifest.read_bytes(), manifest)
+        self.assertEqual([call for call in self.fleet.calls if call[0] not in ('inspect', 'identity')], [])
+
+    def test_bounded_repair_api_releases_only_the_verified_cohort_gate(self):
+        self.equivalent_live_cohort()
+        shown = self.open()
+        generation = shown['profile']['generation']
+        transaction = self.gate()['transaction_id']
+        live = deepcopy(self.fleet.running)
+        records = json.loads(self.hooks._lease_path(transaction).read_text())['profiles'][0]['remotes']
+        self.assertEqual(self.gate()['state'], 'held')
+        adopted = self.fleet.reuse_equivalent(self.store.profile(self.profile['id']), records)
+        self.assertEqual(adopted, {'fixture-a': '0' * 64, 'fixture-b': '0' * 64})
+        def release(data):
+            gate = data['ssh_maintenance'][self.profile['id']]
+            if gate.get('transaction_id') != transaction or gate.get('generation') != generation:
+                raise UpdateError('ssh_generation_changed', 'repair scope changed')
+            gate.update(state='released')
+        self.store.mutate(release)
+        self.assertEqual(self.gate()['state'], 'released')
+        self.assertEqual(self.fixture.closes, [])
+        self.assertEqual(self.fleet.running, live)
+        self.assertEqual(self.instances.show_calls, [self.profile['id']])
+        self.assertEqual({b['revision'] for b in json.loads(self.manifest.read_text())['bindings']}, {'0' * 64})
+
+    def test_reopened_retired_journal_rebuilds_the_cohort_from_current_bindings(self):
+        transaction = str(uuid4())
+        records = [dict(binding=dict(binding, revision='d' * 64), alias=alias, state='unobserved')
+                   for alias, binding in sorted(self.fleet.bindings_by_alias.items())]
+        atomic_json(self.hooks._lease_path(transaction), dict(
+            transaction_id=transaction, ssh_only=True, state='released', profile_scope=[self.profile['id']],
+            target_revision=self.profile['policy']['desired_revision'],
+            profiles=[dict(profile_id=self.profile['id'], generation=str(uuid4()), remote_only=True,
+                           state='released', remotes=records)]))
+        self.store.mutate(lambda data: data.setdefault('ssh_maintenance', {}).update({self.profile['id']: dict(
+            state='attention', transaction_id=transaction, generation=self.profile['generation'],
+            remote_update=False, target_revision=self.profile['policy']['desired_revision'])}))
+        self.open()
+        self.assertEqual(self.fleet.calls, [])
+        self.assertEqual(self.gate()['transaction_id'], transaction)
+        self.assertEqual(self.gate()['state'], 'held')
+        rebuilt = json.loads(self.hooks._lease_path(transaction).read_text())
+        self.assertEqual(rebuilt['state'], 'held')
+        self.assertEqual({record['state'] for record in rebuilt['profiles'][0]['remotes']}, {'unobserved'})
+        self.assertEqual({record['binding']['revision'] for record in rebuilt['profiles'][0]['remotes']},
+                         {'a' * 64})
+
+    def test_retired_journal_is_never_reused_for_a_new_release(self):
+        self.equivalent_live_cohort()
+        self.open()
+        self.pending.pop()()
+        transaction = self.gate()['transaction_id']
+        self.assertEqual(self.gate()['state'], 'released')
+        calls = list(self.fleet.calls)
+        with self.assertRaises(UpdateError) as raised:
+            self.hooks.reconcile_opened_remotes(self.profile['id'], transaction)
+        self.assertEqual(raised.exception.code, 'ssh_generation_changed')
+        self.assertEqual(self.gate()['state'], 'released')
+        self.assertEqual(self.fleet.calls, calls)
+        self.assertEqual(self.fixture.closes, [])
+
     def test_generation_change_during_unchanged_identity_cannot_release_gate(self):
         self.unchanged_live_fleet()
         self.open()

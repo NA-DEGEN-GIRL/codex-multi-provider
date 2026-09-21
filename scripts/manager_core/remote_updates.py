@@ -3,6 +3,10 @@
 Managed updates own one profile's recorded SSH cohort and never own its desktop.
 Stock updates are a separate, explicitly confirmed action and are never replayed
 by the scheduler. Lost managed lifecycle replies retain their original journal.
+A relaunch leaves a reservation pinned to an older generation; the scheduler
+retires it only while the transaction's own preserved journal proves no host
+was ever asked to stop or start, and keeps the automatic update setting for the
+new generation.
 """
 from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
@@ -20,6 +24,46 @@ from .updates import UpdateError, _lock_file, _unlock_file
 
 ACTIVE = frozenset({'queued', 'waiting', 'applying', 'recovering'})
 STOCK_ACTIVE = frozenset({'dispatching', 'pending', 'queued', 'starting', 'applying', 'running', 'unknown'})
+# A reservation is terminal once nothing may be dispatched for its transaction.
+FINISHED = frozenset({'complete', 'cancelled', 'superseded'})
+# Records in these states never crossed a stop/start request boundary.
+UNMOVED = frozenset({'unobserved', 'observed', 'closed'})
+# Keys that only exist once a stop/start was requested, prepared, or resumed.
+UNTOUCHED = ('exit_proof', 'next_binding', 'started', 'reinspect')
+# Refusals that keep the SSH gate until the preserved evidence is reviewed.
+REVIEW = frozenset({'lifecycle_pending', 'journal_missing', 'journal_unverified',
+                    'journal_generation_changed', 'gate_generation_changed'})
+
+
+def _journal_entry(lease, profile_id, transaction_id):
+    """The journal entry that belongs to exactly this profile transaction.
+
+    The file name alone never proves ownership: a path that was rewritten for
+    another transaction, scope or profile is not evidence for this
+    reservation, so its records must never be read as an unmoved proof.
+    """
+    if not isinstance(lease, dict):
+        return None
+    profiles = lease.get('profiles')
+    if (lease.get('transaction_id') != transaction_id or lease.get('ssh_only') is not True
+            or lease.get('profile_scope') != [profile_id] or not isinstance(profiles, list)
+            or len(profiles) != 1 or not isinstance(profiles[0], dict)
+            or profiles[0].get('profile_id') != profile_id
+            or not isinstance(profiles[0].get('remotes'), list)):
+        return None
+    return profiles[0]
+
+
+def _unmoved(records):
+    """True only when no host was ever asked to stop or start.
+
+    An observed host is still unmoved: inspection alone never changes a remote
+    runtime, so its recorded process and idle state do not matter. Any other
+    record state, or any stop/start evidence, keeps the maintenance gate: a
+    lost stop/start reply must never be released without human confirmation.
+    """
+    return all(record.get('state') in UNMOVED and not any(key in record for key in UNTOUCHED)
+               for record in records)
 
 
 def _version(bundle):
@@ -281,6 +325,194 @@ class RemoteUpdates:
         path = self.hooks._lease_path(transaction_id)
         return json.loads(path.read_text(encoding='utf-8')) if path.is_file() else None
 
+    @staticmethod
+    def _stale(value, profile):
+        """A held reservation that pins an older run generation or revision."""
+        pin, job = value.get('_job') or {}, value.get('job') or {}
+        if (not pin or job.get('state') in FINISHED or not value.get('alias')
+                or value.get('profile_id') != profile.get('id')):
+            return False
+        return (pin.get('generation') != profile.get('generation')
+                or pin.get('revision') != profile['policy']['desired_revision'])
+
+    def _cohort_alias(self, profile_id, alias):
+        """A profile's aliases share one reservation; find the alias holding it."""
+        value = self._read(profile_id, alias)
+        if (value.get('_job') or {}) and (value.get('job') or {}).get('state') not in FINISHED:
+            return alias
+        owned = sorted(v['alias'] for v in self.store.read().get('remote_updates', {}).values()
+                       if v.get('profile_id') == profile_id and isinstance(v.get('alias'), str)
+                       and (v.get('_job') or {}) and (v.get('job') or {}).get('state') not in FINISHED)
+        return owned[0] if owned and owned[0] else alias
+
+    def _journal(self, profile_id, transaction_id):
+        """Read this transaction's journal without raising: (present, value).
+
+        ``present`` distinguishes a transaction that never wrote a journal from
+        a path that exists but cannot be read as evidence. An unreadable path
+        still counts as present, so it is reviewed instead of trusted.
+        """
+        path = self.hooks._lease_path(transaction_id)
+        try:
+            if not path.is_file():
+                return False, None
+            return True, json.loads(path.read_text(encoding='utf-8'))
+        except (OSError, ValueError, TypeError):
+            return True, None
+
+    def _retire_stale(self, profile_id, alias, *, apply=False, observe=False):
+        """Safely retire one reservation whose profile generation already moved on.
+
+        Only the transaction's own preserved journal may prove that no stop or
+        start was ever dispatched: unobserved/observed/closed records without
+        an exit proof or a start journal. A journal that is missing, belongs to
+        another transaction or profile, was adopted by another generation, or
+        is already past a lifecycle request keeps its gate for manual review.
+        The superseded journal is persisted before the gate is handed back, so
+        a crash can never leave a released gate claiming an in-flight
+        lifecycle. A released reservation keeps ``auto_apply`` so the next
+        observation can schedule the same update for the current generation.
+        """
+        value = self._read(profile_id, alias)
+        pin, job = value.get('_job') or {}, value.get('job') or {}
+        transaction = pin.get('transaction_id')
+        profile = self.store.profile(profile_id)
+        report = dict(profile_id=profile_id, alias=alias, transaction_id=transaction,
+                      generation=pin.get('generation'), current_generation=profile.get('generation'),
+                      eligible=False, released=False, cancelled=False, gate_released=False,
+                      journal_released=False, observed=False, scheduled=False, reason=None)
+        lease, gated = None, False
+        if value.get('profile_id') != profile_id or value.get('alias') != alias:
+            report['reason'] = 'reservation_mismatch'
+        elif not transaction:
+            report['reason'] = 'no_reservation'
+        elif job.get('state') in FINISHED:
+            report['reason'] = 'already_finished'
+        elif (pin.get('generation') == profile.get('generation')
+                and pin.get('revision') == profile['policy']['desired_revision']):
+            report['reason'] = 'generation_current'
+        elif profile.get('removed_at') or profile.get('view_only'):
+            report['reason'] = 'profile_unavailable'
+        else:
+            present, lease = self._journal(profile_id, transaction)
+            entry = _journal_entry(lease, profile_id, transaction)
+            gate = self.store.read().get('ssh_maintenance', {}).get(profile_id, {})
+            gated = gate.get('transaction_id') == transaction
+            if entry is None and gated:
+                report['reason'] = 'journal_unverified' if present else 'journal_missing'
+            elif entry is None and present:
+                report['reason'] = 'journal_unverified'
+            elif entry is None:
+                # Nothing was ever journaled for this transaction, so no host
+                # was asked to move and there is no evidence to hand back.
+                report['eligible'] = True
+            elif entry.get('generation') != pin.get('generation'):
+                report['reason'] = 'journal_generation_changed'
+            elif gated and gate.get('generation') not in (None, pin.get('generation')):
+                report['reason'] = 'gate_generation_changed'
+            elif not _unmoved(entry['remotes']):
+                report['reason'] = 'lifecycle_pending'
+            else:
+                report['eligible'] = True
+        if not apply or report['reason'] is not None:
+            return report
+        if lease is not None:
+            # Write-ahead the superseded evidence: the gate is the claim that
+            # frees the profile for a fresh lifecycle, so it is handed back only
+            # after this transaction can no longer be resumed as in-flight work.
+            lease.update(state='released', superseded=True)
+            self.hooks._save_lease(lease)
+            report['journal_released'] = True
+        if gated:
+            def release(data):
+                current = data['ssh_maintenance'][profile_id]
+                if (current.get('transaction_id') != transaction
+                        or current.get('generation') not in (None, pin.get('generation'))):
+                    raise UpdateError('ssh_generation_changed', 'SSH 유지보수 게이트가 변경되었습니다.')
+                current.update(state='released', code='ssh_generation_superseded',
+                               message='프로필이 다시 실행되어 이전 SSH 업데이트 예약을 해제했습니다. 자동 업데이트 설정은 유지합니다.',
+                               updated_at=now())
+            try:
+                self.store.mutate(release)
+            except UpdateError:
+                # A concurrent lifecycle re-owned the gate after the preflight.
+                # This reservation is over, but that gate is not ours to release.
+                self._job_state(profile_id, alias, 'cancelled',
+                                '프로필이 다시 실행되어 이전 SSH 업데이트 예약을 정리했습니다. 자동 업데이트 설정은 유지합니다.',
+                                code='ssh_generation_superseded')
+                report['cancelled'] = True
+                report['reason'] = 'gate_changed'
+                return report
+            report['gate_released'] = True
+        self._job_state(profile_id, alias, 'cancelled',
+                        '프로필이 다시 실행되어 이전 SSH 업데이트 예약을 정리했습니다. 자동 업데이트 설정은 유지합니다.',
+                        code='ssh_generation_superseded')
+        report['cancelled'] = True
+        report['released'] = True
+        if observe and (value['auto_check'] or value['auto_apply']):
+            try:
+                self._check(profile_id, alias)
+                report['observed'] = True
+            except Exception as error:
+                report['observation_error'] = getattr(error, 'code', 'ssh_observation_unavailable')
+            report['scheduled'] = (self._read(profile_id, alias).get('job') or {}).get('state') == 'queued'
+        self.wake.set()
+        return report
+
+    def retirement(self, profile_id, alias):
+        """Read-only preview of the safe retirement report for this profile."""
+        self._key(profile_id, alias)
+        return self._retire_stale(profile_id, self._cohort_alias(profile_id, alias))
+
+    def recover(self, profile_id, alias, *, observe=False):
+        """Retire a stale-generation reservation without touching the desktop.
+
+        Runs synchronously under the same cross-process worker claim as apply
+        and cancel, so a second controller can never retire a reservation
+        another one is stepping. Returns the JSON-safe retirement report:
+        ``released`` states whether the gate was handed back, ``cancelled``
+        states whether the stale reservation was retired, and ``reason``
+        explains a refusal (``lifecycle_pending``, ``journal_missing``,
+        ``journal_unverified``, ``journal_generation_changed``,
+        ``gate_generation_changed``, ``gate_changed``, ``generation_current``,
+        ``busy``, ``unavailable``). Never stops, starts, or restarts a remote
+        runtime and never closes the local window.
+        """
+        self._key(profile_id, alias)
+        alias = self._cohort_alias(profile_id, alias)
+        key = profile_id + ':' + alias
+        with self.mutex:
+            if key in self.busy:
+                return dict(self._retire_stale(profile_id, alias), eligible=False, reason='busy')
+            try:
+                claim = _lock_file(self.store.directory / 'remote-updates' / profile_id / (alias + '.lock'))
+            except UpdateError:
+                return dict(self._retire_stale(profile_id, alias), eligible=False, reason='busy')
+            self.busy.add(key)
+        try:
+            return self._retire_stale(profile_id, alias, apply=True, observe=observe)
+        except (RuntimeError, ValueError, OSError, KeyError, TypeError) as error:
+            # A UI caller receives a refusal, never a traceback: an aborted
+            # retirement keeps the gate and only reports that it did not run.
+            report = self._retire_stale(profile_id, alias)
+            report.update(eligible=False, released=False, cancelled=False, reason='unavailable',
+                          error=getattr(error, 'code', 'ssh_retirement_unavailable'))
+            return report
+        finally:
+            with self.mutex:
+                self.busy.discard(key)
+            _unlock_file(claim)
+
+    def _retire_pass(self, profile_id, alias):
+        """Scheduler pass: retire a stale reservation or hand it to review."""
+        report = self._retire_stale(profile_id, alias, apply=True, observe=True)
+        if not report['released'] and report['reason'] in REVIEW:
+            self.hooks.remote_open_failed(profile_id, report['transaction_id'], 'ssh_generation_changed')
+            self._job_state(profile_id, alias, 'attention',
+                            'SSH 업데이트 결과 확인이 필요합니다. 이전 버전의 연결 정보와 적용 기록을 보존했습니다.',
+                            code='ssh_generation_changed')
+        return report
+
     def cancel(self, profile_id, alias):
         self._key(profile_id, alias)
         requested_alias = alias
@@ -302,9 +534,15 @@ class RemoteUpdates:
     def _cancel(self, profile_id, alias):
         value = self._read(profile_id, alias)
         transaction = value['_job']['transaction_id']
-        lease = self._lease(transaction)
-        records = (lease or {}).get('profiles', [{}])[0].get('remotes', [])
-        if any(r.get('state') not in ('unobserved', 'observed', 'closed') or r.get('exit_proof') for r in records):
+        present, lease = self._journal(profile_id, transaction)
+        entry = _journal_entry(lease, profile_id, transaction)
+        # A journal that is missing, malformed, or past a lifecycle request
+        # cannot prove that no host still holds half-applied work: keep the
+        # gate until the preserved evidence is reviewed.
+        gate = self.store.read().get('ssh_maintenance', {}).get(profile_id, {})
+        if ((not present and gate.get('transaction_id') == transaction)
+                or (present and entry is None)
+                or (entry is not None and not _unmoved(entry['remotes']))):
             self._update_pin(profile_id, alias, transaction, cancel_requested=False)
             self._job_state(profile_id, alias, 'recovering',
                             'SSH 종료 또는 시작 요청이 이미 진행되었습니다. 결과를 확인한 뒤 연결 제한을 해제합니다.')
@@ -335,6 +573,11 @@ class RemoteUpdates:
             profile = self.store.profile(profile_id)
             if (profile.get('generation') != pin['generation']
                     or profile['policy']['desired_revision'] != pin['revision']):
+                # An ordinary relaunch or settings change invalidates the pin.
+                # Hand the gate back only while the journal proves that no
+                # stop or start was ever dispatched for this transaction.
+                if self._retire_stale(profile_id, alias, apply=True, observe=True)['released']:
+                    return
                 raise UpdateError('ssh_generation_changed', '프로필 실행 세대 또는 설정이 변경되었습니다.')
             gate = self.store.read().get('ssh_maintenance', {}).get(profile_id, {})
             if gate.get('transaction_id') != transaction:
@@ -450,6 +693,11 @@ class RemoteUpdates:
                     continue
                 if (value.get('job') or {}).get('state') in ACTIVE:
                     self._launch(profile_id, alias, lambda p=profile_id, a=alias: self._queued_pass(p, a))
+                elif self._stale(value, profile):
+                    # A relaunch left a non-active reservation holding the SSH
+                    # gate; retire it or hand it to review instead of waiting
+                    # for the profile to be blocked forever.
+                    self._launch(profile_id, alias, lambda p=profile_id, a=alias: self._retire_pass(p, a))
                 elif (_stock_pending(value['stock']) or (value['auto_check'] and
                       self.clock() - value.get('_checked_epoch', 0) >= self.check_interval)):
                     self.check(profile_id, alias)
