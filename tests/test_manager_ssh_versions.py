@@ -29,6 +29,7 @@ class StockHelperTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.directory = Path(self.temp.name)
         for replacement in (patch.object(helper, 'base', return_value=self.directory),
+                            patch.object(helper, 'npm_plan', return_value=None),
                             patch.object(helper.os, 'getuid', return_value=0, create=True)):
             replacement.start()
             self.addCleanup(replacement.stop)
@@ -152,6 +153,7 @@ class StockHelperTests(unittest.TestCase):
                         daemon_state='running', update_job=dict(id='id', state='attention'))
         record = dict(id='id', state='attention', command_succeeded=True)
         with patch.object(helper, 'read_json', return_value=record), \
+             patch.object(helper, 'update_lock', return_value=nullcontext()), \
              patch.object(helper, 'worker_alive', return_value=False), \
              patch.object(helper, 'atomic') as write, \
              patch.object(helper, 'public_job', return_value=dict(id='id', state='complete')), \
@@ -167,6 +169,75 @@ class StockHelperTests(unittest.TestCase):
         self.assertTrue(helper.service_verified(observed))
         observed['daemon_version'] = '0.154.0'
         self.assertFalse(helper.service_verified(observed))
+
+    def test_result_reads_official_status_instead_of_exit_code_or_message(self):
+        result = helper.update_result(json.dumps(dict(status='unsupported',
+            installedVersion=None, runningVersion='0.154.0', message='private error', managedCodexPath='private path')))
+        self.assertEqual(dict(status='unsupported', installed_version=None, running_version='0.154.0'), result)
+        self.assertNotIn('private', json.dumps(result))
+        for value in ('', '{}', '[]', '{"status":"success"}', 'not JSON'):
+            self.assertIsNone(helper.update_result(value))
+
+    def test_help_does_not_enable_update_without_standalone_install(self):
+        binary = self.directory / 'codex'
+        binary.write_text('fixture')
+        info = types.SimpleNamespace(st_mode=0o100755, st_uid=0, st_mtime_ns=123, st_size=7)
+        with patch.object(helper, 'public_job', return_value=None), \
+             patch.object(helper.shutil, 'which', return_value=str(binary)), \
+             patch.object(Path, 'stat', return_value=info), \
+             patch.object(Path, 'read_text', return_value='machine'), \
+             patch.object(Path, 'home', return_value=self.directory), \
+             patch.object(Path, 'exists', return_value=False), \
+             patch.object(helper, 'command', side_effect=['codex-cli 0.155.1',
+                json.dumps(dict(status='running', appServerVersion='0.154.0', managedCodexVersion=None,
+                    managedCodexPath=str(self.directory / '.codex/packages/standalone/current/codex'))),
+                'codex app-server daemon update']):
+            result = helper.probe()
+        self.assertFalse(result['update_supported'])
+        self.assertEqual('standalone_missing', result['update_block_reason'])
+        self.assertEqual('update_needed', result['state'])
+        self.assertEqual(64, len(result['managed_host_identity']))
+
+    def test_cli_probe_failure_preserves_independent_managed_host_metadata(self):
+        binary = self.directory / 'codex'
+        binary.write_text('fixture')
+        info = types.SimpleNamespace(st_mode=0o100755, st_uid=0, st_mtime_ns=123, st_size=7)
+        with patch.object(helper, 'public_job', return_value=None), \
+             patch.object(helper.shutil, 'which', return_value=str(binary)), \
+             patch.object(Path, 'stat', return_value=info), \
+             patch.object(Path, 'read_text', return_value='machine'), \
+             patch.object(helper, 'command', side_effect=ValueError('probe failed')):
+            result = helper.probe()
+        self.assertEqual(64, len(result['managed_host_identity']))
+        self.assertIn('architecture', result)
+        self.assertFalse(result['update_supported'])
+
+    def test_legacy_success_with_missing_install_settles_without_replaying(self):
+        observed = dict(daemon_state='running', cli_version='0.155.1', daemon_version='0.154.0',
+                        update_block_reason='standalone_missing', update_job=dict(id='id', state='attention'))
+        for alive in (True, False):
+            record = dict(id='id', state='attention', command_succeeded=True)
+            with patch.object(helper, 'read_json', return_value=record), \
+                 patch.object(helper, 'update_lock', return_value=nullcontext()), \
+                 patch.object(helper, 'worker_alive', return_value=alive), \
+                 patch.object(helper, 'atomic') as write, \
+                 patch.object(helper, 'public_job', return_value=dict(id='id', state='unsupported')), \
+                 patch.object(helper.subprocess, 'run') as run:
+                helper.reconcile_completed_command(observed)
+                if alive:
+                    write.assert_not_called()
+                else:
+                    self.assertEqual('unsupported', write.call_args.args[1]['state'])
+                    self.assertEqual('unsupported', observed['update_job']['state'])
+                run.assert_not_called()
+
+    def test_standalone_probe_uncertainty_cannot_settle_legacy_attempt(self):
+        observed = dict(update_block_reason='standalone_unavailable', update_job=dict(id='id', state='attention'))
+        with patch.object(helper, 'read_json', return_value=dict(command_succeeded=True)), \
+             patch.object(helper, 'update_lock', return_value=nullcontext()), \
+             patch.object(helper, 'worker_alive', return_value=False), patch.object(helper, 'atomic') as write:
+            helper.reconcile_completed_command(observed)
+        write.assert_not_called()
 
 
 class StockTransportTests(unittest.TestCase):

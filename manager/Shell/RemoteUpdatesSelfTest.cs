@@ -29,6 +29,8 @@ internal static class RemoteUpdatesSelfTest
         string stockObservation = new('a', 64), stockHostIdentity = new('d', 64);
         string? errorCode = null;
         string? managedObservationCode = null;
+        string? stockBlockReason = null;
+        string? stockUpdateMode = null;
         string managedState = "update_available", stockState = "available";
         string managedMessage = "관리 런타임 새 버전을 사용할 수 있습니다.";
         object? job = null;
@@ -63,6 +65,8 @@ internal static class RemoteUpdatesSelfTest
                     state = stockState,
                     message = "기본 CLI 작업 상태는 자동으로 확인할 수 없습니다.",
                     update_supported = stockSupported,
+                    update_block_reason = stockBlockReason,
+                    update_mode = stockUpdateMode,
                     safe_auto_update = false,
                     update_job = stockJob
                 },
@@ -264,6 +268,38 @@ internal static class RemoteUpdatesSelfTest
             Require(!Control<Button>("StockUpdate").IsEnabled && Text("StockActionHint").Contains("앞선 업데이트"),
                 "an uncertain previous terminal update offers status recovery instead of another update");
             stockJob = null;
+
+            stockSupported = false; stockBlockReason = "standalone_missing";
+            stockJob = new { state = "unsupported", verification_pending = false };
+            await window.LoadAsync(); await Settle();
+            Require(!Control<CheckBox>("StockConfirmation").IsEnabled && !Control<Button>("StockUpdate").IsEnabled &&
+                Control<Button>("StockSetup").Visibility == Visibility.Visible,
+                "a missing standalone install offers setup instead of an unusable update confirmation");
+            Require(Text("StockActionHint").Contains("독립 설치가 없습니다") && !Text("StockActionHint").Contains("앞선 업데이트 결과") &&
+                Text("StockGuidance").Contains("적용되지 않고 끝났습니다"),
+                "unsupported exit zero is explained as a finished non-update rather than endless verification");
+            stockBlockReason = "installation_unsupported";
+            await window.LoadAsync(); await Settle();
+            Require(Control<Button>("StockSetup").Visibility == Visibility.Collapsed && Text("StockActionHint").Contains("설치 도구"),
+                "other installer ownership is explained without offering an unrelated reinstall");
+            stockBlockReason = null; stockSupported = true; stockJob = null;
+            await window.LoadAsync(); Toggle("StockConfirmation", true); await Settle();
+            Require(Control<Button>("StockUpdate").IsEnabled,
+                "a fresh supported installation can be confirmed again after a terminal unsupported result");
+
+            stockUpdateMode = "npm"; stockJob = new { state = "unsupported", verification_pending = false };
+            await window.LoadAsync(); Toggle("StockConfirmation", true); await Settle();
+            Require(Control<Button>("StockUpdate").IsEnabled && Text("StockGuidance").Contains("npm 방식으로 진행할 수 있습니다") &&
+                Text("StockActionHint").Contains("npm 설치 감지됨") && Control<Button>("StockSetup").Visibility == Visibility.Collapsed,
+                "a verified npm fallback enables the normal confirmation without requiring manual standalone setup");
+            stockJob = new { state = "applying", step = "installing_npm" };
+            await window.LoadAsync(); await Settle();
+            Require(!Control<CheckBox>("StockConfirmation").IsEnabled && Text("StockGuidance").Contains("npm으로 터미널 Codex"),
+                "npm install progress blocks duplicate clicks and explains the current step");
+            stockJob = new { state = "complete" };
+            await window.LoadAsync(); await Settle();
+            Require(Text("StockGuidance").Contains("실행 상태를 확인했습니다"), "npm completion is shown after runtime verification");
+            stockJob = null; stockUpdateMode = null;
 
             managedState = "unknown";
             managedMessage = "작업 상태를 확인할 수 없어 적용을 대기합니다.";

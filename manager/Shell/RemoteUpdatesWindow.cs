@@ -21,6 +21,7 @@ internal sealed class RemoteUpdatesWindow : Window
     private readonly Button schedule = Action("ScheduleManaged", "작업 종료 후 적용 예약");
     private readonly Button cancel = Action("CancelManaged", "예약 취소");
     private readonly Button stockUpdate = Action("StockUpdate", "터미널 Codex 업데이트");
+    private readonly Button stockSetup = Action("StockSetup", "공식 설치 명령 복사");
     private readonly Button prepare = Action("PrepareRemote", "이 계정의 SSH 연결 준비");
     private readonly TextBlock managedActive = Version("ManagedActiveVersion");
     private readonly TextBlock managedPrepared = Version("ManagedPreparedVersion");
@@ -91,7 +92,8 @@ internal sealed class RemoteUpdatesWindow : Window
         stock.Children.Add(Versions(("터미널에 설치됨", stockCli), ("백그라운드 실행 중", stockDaemon)));
         stock.Children.Add(stockMessage);
         stock.Children.Add(Note("터미널 작업이 끝났는지는 자동으로 확인할 수 없습니다. 업데이트하면 백그라운드 실행이 다시 시작되며 진행 중인 작업이 중단될 수 있습니다."));
-        stock.Children.Add(stockConfirmation); stock.Children.Add(stockUpdate); stock.Children.Add(stockHint); body.Children.Add(Card(stock));
+        stock.Children.Add(stockConfirmation); stock.Children.Add(stockUpdate); stock.Children.Add(stockHint);
+        stock.Children.Add(stockSetup); body.Children.Add(Card(stock));
 
         var preparation = new StackPanel();
         preparation.Children.Add(Note("현재 계정으로 작업공간의 SSH 연결을 준비합니다. 터미널용 Codex 업데이트는 위에서 별도로 진행하세요."));
@@ -111,6 +113,18 @@ internal sealed class RemoteUpdatesWindow : Window
         autoCheck.Click += async (_, _) => await SaveSettingsAsync();
         autoApply.Click += async (_, _) => await SaveSettingsAsync();
         stockConfirmation.Click += (_, _) => UpdateControls();
+        stockSetup.Click += (_, _) =>
+        {
+            try
+            {
+                Clipboard.SetText("# SSH 터미널 Codex 작업을 모두 마친 뒤 해당 서버의 터미널에서 실행하세요.\n" +
+                    "# 공식 독립 설치를 준비한 뒤 이 창에서 ‘다시 확인’을 누르세요.\n" +
+                    "curl -fsSL https://chatgpt.com/codex/install.sh | sh\n");
+                feedback.Foreground = Muted;
+                feedback.Text = "공식 설치 명령을 복사했습니다. 선택한 서버의 SSH 터미널에서 작업을 마친 뒤 실행하세요. 설치 후 ‘다시 확인’을 누르세요.";
+            }
+            catch (Exception) { ShowError("클립보드에 복사하지 못했습니다. 잠시 후 다시 시도하세요."); }
+        };
         stockUpdate.Click += async (_, _) =>
         {
             // Gate the handler as well as the button: programmatic activation
@@ -201,10 +215,13 @@ internal sealed class RemoteUpdatesWindow : Window
         if (stock.S("state") is "stopped" or "not_running") stockState.Text = "백그라운드 실행 상태 확인 필요";
         managedMessage.Text = RemoteUpdatesPresentation.Managed(managed);
         stockMessage.Text = RemoteUpdatesPresentation.Stock(stock);
+        if (stock.S("update_block_reason").Length > 0) stockState.Text = "터미널 업데이트 설치 확인 필요";
         var stockJob = stock.Get("update_job");
         if (stockJob.ValueKind == JsonValueKind.Object)
         {
-            stockMessage.Text += "\n" + RemoteUpdatesPresentation.Job(stockJob, terminal: true);
+            stockMessage.Text += "\n" + (stockJob.S("state") == "unsupported" && stock.S("update_mode") == "npm"
+                ? "앞선 업데이트는 적용되지 않았습니다. 이번에는 npm 방식으로 진행할 수 있습니다."
+                : RemoteUpdatesPresentation.Job(stockJob, terminal: true));
         }
         var identity = string.Join("|", stock.S("cli_version"), stock.S("daemon_version"), stock.S("daemon_state"),
             stock.S("observation_id"), stock.S("host_identity"));
@@ -245,9 +262,15 @@ internal sealed class RemoteUpdatesWindow : Window
         cancel.IsEnabled = available && queued;
         stockConfirmation.IsEnabled = available && loaded && stockVerified && stock.B("update_supported") && HasStockObservation(stock) && !running && !stockRunning;
         stockUpdate.IsEnabled = stockConfirmation.IsEnabled && stockConfirmation.IsChecked == true && stock.S("state") is not ("updating" or "running" or "applying") && !data.B("checking");
-        stockHint.Text = stockRunning ? "앞선 업데이트 결과를 확인해야 다시 실행할 수 있습니다. ‘다시 확인’을 눌러 주세요."
+        var blocked = RemoteUpdatesPresentation.StockBlock(stock);
+        stockSetup.Visibility = stock.S("update_block_reason") is "standalone_missing" or "standalone_unavailable"
+            ? Visibility.Visible : Visibility.Collapsed;
+        stockSetup.IsEnabled = available;
+        stockHint.Text = blocked.Length > 0 ? blocked
+            : stockRunning ? "앞선 업데이트 결과를 확인해야 다시 실행할 수 있습니다. ‘다시 확인’을 눌러 주세요."
             : !stockVerified || !stock.B("update_supported") || !HasStockObservation(stock) ? "버전과 업데이트 지원 여부를 먼저 확인해야 합니다. ‘다시 확인’을 눌러 주세요."
             : running ? "작업공간 SSH 업데이트가 끝난 뒤 진행할 수 있습니다."
+            : stock.S("update_mode") == "npm" ? "npm 설치 감지됨 · 터미널 작업 종료를 확인하면 설치와 백그라운드 서비스 갱신을 함께 진행합니다."
             : stockConfirmation.IsChecked == true ? "확인한 터미널 Codex에만 적용합니다." : "터미널 작업을 마친 뒤 확인란을 선택하면 업데이트할 수 있습니다.";
     }
 
