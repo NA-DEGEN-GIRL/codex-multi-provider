@@ -4,6 +4,11 @@ Input starts at the HTTP upgrade, after the native SSH synchronization marker.
 The caller preserves that marker and serializes feed/poll/eof calls. No socket,
 credential storage, or logging belongs to this module. Compression is refused:
 the native Codex SSH client already requests perMessageDeflate=false.
+
+One app-server message may legitimately reach the native client's own bound:
+the Rust SSH client accepts 128 MiB per message (remote.rs ``128 << 20``), so
+this bridge must not impose a smaller transport limit on the same wire
+messages. A smaller bound may still be configured for tighter deployments.
 """
 from __future__ import annotations
 
@@ -13,6 +18,12 @@ import hashlib
 import json
 import os
 import struct
+
+
+# Single source of truth for the largest app-server message this transport
+# accepts, matching the native SSH client. Never raise this bound: a larger
+# frame is refused by the native side anyway and only wastes bridge memory.
+MAX_APP_SERVER_MESSAGE_BYTES = 128 * 1024 * 1024
 
 
 class WebSocketProtocolError(ValueError):
@@ -71,9 +82,12 @@ def _headers(raw):
 
 
 class WebSocketAuthBridge:
-    def __init__(self, auth, *, max_message_bytes=32 * 1024 * 1024,
+    def __init__(self, auth, *, max_message_bytes=MAX_APP_SERVER_MESSAGE_BYTES,
                  max_header_bytes=32768, mask_factory=os.urandom):
-        if max_message_bytes < 1 or max_header_bytes < 128:
+        if (not isinstance(max_message_bytes, int) or isinstance(max_message_bytes, bool)
+                or not isinstance(max_header_bytes, int) or isinstance(max_header_bytes, bool)
+                or not 1 <= max_message_bytes <= MAX_APP_SERVER_MESSAGE_BYTES
+                or max_header_bytes < 128):
             raise ValueError('Invalid WebSocket buffer limit.')
         self.auth = auth
         self.max_message_bytes = max_message_bytes
@@ -199,21 +213,31 @@ class WebSocketAuthBridge:
                 self._fail('websocket_message_limit')
             if masked:
                 position += 4
-            if len(buffer) < position + size:
+            end = position + size
+            if len(buffer) < end:
                 return
-            raw = bytes(buffer[:position + size])
-            payload = raw[position:]
-            if masked:
-                key = raw[position - 4:position]
-                payload = bytes(value ^ key[index % 4] for index, value in enumerate(payload))
-            del buffer[:position + size]
             if opcode >= 8:
+                # Control frames are at most 125 bytes and stay byte-exact on
+                # the wire, including the client's own mask.
+                raw = bytes(buffer[:end])
+                del buffer[:end]
+                payload = raw[position:]
+                if masked:
+                    key = raw[position - 4:position]
+                    payload = bytes(value ^ key[index % 4] for index, value in enumerate(payload))
                 if opcode == 8:
                     self._close_payload(payload)
                     self._closed.add(direction)
                     self.state = 'closing'
                 getattr(result, 'runtime' if direction == 'frontend' else 'frontend').append(raw)
                 continue
+            # A data message may be tens of MiB: unmask into one payload copy
+            # and release the wire bytes instead of retaining a second copy.
+            key = bytes(buffer[position - 4:position]) if masked else None
+            payload = bytes(buffer[position:end])
+            del buffer[:end]
+            if masked:
+                payload = bytes(value ^ key[index % 4] for index, value in enumerate(payload))
             # Opposite-direction data may already be in flight when one peer
             # starts the close handshake. Only data after that sender's own
             # Close frame violates the wire protocol.

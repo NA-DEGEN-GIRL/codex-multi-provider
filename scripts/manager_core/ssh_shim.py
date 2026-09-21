@@ -382,12 +382,58 @@ def _load_manifest(environment: dict[str, str]) -> tuple[dict, Path]:
 
 def _audit(path: Path, event: dict) -> None:
     try:
-        allowed = {key: event[key] for key in ('operation', 'alias', 'profile_id', 'revision', 'code', 'stage', 'error_type', 'exit_code') if key in event}
+        allowed = {key: event[key] for key in ('operation', 'alias', 'profile_id', 'revision', 'code', 'stage',
+                                               'error_type', 'errno', 'exit_code') if key in event}
         allowed.update(at=datetime.now(timezone.utc).isoformat(), proxy_pid=os.getpid())
         with path.with_name('ssh-routing.jsonl').open('a', encoding='utf-8') as stream:
             stream.write(json.dumps(allowed, ensure_ascii=True) + '\n')
     except OSError:
         pass
+
+
+# The first transport failure is audited with bounded fields only: an exact
+# allowlisted code, an allowlisted type name and a numeric errno. Peer payload,
+# tokens and free-form exception text can never reach the audit file.
+TRANSPORT_STAGES = frozenset({'frontend', 'runtime', 'poll', 'output-runtime', 'output-frontend'})
+TRANSPORT_TYPES = frozenset({'ShimError', 'WebSocketProtocolError', 'OSError', 'ValueError', 'TypeError',
+                             'EOFError', 'TimeoutError', 'BlockingIOError', 'BrokenPipeError',
+                             'ConnectionResetError', 'ConnectionAbortedError', 'ConnectionRefusedError'})
+TRANSPORT_CODES = frozenset({
+    'ssh_transport_io_error',
+    'adapter_version_mismatch', 'binding_profile_mismatch', 'duplicate_binding', 'host_binding_required',
+    'invalid_binding', 'manifest_invalid', 'manifest_missing', 'native_command_changed', 'native_marker_changed',
+    'native_marker_missing', 'native_path_prefix_changed', 'native_ssh_arguments_changed', 'native_wrapper_changed',
+    'real_ssh_missing', 'ssh_account_binding_required', 'ssh_auth_bridge_missing', 'ssh_generation_changed',
+    'ssh_output_closed', 'ssh_output_limit', 'ssh_policy_pending', 'ssh_proxy_missing',
+    'unsupported_native_ssh_version',
+    'binary_app_server_message_not_supported', 'data_after_transport_eof', 'http_header_limit',
+    'http_upgrade_body_not_supported', 'invalid_app_server_json', 'invalid_http_headers',
+    'invalid_outgoing_app_server_json', 'invalid_websocket_key', 'invalid_websocket_request',
+    'transport_already_failed', 'truncated_http_upgrade', 'truncated_websocket_stream',
+    'unsupported_websocket_negotiation', 'unsupported_websocket_version', 'websocket_accept_mismatch',
+    'websocket_buffer_limit', 'websocket_data_after_close', 'websocket_interleaved_data_message',
+    'websocket_invalid_close_code', 'websocket_invalid_close_payload', 'websocket_invalid_close_reason',
+    'websocket_invalid_control_frame', 'websocket_invalid_long_length', 'websocket_mask_direction',
+    'websocket_message_limit', 'websocket_nonminimal_length', 'websocket_outgoing_message_limit',
+    'websocket_reserved_bits', 'websocket_reserved_opcode', 'websocket_unexpected_continuation',
+    'websocket_upgrade_rejected', 'websocket_upgrade_required',
+})
+
+
+def _transport_failure_detail(stage: str, error) -> dict:
+    """Bounded first-failure detail; never the exception message or payload."""
+    code = getattr(error, 'code', None)
+    if not isinstance(code, str) or code not in TRANSPORT_CODES:
+        arguments = getattr(error, 'args', ())
+        candidate = arguments[0] if arguments and isinstance(arguments[0], str) else None
+        code = candidate if candidate in TRANSPORT_CODES else 'ssh_transport_io_error'
+    name = type(error).__name__ if error is not None else 'OSError'
+    detail = {'stage': stage if stage in TRANSPORT_STAGES else 'unknown', 'code': code,
+              'error_type': name if name in TRANSPORT_TYPES else 'Exception'}
+    number = getattr(error, 'errno', None)
+    if type(number) is int and 0 <= number <= 4096:
+        detail['errno'] = number
+    return detail
 
 
 class MarkerGate:
@@ -425,7 +471,13 @@ class MarkerGate:
 class OutputWriter:
     """Ordered byte writes without holding the bridge's bidirectional state lock."""
 
-    def __init__(self, stream, on_failure, *, close_stream=False, max_bytes=64 * 1024 * 1024):
+    def __init__(self, stream, on_failure, *, close_stream=False, max_bytes=None):
+        if max_bytes is None:
+            from manager_core.websocket_auth import MAX_APP_SERVER_MESSAGE_BYTES
+            # A legal history response must fit on the output side too. Allow
+            # two maximum frames, including their headers, while retaining a
+            # hard per-writer bound when the receiving peer stops draining.
+            max_bytes = 2 * (MAX_APP_SERVER_MESSAGE_BYTES + 14)
         self.stream, self.on_failure = stream, on_failure
         self.close_stream, self.max_bytes = close_stream, max_bytes
         self._condition = threading.Condition()
@@ -472,8 +524,8 @@ class OutputWriter:
                     remaining = remaining[count:]
                 with self._condition:
                     self._bytes -= len(data)
-        except (OSError, ValueError):
-            self.on_failure()
+        except (OSError, ValueError) as error:
+            self.on_failure(error)
         finally:
             if self.close_stream:
                 try:
@@ -529,16 +581,26 @@ def _proxy_with_auth(executable: Path, arguments: list[str], environment: dict,
             auth_state[0] = auth.state
             _audit(path, {**event, 'operation': 'auth-state', 'code': auth.state})
 
-    def fail_transport():
-        failure.set()
+    failure_lock = threading.Lock()
+
+    def fail_transport(stage='unknown', error=None):
+        # One bounded audit line per pump: the first failure names its stage and
+        # only allowlisted code/type/errno fields. Later failures stay silent.
+        with failure_lock:
+            first = not failure.is_set()
+            failure.set()
+        if first:
+            _audit(path, {**event, 'operation': 'transport-failure',
+                          **_transport_failure_detail(stage, error)})
         stop.set()
         try:
             child.terminate()
         except OSError:
             pass
 
-    runtime_writer = OutputWriter(child.stdin, fail_transport, close_stream=True)
-    frontend_writer = OutputWriter(sys.stdout.buffer, fail_transport)
+    runtime_writer = OutputWriter(child.stdin, lambda error=None: fail_transport('output-runtime', error),
+                                  close_stream=True)
+    frontend_writer = OutputWriter(sys.stdout.buffer, lambda error=None: fail_transport('output-frontend', error))
     generation = source_environment.get('CODEX_MANAGER_GENERATION')
     if generation and source_environment.get('CODEX_MANAGER_ROOT'):
         from manager_core.ssh_runtime_control import SshRuntimeControl, endpoint_id
@@ -570,8 +632,8 @@ def _proxy_with_auth(executable: Path, arguments: list[str], environment: dict,
                     break
                 with protocol_lock:
                     emit(bridge.feed('frontend', data))
-        except (OSError, ValueError, TypeError, ShimError, WebSocketProtocolError):
-            fail_transport()
+        except (OSError, ValueError, TypeError, ShimError, WebSocketProtocolError) as error:
+            fail_transport('frontend', error)
         finally:
             frontend_done.set()
             runtime_writer.finish()
@@ -583,8 +645,8 @@ def _proxy_with_auth(executable: Path, arguments: list[str], environment: dict,
             try:
                 with protocol_lock:
                     emit(bridge.poll())
-            except (OSError, ValueError, TypeError, ShimError, WebSocketProtocolError):
-                fail_transport()
+            except (OSError, ValueError, TypeError, ShimError, WebSocketProtocolError) as error:
+                fail_transport('poll', error)
                 return
 
     # A native bootstrap Job Object ensures forced Windows termination closes the
@@ -608,8 +670,8 @@ def _proxy_with_auth(executable: Path, arguments: list[str], environment: dict,
             if protocol:
                 with protocol_lock:
                     emit(bridge.feed('runtime', protocol))
-    except (OSError, ValueError, TypeError, ShimError, WebSocketProtocolError):
-        fail_transport()
+    except (OSError, ValueError, TypeError, ShimError, WebSocketProtocolError) as error:
+        fail_transport('runtime', error)
     finally:
         stop.set()
         if control is not None:
@@ -621,7 +683,7 @@ def _proxy_with_auth(executable: Path, arguments: list[str], environment: dict,
         runtime_writer.finish()
         frontend_writer.finish()
     if failure.is_set():
-        _audit(path, {**event, 'operation': 'blocked', 'code': 'ssh_auth_transport_failed'})
+        _audit(path, {**event, 'operation': 'blocked', 'code': 'ssh_auth_transport_failed', 'exit_code': 125})
         try:
             child.wait(timeout=5)
         except subprocess.TimeoutExpired:

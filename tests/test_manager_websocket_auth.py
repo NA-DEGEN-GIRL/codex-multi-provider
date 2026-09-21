@@ -6,6 +6,7 @@ Reference: https://www.rfc-editor.org/rfc/rfc6455 (sections 4, 5, 7, 8).
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 from pathlib import Path
 import struct
@@ -15,7 +16,8 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 from manager_core.proxy_auth import AuthProxy, AuthTokens
-from manager_core.websocket_auth import WebSocketAuthBridge, WebSocketProtocolError
+from manager_core.websocket_auth import (MAX_APP_SERVER_MESSAGE_BYTES, WebSocketAuthBridge,
+                                         WebSocketProtocolError)
 
 
 REQUEST = (
@@ -302,6 +304,43 @@ class WebSocketFixtureTests(unittest.TestCase):
         bridge.feed('frontend', frame(b'{"v":"' + b'x' * 200, masked=True, fin=False))
         self.rejected('frontend', b'\x80\xfe\x00\x80', bridge)
 
+    def test_default_message_limit_matches_the_native_app_server_bound(self):
+        # The native SSH client accepts 128 MiB per message; the bridge must not
+        # be the smaller transport limit for the same wire messages.
+        self.assertEqual(MAX_APP_SERVER_MESSAGE_BYTES, 128 * 1024 * 1024)
+        self.assertGreater(MAX_APP_SERVER_MESSAGE_BYTES, 32 * 1024 * 1024)
+        self.assertEqual(WebSocketAuthBridge(self.auth).max_message_bytes, MAX_APP_SERVER_MESSAGE_BYTES)
+        # A tighter configured bound stays available for tests and deployments.
+        self.assertEqual(WebSocketAuthBridge(self.auth, max_message_bytes=1024).max_message_bytes, 1024)
+        with self.assertRaises(ValueError):
+            WebSocketAuthBridge(self.auth, max_message_bytes=MAX_APP_SERVER_MESSAGE_BYTES + 1)
+        with self.assertRaises(ValueError):
+            WebSocketAuthBridge(self.auth, max_message_bytes=0)
+
+    def test_configured_message_limit_boundary_is_inclusive(self):
+        limit = 1024
+        bridge = self.opened(WebSocketAuthBridge(self.auth, max_message_bytes=limit))
+        message = {'v': 'x' * (limit - 8)}
+        payload = json.dumps(message, separators=(',', ':')).encode()
+        self.assertEqual(len(payload), limit)
+        self.assertEqual(messages(bridge.feed('frontend', frame(payload, masked=True)).runtime), [message])
+        self.assertEqual(bridge.state, 'open')
+
+    def test_announced_size_above_a_limit_is_refused_before_any_body(self):
+        # Header-only frames: neither a configured small limit nor the native
+        # bound may buffer an announced oversized message.
+        cases = ((1024, b'\x81\xff' + struct.pack('!Q', 1025)),
+                 (MAX_APP_SERVER_MESSAGE_BYTES,
+                  b'\x81\xff' + struct.pack('!Q', MAX_APP_SERVER_MESSAGE_BYTES + 1)))
+        for limit, header in cases:
+            bridge = self.opened(WebSocketAuthBridge(self.auth, max_message_bytes=limit))
+            with self.subTest(limit=limit):
+                with self.assertRaises(WebSocketProtocolError):
+                    bridge.feed('runtime', header)
+                self.assertEqual(bridge.state, 'failed')
+                self.assertEqual(bridge.max_message_bytes, limit)
+        self.assertEqual(self.auth.seen, [])
+
     def test_continuation_without_start_and_interleaved_data_are_rejected(self):
         bridge = self.opened(WebSocketAuthBridge(self.auth))
         self.rejected('frontend', frame(b'{}', opcode=0, masked=True), bridge)
@@ -503,6 +542,80 @@ class WebSocketAuthIntegrationTests(unittest.TestCase):
         self.assertNotIn(token, json.dumps(output.events))
         self.assertNotIn('accessToken', json.dumps(output.events))
         self.assertEqual(bridge.state, 'closing')
+
+    def ready(self):
+        """Drive the synthetic login to ready; the token never reaches the frontend."""
+        auth, bridge, token, loaded = self.synthetic()
+        bridge.feed('frontend', frame({'id': 1, 'method': 'initialize',
+            'params': {'clientInfo': {'name': 'fixture', 'version': '1'}}}, masked=True))
+        output = bridge.feed('runtime', frame({'id': 1, 'result': {'userAgent': 'fixture'}}))
+        login = messages(output.runtime)[0]
+        self.assertEqual(login['method'], 'account/login/start')
+        self.assertEqual(login['params']['accessToken'], token)
+        self.assertEqual(messages(output.frontend), [{'id': 1, 'result': {'userAgent': 'fixture'}}])
+        output = bridge.feed('runtime', frame({'id': login['id'], 'result': {'type': 'chatgptAuthTokens'}}))
+        self.assertEqual(output.frontend, [])
+        self.assertEqual(output.runtime, [])
+        self.assertEqual(auth.state, 'ready')
+        self.assertEqual(loaded, [True])
+        return auth, bridge, token, loaded
+
+    @staticmethod
+    def app_server_line(size):
+        """One compact JSON line of exactly ``size`` ASCII bytes."""
+        prefix, suffix = b'{"id":9,"result":{"data":"', b'"}}'
+        return prefix + b'x' * (size - len(prefix) - len(suffix)) + suffix
+
+    def forwarded(self, chunks):
+        """The single unmasked output frame payload, without copying it."""
+        self.assertEqual(len(chunks), 1)
+        chunk = chunks[0]
+        self.assertEqual(chunk[1] & 0x7f, 127)
+        self.assertFalse(chunk[1] & 0x80)
+        length = struct.unpack('!Q', chunk[2:10])[0]
+        self.assertEqual(len(chunk), 10 + length)
+        return memoryview(chunk)[10:]
+
+    def test_runtime_response_above_the_old_32mib_limit_is_forwarded(self):
+        auth, bridge, token, loaded = self.ready()
+        payload = self.app_server_line(33 * 1024 * 1024 + 1)
+        self.assertGreater(len(payload), 32 * 1024 * 1024)
+        digest = hashlib.sha256(payload).digest()
+        # Split across two fragments: the cumulative bound follows the native
+        # limit, so a >32 MiB message no longer fails the old bridge default.
+        split = 16 * 1024 * 1024
+        self.assertEqual(bridge.feed('runtime', frame(payload[:split], fin=False)).frontend, [])
+        output = bridge.feed('runtime', frame(payload[split:], opcode=0))
+        forwarded = self.forwarded(output.frontend)
+        self.assertEqual(len(forwarded), len(payload))
+        self.assertEqual(hashlib.sha256(forwarded).digest(), digest)
+        self.assertEqual(output.runtime, [])
+        self.assertEqual(bridge.state, 'open')
+        self.assertEqual(auth.state, 'ready')
+        # Login filtering still owns the transport after the large message: the
+        # refreshed token goes only to the runtime and never to the frontend.
+        refresh = bridge.feed('runtime', frame({'id': 12, 'method': 'account/chatgptAuthTokens/refresh',
+                                               'params': {'previousAccountId': 'fixture-account'}}))
+        self.assertEqual(refresh.frontend, [])
+        self.assertEqual(messages(refresh.runtime)[0]['result']['accessToken'], token)
+        self.assertNotIn(token, json.dumps(output.events))
+        self.assertNotIn(token, json.dumps(refresh.events))
+
+    def test_actual_65_920_144_byte_json_line_is_forwarded_unchanged(self):
+        # The largest selected SSH thread JSONL line measured in production.
+        auth, bridge, token, loaded = self.ready()
+        size = 65_920_144
+        payload = self.app_server_line(size)
+        self.assertEqual(len(payload), size)
+        self.assertLess(size, MAX_APP_SERVER_MESSAGE_BYTES)
+        output = bridge.feed('runtime', frame(payload))
+        forwarded = self.forwarded(output.frontend)
+        self.assertEqual(len(forwarded), size)
+        self.assertEqual(hashlib.sha256(forwarded).digest(), hashlib.sha256(payload).digest())
+        self.assertEqual(output.runtime, [])
+        self.assertEqual(bridge.state, 'open')
+        self.assertEqual(auth.state, 'ready')
+        self.assertEqual(loaded, [True])
 
 
 if __name__ == '__main__':

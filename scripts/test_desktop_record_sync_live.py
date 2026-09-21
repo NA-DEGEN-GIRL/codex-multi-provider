@@ -19,6 +19,19 @@ from test_shared_editing_headless import Client, Fixture, ROOT
 
 RENDERER_DIAGNOSTIC = rb'''
 (() => {
+ globalThis.fixtureHistoryRequests={fullReads:0,turnPages:0,itemPages:0};
+ const sync=globalThis.__codexRendererRecordSync,register=sync.register;
+ sync.register=function(m){
+   register(m);
+   const client=m.requestClient,send=client.sendRequest;
+   client.sendRequest=function(method,params,...rest){
+     const counts=globalThis.fixtureHistoryRequests;
+     if(method==='thread/read'&&params?.includeTurns===true)counts.fullReads++;
+     if(method==='thread/turns/list')counts.turnPages++;
+     if(method==='thread/items/list')counts.itemPages++;
+     return Reflect.apply(send,this,[method,params,...rest]);
+   };
+ };
  const route=globalThis.__codexProfileResume;
  globalThis.__codexProfileResume=async function(...args){
    const result=await route(...args);
@@ -51,7 +64,7 @@ DIAGNOSTIC = r'''
    try {
      const store=manager.threadStore;
      if(!loaded){
-       await store.hydrateThreads([id],{addToRecentConversations:true,includeTurns:true,maxTurns:8,retainHistoryPagination:true,notifyAnyCallbacks:true});
+       await store.hydrateThreads([id],{addToRecentConversations:true,includeTurns:false,retainHistoryPagination:true,notifyAnyCallbacks:true});
        loaded=true;
      }
      if(fs.existsSync(path.join(root,'resume-again')) && !globalThis.fixtureResumed){
@@ -70,7 +83,7 @@ DIAGNOSTIC = r'''
 
      fs.writeFileSync(path.join(root,'snapshot.tmp'),JSON.stringify({loaded,
        seed:body?.includes('SYNC_SEED'), second:body?.includes('SYNC_SECOND'),
-       third:body?.includes('SYNC_THIRD'), draft:rendered.includes('UNSENT_DRAFT_KEEP'), uiSeed:rendered.includes('SYNC_SEED'), uiSecond:rendered.includes('SYNC_SECOND'), uiThird:rendered.includes('SYNC_THIRD'), resumedProvider:globalThis.fixtureResumed?.modelProvider, visibleResume:await view.executeJavaScript('globalThis.fixtureVisibleResume'), rendererStatus:await view.executeJavaScript('globalThis.__codexRendererRecordSync?.status()'), status:sync.status(),error:lastError}));
+       third:body?.includes('SYNC_THIRD'), draft:rendered.includes('UNSENT_DRAFT_KEEP'), uiSeed:rendered.includes('SYNC_SEED'), uiSecond:rendered.includes('SYNC_SECOND'), uiThird:rendered.includes('SYNC_THIRD'), resumedProvider:globalThis.fixtureResumed?.modelProvider, visibleResume:await view.executeJavaScript('globalThis.fixtureVisibleResume'), historyRequests:await view.executeJavaScript('globalThis.fixtureHistoryRequests'), rendererStatus:await view.executeJavaScript('globalThis.__codexRendererRecordSync?.status()'), status:sync.status(),error:lastError}));
      fs.renameSync(path.join(root,'snapshot.tmp'),path.join(root,'snapshot.json'));
    }catch(e){lastError=String(e);fs.writeFileSync(path.join(root,'fixture-error.txt'),lastError);}
    finally{busy=false;}
@@ -147,7 +160,7 @@ def run(binary=None, before_writes=None):
         with (output/'desktop.log').open('w',encoding='utf8') as log:
             desktop=subprocess.Popen([str(program/'ChatGPT.exe'),'--user-data-dir='+str(output/'ui')],
                 env=env,startupinfo=startup,creationflags=subprocess.CREATE_NO_WINDOW,stdout=log,stderr=log)
-            initial=wait_for(lambda s:s['seed'] and s['uiSeed'] and s.get('visibleResume',{}).get('provider')=='fixture');checks['native_ui_loaded_seed']=True
+            initial=wait_for(lambda s:s['loaded'] and s['uiSeed'] and s.get('visibleResume',{}).get('provider')=='fixture');checks['native_ui_loaded_seed']=True
             checks['visible_renderer_resumes_foreign_provider']=initial['visibleResume']['model']=='gpt-5.5'
             (output/'insert-draft').touch()
             wait_for(lambda s:s['draft'])
@@ -176,16 +189,18 @@ def run(binary=None, before_writes=None):
                 signals.observe({'method':'thread/started','params':{'thread':{'id':'00000000-0000-4000-8000-000000000099'}}})
                 for event in writer.events[offset:]:signals.observe(event)
                 if key=='second':
-                    snap=wait_for(lambda s:s['second'] and s['rendererStatus']['draftDeferred']>0)
+                    snap=wait_for(lambda s:s['rendererStatus']['pending']>0 and s['rendererStatus']['draftDeferred']>0)
                     checks['unsent_draft_preserved']=snap['draft']
                     checks['merge_deferred_while_composing']=not snap['uiSecond']
                     (output/'clear-draft').touch()
-                snap=wait_for(lambda s:s[key] and s['ui'+key.title()]);checks[key+'_in_renderer_without_reopen']=True
+                snap=wait_for(lambda s:s['ui'+key.title()]);checks[key+'_in_renderer_without_reopen']=True
             (output/'resume-again').touch()
             snap=wait_for(lambda s:s.get('resumedProvider')=='fixture')
             checks['native_app_resumes_api_history_with_own_provider']=True
             checks['desktop_alive']=desktop.poll() is None
-            checks['native_hydration_executed']=snap['status']['historyRefreshes']>=2
+            checks['main_catalog_refreshed']=snap['status']['summaryRefreshes']>=2
+            checks['paginated_history_avoids_full_reads']=snap['historyRequests']['fullReads']==0
+            checks['native_history_pages_loaded']=snap['historyRequests']['turnPages']>0 and snap['historyRequests']['itemPages']>0
             checks['no_sync_failures']=snap['status']['failures']==0
             checks['renderer_refreshed']=snap['rendererStatus']['refreshes']>=2
             checks['no_renderer_sync_failures']=snap['rendererStatus']['failures']==0

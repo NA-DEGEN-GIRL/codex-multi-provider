@@ -98,7 +98,7 @@ def _read_frame_body(stream, first, *, masked, record=None):
         size = struct.unpack('!H', read_exact(stream, 2, record))[0]
     elif size == 127:
         size = struct.unpack('!Q', read_exact(stream, 8, record))[0]
-    if size > 4 * 1024 * 1024:
+    if size > 128 * 1024 * 1024:
         raise ValueError('Fixture message size limit.')
     key = read_exact(stream, 4, record) if masked else None
     payload = read_exact(stream, size, record)
@@ -196,6 +196,19 @@ def runtime_fixture(directory, scenario):
         send(target, {'method': 'fixture/after-eof', 'params': {'complete': True}})
         report['sawInputEofBeforeResponse'] = True
         code = 23
+    elif scenario == 'large-response':
+        message = read_frame(source, masked=True)
+        if message.get('id') != 2:
+            raise ValueError('Unexpected large-response request.')
+        # Exceeds both the former 32 MiB frame limit and 64 MiB writer budget.
+        send(target, {'id': 2, 'result': {'data': 'R' * (65 * 1024 * 1024)}})
+        message = read_frame(source, masked=True)
+        if message.get('id') != 3 or message.get('method') != 'fixture/ping':
+            raise ValueError('The connection did not survive the large response.')
+        send(target, {'id': 3, 'result': {'pong': True}})
+        if source.read() != b'':
+            raise ValueError('Unexpected large-response trailing data.')
+        code = 0
     elif scenario == 'idle':
         message = read_frame(source, masked=True)
         if message.get('method') != 'fixture/ping':
@@ -344,6 +357,49 @@ class FixtureClient:
                 stream.close()
 
 
+class TransportFailureAuditTests(unittest.TestCase):
+    """Bounded first-failure fields: no payload, token or free-form text."""
+
+    def setUp(self):
+        from manager_core import ssh_shim
+        self.shim = ssh_shim
+
+    def test_allowlisted_shim_code_is_recorded_without_its_message(self):
+        detail = self.shim._transport_failure_detail(
+            'output-frontend', self.shim.ShimError('ssh_output_limit', 'SENSITIVE free-form text'))
+        self.assertEqual(detail, {'stage': 'output-frontend', 'code': 'ssh_output_limit',
+                                  'error_type': 'ShimError'})
+        self.assertNotIn('SENSITIVE', json.dumps(detail))
+
+    def test_unlisted_code_unknown_stage_and_type_collapse_to_safe_defaults(self):
+        class Sneaky(RuntimeError):
+            code = 'SENSITIVE-' + fixture_token()
+        detail = self.shim._transport_failure_detail('not-a-stage', Sneaky('SENSITIVE payload'))
+        self.assertEqual(detail, {'stage': 'unknown', 'code': 'ssh_transport_io_error',
+                                  'error_type': 'Exception'})
+        self.assertNotIn('SENSITIVE', json.dumps(detail))
+
+    def test_numeric_errno_is_bounded_and_optional(self):
+        import errno
+        detail = self.shim._transport_failure_detail('runtime', OSError(errno.EPIPE, 'SENSITIVE payload'))
+        self.assertEqual(detail['errno'], errno.EPIPE)
+        # errno.EPIPE maps to BrokenPipeError, an allowlisted OSError subclass.
+        self.assertEqual(detail['error_type'], 'BrokenPipeError')
+        self.assertIn(detail['error_type'], self.shim.TRANSPORT_TYPES)
+        self.assertEqual(detail['code'], 'ssh_transport_io_error')
+        self.assertNotIn('SENSITIVE', json.dumps(detail))
+        self.assertNotIn('errno', self.shim._transport_failure_detail('runtime', OSError()))
+
+    def test_websocket_code_comes_from_the_allowlist_never_from_text(self):
+        from manager_core.websocket_auth import WebSocketProtocolError
+        allowed = self.shim._transport_failure_detail('frontend', WebSocketProtocolError('websocket_mask_direction'))
+        self.assertEqual(allowed, {'stage': 'frontend', 'code': 'websocket_mask_direction',
+                                   'error_type': 'WebSocketProtocolError'})
+        hidden = self.shim._transport_failure_detail('frontend', WebSocketProtocolError('SENSITIVE payload'))
+        self.assertEqual(hidden['code'], 'ssh_transport_io_error')
+        self.assertNotIn('SENSITIVE', json.dumps(hidden))
+
+
 @unittest.skipUnless(os.name == 'nt', 'Windows native bootstrap integration')
 class PumpIntegrationTests(unittest.TestCase):
     @classmethod
@@ -385,6 +441,21 @@ class PumpIntegrationTests(unittest.TestCase):
         report = json.loads((client.directory / 'driver-report.json').read_text())
         self.assertTrue(report['childExitedBeforePumpReturned'])
 
+    def transport_failures(self, client):
+        """First-failure audit lines: bounded fields only, one per pump."""
+        from manager_core import ssh_shim
+        entries = [json.loads(line) for line in
+                   (client.directory / 'ssh-routing.jsonl').read_text().splitlines()]
+        failures = [entry for entry in entries if entry.get('operation') == 'transport-failure']
+        self.assertEqual(len(failures), 1, entries)
+        self.assertEqual(set(failures[0]) - {'operation', 'alias', 'profile_id', 'revision', 'code', 'stage',
+                                             'error_type', 'errno', 'at', 'proxy_pid'}, set())
+        self.assertIn(failures[0]['code'], ssh_shim.TRANSPORT_CODES)
+        self.assertIn(failures[0]['stage'], ssh_shim.TRANSPORT_STAGES)
+        self.assertIn(failures[0]['error_type'], ssh_shim.TRANSPORT_TYPES)
+        self.assertNotIn(fixture_token(), json.dumps(entries))
+        return failures[0]
+
     def test_duplex_backpressure_preserves_two_mebibytes_each_direction(self):
         client = self.client('duplex')
         send(client.process.stdin, {'id': 2, 'method': 'fixture/large', 'params': {'data': 'C' * SIZE}}, masked=True)
@@ -410,6 +481,21 @@ class PumpIntegrationTests(unittest.TestCase):
         self.assertEqual(response['result']['sha256'], hashlib.sha256(('C' * SIZE).encode()).hexdigest())
         client.process.stdin.close()
         client.wait_for(lambda message: message.get('method') == 'fixture/after-eof')
+        code, stderr = client.finish()
+        self.assertEqual(code, 0, stderr.decode(errors='replace'))
+        self.assert_private_auth_hidden(client, stderr)
+
+    def test_large_history_response_keeps_transport_open_for_next_request(self):
+        client = self.client('large-response')
+        send(client.process.stdin, {'id': 2, 'method': 'fixture/large'}, masked=True)
+        response = client.wait_for(lambda message: message.get('id') == 2, timeout=45)
+        data = response['result']['data']
+        self.assertEqual(len(data), 65 * 1024 * 1024)
+        self.assertEqual(hashlib.sha256(data.encode()).hexdigest(),
+                         hashlib.sha256(b'R' * (65 * 1024 * 1024)).hexdigest())
+        send(client.process.stdin, {'id': 3, 'method': 'fixture/ping'}, masked=True)
+        self.assertEqual(client.wait_for(lambda message: message.get('id') == 3)['result'], {'pong': True})
+        client.process.stdin.close()
         code, stderr = client.finish()
         self.assertEqual(code, 0, stderr.decode(errors='replace'))
         self.assert_private_auth_hidden(client, stderr)
@@ -442,6 +528,11 @@ class PumpIntegrationTests(unittest.TestCase):
         audit = (self.directory / 'ssh-routing.jsonl').read_text()
         self.assertIn('ssh_auth_transport_failed', audit)
         self.assertNotIn('SENSITIVE-invalid-protocol-payload', audit)
+        failure = self.transport_failures(client)
+        self.assertEqual(failure['stage'], 'runtime')
+        self.assertEqual(failure['error_type'], 'WebSocketProtocolError')
+        self.assertEqual(failure['code'], 'websocket_mask_direction')
+        self.assertNotIn('SENSITIVE-invalid-protocol-payload', json.dumps(failure))
         send(sentinel.process.stdin, {'id': 7, 'method': 'fixture/ping'}, masked=True)
         pong = sentinel.wait_for(lambda message: message.get('id') == 7)
         self.assertEqual(pong['result'], {'pong': True})
@@ -449,6 +540,23 @@ class PumpIntegrationTests(unittest.TestCase):
         code, stderr = sentinel.finish()
         self.assertEqual(code, 0, stderr.decode(errors='replace'))
         self.assert_private_auth_hidden(sentinel, stderr)
+
+    def test_frontend_protocol_failure_audits_bounded_stage_and_still_exits_125(self):
+        client = self.client('idle')
+        # Client frames must be masked; an unmasked frame is a bounded failure
+        # of exactly this local transport, never a lifecycle operation.
+        client.process.stdin.write(frame({'id': 2, 'method': 'fixture/ping'}, masked=False))
+        client.process.stdin.flush()
+        code, stderr = client.finish()
+        self.assertEqual(code, 125, stderr.decode(errors='replace'))
+        self.assert_private_auth_hidden(client, stderr)
+        failure = self.transport_failures(client)
+        self.assertEqual(failure['stage'], 'frontend')
+        self.assertEqual(failure['error_type'], 'WebSocketProtocolError')
+        self.assertEqual(failure['code'], 'websocket_mask_direction')
+        audit = (client.directory / 'ssh-routing.jsonl').read_text()
+        self.assertIn('ssh_auth_transport_failed', audit)
+        self.assertNotIn('fixture/ping', audit)
 
 
 if __name__ == '__main__':
