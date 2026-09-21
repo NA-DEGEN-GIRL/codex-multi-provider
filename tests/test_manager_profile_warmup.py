@@ -56,6 +56,24 @@ class ProfileWarmupTests(unittest.TestCase):
         complete['profiles'].clear()
         self.assertEqual(len(self.warmup.status()['profiles']), 3)
 
+    def test_resume_after_failed_exit_allows_startup_without_reopening_closed_profiles(self):
+        self.run_worker()
+        self.warmup.shutdown()
+        self.warmup.resume()
+        self.assertEqual(self.warmup.start()['state'], 'complete')
+        self.assertEqual(self.workers, [])
+        self.assertEqual(len(self.launched), 3)
+
+    def test_resume_waits_for_cancelled_warmup_pass_to_finish(self):
+        self.warmup.start()
+        self.warmup.shutdown()
+        self.warmup.resume()
+        self.assertTrue(self.warmup.stopping.is_set())
+        self.workers.pop()()
+        self.assertFalse(self.warmup.stopping.is_set())
+        self.assertFalse(self.warmup.start()['worker_active'])
+        self.assertEqual(self.launched, [])
+
     def test_default_pool_bounds_concurrency_prioritizes_and_cancels_queued_profiles(self):
         self.profiles += [self.store.add_profile('parallel') for _ in range(4)]
         entered = {p['id']: threading.Event() for p in self.profiles}

@@ -91,6 +91,18 @@ class RemoteUpdateTests(unittest.TestCase):
         self.assertEqual(self.fleet.calls, [])
         self.assertEqual(self.pending, [])
 
+    def test_shutdown_preserves_remote_journal_but_cancels_queued_callbacks(self):
+        self.schedule()
+        before = self.store.read()['remote_updates']
+        self.service.shutdown()
+        self.drain()
+        self.service.tick()
+        self.assertEqual(self.pending, [])
+        self.assertEqual(self.service.busy, set())
+        self.assertEqual(self.store.read()['remote_updates'], before)
+        self.assertEqual(self.fleet.calls, [])
+        self.stock_update.assert_not_called()
+
     def test_cohort_status_and_cancel_preserve_requested_alias(self):
         self.schedule()
         value = self.service.schedule(self.profile_id, 'fixture-b')

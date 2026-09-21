@@ -22,6 +22,7 @@ class ProfileWarmup:
         self.lock = threading.RLock()
         self.stopping = threading.Event()
         self.started = False
+        self.resume_after_drain = False
         self.pending = []
         self.priority = None
         self.entries = {}
@@ -71,11 +72,23 @@ class ProfileWarmup:
 
     def shutdown(self):
         with self.lock:
+            self.resume_after_drain = False
             self.stopping.set()
             self.result['state'] = 'stopped'
             for entry in self.entries.values():
                 if entry['state'] == 'queued':
                     entry.update(state='cancelled', code='service_stopped')
+
+    def resume(self):
+        """Undo a failed full exit without relaunching closed profiles."""
+        with self.lock:
+            if self.result['worker_active']:
+                # The admitted pass must still finish cancelling its queue.
+                self.resume_after_drain = True
+                return
+            self.stopping.clear()
+            if self.result['state'] == 'stopped':
+                self.result['state'] = 'complete' if self.started else 'not_started'
 
     def _update(self, profile_id, **changes):
         with self.lock:
@@ -118,6 +131,9 @@ class ProfileWarmup:
                             entry.update(state='cancelled', code='service_stopped')
                 self.pending.clear()
                 self.priority = None
+                if self.resume_after_drain:
+                    self.stopping.clear()
+                    self.resume_after_drain = False
                 self.result.update(
                     worker_active=False,
                     state='stopped' if self.stopping.is_set() else 'attention'

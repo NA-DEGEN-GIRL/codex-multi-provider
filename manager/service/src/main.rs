@@ -32,6 +32,7 @@ struct Service {
     operations: std::sync::Mutex<HashMap<String, Value>>,
     clients: AtomicUsize,
     stopping: AtomicBool,
+    draining: AtomicBool,
     retire: Mutex<()>,
     stopped: Notify,
     admission: tokio::sync::RwLock<()>,
@@ -51,6 +52,8 @@ impl Service {
             status["engine"] = json!("rust");
             status["clients"] = json!(self.clients.load(Ordering::Relaxed));
             status["preserves_background_profiles"] = json!(true);
+            status["graceful_shutdown"] = json!(true);
+            status["shutdown_draining"] = json!(self.draining.load(Ordering::SeqCst));
             status["operations"] = json!(
                 self.operations
                     .lock()
@@ -61,18 +64,25 @@ impl Service {
             );
             return ok(id, status);
         }
-        if command == "supervisor.retire" {
+        if command == "supervisor.retire" || command == "supervisor.shutdown" {
+            let explicit = command == "supervisor.shutdown";
+            if explicit && request.version != protocol::VERSION {
+                return error(id, "protocol_version", "관리 프로그램 버전이 맞지 않습니다.");
+            }
             let _guard = self.retire.lock().await;
             let Ok(_admission) = self.admission.try_write() else {
                 return error(id, "backend_busy", "진행 중인 관리 요청이 있습니다.");
             };
-            if self.clients.load(Ordering::Relaxed) > 1
-                || self.backend.pending() > 0
+            if self.clients.load(Ordering::Relaxed) > 1 {
+                return error(id, "backend_busy", "다른 관리창이 연결되어 있습니다. 다른 관리창을 닫아 주세요.");
+            }
+            if self.backend.pending() > 0
                 || !self.operations.lock().unwrap().is_empty()
             {
                 return error(id, "backend_busy", "진행 중인 관리 작업이 있습니다.");
             }
-            if self.backend.status().await["backend_status"] == "faulted"
+            if !self.draining.load(Ordering::SeqCst)
+                && self.backend.status().await["backend_status"] == "faulted"
                 && !self.backend.reconnect().await
             {
                 return error(
@@ -81,14 +91,24 @@ impl Service {
                     "기존 관리 어댑터의 종료를 확인하고 있습니다.",
                 );
             }
-            if self.backend.status().await["backend_status"] != "not_started" {
+            if !self.draining.load(Ordering::SeqCst)
+                && self.backend.status().await["backend_status"] != "not_started" {
                 let state = self.backend.request("state", json!({})).await;
-                if !can_stop(&state) {
+                if !(if explicit { can_drain(&state) } else { can_stop(&state) }) {
                     return error(
                         id,
                         "backend_busy",
                         "실행 중인 프로필과 관리 작업을 유지합니다. 완전 종료 후 관리 서비스를 바꿀 수 있습니다.",
                     );
+                }
+            }
+            if explicit || self.draining.load(Ordering::SeqCst) {
+                // EOF stops schedulers and lets admitted workers finish. A saved
+                // SSH retry/verification journal is not a live worker. Never
+                // kill the adapter or replay an uncertain remote operation.
+                self.draining.store(true, Ordering::SeqCst);
+                if !self.backend.reconnect().await {
+                    return error(id, "backend_busy", "진행 중인 SSH 확인과 관리 작업을 마무리하고 있습니다. 예약 기록은 보존됩니다.");
                 }
             }
             self.stopping.store(true, Ordering::SeqCst);
@@ -122,8 +142,11 @@ impl Service {
                 Err(_) => error(id, "process_failed", "프로세스 관리 오류"),
             };
         }
+        if self.draining.load(Ordering::SeqCst) {
+            return error(id, "service_draining", "관리 작업을 마무리하며 종료 중입니다. 잠시 뒤 완전 종료를 다시 눌러 주세요.");
+        }
         let _admission = self.admission.read().await;
-        if self.stopping.load(Ordering::SeqCst) {
+        if self.stopping.load(Ordering::SeqCst) || self.draining.load(Ordering::SeqCst) {
             return error(id, "service_updating", "관리 서비스가 종료 중입니다.");
         }
         if command == "supervisor.reconnect" {
@@ -277,6 +300,16 @@ fn allowed(command: &str) -> bool {
     .contains(&command)
 }
 fn can_stop(response: &Value) -> bool {
+    can_stop_management(response, false)
+}
+
+fn can_drain(response: &Value) -> bool {
+    response["result"]["local_launches"]["stopping"] == true
+        && response["result"]["local_launches"]["active"] == 0
+        && can_stop_management(response, true)
+}
+
+fn can_stop_management(response: &Value, drain_remote_queue: bool) -> bool {
     let state = &response["result"];
     response["ok"] == true
         && state["profiles"].is_array()
@@ -287,7 +320,7 @@ fn can_stop(response: &Value) -> bool {
         && state.get("view_instances").is_none_or(profiles_exited)
         && state.get("local_launches").is_none_or(|launches| launches["active"] == 0)
         && ["updates", "startup_updates", "profile_warmup", "remote_updates"].iter().all(|key| {
-            state[key]
+            (drain_remote_queue && *key == "remote_updates") || state[key]
                 .get("worker_active")
                 .is_none_or(|active| active == false)
         })
@@ -351,6 +384,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         operations: std::sync::Mutex::default(),
         clients: AtomicUsize::new(0),
         stopping: AtomicBool::new(false),
+        draining: AtomicBool::new(false),
         retire: Mutex::new(()),
         stopped: Notify::new(),
         admission: tokio::sync::RwLock::new(()),

@@ -645,6 +645,8 @@ public sealed class MainWindow : Window
     }
     private async Task<JsonElement> Request(string command, object? args = null)
     {
+        if (_serviceShutdown.DrainStarted)
+            throw new InvalidOperationException("관리 서비스가 종료 중입니다. 완전 종료를 다시 눌러 마무리해 주세요.");
         if (_fixtureRequest is not null) return await _fixtureRequest(command, args);
         if (_client is null) throw new InvalidOperationException("관리 서비스 연결을 기다려 주세요.");
         var tracked = command is not ("state" or "conversation.navigate" or "remote.updates.status");
@@ -1416,9 +1418,10 @@ public sealed class MainWindow : Window
         }
     }
     private bool _shutdownInProgress, _shutdownComplete, _exitAllRequested;
+    private readonly WorkspaceShutdown _serviceShutdown = new();
     private Task ExitWorkspaceAsync()
     {
-        if (_shutdownInProgress || _closing) return Task.CompletedTask;
+        if (_shutdownInProgress || (_closing && !_serviceShutdown.DrainStarted)) return Task.CompletedTask;
         if (MessageBox.Show(this, "관리 중인 모든 Codex 프로필과 작업을 종료합니다.\n진행 중인 작업은 중단됩니다.\n\n창만 닫고 작업을 계속하려면 취소한 뒤 제목줄의 X를 누르세요.",
             "작업 공간 완전 종료", MessageBoxButton.OKCancel, MessageBoxImage.Warning, MessageBoxResult.Cancel) != MessageBoxResult.OK)
             return Task.CompletedTask;
@@ -1483,106 +1486,111 @@ public sealed class MainWindow : Window
         await Task.Yield();
         try
         {
-            if (_client is not null && !_client.IsConnected)
+            if (!_serviceShutdown.DrainStarted)
             {
-                // Reconnect only for shutdown; startup hooks would enqueue new
-                // background windows while we are trying to drain them.
-                using var reconnect = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-                await _client.DisposeAsync();
-                _client = await ManagerClient.ConnectAsync(_root, reconnect.Token);
-            }
-            if (_client?.IsConnected == true)
-            {
-                // Stop the queue before taking the shutdown snapshot. Otherwise
-                // a warmup could create another hidden app after its peers exit.
-                using var stopWarmup = new CancellationTokenSource(TimeSpan.FromSeconds(20));
-                await _client.RequestAsync("manager.stop_warmup", cancellationToken: stopWarmup.Token);
-                do
+                if (_client is not null && !_client.IsConnected)
                 {
+                    // Reconnect only for shutdown; startup hooks would enqueue new
+                    // background windows while we are trying to drain them.
+                    using var reconnect = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+                    await _client.DisposeAsync();
+                    _client = await ManagerClient.ConnectAsync(_root, reconnect.Token);
+                }
+                if (_client?.IsConnected == true)
+                {
+                    // Stop the queue before taking the shutdown snapshot. Otherwise
+                    // a warmup could create another hidden app after its peers exit.
+                    using var stopWarmup = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+                    await _client.RequestAsync("manager.stop_warmup", cancellationToken: stopWarmup.Token);
+                    do
+                    {
+                        _state = await _client.RequestAsync("state", cancellationToken: stopWarmup.Token);
+                        if (!_state.Get("profile_warmup").B("worker_active") &&
+                            _state.Get("local_launches").N("active") == 0) break;
+                        await Task.Delay(100, stopWarmup.Token);
+                    } while (true);
+                    // State reads profile identities before the launch counter. A
+                    // launch may finish between those reads; take a post-drain
+                    // snapshot while the admission barrier is still armed.
                     _state = await _client.RequestAsync("state", cancellationToken: stopWarmup.Token);
-                    if (!_state.Get("profile_warmup").B("worker_active") &&
-                        _state.Get("local_launches").N("active") == 0) break;
-                    await Task.Delay(100, stopWarmup.Token);
-                } while (true);
-                // State reads profile identities before the launch counter. A
-                // launch may finish between those reads; take a post-drain
-                // snapshot while the admission barrier is still armed.
-                _state = await _client.RequestAsync("state", cancellationToken: stopWarmup.Token);
-                // Preloaded windows have never been attached or parked. Include
-                // their verified process/window identities in normal shutdown.
-                var hidden = _state.Arr("profiles").Concat(_state.Arr("view_instances")).Where(p => p.S("status") == "running" &&
-                    p.N("window_handle") != 0 && !_parked.ContainsKey((nint)p.N("window_handle"))).ToArray();
-                await Task.WhenAll(hidden.Select(async profile =>
+                    // Preloaded windows have never been attached or parked. Include
+                    // their verified process/window identities in normal shutdown.
+                    var hidden = _state.Arr("profiles").Concat(_state.Arr("view_instances")).Where(p => p.S("status") == "running" &&
+                        p.N("window_handle") != 0 && !_parked.ContainsKey((nint)p.N("window_handle"))).ToArray();
+                    await Task.WhenAll(hidden.Select(async profile =>
+                    {
+                        if (!await NativeWindowShutdown.RequestAsync(_root, (int)profile.N("process_id"),
+                            (nint)profile.N("window_handle"), profile.S("executable_path"), profile.N("process_created")))
+                            throw new InvalidOperationException("백그라운드 프로필의 정상 종료 확인이 필요합니다.");
+                    }));
+                }
+                await Task.WhenAll(_parked.Values.ToArray().Select(async window =>
                 {
-                    if (!await NativeWindowShutdown.RequestAsync(_root, (int)profile.N("process_id"),
-                        (nint)profile.N("window_handle"), profile.S("executable_path"), profile.N("process_created")))
-                        throw new InvalidOperationException("백그라운드 프로필의 정상 종료 확인이 필요합니다.");
+                    if (!window.MatchesLifetime) { _parked.Remove(window.Handle); return; }
+                    Log($"관리 중인 Codex 앱 종료 요청 · PID {window.Pid}");
+                    if (await NativeWindowShutdown.RequestAsync(_root, window.Pid, window.Handle, window.Executable))
+                    {
+                        Log($"관리 중인 Codex 프로세스 종료 확인 · PID {window.Pid}");
+                        window.ClearMarker(); _parked.Remove(window.Handle);
+                    }
                 }));
-            }
-            await Task.WhenAll(_parked.Values.ToArray().Select(async window =>
-            {
-                if (!window.MatchesLifetime) { _parked.Remove(window.Handle); return; }
-                Log($"관리 중인 Codex 앱 종료 요청 · PID {window.Pid}");
-                if (await NativeWindowShutdown.RequestAsync(_root, window.Pid, window.Handle, window.Executable))
+                if (_parked.Count > 0)
+                    throw new InvalidOperationException("일부 Codex가 종료 요청에 응답하지 않았습니다. 관리창을 유지합니다. 구버전 프로필은 원래 창에서 앱을 종료해 주세요.");
+                if (_client?.IsConnected == true)
                 {
-                    Log($"관리 중인 Codex 프로세스 종료 확인 · PID {window.Pid}");
-                    window.ClearMarker(); _parked.Remove(window.Handle);
-                }
-            }));
-            if (_parked.Count > 0)
-                throw new InvalidOperationException("일부 Codex가 종료 요청에 응답하지 않았습니다. 관리창을 유지합니다. 구버전 프로필은 원래 창에서 앱을 종료해 주세요.");
-            if (_client?.IsConnected == true)
-            {
-                // A mode switch can hand the UI to a process that is no longer a
-                // child of the tracked window, so the graceful close above can
-                // leave ChatGPT processes behind. The service reaps every managed
-                // process that carries this profile's own --user-data-dir.
-                var cleanupErrors = new List<string>();
-                foreach (var profile in _state.Arr("profiles").Concat(_state.Arr("view_instances")))
-                {
-                    var id = profile.S("id");
-                    if (id == "" || profile.S("process_id") == "") continue;
-                    try
+                    // A mode switch can hand the UI to a process that is no longer a
+                    // child of the tracked window, so the graceful close above can
+                    // leave ChatGPT processes behind. The service reaps every managed
+                    // process that carries this profile's own --user-data-dir.
+                    var cleanupErrors = new List<string>();
+                    foreach (var profile in _state.Arr("profiles").Concat(_state.Arr("view_instances")))
                     {
-                        using var stopDeadline = new CancellationTokenSource(TimeSpan.FromSeconds(6));
-                        await _client.RequestAsync("profile.cleanup",
-                            new { profile_id = id, generation = profile.S("generation") },
-                            cancellationToken: stopDeadline.Token);
-                        Log($"남은 Codex 프로세스 정리 · {profile.S("alias", id)}");
+                        var id = profile.S("id");
+                        if (id == "" || profile.S("process_id") == "") continue;
+                        try
+                        {
+                            using var stopDeadline = new CancellationTokenSource(TimeSpan.FromSeconds(6));
+                            await _client.RequestAsync("profile.cleanup",
+                                new { profile_id = id, generation = profile.S("generation") },
+                                cancellationToken: stopDeadline.Token);
+                            Log($"남은 Codex 프로세스 정리 · {profile.S("alias", id)}");
+                        }
+                        catch (Exception error)
+                        {
+                            cleanupErrors.Add(profile.S("alias", id));
+                            Log("프로세스 종료 확인 실패 · " + error.Message);
+                        }
                     }
-                    catch (Exception error)
-                    {
-                        cleanupErrors.Add(profile.S("alias", id));
-                        Log("프로세스 종료 확인 실패 · " + error.Message);
-                    }
+                    if (cleanupErrors.Count > 0)
+                        throw new InvalidOperationException("일부 프로필의 종료를 확인하지 못해 관리창을 유지합니다: " + string.Join(", ", cleanupErrors));
                 }
-                if (cleanupErrors.Count > 0)
-                    throw new InvalidOperationException("일부 프로필의 종료를 확인하지 못해 관리창을 유지합니다: " + string.Join(", ", cleanupErrors));
             }
             if (_client?.IsConnected == true)
             {
+                using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+                await _serviceShutdown.FinishAsync(
+                    (command, token) => _client.RequestAsync(command, cancellationToken: token),
+                    message => SetStatus(message), deadline.Token);
+            }
+            if (_serviceShutdown.DrainStarted)
+            {
+                using var exitDeadline = new CancellationTokenSource(TimeSpan.FromSeconds(10));
                 try
                 {
-                    using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(8));
-                    while (true)
-                    {
-                        try { await _client.RequestAsync("supervisor.retire", cancellationToken: deadline.Token); break; }
-                        catch (ManagerException error) when (error.Code == "backend_busy")
-                        { await Task.Delay(200, deadline.Token); }
-                    }
-                    Log("관리 서비스 종료 요청 완료");
+                    using var service = System.Diagnostics.Process.GetProcessById(_serviceShutdown.ServicePid);
+                    await service.WaitForExitAsync(exitDeadline.Token);
                 }
+                catch (ArgumentException) { /* The verified service already exited. */ }
                 catch (OperationCanceledException)
-                {
-                    throw new InvalidOperationException("남은 관리 작업의 종료를 확인하지 못했습니다. 진행 기록을 확인한 뒤 완전 종료를 다시 시도해 주세요.");
-                }
+                { throw new InvalidOperationException("관리 서비스의 종료를 기다리고 있습니다. 잠시 뒤 완전 종료를 다시 눌러 주세요."); }
+                Log("관리 서비스와 남은 관리 작업 종료 확인");
             }
             _shutdownComplete = true;
             Close();
         }
         catch (Exception error)
         {
-            if (_client?.IsConnected == true)
+            if (!_serviceShutdown.DrainStarted && _client?.IsConnected == true)
             {
                 try
                 {
@@ -1591,9 +1599,9 @@ public sealed class MainWindow : Window
                 }
                 catch (Exception resumeError) { Log("프로필 실행 재개 확인 · " + resumeError.Message); }
             }
-            _closing = false; _shutdownInProgress = false; _exitAllRequested = false;
+            _closing = _serviceShutdown.DrainStarted; _shutdownInProgress = false; _exitAllRequested = _serviceShutdown.DrainStarted;
             IsEnabled = true;
-            _timer.Start(); _activityTimer.Start();
+            if (!_serviceShutdown.DrainStarted) { _timer.Start(); _activityTimer.Start(); }
             SetStatus(error.Message, true);
         }
     }

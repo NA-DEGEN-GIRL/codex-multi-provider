@@ -61,6 +61,7 @@ internal static class WindowControlsSelfTest
         checks.Add("Profile settings retain the right-clicked account after popup close without selecting it; keyboard reopening resets the target.");
         CheckMenuCommands(root, checks);
         ProfileAgentPresentationSelfTest.Run(checks);
+        WorkspaceShutdownSelfTest.Run(checks);
         var field = typeof(MainWindow).GetField("_profileRequestTicket", BindingFlags.Instance | BindingFlags.NonPublic)!;
         field.SetValue(window, (int?)987);
         var navigation = typeof(MainWindow).GetField("_navigation", BindingFlags.Instance | BindingFlags.NonPublic)!;
@@ -118,7 +119,7 @@ internal static class WindowControlsSelfTest
             throw new InvalidOperationException("A context action reached the selected item.");
         var beforeClose = requests.Count;
         window.Close();
-        if (requests.Skip(beforeClose).Any(r => r.Command is "profile.cleanup" or "supervisor.retire" or "manager.stop_warmup"))
+        if (requests.Skip(beforeClose).Any(r => r.Command is "profile.cleanup" or "supervisor.retire" or "supervisor.shutdown" or "manager.stop_warmup"))
             throw new InvalidOperationException("Normal UI close dispatched a work-stopping request.");
         checks.Add("Real post-close WPF menu Click routes move, login status, restart, remove, prepare and shortcut deletion to the right-clicked item using an isolated RPC recorder.");
     }

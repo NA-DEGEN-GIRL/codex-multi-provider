@@ -299,6 +299,7 @@ class ControlCenter:
             return self.profile_warmup.status()
         if command=='manager.resume_launches':
             self.instances.resume_launches()
+            self.profile_warmup.resume()
             return self.instances.launch_status()
         if command=='profile.cleanup':
             from manager_core import rust_service

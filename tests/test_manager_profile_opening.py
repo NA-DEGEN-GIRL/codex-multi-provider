@@ -69,6 +69,11 @@ class ProfileOpeningTests(unittest.TestCase):
         self.center.dispatch('manager.stop_warmup',{})
         self.center.profile_warmup.shutdown.assert_called_once_with()
 
+    def test_failed_full_exit_resumes_launches_and_warmup_admission(self):
+        self.center.dispatch('manager.resume_launches',{})
+        self.center.instances.resume_launches.assert_called_once_with()
+        self.center.profile_warmup.resume.assert_called_once_with()
+
     def test_cleanup_is_scoped_to_the_requested_current_generation(self):
         pid='00000000-0000-4000-8000-000000000001'
         generation='00000000-0000-4000-8000-000000000002'

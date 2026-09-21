@@ -223,6 +223,71 @@ fn retirement_requires_exited_profiles_and_known_idle_management_state() {
     }
 }
 
+#[test]
+fn explicit_shutdown_only_drains_remote_queue_after_profiles_and_launches_exit() {
+    let mut response = json!({"ok":true,"result":{
+        "profiles":[], "view_instances":[],
+        "local_launches":{"active":0,"stopping":true},
+        "remote_updates":{"worker_active":true,"items":[{"job":{"state":"waiting"}}]}
+    }});
+    assert!(!can_stop(&response)); // Passive UI close/update must preserve the queue.
+    assert!(can_drain(&response)); // Explicit exit instead waits for adapter EOF.
+    response["result"]["local_launches"]["stopping"] = json!(false);
+    assert!(!can_drain(&response));
+    response["result"]["local_launches"]["stopping"] = json!(true);
+    response["result"]["profiles"] = json!([{"status":"unknown"}]);
+    assert!(!can_drain(&response));
+    response["result"]["profiles"] = json!([]);
+    for key in ["updates", "startup_updates", "profile_warmup"] {
+        response["result"][key] = json!({"worker_active":true});
+        assert!(!can_drain(&response));
+        response["result"][key] = json!({"worker_active":false});
+    }
+    assert!(can_drain(&response));
+    response["result"]["profile_restarts"] = json!({"p":{"phase":"opening"}});
+    assert!(!can_drain(&response));
+}
+
+#[tokio::test]
+async fn full_exit_drains_real_adapter_once_and_keeps_retry_journal() {
+    let root = tempdir().unwrap();
+    std::fs::create_dir(root.path().join("scripts")).unwrap();
+    let state = json!({"profiles":[],"view_instances":[],
+        "local_launches":{"active":0,"stopping":true},
+        "remote_updates":{"worker_active":true,"items":[{"job":{"state":"waiting"}}]}});
+    let journal = root.path().join("fixture-state.json");
+    std::fs::write(&journal, state.to_string()).unwrap();
+    std::fs::write(root.path().join("scripts/control_center.py"), r#"
+import sys,json,time
+from pathlib import Path
+for line in sys.stdin:
+    req=json.loads(line)
+    print(json.dumps({'id':req['id'],'ok':True,'result':json.loads(Path('fixture-state.json').read_text())}),flush=True)
+# Emulate an already admitted worker finishing after the first bounded wait.
+time.sleep(3.4)
+Path('adapter-exited').write_text('normal EOF')
+"#).unwrap();
+    let service = service(root.path().into());
+    assert_eq!(service.dispatch(request("state", json!({}))).await["ok"], true);
+    assert_eq!(service.dispatch(request("supervisor.retire", json!({}))).await["error"]["code"], "backend_busy");
+    service.clients.store(2, Ordering::SeqCst);
+    assert_eq!(service.dispatch(request("supervisor.shutdown", json!({}))).await["error"]["code"], "backend_busy");
+    assert!(!service.draining.load(Ordering::SeqCst));
+    service.clients.store(1, Ordering::SeqCst);
+    let first = service.dispatch(request("supervisor.shutdown", json!({}))).await;
+    assert_eq!(first["error"]["code"], "backend_busy");
+    assert!(service.draining.load(Ordering::SeqCst));
+    assert!(!service.stopping.load(Ordering::SeqCst));
+    assert_eq!(service.dispatch(request("state", json!({}))).await["error"]["code"], "service_draining");
+    assert_eq!(service.dispatch(request("profile.show", json!({}))).await["error"]["code"], "service_draining");
+    let result = service.dispatch(request("supervisor.shutdown", json!({}))).await;
+    assert_eq!(result["ok"], true, "{result}");
+    assert!(service.stopping.load(Ordering::SeqCst));
+    assert_eq!(service.backend.status().await["backend_status"], "not_started");
+    assert_eq!(std::fs::read_to_string(root.path().join("adapter-exited")).unwrap(), "normal EOF");
+    assert_eq!(std::fs::read_to_string(&journal).unwrap(), state.to_string());
+}
+
 fn note_fork_map(root: &std::path::Path, mapping: Value) {
     let path = root.join("work/control-center/note-forks.json");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -970,6 +1035,7 @@ fn service(root: PathBuf) -> Arc<Service> {
         operations: std::sync::Mutex::default(),
         clients: AtomicUsize::new(0),
         stopping: AtomicBool::new(false),
+        draining: AtomicBool::new(false),
         retire: Mutex::new(()),
         stopped: Notify::new(),
         admission: tokio::sync::RwLock::new(()),
