@@ -441,7 +441,20 @@ class Instances:
         profile['manager_runtime_revision'] = runtime_revision(profile['manager_release'])
         try:
             from .app_catalog_cache import prepare as prepare_catalog_cache
-            preparation['sidebar_cache'] = prepare_catalog_cache(profile['home'], env)
+            from .remote import ALIAS
+            # Native SSH catalog sweeps retain unseen IDs. Rebuild each managed
+            # host's old projection cache once, only after the desktop exited.
+            # These are sidebar metadata, not the remote conversation stores.
+            ssh_hosts = {
+                'remote-ssh-discovered:' + binding['alias']
+                for binding in profile.get('remote_bindings', [])
+                if profile.get('runtime_channel') != 'packaged'
+                and binding.get('prepared') is True
+                and binding.get('profile_id') == profile['id']
+                and isinstance(binding.get('alias'), str)
+                and ALIAS.fullmatch(binding['alias'])
+            }
+            preparation['sidebar_cache'] = prepare_catalog_cache(profile['home'], env, ssh_hosts=ssh_hosts)
             # The combined desktop also offers ChatGPT/Work. Its native deep link
             # selects the Codex composer without creating or submitting a task.
             from . import rust_service
