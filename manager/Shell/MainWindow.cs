@@ -18,9 +18,16 @@ public sealed class MainWindow : Window
     private ManagerClient? _client;
     private readonly Func<string, object?, Task<JsonElement>>? _fixtureRequest;
     private readonly TaskNotesPanel _notes;
+    // Notes open/closed is remembered per profile; _notesKey is the profile
+    // (or catalog) whose state the panel currently shows.
+    private readonly NotesPanelVisibility _notesVisibility;
+    private Action<bool>? _setNotesVisible;
+    private string? _notesKey;
     private readonly ManagerUpdatePanel _managerUpdates;
     private TaskContextWatcher? _taskContext;
     private SelectedTask? _selectedTask;
+    // Cold-profile cache notices already shown (task/profile/warm profile -> time).
+    private readonly Dictionary<string, DateTime> _cacheNotices = new();
     private readonly ColumnDefinition _notesColumn = new() { Width = new GridLength(340), MinWidth = 280, MaxWidth = 620 };
     private NotificationActivation? _notificationActivation;
     private WorkspaceNotifications? _workspaceNotifications;
@@ -131,6 +138,7 @@ public sealed class MainWindow : Window
             return await _client.RequestAsync(command, args, timeout.Token);
         });
         _diagnostics = new DiagnosticLog(_root);
+        _notesVisibility = new NotesPanelVisibility(_root, Log);
         // Toast delivery reports from its STA worker; the log belongs to this thread.
         if (!fixture) _workspaceNotifications = new WorkspaceNotifications(_root, message =>
         { if (Dispatcher.CheckAccess()) Log(message); else Dispatcher.BeginInvoke(new Action(() => Log(message))); });
@@ -349,8 +357,9 @@ public sealed class MainWindow : Window
             if (notesToggle is not null) WorkspaceAppearance.Active(notesToggle, visible);
         }
         right.SizeChanged += (_, _) => LimitNotesWidth();
-        _notes.CollapseRequested += () => SetNotesVisible(false);
+        _notes.CollapseRequested += () => ChooseNotesVisible(false);
         SetNotesVisible(false);
+        _setNotesVisible = SetNotesVisible;
         right.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         right.RowDefinitions.Add(new RowDefinition());
         right.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
@@ -363,7 +372,7 @@ public sealed class MainWindow : Window
         var identity = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
         identity.Children.Add(_identity); identity.Children.Add(_taskIdentity); headingRow.Children.Add(identity);
         var controls = new WrapPanel { Name = "WorkspaceTools", VerticalAlignment = VerticalAlignment.Center };
-        notesToggle = WorkspaceAppearance.Tool(Action("작업 메모", () => { SetNotesVisible(_notes.Visibility != Visibility.Visible); return Task.CompletedTask; }, "이 작업의 메모와 체크리스트 열기 / 접기"), "ToggleTaskNotes");
+        notesToggle = WorkspaceAppearance.Tool(Action("작업 메모", () => { ChooseNotesVisible(_notes.Visibility != Visibility.Visible); return Task.CompletedTask; }, "이 작업의 메모와 체크리스트 열기 / 접기"), "ToggleTaskNotes");
         controls.Children.Add(notesToggle);
         controls.Children.Add(WorkspaceAppearance.Tool(Action("관리창 안에 표시", AttachSelectedAsync), "RestoreWorkspaceView"));
         controls.Children.Add(WorkspaceAppearance.Tool(MenuButton("창 및 연결", ("원래 창으로 보기", DetachAsync), ("연결 확인", VerifyConversationAsync),
@@ -431,6 +440,7 @@ public sealed class MainWindow : Window
             _taskIdentity.ToolTip = task is null ? null : task.Title + "\n" + task.Task.Key;
             if (_selectedProfile is { } profile && !_viewingCatalog) _workspaceNotifications?.Remember(profile, task);
             _ = _notes.SelectTaskAsync(task);
+            RefreshCacheLines();
         });
         if (!fixture) Loaded += async (_, _) => await Safe(async () => {
             await InitializeAsync(); _initialized = true;
@@ -821,6 +831,26 @@ public sealed class MainWindow : Window
         catch (Exception ex) { SetStatus("상태 갱신: " + ex.Message, true); }
         finally { _refreshing = false; }
     }
+    // A notes toggle belongs to the profile selected now (the sidebar already
+    // shows it), even before that selection's Render.
+    private void ChooseNotesVisible(bool visible)
+    {
+        _notesKey = NotesPanelVisibility.Key(_selectedProfile, _viewingCatalog);
+        _notesVisibility.Set(_notesKey, visible);
+        _setNotesVisible?.Invoke(visible);
+    }
+    // Restores the selected profile's own notes state once per selection change;
+    // periodic state renders of the same profile never undo the user's choice.
+    private void ApplyProfileNotes()
+    {
+        var key = NotesPanelVisibility.Key(_selectedProfile, _viewingCatalog);
+        if (key == _notesKey) return;
+        _notesKey = key;
+        // Re-showing an open panel would reset a dragged width to the last
+        // width captured on close; only a real open/closed change applies.
+        var open = _notesVisibility.IsOpen(key);
+        if (open != (_notes.Visibility == Visibility.Visible)) _setNotesVisible?.Invoke(open);
+    }
     private void Render()
     {
         using var timing = _responsiveness?.Stage("shell.Render");
@@ -848,7 +878,7 @@ public sealed class MainWindow : Window
                 }
                 var label = p.S("auth_mode") == "external" ? "[API] " + p.S("alias") : p.S("alias", "이름 없는 프로필");
                 var usage = p.S("auth_mode") == "external" ? p.S("external_model_name", "외부 API") : Usage(p.Get("usage"));
-                return new Choice(p.S("id"), $"{label}\n{usage} · {Status(p.S("status"))}" + suffix, p) { ProfileNotice = suffix };
+                return ProfileCacheLine.Apply(new Choice(p.S("id"), $"{label}\n{usage} · {Status(p.S("status"))}" + suffix, p) { ProfileNotice = suffix }, _state, _selectedTask);
             }), _selectedProfile);
             var shortcuts = _state.Arr("shortcuts");
             using (_responsiveness?.Stage("shell.shortcut_list", 25))
@@ -862,6 +892,7 @@ public sealed class MainWindow : Window
                 if (liveViewer.ValueKind == JsonValueKind.Object) _viewerProfile = liveViewer;
                 p = _viewerProfile;
             }
+            ApplyProfileNotes();
             _identity.Text = _selectedProfile is null ? "사용할 프로필을 선택하세요" : (p.S("auth_mode") == "external" ? "외부 API 프로필 " : "Codex 프로필 ") + p.S("alias", "연결된 프로필 없음");
             _identity.ToolTip = _identity.Text;
             var openedTask = p.Get("runtime_state").Get("opened_task");
@@ -870,6 +901,7 @@ public sealed class MainWindow : Window
             _taskIdentity.ToolTip = "이 프로필에서 마지막으로 열기 완료한 작업입니다.\n" + openedTask.S("title") + "\n" + openedTask.S("thread_id");
             using (_responsiveness?.Stage("shell.task_context", 25)) _taskContext?.Select(p);
             if (_selectedTask is { } selectedTask) { _taskIdentity.Text = "작업 · " + selectedTask.Title; _taskIdentity.ToolTip = selectedTask.Title + "\n" + selectedTask.Task.Key; }
+            ShowCacheNotice();
             var policy = p.Get("policy");
             var mode = p.S("auth_mode") == "external" ? p.S("external_model_name", "외부 API 모델") : "GPT 사용";
             var agentBadge = ProfileAgentPresentation.Badge(p);
@@ -1003,6 +1035,25 @@ public sealed class MainWindow : Window
             box.Items.Clear(); foreach (var value in items) box.Items.Add(value);
         }
         box.SelectedItem = box.Items.OfType<Choice>().FirstOrDefault(x => x.Id == selected);
+    }
+    // The selected task changed between state polls: update only the cards'
+    // cache lines from the current state, without a new request or render.
+    private void RefreshCacheLines()
+    {
+        if (_rendering || _profileOrdering.IsInteracting || _profiles.Items.Count == 0) return;
+        var items = _profiles.Items.OfType<Choice>().Select(choice => ProfileCacheLine.Apply(choice, _state, _selectedTask)).ToArray();
+        _rendering = true;
+        try { Fill(_profiles, items, _selectedProfile); }
+        finally { _rendering = false; }
+        ShowCacheNotice();
+    }
+    // The selected task is open on a profile whose cache is cold while another
+    // account on the same provider still holds it: one status-line notice.
+    private void ShowCacheNotice()
+    {
+        // A pending profile-open error keeps the status line; the card line stays.
+        if (_viewingCatalog || _profileOpenNoticeProfile is not null) return;
+        if (ProfileCacheLine.Notice(_state, _selectedTask, _selectedProfile, _cacheNotices, DateTime.UtcNow) is { } notice) SetStatus(notice);
     }
     private JsonElement Profile() => _state.Arr("profiles").FirstOrDefault(p => p.S("id") == _selectedProfile);
     // A returned launch is newer than _state until a state requested after it
@@ -1290,6 +1341,11 @@ public sealed class MainWindow : Window
             var job = await _client.RequestAsync("profile.remote_stop",
                 new { profile_id = profile.S("id"), generation = profile.S("generation") }, requestDeadline.Token);
             jobs[profile.S("id")] = job.S("id");
+            // The service turned a pending "SSH 작업 종료 후 설정 적용" into this stop.
+            if (job.B("stop_converted"))
+                Log($"{profile.S("alias", profile.S("id"))} · " + (job.B("stop_only")
+                    ? "진행 중이던 SSH 설정 적용 대신 현재 답변이 끝나면 원격 실행을 종료합니다."
+                    : "진행 중인 SSH 설정 적용이 끝나는 대로 원격 실행을 종료합니다."));
         }
         using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(30));
         try

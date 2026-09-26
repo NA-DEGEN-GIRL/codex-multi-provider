@@ -161,6 +161,7 @@ internal static class LayoutSelfTest
         window.UpdateLayout();
         if (notesPanel.IsVisible || notesGrid.ColumnDefinitions[2].ActualWidth > 0)
             throw new InvalidOperationException("Closing notes did not return the space to the workspace.");
+        await AssertNotesPerProfileAsync(window, fixtureRoot, fixture.RootElement, FixtureRequest);
         settings.IsExpanded = true;
         window.UpdateLayout();
         AssertScrollContentReachable(update, layout);
@@ -171,12 +172,94 @@ internal static class LayoutSelfTest
             grouped_actions_reachable = true, secondary_panels_collapsed = true, minimum_window_checked = true,
             zero_positive_unknown_credits_checked = true, malformed_credits_unknown = true, external_api_quota_hidden = true,
             long_alias_ellipsis = true, quota_and_reset_values_single_line = true, selection_retained = true,
-            notes_open_close_checked = true, compact_notes_and_log_checked = true, wide_notes_resize_checked = true, many_note_tabs_accessible = true,
+            notes_open_close_checked = true, notes_per_profile_checked = true, compact_notes_and_log_checked = true, wide_notes_resize_checked = true, many_note_tabs_accessible = true,
             compatibility_states_and_refresh_reachable = true, compatibility_inspection_checks = compatibilityChecks,
             sidebar_drag_checked = true, independent_list_scrolling = true, sidebar_selection_preserved = true,
             sidebar_extremes_and_compact_settings_checked = true, sidebar_ratio_reloaded = true, sidebar_scroll_preserved_on_refresh = true,
             source = "synthetic WPF controls only; no live profile or Codex process", png, sidebar_png = sidebarPng, notes_png = notesPng, notes_detail_png = notesDetailPng, compact_png = narrowPng }, new JsonSerializerOptions { WriteIndented = true }));
         window.Close();
+    }
+
+    // Notes open/closed belongs to each profile: switching restores that
+    // profile's own choice, a same-profile refresh keeps it, a new window
+    // reloads it, and a profile without a saved choice starts closed.
+    private static async Task AssertNotesPerProfileAsync(MainWindow window, string fixtureRoot, JsonElement state,
+        Func<string, object?, Task<JsonElement>> fixtureRequest)
+    {
+        const System.Reflection.BindingFlags flags = System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+        var selected = typeof(MainWindow).GetField("_selectedProfile", flags)!;
+        var render = typeof(MainWindow).GetMethod("Render", flags, Type.EmptyTypes)!;
+        // The production switch path: ShowProfileCoreAsync sets the field, then renders.
+        void Select(MainWindow target, string id) { selected.SetValue(target, id); render.Invoke(target, null); target.UpdateLayout(); }
+        static void Click(FrameworkElement parent, string name)
+        {
+            Descendants(parent).OfType<Button>().Single(button => button.Name == name).RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent));
+            parent.UpdateLayout();
+        }
+        static TaskNotesPanel Panel(Window target) => Descendants((FrameworkElement)target.Content).OfType<TaskNotesPanel>().Single();
+        static void Require(bool condition, string message) { if (!condition) throw new InvalidOperationException(message); }
+        var layout = (FrameworkElement)window.Content;
+        var panel = Panel(window);
+        Select(window, "fixture-01");
+        Require(!panel.IsVisible, "Closing notes was not kept for the selected profile.");
+        Click(layout, "ToggleTaskNotes");
+        Require(panel.IsVisible, "The notes toggle did not open the selected profile's notes.");
+        Select(window, "fixture-02");
+        Require(!panel.IsVisible, "Opening notes in one profile opened them in another profile.");
+        Select(window, "fixture-01");
+        Require(panel.IsVisible, "Returning to a profile did not restore its open notes.");
+        // The shared width a user dragged survives refreshes and switches between open profiles.
+        var column = ((Grid)panel.Parent).ColumnDefinitions[2];
+        column.Width = new GridLength(480);
+        window.UseFixture(state); window.UpdateLayout();
+        Require(panel.IsVisible, "A state refresh of the same profile changed its notes panel.");
+        Require(Math.Abs(column.Width.Value - 480) < 0.5, "A state refresh reset the dragged notes width.");
+        Select(window, "fixture-02");
+        Click(layout, "ToggleTaskNotes");
+        column.Width = new GridLength(480);
+        Select(window, "fixture-01");
+        Require(panel.IsVisible && Math.Abs(column.Width.Value - 480) < 0.5, "Switching between open profiles reset the dragged notes width.");
+        Click(panel, "CloseTaskNotes");
+        Require(!panel.IsVisible, "The panel close button did not close the selected profile's notes.");
+        Select(window, "fixture-02");
+        Require(panel.IsVisible, "Closing notes in one profile closed them in another profile.");
+        var file = Path.Combine(fixtureRoot, "work", "control-center", "notes-panel.json");
+        using (var saved = JsonDocument.Parse(File.ReadAllText(file)))
+        {
+            var profiles = saved.RootElement.GetProperty("profiles");
+            Require(saved.RootElement.GetProperty("version").GetInt32() == 1 && !profiles.GetProperty("fixture-01").GetBoolean()
+                && profiles.GetProperty("fixture-02").GetBoolean() && !profiles.TryGetProperty("fixture-03", out _),
+                "Notes visibility was not saved as a per-profile map.");
+        }
+        var reopened = new MainWindow(fixtureRoot, fixture: true, fixtureRequest: fixtureRequest)
+        { WindowState = WindowState.Normal, Width = 1440, Height = 960, Left = -28000, Top = -28000, ShowInTaskbar = false, ShowActivated = false };
+        try
+        {
+            reopened.UseFixture(state);
+            reopened.Show();
+            await reopened.Dispatcher.InvokeAsync(() => { }, DispatcherPriority.ApplicationIdle);
+            reopened.UpdateLayout();
+            var restored = Panel(reopened);
+            Require(!restored.IsVisible, "A new window opened notes for a profile that had closed them.");
+            Select(reopened, "fixture-02");
+            Require(restored.IsVisible, "A new window did not restore a profile's open notes.");
+            Select(reopened, "fixture-03");
+            Require(!restored.IsVisible, "A profile without a saved choice did not start with notes closed.");
+        }
+        finally { reopened.Close(); }
+        // Unreadable, mistyped or future preferences start every profile closed.
+        var broken = Path.Combine(fixtureRoot, "notes-panel-broken");
+        Directory.CreateDirectory(Path.Combine(broken, "work", "control-center"));
+        foreach (var text in new[] { "{", """{"version":1,"profiles":{"fixture-02":"yes"}}""", """{"version":2,"profiles":{"fixture-02":true}}""", """{"profiles":{"fixture-02":true}}""" })
+        {
+            File.WriteAllText(Path.Combine(broken, "work", "control-center", "notes-panel.json"), text);
+            Require(!new NotesPanelVisibility(broken, _ => { }).IsOpen("fixture-02"), "Malformed notes preferences opened a panel: " + text);
+        }
+        // Leave every profile closed and the baseline profile selected.
+        Click(layout, "ToggleTaskNotes");
+        Require(!panel.IsVisible, "The notes toggle did not close the selected profile's notes.");
+        Select(window, "fixture-01");
+        Require(!panel.IsVisible, "Notes reopened after switching back to a closed profile.");
     }
 
     private static async Task AssertSidebarSplitAsync(MainWindow window, string fixtureRoot, JsonElement baseline,

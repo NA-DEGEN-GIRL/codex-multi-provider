@@ -420,6 +420,44 @@ internal static class ProfileOpenStatusSelfTest
                 !Header(599).Contains("분 전 값", StringComparison.Ordinal) && Header(600).EndsWith(" · 10분 전 값", StringComparison.Ordinal),
                 "Usage age labels do not match the 300 s refresh cadence.");
             checks.Add("Usage cards and header label a value's age only from 600 s, two 300 s refresh periods.");
+
+            // Cache lines and the cold-profile notice. Every value comes from cache_warmth.py;
+            // the digest must equal serve_ledger.thread_hash (tests/test_manager_serve_ledger.py).
+            const string cacheThread = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b", cacheKey = "b912d61979d18e95338694ec";
+            Require(ProfileCacheLine.ThreadHash(cacheThread) == cacheKey && ProfileCacheLine.ThreadHash(cacheThread.ToUpperInvariant()) == cacheKey,
+                "The Shell thread digest differs from serve_ledger.thread_hash.");
+            const string coldLine = "이 작업 캐시 없음 · 첫 요청 ≈ 38 크레딧 (15.2만 token)";
+            const string coldNotice = "01에서 12.4만 token이 5분 전에 캐시됐습니다. 여기서 이어가면 첫 요청이 캐시 없이 처리됩니다(약 38 크레딧).";
+            var warmthState = JsonSerializer.SerializeToElement(new Dictionary<string, object>
+            {
+                ["profiles"] = new[] { Profile(), Profile("01") },
+                ["cache_warmth"] = new { version = 1, threads = new Dictionary<string, object> { [cacheKey] = new { profiles = new Dictionary<string, object>
+                {
+                    ["03"] = new { state = "cold", line = coldLine, tone = "warning", notice = coldNotice, warm_profile = "01" },
+                    ["01"] = new { state = "warm", line = "이 작업 캐시 · 약 25분 남음 · 첫 요청 ≈ 10 크레딧", tone = "ready" },
+                } } } },
+            });
+            var cacheTask = new SelectedTask(new NoteTask("local", cacheThread), "fixture");
+            var coldCard = ProfileCacheLine.Apply(new Choice("03", "03", Profile()), warmthState, cacheTask).Card;
+            var noTaskCard = ProfileCacheLine.Apply(new Choice("03", "03", Profile()), warmthState, null).Card;
+            Require(coldCard.Cache == coldLine && coldCard.CacheTone == "warning" && coldCard.CacheVisibility == System.Windows.Visibility.Visible &&
+                coldCard.DetailHint.EndsWith(coldLine, StringComparison.Ordinal) && noTaskCard.Cache == "" &&
+                noTaskCard.CacheVisibility == System.Windows.Visibility.Collapsed && coldCard != noTaskCard,
+                "Profile cards do not show the selected task's cache line.");
+            stateField.SetValue(window, warmthState);
+            selectedField.SetValue(window, "03");
+            type.GetField("_selectedTask", flags)!.SetValue(window, cacheTask);
+            var cacheNotice = type.GetMethod("ShowCacheNotice", flags)!;
+            setStatus.Invoke(window, ["fixture", false]);
+            cacheNotice.Invoke(window, []);
+            Require(status.Text == coldNotice, "Opening a task on a cold profile did not show the warm-profile notice: " + status.Text);
+            setStatus.Invoke(window, ["fixture", false]);
+            cacheNotice.Invoke(window, []);
+            Require(status.Text == "fixture", "The cold-profile notice repeated on the next state poll.");
+            selectedField.SetValue(window, "01");
+            cacheNotice.Invoke(window, []);
+            Require(status.Text == "fixture", "A warm profile showed a cold-profile notice.");
+            checks.Add("Profile cards show the selected task's cache line; a cold pick shows one notice per warm profile.");
             return checks;
         }
         finally { window.Close(); }

@@ -129,6 +129,11 @@ internal static class ProfileCards
                            TextWrapping="NoWrap" TextTrimming="CharacterEllipsis" VerticalAlignment="Center"
                            ToolTip="{Binding Card.Model}"/>
               </Grid>
+              <!-- Selected task's prompt cache on this profile: warm or cold, minutes left and the
+                   first request's rough cost. Wraps rather than trims so the cost stays whole. -->
+              <TextBlock Text="{Binding Card.Cache}" FontSize="11" Foreground="{Binding Card.CacheBrush}"
+                         TextWrapping="Wrap" Margin="0,4,0,0" Visibility="{Binding Card.CacheVisibility}"
+                         ToolTip="선택한 작업의 프롬프트 캐시 추정입니다. 캐시는 계정·제공자마다 따로이며, 값은 요청 기록으로 계산한 근사치입니다."/>
               <TextBlock Text="{Binding Card.Notice}" FontSize="11" Foreground="#E5B773" TextWrapping="Wrap"
                          Margin="0,5,0,0" Visibility="{Binding Card.NoticeVisibility}"/>
               <Border Visibility="{Binding AgentBadgeVisibility}" ToolTip="{Binding AgentHint}"
