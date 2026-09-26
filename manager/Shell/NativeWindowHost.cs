@@ -26,7 +26,7 @@ public sealed class NativeWindowHost : HwndHost
     private readonly WinEventCallback _foregroundChanged, _presentationChanged;
     private readonly DispatcherTimer _watch, _settleWatch;
     private bool _changingWindow, _resizing;
-    private DispatcherOperation? _queuedLayout;
+    private DispatcherOperation? _queuedLayout, _queuedZOrder;
     private bool _liveResize, _settling, _forceRepair, _settleHidden;
     private bool _settleFailureQueued;
     private long _settleStarted;
@@ -60,7 +60,7 @@ public sealed class NativeWindowHost : HwndHost
         // use that same instance when removing it from a replaced root source.
         _rootMessages = RootMessages;
         Focusable = true;
-        _foregroundChanged = (_, _, _, _, _, _, _) => QueueLayout();
+        _foregroundChanged = (_, _, _, _, _, _, _) => QueueZOrder();
         _presentationChanged = (_, eventId, hwnd, objectId, _, _, _) =>
         {
             // Owl can finish a previously queued show after the manager hid the
@@ -68,7 +68,7 @@ public sealed class NativeWindowHost : HwndHost
             if (objectId == 0 && hwnd == AttachedHandle && eventId is 0x8002 or 0x8003 or 0x800B) QueueLayout();
             // Top-level Z-order changes report the desktop container, not the
             // reordered HWND. This hook is already scoped to the attached PID.
-            if (eventId == 0x8004 && hwnd == GetDesktopWindow()) QueueLayout();
+            if (eventId == 0x8004 && hwnd == GetDesktopWindow()) QueueZOrder();
         };
         _watch = new DispatcherTimer(TimeSpan.FromSeconds(1), DispatcherPriority.Background,
             (_, _) => CheckAttachedWindow(), Dispatcher);
@@ -262,6 +262,27 @@ public sealed class NativeWindowHost : HwndHost
         }));
     }
 
+    // Activation must not wait behind background layout, region updates or DWM
+    // capture. Re-read the foreground when dispatched: an old event must never
+    // raise a profile after the user has already selected another application.
+    internal void QueueZOrder()
+    {
+        if (Dispatcher.HasShutdownStarted || _attachment is not { } expected ||
+            _queuedZOrder is { Status: DispatcherOperationStatus.Pending }) return;
+        _queuedZOrder = Dispatcher.BeginInvoke(DispatcherPriority.Normal, new Action(() =>
+        {
+            _queuedZOrder = null;
+            if (_attachment != expected || !HasLiveAttachment || !ShouldShow(expected)) return;
+            try { SynchronizeZOrder(expected); }
+            catch (Win32Exception error)
+            {
+                LastError = error.Message;
+                Diagnostic?.Invoke(error.Message);
+                QueueLayout();
+            }
+        }));
+    }
+
     /// <summary>Repair the current viewport without detaching or changing native input ownership.</summary>
     public bool RestoreViewport()
     {
@@ -355,8 +376,9 @@ public sealed class NativeWindowHost : HwndHost
         {
             // Clicking the native editor activates its own input queue. Bring
             // the manager directly underneath it WITHOUT changing keyboard focus.
-            if (GetWindow(a.Hwnd, 2 /* GW_HWNDNEXT */) != root)
-                SetWindowPos(root, a.Hwnd, 0, 0, 0, 0, flags);
+            if (GetWindow(a.Hwnd, 2 /* GW_HWNDNEXT */) != root &&
+                !SetWindowPos(root, a.Hwnd, 0, 0, 0, 0, flags))
+                throw new Win32Exception(Marshal.GetLastPInvokeError(), "Cannot bring manager underneath active viewport.");
             return;
         }
         var previous = GetWindow(root, 3 /* GW_HWNDPREV */);
@@ -801,6 +823,7 @@ public sealed class NativeWindowHost : HwndHost
     private bool Fail(string message, out string error) { error = LastError = message; return false; }
     private void ForgetAttachment(string error)
     {
+        _queuedZOrder?.Abort(); _queuedZOrder = null;
         _watch.Stop();
         _settleWatch.Stop();
         _settling = _forceRepair = _settleHidden = _settleFailureQueued = false;

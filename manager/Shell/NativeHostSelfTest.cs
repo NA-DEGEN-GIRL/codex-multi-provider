@@ -300,7 +300,7 @@ public static class NativeHostSelfTest
                         "Notes/expander resize left an old native region protruding outside the viewport.");
                 }
                 finally { DeleteObject(clip); }
-                Require(GetForegroundWindow() == layoutForeground && host.HasLiveAttachment,
+                Require(ForegroundNotStolen(layoutForeground, new WindowInteropHelper(window).Handle, fixtureWindow) && host.HasLiveAttachment,
                     "Layout settlement changed input focus or disconnected the editor.");
             }
             surface.ColumnDefinitions.Clear(); surface.RowDefinitions.Clear();
@@ -402,8 +402,33 @@ public static class NativeHostSelfTest
             host.ForegroundWindow = () => fixtureWindow;
             SetWindowPos(fixtureWindow, 0, 0, 0, 0, 0, SwpNoActivate | SwpNoMove | SwpNoSize | SwpAsyncWindowPos);
             await Task.Delay(300);
-            host.SynchronizeLayout(); await Task.Delay(150);
-            Require(GetWindow(fixtureWindow, 2) == rootHandle, "Native editor activation left the manager behind unrelated windows.");
+            var obstacle = new Window { Width = 80, Height = 80, Left = -29000, Top = -29000,
+                ShowActivated = false, ShowInTaskbar = false, WindowStyle = WindowStyle.None };
+            obstacle.Show();
+            var obstacleHandle = new WindowInteropHelper(obstacle).Handle;
+            try
+            {
+                SetWindowPos(obstacleHandle, fixtureWindow, 0, 0, 0, 0, SwpNoActivate | SwpNoMove | SwpNoSize);
+                Require(GetWindow(fixtureWindow, 2) == obstacleHandle, "Cannot arrange split activation fixture.");
+                var focusBefore = GetForegroundWindow();
+                // Input priority runs ahead of background layout. The foreground
+                // hook's dedicated queue must already have restored both windows.
+                host.QueueZOrder(); host.QueueZOrder();
+                await Application.Current.Dispatcher.InvokeAsync(() =>
+                {
+                    Require(GetWindow(fixtureWindow, 2) == rootHandle,
+                        "Activation repair waited for background layout and left a split window stack.");
+                    Require(ForegroundNotStolen(focusBefore, rootHandle, fixtureWindow, obstacleHandle), "Window order repair stole keyboard focus.");
+                }, DispatcherPriority.Input);
+                // A stale activation event must re-check who owns foreground.
+                host.QueueZOrder();
+                host.ForegroundWindow = () => obstacleHandle;
+                await Application.Current.Dispatcher.InvokeAsync(() => { }, DispatcherPriority.Input);
+                Require((ReadStyle(fixtureWindow, GwlExStyle).ToInt64() & 8) == 0,
+                    "Stale activation promoted viewport to topmost.");
+                checks.Add("Activation restores the manager before queued input, coalesces events and rechecks foreground without stealing focus.");
+            }
+            finally { obstacle.Close(); }
             host.ForegroundWindow = () => rootHandle;
             for (var cycle = 0; cycle < 3; cycle++)
             {
@@ -543,5 +568,13 @@ public static class NativeHostSelfTest
     private static void Require(bool condition, string message)
     {
         if (!condition) throw new InvalidOperationException(message);
+    }
+
+    private static bool ForegroundNotStolen(nint previous, params nint[] fixtureWindows)
+    {
+        var current = GetForegroundWindow();
+        // The user can continue using other applications during this off-screen
+        // test. Only activation of a test window is evidence of stolen focus.
+        return current == previous || !fixtureWindows.Contains(current);
     }
 }

@@ -35,6 +35,7 @@ public sealed class MainWindow : Window
     private readonly ProfileOrdering _profileOrdering;
     private readonly ListBox _shortcuts = new();
     private readonly TextBlock _status = new() { TextWrapping = TextWrapping.Wrap, TextTrimming = TextTrimming.CharacterEllipsis, FontSize = 11, LineHeight = 16, Foreground = Muted, MaxHeight = 32 };
+    private readonly TextBlock _executionMode = new() { TextWrapping = TextWrapping.Wrap, FontSize = 11, Foreground = Muted, Margin = new Thickness(2, 8, 2, 0) };
     private string? _profileOpenNoticeProfile;
     private readonly TextBlock _identity = new() { FontSize = 12, FontWeight = FontWeights.SemiBold, Foreground = WorkspaceAppearance.Accent, TextTrimming = TextTrimming.CharacterEllipsis };
     private readonly TextBlock _taskIdentity = new() { FontSize = 18, FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 5, 0, 0), TextTrimming = TextTrimming.CharacterEllipsis };
@@ -76,6 +77,10 @@ public sealed class MainWindow : Window
     private DateTime _attachDeadline;
     private int? _profileRequestTicket;
     private WindowLaunchIdentity? _expectedWindowLaunch;
+    // Each profile's profile.show/login payload until a state requested after it
+    // lands. Older state must not hide (login recovery), fail or detach it.
+    private readonly Dictionary<string, JsonElement> _shownProfiles = [];
+    private (int Ticket, string Id, long Started)? _attachTiming;
     private nint _closedWindow;
     private readonly Dictionary<nint, WindowIdentity> _parked = [];
     private readonly Dictionary<string, (JsonElement Result, DateTime CheckedAt)> _loginStatuses = [];
@@ -86,6 +91,7 @@ public sealed class MainWindow : Window
         set { if (value is null) _attachedWindows.Remove(_host); else _attachedWindows[_host] = value; }
     }
     private bool _refreshing, _rendering, _closing, _embedRequested, _layoutRetryQueued;
+    private bool _administratorLaunchPending, _restartAsAdministrator;
     private int _navigation;
     private int _stateRevision;
     private string? _contextProfile, _contextShortcut;
@@ -108,11 +114,14 @@ public sealed class MainWindow : Window
         public void ClearMarker() { if (MatchesLifetime) NativeWindowInterop.RemovePropW(Handle, Marker); Marked = false; }
     }
 
-    public MainWindow(string root, bool fixture = false, Func<string, object?, Task<JsonElement>>? fixtureRequest = null)
+    public MainWindow(string root, bool fixture = false, Func<string, object?, Task<JsonElement>>? fixtureRequest = null, bool administratorPending = false)
     {
+        ConfirmProfileRestart = (message, title) => MessageBox.Show(this, message, title,
+            MessageBoxButton.OKCancel, MessageBoxImage.Warning) == MessageBoxResult.OK;
         if (!fixture && fixtureRequest is not null) throw new ArgumentException("Request fixtures require an isolated fixture window.");
         _fixtureRequest = fixtureRequest;
         _fixture = fixture;
+        _administratorLaunchPending = administratorPending;
         _root = Path.GetFullPath(root);
         _notes = new TaskNotesPanel(_root, async (command, args) =>
         {
@@ -122,7 +131,9 @@ public sealed class MainWindow : Window
             return await _client.RequestAsync(command, args, timeout.Token);
         });
         _diagnostics = new DiagnosticLog(_root);
-        if (!fixture) _workspaceNotifications = new WorkspaceNotifications(_root, Log);
+        // Toast delivery reports from its STA worker; the log belongs to this thread.
+        if (!fixture) _workspaceNotifications = new WorkspaceNotifications(_root, message =>
+        { if (Dispatcher.CheckAccess()) Log(message); else Dispatcher.BeginInvoke(new Action(() => Log(message))); });
         if (!fixture) _responsiveness = new ResponsivenessMonitor(_diagnostics.Path, _root, Dispatcher);
         _hostDeck = new NativeHostDeck(host =>
         {
@@ -173,7 +184,7 @@ public sealed class MainWindow : Window
         heading.Children.Add(new TextBlock { Text = "계정과 작업을 한곳에서", Foreground = Muted, FontSize = 11, Margin = new Thickness(0, 5, 0, 20) });
         var profileMenu = MenuButton("프로필 관리", ("외부 모델 기본 설정", EditExternalModelAsync), ("하위 에이전트 설정", ProfileProvidersAsync), ("로그인 · API 키 관리", LoginProfileAsync),
             ("현재 앱의 로그인 계정 연결", RegisterCurrentAsync), ("로그인 상태 새로 확인", RefreshLoginStatusAsync),
-            ("이 프로필 다시 열기", RecoverProfileAsync), ("작업 종료 후 설정 적용 예약", RestartProfileAsync),
+            ("이 프로필 다시 열기", RecoverProfileAsync), ("작업 종료 후 설정 적용 예약", RestartProfileAsync), ("SSH 작업 종료 후 설정 적용", RestartRemoteProfileAsync),
             ("원래 창으로 분리", DetachAsync), ("별칭 변경", RenameProfileAsync),
             ("계정을 목록에서 제거", RemoveProfileAsync), ("제거한 계정 복원", RestoreProfileAsync), ("프로필 준비", PrepareProfileAsync));
         heading.Children.Add(SidebarSection("프로필", _profileCount,
@@ -198,7 +209,7 @@ public sealed class MainWindow : Window
             if (choice is not null) Log($"프로필 클릭 수신 · {choice.Data.S("alias")} · {choice.Id}");
         };
         _profiles.MouseLeftButtonUp += async (_, e) => { if (_profileAlreadySelected && ClickedChoice(e.OriginalSource) is { } choice) await Safe(() => ShowProfileAsync(choice.Id)); };
-        _profiles.ContextMenu = ProfileMenu(("위로 이동", id => _profileOrdering.MoveByAsync(id, -1)), ("아래로 이동", id => _profileOrdering.MoveByAsync(id, 1)), ("외부 모델 기본 설정", EditExternalModelAsync), ("하위 에이전트 설정", id => ShowProvidersAsync(id)), ("로그인 · API 키 관리", LoginProfileAsync), ("로그인 상태 새로 확인", RefreshLoginStatusAsync), ("이 프로필 다시 열기", RecoverProfileAsync), ("작업 종료 후 설정 적용 예약", RestartProfileAsync), ("별칭 변경", RenameProfileAsync), ("계정을 목록에서 제거", RemoveProfileAsync), ("제거한 계정 복원", _ => RestoreProfileAsync()), ("프로필 준비", PrepareProfileAsync));
+        _profiles.ContextMenu = ProfileMenu(("위로 이동", id => _profileOrdering.MoveByAsync(id, -1)), ("아래로 이동", id => _profileOrdering.MoveByAsync(id, 1)), ("외부 모델 기본 설정", EditExternalModelAsync), ("하위 에이전트 설정", id => ShowProvidersAsync(id)), ("로그인 · API 키 관리", LoginProfileAsync), ("로그인 상태 새로 확인", RefreshLoginStatusAsync), ("이 프로필 다시 열기", RecoverProfileAsync), ("작업 종료 후 설정 적용 예약", RestartProfileAsync), ("SSH 작업 종료 후 설정 적용", RestartRemoteProfileAsync), ("별칭 변경", RenameProfileAsync), ("계정을 목록에서 제거", RemoveProfileAsync), ("제거한 계정 복원", _ => RestoreProfileAsync()), ("프로필 준비", PrepareProfileAsync));
         _profiles.ContextMenu.Opened += (_, _) =>
         {
             // WPF closes the popup before dispatching MenuItem.Click. Keep the
@@ -269,9 +280,13 @@ public sealed class MainWindow : Window
         settings.Children.Add(_updateButton);
         settings.Children.Add(_updateStatus);
         settings.Children.Add(Action("관리 서비스 다시 연결", ReconnectAsync));
+        settings.Children.Add(Action("Windows 실행 권한…", ExecutionModeAsync));
+        settings.Children.Add(Action("완전 종료 후 관리자 실행…", RestartAdministratorAsync));
         footer.Children.Add(new Expander { Header = "설정 및 관리", Margin = new Thickness(0, 8, 0, 0),
             Content = settings });
         _status.Margin = new Thickness(0, 10, 0, 0); footer.Children.Add(_status);
+        footer.Children.Add(_executionMode);
+        RenderExecutionMode();
         var version = Action($"{WorkspaceBuild.Label} · 버전 복사", CopyVersionAsync,
             WorkspaceBuild.CopyText + "\n\n현재 실행 중인 작업공간앱 버전입니다. 클릭하면 버전 정보가 복사됩니다.");
         version.Name = "WorkspaceVersion";
@@ -430,24 +445,32 @@ public sealed class MainWindow : Window
             {
                 _notificationActivation = new NotificationActivation(Path.Combine(_root, "work", "control-center", "window-hosts"),
                     click => Dispatcher.BeginInvoke(new Action(() => ActivateNotification(click))),
-                    (source, notice) => Dispatcher.InvokeAsync(() => ShowWorkspaceNotification(source, notice)).Task);
+                    (source, notice) => Dispatcher.InvokeAsync(() => ShowWorkspaceNotification(source, notice)).Task.Unwrap());
                 NativeWindowLease.NotificationPipe = _notificationActivation.PipeName;
                 _workspaceActivation = new WorkspaceActivation(_root, ticket => Dispatcher.BeginInvoke(new Action(() => ActivateWorkspaceNotification(ticket))));
             }
 
         };
-        Closed += async (_, _) => { _managerUpdates.Dispose(); _notificationNavigation?.Cancel(); _workspaceActivation?.Dispose(); _responsiveness?.Dispose(); _taskContext?.Dispose(); _notificationActivation?.Dispose(); _timer.Stop(); _activityTimer.Stop(); if (_client is not null) await _client.DisposeAsync(); };
+        Closed += async (_, _) => { _managerUpdates.Dispose(); _notificationNavigation?.Cancel(); _workspaceActivation?.Dispose(); _responsiveness?.Dispose(); _taskContext?.Dispose(); _notificationActivation?.Dispose(); _workspaceNotifications?.Dispose(); _timer.Stop(); _activityTimer.Stop(); if (_client is not null) await _client.DisposeAsync(); };
     }
 
     private bool ProfileExists(string id) => _state.Arr("profiles").Any(p => p.S("id") == id);
     private string ProfileAlias(string id) => _state.Arr("profiles").FirstOrDefault(p => p.S("id") == id).S("alias", id[..8]);
-    private bool ShowWorkspaceNotification(NotificationClick source, WorkspaceNotice notice)
+    private Task<bool> ShowWorkspaceNotification(NotificationClick source, WorkspaceNotice notice)
     {
-        if (_closing || DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - source.ClickedAt > 1500) return false;
+        using var timing = _responsiveness?.Stage("notification.show");
+        if (_closing || _workspaceNotifications is not { } notifications ||
+            DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - source.ClickedAt > 1500) return Task.FromResult(false);
         var host = _attachedWindows.FirstOrDefault(p => p.Value.Pid == source.AppPid && p.Value.Handle == source.Hwnd && p.Value.MatchesLifetime).Key;
         var profile = _state.Arr("profiles").FirstOrDefault(p => _hostDeck.Find(p.S("id")) == host);
-        return host is not null && profile.S("id") != "" &&
-            _workspaceNotifications?.Show(notice, profile.S("id"), ProfileExists, ProfileAlias) == true;
+        if (host is null || profile.S("id") == "") return Task.FromResult(false);
+        // The toast worker must not read _state, which this thread replaces.
+        var aliases = new Dictionary<string, string>();
+        foreach (var p in _state.Arr("profiles"))
+            if (p.S("id") is { Length: > 0 } id) aliases.TryAdd(id, p.S("alias", id.Length >= 8 ? id[..8] : id));
+        // Same 1.5 s acceptance window as above, inside Electron's 1.8 s fallback.
+        return notifications.ShowAsync(notice, profile.S("id"), aliases.ContainsKey,
+            id => aliases.TryGetValue(id, out var alias) ? alias : id[..8], DateTimeOffset.FromUnixTimeMilliseconds(source.ClickedAt + 1500));
     }
     internal void ActivateWorkspaceNotification(string ticket)
     {
@@ -458,23 +481,49 @@ public sealed class MainWindow : Window
         if (!_initialized) { _pendingNotification = ticket; return; }
         _ = Safe(() => OpenNotificationAsync(ticket));
     }
+    // A toast waits on TryAttach's own budget (_attachDeadline, extended while
+    // the launch is in progress); this much later it stops a wait TryAttach
+    // never reported, such as a host that stays in transition.
+    private static readonly TimeSpan NotificationAttachSlack = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan NotificationWindowGrace = TimeSpan.FromSeconds(30);
+    internal static bool NotificationAttachOverdue(DateTime now, DateTime attachDeadline, bool launching)
+        => AttachOverdue(now, attachDeadline + NotificationAttachSlack, launching);
     private async Task OpenNotificationAsync(string ticket)
     {
         var target = _workspaceNotifications?.ReadTicket(ticket, ProfileExists)
             ?? throw new InvalidOperationException("이 알림의 작업 정보를 찾을 수 없습니다. 작업 목록에서 열어 주세요.");
         if (!ProfileExists(target.ProfileId)) throw new InvalidOperationException("이 알림에 연결된 프로필이 제거되었습니다.");
         _notificationNavigation?.Cancel();
-        using var cancel = new CancellationTokenSource(TimeSpan.FromSeconds(35));
+        // Cancelled by a newer toast or closing; the wait's budget is checked below.
+        using var cancel = new CancellationTokenSource();
         _notificationNavigation = cancel;
         try
         {
         await ShowProfileAsync(target.ProfileId);
         int navigation = _navigation;
+        // TryAttach owns the wait, as in the normal open: the show (which a
+        // launch can block) does not count, the budget extends while the
+        // service reports this launch in progress, and it reports a missing
+        // window itself. That report (_embedRequested false) ends this wait and
+        // keeps its status. Once the window exists, attach passes can still
+        // retry (layout, parent change, transition), so a slow launch gets
+        // NotificationWindowGrace from its window instead of the deadline.
+        DateTime? windowSeen = null;
         while (!_host.HasLiveAttachment)
         {
             cancel.Token.ThrowIfCancellationRequested();
             if (_closing || _navigation != navigation || _selectedProfile != target.ProfileId) return;
-            TryAttach(Profile());
+            var profile = Profile();
+            TryAttach(profile);
+            if (_host.HasLiveAttachment) break;
+            if (!_embedRequested) return;
+            var latest = Latest(profile);
+            var now = DateTime.UtcNow;
+            if (latest.N("window_handle") != 0) windowSeen ??= now;
+            if (windowSeen is { } seen
+                    ? now > seen + NotificationWindowGrace
+                    : NotificationAttachOverdue(now, _attachDeadline, LaunchInProgress(_state, latest)))
+                throw new TimeoutException("알림의 Codex 창을 연결하지 못했습니다. 프로필을 다시 선택한 뒤 작업 목록에서 열어 주세요.");
             await Task.Delay(150, cancel.Token);
         }
         if (_selectedProfile != target.ProfileId || _navigation != navigation) return;
@@ -519,7 +568,9 @@ public sealed class MainWindow : Window
         }
         return null;
     }
-    internal void UseFixture(JsonElement state) { _state = state; _selectedProfile = state.Arr("profiles").FirstOrDefault().S("id"); Render(); SetStatus("화면 배치 자체 시험 · 실제 계정과 연결하지 않음"); }
+    internal void UseFixture(JsonElement state) { _state = state; _shownProfiles.Clear(); _selectedProfile = state.Arr("profiles").FirstOrDefault().S("id"); Render(); SetStatus("화면 배치 자체 시험 · 실제 계정과 연결하지 않음"); }
+    // Self-tests only: state refreshes also go through the request fixture.
+    internal bool FixtureRefreshesState { get; init; }
     internal TaskNotesPanel FixtureNotes(ManagerClient client) { _client = client; return _notes; }
 
     private static TextBlock Label(string text) => new() { Text = text, FontWeight = FontWeights.SemiBold, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 10, 0) };
@@ -605,13 +656,26 @@ public sealed class MainWindow : Window
         SetStatus("관리 서비스를 연결하고 있습니다…");
         _client = await ManagerClient.ConnectAsync(_root);
         if (_closing) { await _client.DisposeAsync(); return; }
-        await CheckStartupUpdatesAsync();
+        RenderExecutionMode();
+        Log(_executionMode.Text);
+        // The profile shown first starts first; the service holds the other
+        // background launches briefly behind it (profile_warmup leader gate).
+        // The toast that started the app opens its own profile instead of the
+        // restored one. Read before any state, so the ticket's saved profile
+        // leads: a recent/activity owner (ReadTicket) may be a removed profile
+        // that OpenNotificationAsync skips; the service ignores unknown ones.
+        await CheckStartupUpdatesAsync(StartupLeader(session, _pendingNotification, _workspaceNotifications));
         await RefreshAsync();
         if (_closing) return;
         _timer.Start();
+        // The first toast otherwise froze this thread for 3-10 s (toolkit
+        // registration); do that once on the toast worker after first render.
+        _workspaceNotifications?.Warm();
         if (_client.ServiceUpdateDeferred) Log("새 관리창을 기존 서비스에 연결했습니다. 작업을 유지하며 서비스 업데이트는 완전 종료 후 적용합니다.");
         _ = _managerUpdates.RefreshAsync();
-        SetStatus("창을 닫아도 작업은 계속됩니다. 모두 끝내려면 완전 종료를 누르세요.");
+        SetStatus(_administratorLaunchPending
+            ? "일반 권한으로 진행 중인 작업에 다시 연결했습니다. 작업을 마친 뒤 설정 및 관리의 ‘완전 종료 후 관리자 실행…’을 누르세요."
+            : "창을 닫아도 작업은 계속됩니다. 모두 끝내려면 완전 종료를 누르세요.");
         if (_navigation == navigation && _pendingNotification is null && session is not null)
         {
             if (session.ViewingCatalog) await ShowCatalogAsync();
@@ -622,15 +686,55 @@ public sealed class MainWindow : Window
     {
         _timer.Stop();
         if (_client is not null) await _client.DisposeAsync();
+        _client = null;
+        RenderExecutionMode();
         _client = await ManagerClient.ConnectAsync(_root);
+        RenderExecutionMode();
         await Request("supervisor.reconnect");
         await CheckStartupUpdatesAsync();
         await RefreshAsync(); _timer.Start(); SetStatus("관리 서비스에 다시 연결했습니다. 이전 변경 요청은 다시 실행하지 않았습니다.");
         _ = _managerUpdates.RefreshAsync();
     }
-    private async Task CheckStartupUpdatesAsync()
+    private void RenderExecutionMode()
     {
-        try { await Request("manager.startup"); }
+        var current = WindowsExecutionIdentity.Current();
+        var shell = !current.Known ? "확인 불가" : current.Elevated == true ? "관리자" : "일반";
+        var service = _client?.IsConnected == true && _client.ServiceElevated is bool elevated
+            ? elevated ? "관리자" : "일반" : "연결 안 됨";
+        _executionMode.Text = $"Windows 권한 · 관리창 {shell} · 서비스 {service}";
+        if (_administratorLaunchPending) _executionMode.Text += "\n관리자 전환 대기 · 작업 종료 후 적용";
+        if (!_fixture)
+        {
+            try
+            {
+                bool requested = WorkspaceExecutionMode.ReadAdministrator(_root);
+                if (!_administratorLaunchPending && current.Known && requested != current.Elevated)
+                    _executionMode.Text += requested ? "\n다음 실행 · 관리자 요청" : "\n다음 실행 · 일반 (일반 권한에서 실행)";
+            }
+            catch (InvalidOperationException) { _executionMode.Text += "\n다음 실행 설정 확인 필요"; }
+        }
+    }
+    private Task ExecutionModeAsync()
+    {
+        RenderExecutionMode();
+        var requested = Dialogs.ExecutionMode(this, WorkspaceExecutionMode.ReadAdministrator(_root), _executionMode.Text);
+        if (requested is not bool administrator) return Task.CompletedTask;
+        WorkspaceExecutionMode.SaveAdministrator(_root, administrator);
+        _administratorLaunchPending = administrator && !WindowsExecutionIdentity.IsElevated;
+        RenderExecutionMode();
+        SetStatus("실행 권한 설정을 저장했습니다. 작업을 마친 뒤 완전 종료하고 다시 실행하면 적용됩니다.");
+        return Task.CompletedTask;
+    }
+    // The startup warmup's leader: a pending toast's saved profile (none when
+    // its ticket cannot be read), otherwise the restored profile unless the
+    // session ended on the task catalog.
+    internal static string? StartupLeader(WorkspaceSession? session, string? pendingTicket,
+        WorkspaceNotifications? notifications)
+        => pendingTicket is not null ? notifications?.ReadStoredTicket(pendingTicket)?.ProfileId
+            : session is { ViewingCatalog: false } ? session.ProfileId : null;
+    private async Task CheckStartupUpdatesAsync(string? selectedProfile = null)
+    {
+        try { await Request("manager.startup", selectedProfile is null ? null : new { selected_profile_id = selectedProfile }); }
         catch (Exception ex) { Log("시작 시 업데이트 확인 실패 · " + ex.Message); }
     }
     private async Task Safe(Func<Task> action)
@@ -679,6 +783,7 @@ public sealed class MainWindow : Window
         "profile.show" => "Codex 프로필 열기", "profile.prepare" => "프로필 준비", "accounts.refresh" => "계정·사용량 확인",
         "profile.login" => "프로필 로그인 화면 열기", "profile.login_status" => "로그인 계정 상태 확인",
         "profile.restart" => "설정 적용 · 정상 종료 후 다시 열기",
+        "profile.remote_restart" => "프로필 SSH 설정 적용", "profile.remote_stop" => "프로필 SSH 종료",
         "profile.recover" => "선택한 관리용 Codex 종료",
         "catalog.list" => "대화 목록 읽기", "catalog.show" => "원본 Codex 전체 기록 열기", "conversation.open" => "지정 계정에서 대화 열기", "policy.set" => "모델 조합 적용",
         "providers.verify" => "모델 API 연결 시험", "providers.key" => "API 키 저장", "providers.save" => "모델 연결 등록",
@@ -697,7 +802,7 @@ public sealed class MainWindow : Window
     }
     private async Task RefreshAsync()
     {
-        if (_client is null || _refreshing || _closing || _profileOrdering.IsInteracting) return;
+        if ((_client is null && !FixtureRefreshesState) || _refreshing || _closing || _profileOrdering.IsInteracting) return;
         _refreshing = true;
         var navigation = _navigation;
         var revision = _stateRevision;
@@ -705,7 +810,9 @@ public sealed class MainWindow : Window
         {
             var state = await Request("state");
             if (_closing || navigation != _navigation || revision != _stateRevision || _profileOrdering.IsInteracting) return;
-            _state = state;
+            // Every show bumps _stateRevision, so this state was requested after
+            // each launch still kept in _shownProfiles.
+            _state = state; _shownProfiles.Clear();
             Render();
             var current = _viewingCatalog ? _viewerProfile : Profile();
             if (_host.IsAttached && _expectedWindowLaunch?.Matches(current) == true &&
@@ -869,9 +976,11 @@ public sealed class MainWindow : Window
             using (_responsiveness?.Stage("shell.selected_window", 25))
             if (_embedRequested && _profileRequestTicket is null && _selectedProfile is not null)
             {
-                if (p.Get("restart").S("phase") is "acquiring" or "closing" or "opening" or "releasing" or "waiting" or "recovering" or "connecting")
+                // Layout-retry renders can run before the post-show refresh lands.
+                var selected = _viewingCatalog ? p : Latest(_selectedProfile, p);
+                if (selected.Get("restart").S("phase") is "acquiring" or "closing" or "opening" or "releasing" or "waiting" or "recovering" or "connecting")
                     _attachDeadline = DateTime.UtcNow.AddSeconds(25);
-                TryAttach(p, refreshPresentation: false);
+                TryAttach(selected, refreshPresentation: false);
             }
             using (_responsiveness?.Stage("shell.background_windows", 25)) ReconcileBackgroundWindows();
         }
@@ -896,6 +1005,11 @@ public sealed class MainWindow : Window
         box.SelectedItem = box.Items.OfType<Choice>().FirstOrDefault(x => x.Id == selected);
     }
     private JsonElement Profile() => _state.Arr("profiles").FirstOrDefault(p => p.S("id") == _selectedProfile);
+    // A returned launch is newer than _state until a state requested after it
+    // lands, so launch identity (attach, re-clicks, background hosts) prefers it.
+    private JsonElement Latest(JsonElement profile) => Latest(profile.S("id"), profile);
+    private JsonElement Latest(string? id, JsonElement fallback) =>
+        id is not null && _shownProfiles.TryGetValue(id, out var shown) ? shown : fallback;
     private string RequireProfile() => _selectedProfile ?? throw new InvalidOperationException("먼저 왼쪽 프로필을 선택하세요.");
     private static string Status(string value) => value switch { "running" => "실행 중", "ready" => "준비됨", "stopped" or "not_started" => "닫힘", "unprepared" => "준비 전", "error" => "확인 필요", "starting" => "여는 중", "unknown" or "" => "상태 확인 중", _ => value };
     private static string Usage(JsonElement usage)
@@ -913,7 +1027,7 @@ public sealed class MainWindow : Window
         var age = usage.N("age_seconds");
         var stamp = usage.B("refreshing") ? " · 갱신 중" :
             age >= 86400 ? $" · {age / 86400}일 전 값" : age >= 3600 ? $" · {age / 3600}시간 전 값" :
-            age >= 120 ? $" · {age / 60}분 전 값" : "";
+            age >= 600 ? $" · {age / 60}분 전 값" : ""; // Two 300 s usage refresh periods.
         if (stamp == "" && (usage.S("freshness") == "stale" || usage.Get("error").ValueKind is not (JsonValueKind.Null or JsonValueKind.Undefined))) stamp = " · 이전 값";
         // Weekly reset time and any redeemable reset credits stay on the card so
         // the profile list answers "when does it come back" without a dialog.
@@ -930,10 +1044,13 @@ public sealed class MainWindow : Window
     {
         using var timing = _responsiveness?.Time("profile.switch." + id);
         using var action = _profileActions.Enter(id, "계정 열기");
-        await ShowProfileCoreAsync(id, command);
+        await ShowProfileCoreAsync(id, command, action);
     }
-    private async Task ShowProfileCoreAsync(string id, string command = "profile.show")
+    // Ends the caller's action gate once the returned window is attached; the
+    // caller's using still releases it on every earlier exit.
+    private async Task ShowProfileCoreAsync(string id, string command, IDisposable action)
     {
+        var started = Environment.TickCount64;
         var ticket = ++_navigation;
         _expectedConversation = null;
         if (_selectedProfile != id || _viewingCatalog) ParkCurrent();
@@ -941,28 +1058,32 @@ public sealed class MainWindow : Window
         _selectedProfile = id;
         _hostDeck.Select(id);
         BeginAttach(); _profileRequestTicket = ticket; Render();
-        if (command == "profile.show" && ProfileLoginPresentation.ShowRecovery(Profile()))
+        // A re-click before the post-show state lands judges the launch that show
+        // returned, not the older state.
+        var current = Latest(id, Profile());
+        if (command == "profile.show" && ProfileLoginPresentation.ShowRecovery(current))
         {
             _profileRequestTicket = null;
-            ShowLoginRecovery(Profile());
+            ShowLoginRecovery(current);
             return;
         }
-        if (command == "profile.show" && AutomaticProfileUpdate.IsReplacing(Profile()))
+        if (command == "profile.show" && AutomaticProfileUpdate.IsReplacing(current))
         {
             _profileRequestTicket = null;
             SetStatus("업데이트 적용 후 이 프로필의 새 창을 관리창 안에 표시합니다…");
             return;
         }
         if (command == "profile.show" && _attached is { } cached && cached.MatchesLifetime &&
-            _host.IsAttached && _windowLaunches.TryGetValue(_host, out var launch) && launch.Matches(Profile()) &&
-            !(Profile().Get("restart").B("remote_background") && Profile().Get("restart").S("phase") == "attention"))
+            _host.IsAttached && _windowLaunches.TryGetValue(_host, out var launch) && launch.Matches(current) &&
+            !(current.Get("restart").B("remote_background") && current.Get("restart").S("phase") == "attention" &&
+              !current.Get("restart").B("connections_restored")))
         {
             _profileRequestTicket = null;
-            TryAttach(Profile());
-            Log($"프로필 전환 · {Profile().S("alias")} · 기존 창 연결 유지");
+            TryAttach(current);
+            Log($"프로필 전환 · {current.S("alias")} · 기존 창 연결 유지");
             return;
         }
-        Log($"프로필 선택 · {Profile().S("alias")} · {id}");
+        Log($"프로필 선택 · {current.S("alias")} · {id}");
         SetStatus(command == "profile.login" ? "선택한 프로필의 로그인 화면을 여는 중입니다…" : "선택한 프로필을 여는 중입니다…");
         JsonElement returnedProfile;
         try
@@ -993,8 +1114,14 @@ public sealed class MainWindow : Window
             }
             Log($"{returnedProfile.S("alias")} · {(result.S("state") == "launched" ? "새 프로세스 시작" : "기존 프로세스 사용")} · PID {returnedProfile.N("process_id")} · 실행 {returnedProfile.S("generation")}");
             _expectedWindowLaunch = WindowLaunchIdentity.From(returnedProfile);
+            // The show can outlive BeginAttach's budget (admission waits); the
+            // returned launch gets its own.
+            _attachDeadline = DateTime.UtcNow.AddSeconds(25);
+            // Kept until a later state lands. The bump discards a poll that
+            // started before this show; the refresh runs after attaching below.
+            _shownProfiles[id] = returnedProfile;
             ++_stateRevision;
-            await RefreshAsync();
+            _attachTiming = (ticket, id, started);
         }
         catch (Exception error)
         {
@@ -1019,8 +1146,36 @@ public sealed class MainWindow : Window
             throw;
         }
         finally { if (_profileRequestTicket == ticket) _profileRequestTicket = null; }
-        if (ticket != _navigation || _selectedProfile != id || !_embedRequested || _closing) return;
-        TryAttach(returnedProfile);
+        // TryAttach reads only the returned profile, pinned by _expectedWindowLaunch,
+        // so attach first. The full state (0.8-2 s, longer when the service is
+        // busy) then refreshes the sidebar without holding the window back.
+        if (ticket == _navigation && _selectedProfile == id && _embedRequested && !_closing)
+        {
+            TryAttach(returnedProfile);
+            if (_host.HasLiveAttachment && _windowLaunches.TryGetValue(_host, out var attached) && attached.Matches(returnedProfile))
+                RecordAttached(id);
+        }
+        // Re-clicks and same-profile actions read Latest(id), so the gate ends
+        // here instead of covering an in-flight poll plus a fresh state (~40 s).
+        action.Dispose();
+        using (_responsiveness?.Time("profile.switch.refresh." + id))
+        {
+            // A poll already in flight was discarded above and would turn this
+            // refresh into a no-op. Wait only briefly: a slow one is left to the
+            // next timer poll (_shownProfiles bridges until then), so callers such
+            // as notification navigation are not held for two full state calls.
+            var waitUntil = Environment.TickCount64 + 2000;
+            while (_refreshing && !_closing && Environment.TickCount64 < waitUntil) await Task.Delay(25);
+            if (!_refreshing && _shownProfiles.ContainsKey(id)) await RefreshAsync();
+        }
+    }
+    // profile.switch.<id> also covers the post-show refresh; this is the time
+    // from the click to the attached window.
+    private void RecordAttached(string id)
+    {
+        if (_attachTiming is not { } timing || timing.Ticket != _navigation || timing.Id != id) return;
+        _attachTiming = null;
+        _responsiveness?.Record("operation", new { name = "profile.attached." + id, elapsed_ms = Environment.TickCount64 - timing.Started });
     }
     private static string LoginLabel(JsonElement result) => result.S("state") switch
     {
@@ -1044,8 +1199,8 @@ public sealed class MainWindow : Window
             return;
         }
         _loginRepair.Visibility = !_viewingCatalog && ProfileLoginPresentation.NeedsLogin(saved) ? Visibility.Visible : Visibility.Collapsed;
-        _loginRepair.IsEnabled = saved.S("status") != "running";
-        _loginRepair.ToolTip = "이 프로필의 실행 창을 닫은 뒤, 등록된 계정으로 전용 로그인을 진행합니다.";
+        _loginRepair.IsEnabled = true;
+        _loginRepair.ToolTip = "등록된 계정으로 다시 로그인합니다. 기존 실행이 남아 있으면 종료 확인 후 전용 로그인 화면을 엽니다.";
         _accountState.Foreground = ProfileLoginPresentation.NeedsLogin(saved) ? Brushes.Orange : Muted;
         var savedLabel = saved.S("login_state") == "signed_in" && DateTimeOffset.TryParse(saved.S("login_verified_at"), out var verified)
             ? $"마지막 서버 로그인 확인 · {verified.ToLocalTime():MM-dd HH:mm:ss}"
@@ -1073,6 +1228,16 @@ public sealed class MainWindow : Window
             return;
         }
         _loginStatuses.Remove(id);
+        // X may hide Electron while its background process keeps the bound
+        // login guard alive. Ask before using the existing profile-scoped exit.
+        var status = await Request("profile.login_status", new { profile_id = id });
+        if (_closing) return;
+        var profile = Latest(id, _state.Arr("profiles").First(p => p.S("id") == id));
+        if (ProfileLoginPresentation.RequiresRestartForLogin(profile, status))
+        {
+            await RecoverProfileAsync(id, forLogin: true);
+            return;
+        }
         await ShowProfileAsync(id, "profile.login");
     }
     private Task RefreshLoginStatusAsync() => RefreshLoginStatusAsync(RequireProfile());
@@ -1095,14 +1260,75 @@ public sealed class MainWindow : Window
         await RefreshAsync();
         SetStatus(result.Message("이 프로필의 설정 적용을 예약했습니다."), result.S("phase") == "attention");
     }
+    private Task RestartRemoteProfileAsync() => RestartRemoteProfileAsync(RequireProfile());
+    private async Task RestartRemoteProfileAsync(string id)
+    {
+        using var action = _profileActions.Enter(id, "SSH 설정 적용");
+        if (!_state.Get("capabilities").B("remote_profile_lifecycle"))
+            throw new InvalidOperationException("실행 중인 관리 서비스가 이전 버전입니다. 작업을 마친 뒤 완전 종료하고 새 버전으로 다시 열어 주세요.");
+        var profile = Latest(id, _state.Arr("profiles").First(p => p.S("id") == id));
+        if (MessageBox.Show(this, $"{profile.S("alias")} 프로필의 SSH 작업이 끝나면 원격 Codex를 다시 열어 모델·하위 에이전트 설정을 적용합니다.\n\n현재 답변은 끝날 때까지 기다립니다. 연결이 잠시 끊겼다가 다시 연결됩니다. 다른 프로필과 터미널용 Codex는 유지됩니다.",
+            "이 프로필의 SSH 설정 적용", MessageBoxButton.OKCancel, MessageBoxImage.Information) != MessageBoxResult.OK) return;
+        var result = await Request("profile.remote_restart", new { profile_id = id, generation = profile.S("generation") });
+        await RefreshAsync();
+        SetStatus(result.Message());
+    }
+
+    private async Task StopRemoteProfilesAsync()
+    {
+        if (_client?.IsConnected != true) throw new InvalidOperationException("원격 종료를 확인할 관리 서비스가 연결되지 않았습니다.");
+        if (!_state.Get("capabilities").B("remote_profile_lifecycle"))
+        {
+            Log("이전 서비스의 로컬 종료만 수행 · SSH 원격 실행 유지");
+            return; // The confirmation dialog explicitly describes this legacy scope.
+        }
+        var jobs = new Dictionary<string, string>();
+        foreach (var profile in _state.Arr("profiles"))
+        {
+            if (profile.S("generation") == "" || !profile.Arr("remote_bindings").Any(b => b.B("prepared"))) continue;
+            using var requestDeadline = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+            var job = await _client.RequestAsync("profile.remote_stop",
+                new { profile_id = profile.S("id"), generation = profile.S("generation") }, requestDeadline.Token);
+            jobs[profile.S("id")] = job.S("id");
+        }
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        try
+        {
+            while (jobs.Count > 0)
+            {
+                var state = await _client.RequestAsync("state", cancellationToken: deadline.Token);
+                foreach (var (id, jobId) in jobs.ToArray())
+                {
+                    var job = state.Get("profile_restarts").Get(id);
+                    if (job.S("id") != jobId) throw new InvalidOperationException("SSH 종료 요청이 변경되어 종료 확인을 중지했습니다.");
+                    if (job.S("phase") == "complete") { jobs.Remove(id); Log("프로필 원격 종료 확인 · " + id); }
+                    else if (job.S("phase") is "attention" or "superseded")
+                        throw new InvalidOperationException(job.Message("SSH 종료 결과를 확인하지 못했습니다."));
+                }
+                if (jobs.Count == 0) break;
+                SetStatus("SSH 작업 종료를 기다립니다. 현재 답변이 끝나면 원격 실행을 종료합니다.");
+                await Task.Delay(1000, deadline.Token);
+            }
+        }
+        catch (OperationCanceledException) when (deadline.IsCancellationRequested)
+        {
+            throw new InvalidOperationException("SSH 작업이 아직 진행 중이거나 종료를 확인하고 있습니다. 종료 요청은 유지됩니다. 작업이 끝난 뒤 완전 종료를 다시 눌러 주세요.");
+        }
+    }
+
     private Task RecoverProfileAsync() => RecoverProfileAsync(RequireProfile());
-    private async Task RecoverProfileAsync(string id)
+    private Task RecoverProfileAsync(string id) => RecoverProfileAsync(id, forLogin: false);
+    private async Task RecoverProfileAsync(string id, bool forLogin)
     {
         using var action = _profileActions.Enter(id, "이 프로필 다시 열기");
         if (_viewingCatalog) throw new InvalidOperationException("왼쪽에서 복구할 계정 프로필을 선택하세요.");
         if (_profileRequestTicket is not null) throw new InvalidOperationException("현재 프로필 열기가 끝난 뒤 복구하세요.");
-        var profile = _state.Arr("profiles").First(p => p.S("id") == id);
-        if (MessageBox.Show(this, $"{profile.S("alias")} 프로필의 관리용 Codex를 종료하고 새 버전으로 다시 엽니다.\n이 창에서 실행 중인 작업은 중단되며, 보내지 않은 입력은 사라질 수 있습니다.\n\n작업을 정리했다면 확인을 누르세요. 원래 Codex와 다른 프로필은 유지됩니다.", "이 프로필 다시 열기", MessageBoxButton.OKCancel, MessageBoxImage.Warning) != MessageBoxResult.OK) return;
+        // The launch a show just attached, not an older state's generation/PID.
+        var profile = Latest(id, _state.Arr("profiles").First(p => p.S("id") == id));
+        var prompt = forLogin
+            ? $"{profile.S("alias")}의 기존 실행이 백그라운드에 남아 있습니다. 이 프로필을 종료한 뒤 전용 로그인 화면을 엽니다.\n\n이 프로필의 진행 중인 작업과 SSH 연결이 끊길 수 있고, 보내지 않은 입력은 사라질 수 있습니다. 저장된 대화와 다른 프로필은 유지됩니다.\n\n이 프로필의 작업을 마쳤다면 확인을 누르세요."
+            : $"{profile.S("alias")} 프로필의 관리용 Codex를 종료하고 새 버전으로 다시 엽니다.\n이 창에서 실행 중인 작업은 중단되며, 보내지 않은 입력은 사라질 수 있습니다.\n\n작업을 정리했다면 확인을 누르세요. 원래 Codex와 다른 프로필은 유지됩니다.";
+        if (!ConfirmProfileRestart(prompt, forLogin ? "이 프로필 다시 로그인" : "이 프로필 다시 열기")) return;
         var ticket = ++_navigation;
         _profileRequestTicket = ticket;
         _embedRequested = false;
@@ -1124,8 +1350,9 @@ public sealed class MainWindow : Window
         }
         finally { if (_profileRequestTicket == ticket) _profileRequestTicket = null; }
         if (ticket != _navigation || _closing) return;
-        await ShowProfileCoreAsync(id);
+        await ShowProfileCoreAsync(id, forLogin ? "profile.login" : "profile.show", action);
     }
+    internal Func<string, string, bool> ConfirmProfileRestart { get; set; } = null!;
     private Task CheckInputAsync()
     {
         SetStatus(_host.InputDiagnostic());
@@ -1193,6 +1420,23 @@ public sealed class MainWindow : Window
             Log("창 연결 · 이전 창 종료 확인 · 새 창 연결 대기");
         }
     }
+    // Eight desktops starting together created their windows 40-48 s after
+    // spawn (revision 94); 25 s + 65 s still bounds a launch that never shows.
+    private static readonly TimeSpan LaunchProgressGrace = TimeSpan.FromSeconds(65);
+    // The service still reports this profile's launch in progress: queued or
+    // preparing in the startup warmup (also behind the leader gate), or
+    // spawned without its first window yet.
+    private static bool LaunchInProgress(JsonElement state, JsonElement profile)
+    {
+        if (profile.S("status") == "running" && profile.N("process_id") != 0 && profile.N("window_handle") == 0) return true;
+        var warmup = state.Get("profile_warmup");
+        return warmup.B("worker_active") && warmup.Arr("profiles").Any(entry =>
+            entry.S("profile_id") == profile.S("id") && entry.S("state") is "queued" or "checking" or "opening");
+    }
+    // Shared by TryAttach and a toast's open: past its deadline a missing
+    // window is an error, unless the launch is in progress (LaunchProgressGrace more).
+    internal static bool AttachOverdue(DateTime now, DateTime deadline, bool launching)
+        => now >= deadline + (launching ? LaunchProgressGrace : TimeSpan.Zero);
     private void AttachFailure(string error)
     {
         _embedRequested = false;
@@ -1204,6 +1448,7 @@ public sealed class MainWindow : Window
     }
     private void TryAttach(JsonElement profile, bool refreshPresentation = true)
     {
+        profile = Latest(profile);
         if (ProfileLoginPresentation.ShowRecovery(profile)) { ShowLoginRecovery(profile); return; }
         if (!_embedRequested || _host.IsTransitioning) return;
         if (AutomaticProfileUpdate.IsClosing(profile))
@@ -1244,8 +1489,19 @@ public sealed class MainWindow : Window
         var path = profile.S("executable_path", profile.S("executable"));
         if (hwnd == 0 || hwnd == _closedWindow || pid == 0 || string.IsNullOrWhiteSpace(path))
         {
-            if (DateTime.UtcNow >= _attachDeadline) AttachFailure("25초 안에 Codex 기본 창을 찾지 못했습니다. 프로필을 다시 선택해 주세요.");
-            else { _empty.Text = "Codex 기본 창을 찾고 있습니다…\n25초 안에 연결되지 않으면 오류와 확인 방법을 표시합니다."; _empty.Visibility = Visibility.Visible; }
+            // While the service still reports this launch in progress, the 25 s
+            // budget extends by LaunchProgressGrace (90 s in all).
+            var starting = LaunchInProgress(_state, profile);
+            if (AttachOverdue(DateTime.UtcNow, _attachDeadline, starting))
+                AttachFailure(starting ? "90초 안에 Codex 기본 창을 찾지 못했습니다. 프로필을 다시 선택해 주세요."
+                    : "25초 안에 Codex 기본 창을 찾지 못했습니다. 프로필을 다시 선택해 주세요.");
+            else
+            {
+                _empty.Text = starting
+                    ? "Codex 기본 창을 찾고 있습니다…\n프로필을 여는 중입니다. 여러 프로필을 함께 시작하면 1분 넘게 걸릴 수 있으며, 창이 준비되면 바로 연결합니다."
+                    : "Codex 기본 창을 찾고 있습니다…\n25초 안에 연결되지 않으면 오류와 확인 방법을 표시합니다.";
+                _empty.Visibility = Visibility.Visible;
+            }
             return;
         }
         _hostDeck.Select(profile.S("id"));
@@ -1276,8 +1532,11 @@ public sealed class MainWindow : Window
     private void ReconcileBackgroundWindows()
     {
         if (_closing) return;
-        foreach (var profile in _state.Arr("profiles").Concat(_state.Arr("view_instances")))
+        foreach (var listed in _state.Arr("profiles").Concat(_state.Arr("view_instances")))
         {
+            // A profile switched away from before its post-show refresh landed:
+            // the older launch must not replace the window attached for the new one.
+            var profile = Latest(listed);
             var id = profile.S("id");
             if (id == "" || profile.S("status") != "running" || profile.N("window_handle") == 0
                 || (!_viewingCatalog && id == _selectedProfile) || (_viewingCatalog && id == _viewerProfile.S("id"))
@@ -1348,6 +1607,7 @@ public sealed class MainWindow : Window
             {
                 _closedWindow = 0;
                 _empty.Visibility = Visibility.Collapsed; SetStatus("선택한 프로필의 Codex 창을 연결했습니다.");
+                RecordAttached(id);
             }
             else
             {
@@ -1394,7 +1654,7 @@ public sealed class MainWindow : Window
     {
         if (_host.IsTransitioning) throw new InvalidOperationException("창 연결이 진행 중입니다. 연결이 끝난 뒤 분리해 주세요.");
         ++_navigation;
-        var profile = _viewingCatalog ? _viewerProfile : Profile();
+        var profile = _viewingCatalog ? _viewerProfile : Latest(_selectedProfile, Profile());
         _detachedProfiles[profile.S("id")] = WindowLaunchIdentity.From(profile);
         var detached = _attached;
         _embedRequested = false; _host.Detach();
@@ -1419,12 +1679,28 @@ public sealed class MainWindow : Window
     }
     private bool _shutdownInProgress, _shutdownComplete, _exitAllRequested;
     private readonly WorkspaceShutdown _serviceShutdown = new();
-    private Task ExitWorkspaceAsync()
+    private Task ExitWorkspaceAsync() => RequestWorkspaceExitAsync(false);
+    private Task RestartAdministratorAsync()
+    {
+        if (WindowsExecutionIdentity.IsElevated)
+        { SetStatus("현재 관리창은 이미 관리자 권한으로 실행 중입니다."); return Task.CompletedTask; }
+        if (_client?.IsConnected != true)
+        { SetStatus("기존 관리 서비스에 연결한 뒤 다시 시도해 주세요. 진행 중인 작업은 유지했습니다.", true); return Task.CompletedTask; }
+        return RequestWorkspaceExitAsync(true);
+    }
+    private Task RequestWorkspaceExitAsync(bool restartAdministrator)
     {
         if (_shutdownInProgress || (_closing && !_serviceShutdown.DrainStarted)) return Task.CompletedTask;
-        if (MessageBox.Show(this, "관리 중인 모든 Codex 프로필과 작업을 종료합니다.\n진행 중인 작업은 중단됩니다.\n\n창만 닫고 작업을 계속하려면 취소한 뒤 제목줄의 X를 누르세요.",
-            "작업 공간 완전 종료", MessageBoxButton.OKCancel, MessageBoxImage.Warning, MessageBoxResult.Cancel) != MessageBoxResult.OK)
+        var message = restartAdministrator
+            ? "관리 중인 모든 Codex 프로필과 작업을 종료한 뒤 관리자 권한으로 다시 실행합니다.\n진행 중인 작업은 중단됩니다. 작업을 모두 마쳤을 때만 계속하세요.\n\n종료가 확인되면 Windows 권한 허용 창이 나타납니다."
+            : "관리 중인 모든 Codex 프로필과 작업을 종료합니다.\n진행 중인 작업은 중단됩니다.\n\n창만 닫고 작업을 계속하려면 취소한 뒤 제목줄의 X를 누르세요.";
+        message += _state.Get("capabilities").B("remote_profile_lifecycle")
+            ? "\n\nSSH에서는 이 앱에 등록된 프로필의 현재 답변이 끝나기를 기다린 뒤 종료합니다. 서버와 별도 터미널 Codex는 유지합니다."
+            : "\n\n현재 실행 중인 이전 관리 서비스는 로컬 종료만 지원합니다. SSH 원격 실행은 유지됩니다. 새 서비스로 다시 연 뒤 SSH 종료 기능을 사용할 수 있습니다.";
+        if (MessageBox.Show(this, message,
+            restartAdministrator ? "완전 종료 후 관리자 실행" : "작업 공간 완전 종료", MessageBoxButton.OKCancel, MessageBoxImage.Warning, MessageBoxResult.Cancel) != MessageBoxResult.OK)
             return Task.CompletedTask;
+        _restartAsAdministrator = restartAdministrator;
         _exitAllRequested = true;
         Close();
         return Task.CompletedTask;
@@ -1474,6 +1750,8 @@ public sealed class MainWindow : Window
         }
         if (_parked.Count == 0 && _client is null)
         {
+            if (_restartAsAdministrator)
+            { SetStatus("관리 서비스 종료를 확인하지 못해 관리자 실행을 보류했습니다.", true); return; }
             using var timing = _responsiveness?.Stage("profile.cached-select");
             _closing = true; _shutdownComplete = true; e.Cancel = false;
             return;
@@ -1504,7 +1782,8 @@ public sealed class MainWindow : Window
                     await _client.RequestAsync("manager.stop_warmup", cancellationToken: stopWarmup.Token);
                     do
                     {
-                        _state = await _client.RequestAsync("state", cancellationToken: stopWarmup.Token);
+                        // No show lands after _closing, so this snapshot is newer than any kept launch.
+                        _state = await _client.RequestAsync("state", cancellationToken: stopWarmup.Token); _shownProfiles.Clear();
                         if (!_state.Get("profile_warmup").B("worker_active") &&
                             _state.Get("local_launches").N("active") == 0) break;
                         await Task.Delay(100, stopWarmup.Token);
@@ -1542,27 +1821,48 @@ public sealed class MainWindow : Window
                     // child of the tracked window, so the graceful close above can
                     // leave ChatGPT processes behind. The service reaps every managed
                     // process that carries this profile's own --user-data-dir.
+                    // Every profile that ever launched is swept, not only observed
+                    // ones: a launch that failed before its identity was saved leaves
+                    // a desktop that no recorded process id points to.
                     var cleanupErrors = new List<string>();
+                    var cleanupWarnings = new List<string>();
                     foreach (var profile in _state.Arr("profiles").Concat(_state.Arr("view_instances")))
                     {
                         var id = profile.S("id");
-                        if (id == "" || profile.S("process_id") == "") continue;
+                        if (id == "" || profile.S("generation") == "") continue;
+                        var observed = profile.S("process_id") != "";
                         try
                         {
                             using var stopDeadline = new CancellationTokenSource(TimeSpan.FromSeconds(6));
-                            await _client.RequestAsync("profile.cleanup",
+                            var cleanup = await _client.RequestAsync("profile.cleanup",
                                 new { profile_id = id, generation = profile.S("generation") },
                                 cancellationToken: stopDeadline.Token);
-                            Log($"남은 Codex 프로세스 정리 · {profile.S("alias", id)}");
+                            if (observed || cleanup.S("state") != "already_stopped")
+                                Log($"남은 Codex 프로세스 정리 · {profile.S("alias", id)}");
                         }
                         catch (Exception error)
                         {
-                            cleanupErrors.Add(profile.S("alias", id));
-                            Log("프로세스 종료 확인 실패 · " + error.Message);
+                            var reason = error is OperationCanceledException ? "정리 확인 시간 초과" : error.Message;
+                            Log($"프로세스 종료 확인 실패 · {profile.S("alias", id)} · {reason}");
+                            // An observed process blocks the exit. Without one, only an
+                            // older service's refusal of a profile with no recorded
+                            // process is expected; any other failure (a sweep timeout,
+                            // an unverifiable process) may leave an orphan running.
+                            if (observed) cleanupErrors.Add(profile.S("alias", id));
+                            else if (!reason.Contains("실행 프로필이 없습니다", StringComparison.Ordinal))
+                                cleanupWarnings.Add($"{profile.S("alias", id)} · {reason}");
                         }
                     }
                     if (cleanupErrors.Count > 0)
                         throw new InvalidOperationException("일부 프로필의 종료를 확인하지 못해 관리창을 유지합니다: " + string.Join(", ", cleanupErrors));
+                    if (cleanupWarnings.Count > 0 && MessageBox.Show(this,
+                            "다음 프로필에 남은 Codex 프로세스가 없는지 확인하지 못했습니다. 그대로 종료하면 백그라운드 Codex가 남을 수 있습니다.\n\n" +
+                            string.Join("\n", cleanupWarnings) +
+                            "\n\n그래도 완전 종료하려면 확인을, 관리창을 유지하고 다시 시도하려면 취소를 누르세요.",
+                            "남은 Codex 정리 확인", MessageBoxButton.OKCancel, MessageBoxImage.Warning, MessageBoxResult.Cancel) != MessageBoxResult.OK)
+                        throw new InvalidOperationException("남은 Codex 프로세스 정리를 확인하지 못해 관리창을 유지합니다: " +
+                            string.Join(", ", cleanupWarnings));
+                    await StopRemoteProfilesAsync();
                 }
             }
             if (_client?.IsConnected == true)
@@ -1584,6 +1884,12 @@ public sealed class MainWindow : Window
                 catch (OperationCanceledException)
                 { throw new InvalidOperationException("관리 서비스의 종료를 기다리고 있습니다. 잠시 뒤 완전 종료를 다시 눌러 주세요."); }
                 Log("관리 서비스와 남은 관리 작업 종료 확인");
+            }
+            if (_restartAsAdministrator)
+            {
+                if (!_serviceShutdown.DrainStarted)
+                    throw new InvalidOperationException("관리 서비스 종료를 확인하지 못해 관리자 실행을 보류했습니다.");
+                ((App)Application.Current).RestartAdministratorAfterExit(_root);
             }
             _shutdownComplete = true;
             Close();
@@ -1746,7 +2052,9 @@ public sealed class MainWindow : Window
         if (_attached is not { } window) throw new InvalidOperationException("먼저 프로필의 원본 Codex 창을 관리창 안에 표시하세요.");
         var ticket = _navigation; var profileId = _selectedProfile;
         var viewerId = _viewingCatalog ? _viewerProfile.S("id") : null;
-        var captured = await NativeConversationCapture.CaptureAsync(window.Handle, window.Pid, window.Executable);
+        var captured = await NativeConversationCapture.CaptureAsync(window.Handle, window.Pid, window.Executable,
+            new WindowInteropHelper(this).Handle, () => ticket == _navigation && profileId == _selectedProfile &&
+                !_closing && _host.HasLiveAttachment && _host.AttachedHandle == window.Handle && window.MatchesLifetime);
         if (ticket != _navigation || profileId != _selectedProfile || _closing) return;
         if (!captured.Success) throw new InvalidOperationException(captured.Error ?? "현재 대화 링크를 확인하지 못했습니다.");
         JsonElement resolved = default;
@@ -1796,7 +2104,9 @@ public sealed class MainWindow : Window
         if (expected.HostId != "local") throw new InvalidOperationException("SSH 대화 링크에는 호스트 정보가 없어 자동 확인할 수 없습니다. 원본 화면의 연결과 대화를 확인하세요.");
         if (_attached is not { } window) throw new InvalidOperationException("해당 프로필 창을 관리창 안에 표시한 뒤 확인하세요.");
         var ticket = _navigation;
-        var result = await NativeConversationCapture.CaptureAsync(window.Handle, window.Pid, window.Executable);
+        var result = await NativeConversationCapture.CaptureAsync(window.Handle, window.Pid, window.Executable,
+            new WindowInteropHelper(this).Handle, () => ticket == _navigation && expected.ProfileId == _selectedProfile &&
+                !_closing && _host.HasLiveAttachment && _host.AttachedHandle == window.Handle && window.MatchesLifetime);
         if (ticket != _navigation || _selectedProfile != expected.ProfileId || _closing) return;
         if (!result.Success) throw new InvalidOperationException(result.Error ?? "원본 화면의 현재 대화를 확인하지 못했습니다.");
         if (result.ThreadId != expected.ThreadId) throw new InvalidOperationException("현재 원본 화면은 요청한 대화와 다릅니다. 대화가 열린 뒤 다시 확인하세요. 메시지는 전송하지 않았습니다.");

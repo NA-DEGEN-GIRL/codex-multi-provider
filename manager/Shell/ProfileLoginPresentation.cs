@@ -4,6 +4,9 @@ namespace Codex.ControlCenter.Shell;
 
 internal static class ProfileLoginPresentation
 {
+    internal static bool RequiresRestartForLogin(JsonElement profile, JsonElement login) =>
+        profile.S("status") == "running" && profile.S("runtime_channel") != "packaged" &&
+        !profile.B("native_login_pending") && login.S("state") is not ("credential_saved" or "signed_in");
     public static bool NeedsLogin(JsonElement profile) => profile.Get("login_health").B("blocks_launch");
     public static bool ShowRecovery(JsonElement profile) => NeedsLogin(profile) && profile.S("status") != "running";
     public static string Message(JsonElement profile) => "프로필 " + profile.S("alias") + " · 로그인 확인 필요\n\n" +

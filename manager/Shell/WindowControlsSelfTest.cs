@@ -61,6 +61,7 @@ internal static class WindowControlsSelfTest
         checks.Add("Profile settings retain the right-clicked account after popup close without selecting it; keyboard reopening resets the target.");
         CheckMenuCommands(root, checks);
         ProfileAgentPresentationSelfTest.Run(checks);
+        ShortcutLoginSelfTest.Run(root, checks);
         WorkspaceShutdownSelfTest.Run(checks);
         var field = typeof(MainWindow).GetField("_profileRequestTicket", BindingFlags.Instance | BindingFlags.NonPublic)!;
         field.SetValue(window, (int?)987);

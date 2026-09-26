@@ -57,8 +57,9 @@ internal sealed record ProfileCardData(string Name, string Status, string Status
         var redeem = credits.ValueKind == JsonValueKind.Number && credits.TryGetInt64(out var count) && count is >= 0 and <= 1_000_000
             ? $"리딤 {count:N0}회" : "리딤 확인 안 됨";
         var age = usage.N("age_seconds");
+        // Usage refreshes every 300 s; label a value only after two missed periods.
         var freshness = usage.B("refreshing") ? "갱신 중" : age >= 86400 ? $"{age / 86400}일 전 값"
-            : age >= 3600 ? $"{age / 3600}시간 전 값" : age >= 120 ? $"{age / 60}분 전 값"
+            : age >= 3600 ? $"{age / 3600}시간 전 값" : age >= 600 ? $"{age / 60}분 전 값"
             : usage.S("freshness") == "stale" || usage.Get("error").ValueKind is not (JsonValueKind.Undefined or JsonValueKind.Null) ? "이전 값" : "";
         return new(profile.S("alias", fallback.Split('\n')[0]), status, tone,
             external || profile.ValueKind != JsonValueKind.Object ? "" : hasQuota ? window.S("label", window.S("name", "사용량")) + " 남음" : "사용량",

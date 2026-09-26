@@ -15,7 +15,8 @@ public sealed record NativeConversationCaptureResult(string? ThreadId, string? E
 
 /// <summary>
 /// An explicit user action only. Never call this from a timer, discovery, selection, or a test
-/// against a real Codex instance. It does not activate a background window or submit a message.
+/// against a real Codex instance. From the foreground manager it may activate only
+/// the verified current viewport. It never activates an unrelated window or submits a message.
 /// </summary>
 public static class NativeConversationCapture
 {
@@ -31,13 +32,14 @@ public static class NativeConversationCapture
         "CanUploadToCloudClipboard", "ExcludeClipboardContentFromMonitorProcessing"
     };
 
-    public static async Task<NativeConversationCaptureResult> CaptureAsync(nint hwnd, int pid, string expectedExecutable)
+    public static async Task<NativeConversationCaptureResult> CaptureAsync(nint hwnd, int pid, string expectedExecutable,
+        nint manager = 0, Func<bool>? selectionIsCurrent = null)
     {
         var dispatcher = Application.Current?.Dispatcher;
         if (dispatcher is null || dispatcher.HasShutdownStarted)
             return Failure("Capture requires the running WPF application dispatcher.");
         if (!dispatcher.CheckAccess())
-            return await dispatcher.InvokeAsync(() => CaptureAsync(hwnd, pid, expectedExecutable)).Task.Unwrap();
+            return await dispatcher.InvokeAsync(() => CaptureAsync(hwnd, pid, expectedExecutable, manager, selectionIsCurrent)).Task.Unwrap();
         if (!await CaptureGate.WaitAsync(0))
             return Failure("Another conversation capture is already in progress.");
 
@@ -53,8 +55,21 @@ public static class NativeConversationCapture
                 return Failure(Win32Error("Cannot verify the selected Codex process"));
             VerifyIdentity(hwnd, pid, expectedExecutable, process);
             nint foreground = GetForegroundWindow();
-            if (foreground == 0 || GetAncestor(hwnd, 2) != foreground || !IsWindowVisible(hwnd))
-                return Failure("The selected Codex window must already be visible in the foreground. Capture did not activate another window.");
+            bool CurrentSelection() => selectionIsCurrent?.Invoke() ?? manager == 0;
+            bool ValidManager()
+            {
+                GetWindowThreadProcessId(manager, out uint managerPid);
+                return manager != 0 && managerPid == Environment.ProcessId && IsWindowVisible(manager)
+                    && IsWindowEnabled(manager) && GetAncestor(manager, 2) == manager;
+            }
+            void VerifyTarget()
+            {
+                VerifyIdentity(hwnd, pid, expectedExecutable, process);
+                if (!IsWindowVisible(hwnd)) throw new InvalidOperationException("선택한 Codex 창이 보이지 않습니다.");
+            }
+            if (!CurrentSelection() || foreground == 0 || !IsWindowVisible(hwnd) ||
+                (GetAncestor(hwnd, 2) != foreground && (foreground != manager || !ValidManager())))
+                return Failure("작업 공간 창에서 해당 프로필을 선택한 뒤 다시 눌러 주세요.");
 
             // An old clipboard owner may hang while rendering a promised format. A dedicated
             // background STA can finish its read/cleanup later, but can never send input or
@@ -64,11 +79,10 @@ public static class NativeConversationCapture
             uint baselineSequence = snapshot.Sequence;
             clipboardWindow = CreateClipboardWindow();
 
-            // A click on the shell button may focus WPF. Focus only this verified child of the
-            // already-foreground root. Never use SetForegroundWindow or restore focus later.
-            VerifyIdentity(hwnd, pid, expectedExecutable, process);
-            if (GetForegroundWindow() != foreground)
-                return Failure("Foreground changed before capture. Nothing was sent to Codex.");
+            // Clipboard acquisition can yield to another window/profile. Verify the
+            // original selection again before activating the independent viewport.
+            foreground = ConversationCaptureActivation.Prepare(GetAncestor(hwnd, 2), foreground, manager,
+                GetForegroundWindow, ValidManager, CurrentSelection, VerifyTarget, SetForegroundWindow);
             FocusVerifiedWindow(hwnd, foreground);
             if (!OwnsKeyboardFocus(hwnd, foreground) || GetClipboardSequenceNumber() != baselineSequence)
                 return Failure("Focus or clipboard changed before capture. Nothing was sent to Codex.");
@@ -76,7 +90,7 @@ public static class NativeConversationCapture
                 return Failure("Release Ctrl, Alt, Shift, Windows, and L before capturing the conversation.");
 
             VerifyIdentity(hwnd, pid, expectedExecutable, process);
-            if (!OwnsKeyboardFocus(hwnd, foreground) || GetClipboardSequenceNumber() != baselineSequence)
+            if (!CurrentSelection() || !OwnsKeyboardFocus(hwnd, foreground) || GetClipboardSequenceNumber() != baselineSequence)
                 return Failure("Focus or clipboard changed immediately before capture. Nothing was sent to Codex.");
             Input[] chord = [Key(0x11), Key(0x12), Key(0x4C), Key(0x4C, true), Key(0x12, true), Key(0x11, true)];
             Marshal.SetLastPInvokeError(0);
@@ -96,7 +110,7 @@ public static class NativeConversationCapture
             {
                 await Task.Delay(40);
                 VerifyIdentity(hwnd, pid, expectedExecutable, process);
-                if (GetForegroundWindow() != foreground)
+                if (!CurrentSelection() || GetForegroundWindow() != foreground)
                     return Failure("Foreground changed during capture. No window was reactivated and clipboard restoration was skipped.");
                 if (GetClipboardSequenceNumber() == baselineSequence)
                     continue;
@@ -118,7 +132,7 @@ public static class NativeConversationCapture
                     // The comparison and replacement share the same clipboard lock. A later
                     // third-party copy cannot be overwritten between these two operations.
                     if (GetClipboardSequenceNumber() != capturedSequence || ReadUnicodeText() != link ||
-                        GetClipboardOwner() != owner || GetForegroundWindow() != foreground)
+                        GetClipboardOwner() != owner || !CurrentSelection() || GetForegroundWindow() != foreground)
                         return new(threadId, "Capture succeeded, but the clipboard or foreground changed; restoration was skipped.", false);
                     string? restoreError = RestoreClipboard(saved);
                     return new(threadId, restoreError, restoreError is null);
@@ -399,6 +413,8 @@ public static class NativeConversationCapture
     [DllImport("user32.dll", SetLastError = true)] private static extern uint SendInput(uint count, Input[] input, int size);
     [DllImport("user32.dll")] private static extern short GetAsyncKeyState(int key);
     [DllImport("user32.dll")] private static extern nint GetForegroundWindow();
+    [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool SetForegroundWindow(nint hwnd);
+    [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool IsWindowEnabled(nint hwnd);
     [DllImport("user32.dll")] private static extern nint GetAncestor(nint hwnd, uint flags);
     [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool IsWindow(nint hwnd);
     [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool IsWindowVisible(nint hwnd);
