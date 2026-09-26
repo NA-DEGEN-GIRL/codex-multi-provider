@@ -120,8 +120,14 @@ def build(root=ROOT):
     match = re.fullmatch(r"codex-cli ([A-Za-z0-9][A-Za-z0-9_.-]{0,95})\s*", response.stdout)
     if not match:
         raise RuntimeError("The built runtime returned an unexpected version.")
+    # Every patched build reports the upstream version; tag it with the recorded
+    # patch so the SSH update screen can tell two managed builds apart.
+    source_sha256 = json.loads((root / "patches/runtime-source.json").read_text(encoding="utf-8"))["patch_sha256"]
+    if not re.fullmatch(r"[0-9a-f]{64}", source_sha256):
+        raise RuntimeError("The recorded runtime patch digest is invalid.")
     manifest = {"schema": 1, "platform": "linux", "architecture": arch,
-                "version": match.group(1), "external_bridge_present": True,
+                "version": match.group(1) + "-managed-" + source_sha256[:16],
+                "build_source_sha256": source_sha256, "external_bridge_present": True,
                 "managed_sources_present": contains_marker(binary, b"CODEX_MANAGER_MANAGED_SOURCES"),
                 "source_catalog_present": (
                     contains_marker(binary, b"CODEX_MANAGER_SHARED_CATALOG")
