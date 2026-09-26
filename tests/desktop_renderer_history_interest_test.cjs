@@ -23,8 +23,8 @@ function manager(hostId='local'){
       const threadId=ids[0],version=versions.get(threadId)||0;
       reads.push({id:threadId,includeTurns:options.includeTurns});
       assert.equal(options.retainHistoryPagination,true);
-      if(options.includeTurns)assert.equal(options.maxTurns,8);
-      else assert.equal(options.maxTurns,undefined,'inactive summaries never request a turn window');
+      assert.equal(options.includeTurns,true,'a task that is not open is never read, not even as a summary');
+      assert.equal(options.maxTurns,8);
       if(nextBlocked){nextBlocked=false;await new Promise(resolve=>unblock=resolve);}
       if(sync.canApply(store)&&options.includeTurns){parses++;cache.set(threadId,version);}
     }
@@ -37,13 +37,15 @@ function invalidate(hostId='local',ids=[id],extra={}){events.message({data:{type
 (async()=>{
   const local=manager();sync.register(local.m);local.cache.set(id,-1);local.versions.set(id,1);
   invalidate();await settle();
-  assert.deepEqual(local.reads,[{id,includeTurns:false}]);assert.equal(local.parses(),0);
+  assert.deepEqual(local.reads,[],'a task that is not open is only marked dirty');assert.equal(local.parses(),0);
   assert.equal(local.cache.get(id),-1,'a cached inactive transcript is left unparsed');
   local.versions.set(id,2);invalidate();await settle();
+  assert.equal(sync.status().pending,0);assert.equal(sync.status().dirtyOnly,2);
   const changed=[];let release=local.store.retainActiveConversation(id,value=>changed.push(value));
-  assert.deepEqual(changed,[true]);assert.equal(local.reads.length,2,'retention must not hydrate inside its caller');
+  assert.deepEqual(changed,[true]);assert.equal(local.reads.length,0,'retention must not hydrate inside its caller');
   await advance(399);assert.equal(local.parses(),0);
   await advance(1);assert.equal(local.parses(),1);assert.equal(local.cache.get(id),2,'activation reads the newest transcript once');
+  assert.equal(local.reads.length,1);
   const second=local.store.retainActiveConversation(id,()=>assert.fail('already active'));
   await advance(1000);assert.equal(local.parses(),1,'another interest does not repeat a clean activation');
   assert.equal(second(),'native-release');assert.equal(release(),'native-release');assert.deepEqual(changed,[true,false]);
@@ -60,9 +62,10 @@ function invalidate(hostId='local',ids=[id],extra={}){events.message({data:{type
   assert.equal(local.cache.get(id),4,'abandoned activation leaves dirty history available for the next activation');release();
 
   local.versions.set(id,5);local.block();invalidate();await settle();
+  assert.equal(local.reads.length,beforeAbandon+1,'no read while the task is not open');
   release=local.store.retainActiveConversation(id,()=>{});
   local.versions.set(id,6);invalidate();local.unblock();await settle();await advance(700);
-  assert.equal(local.cache.get(id),6,'activation during an inactive read preserves the newer in-flight invalidation');
+  assert.equal(local.cache.get(id),6,'an invalidation of an open task reads the newest transcript');
   local.versions.set(id,7);local.block();invalidate();await settle();
   local.versions.set(id,8);invalidate();local.unblock();await settle();await advance(700);
   assert.equal(local.cache.get(id),8,'a completed transcript read cannot clear a newer dirty generation');release();
@@ -94,7 +97,7 @@ function invalidate(hostId='local',ids=[id],extra={}){events.message({data:{type
   const delayed=manager('delayed'),delayedStore=delayed.store,nativeRetain=delayedStore.retainActiveConversation;
   delete delayed.m.threadStore;sync.register(delayed.m);delayed.m.threadStore=delayedStore;
   delayed.versions.set(id,30);invalidate('delayed');await settle();
-  assert.equal(delayed.reads[0].includeTurns,false,'constructor registration before store assignment installs the hook lazily');
+  assert.equal(delayed.reads.length,0,'constructor registration before store assignment installs the hook lazily');
   assert.notEqual(delayedStore.retainActiveConversation,nativeRetain);
   const delayedRelease=delayedStore.retainActiveConversation(id,()=>{});await advance(400);
   assert.equal(delayed.cache.get(id),30);delayedRelease();
@@ -115,7 +118,8 @@ function invalidate(hostId='local',ids=[id],extra={}){events.message({data:{type
   const orphans=Array.from({length:9},(_,i)=>(2000+i).toString(16).padStart(8,'0')+'-1111-4111-8111-111111111111');
   invalidate('unregistered-host',orphans);await settle();
   assert.equal(sync.status().refreshScheduled,false,'unregistered host invalidations must not create a refresh poll');
-  const served=manager('served');sync.register(served.m);invalidate('served');await settle();
+  const served=manager('served');sync.register(served.m);served.store.retainActiveConversation(id,()=>{});
+  invalidate('served');await settle();
   assert.equal(served.reads.length,1,'older unmatched hosts cannot occupy the matching host read budget');
   assert.equal(sync.status().refreshScheduled,false);
   const reconnecting=manager('reconnect');sync.register(reconnecting.m);
@@ -128,8 +132,11 @@ function invalidate(hostId='local',ids=[id],extra={}){events.message({data:{type
   delete replacement.m.threadStore;sync.register(replacement.m);
   assert.equal(sync.status().refreshScheduled,true,'registration wakes the preserved host queue before store assignment');
   replacement.m.threadStore=replacementStore;await advance(400);
-  assert.equal(replacement.reads.length,1);assert.equal(sync.status().pending,preserved-1);
+  assert.equal(replacement.reads.length,0,'a preserved invalidation of a task that is not open only marks it dirty');
+  assert.equal(sync.status().pending,preserved-1);
   assert.equal(sync.status().refreshScheduled,false);
+  replacementStore.retainActiveConversation(id,()=>{});await advance(400);
+  assert.equal(replacement.reads.length,1,'the replacement store reads the task when it is opened');
 
   // An unrelated failed task must retain its own backoff without delaying a
   // newly activated cached transcript behind that later scheduler deadline.
@@ -141,6 +148,7 @@ function invalidate(hostId='local',ids=[id],extra={}){events.message({data:{type
     return Reflect.apply(retryHydrate,this,[ids,options]);
   };
   sync.register(retrying.m);retrying.versions.set(id,51);invalidate('retry-deadline');await settle();
+  retrying.store.retainActiveConversation(failedId,()=>{});
   const failedAt=now;invalidate('retry-deadline',[failedId]);await settle();
   assert.equal(attempts.filter(attempt=>attempt.id===failedId).length,1);
   retrying.store.retainActiveConversation(id,()=>{});await advance(399);
@@ -157,7 +165,8 @@ function invalidate(hostId='local',ids=[id],extra={}){events.message({data:{type
   bounded.cache.set(ids[0],-1);bounded.versions.set(ids[0],99);
   for(const threadId of ids){invalidate('bounded',[threadId]);await settle();}
   const beforeBounded=bounded.reads.length;bounded.store.retainActiveConversation(ids[0],()=>{});await advance(400);
+  assert.equal(beforeBounded,0,'1,025 invalidations of tasks that are not open issue no reads');
   assert.equal(bounded.reads.length,beforeBounded+1);assert.equal(bounded.cache.get(ids[0]),99);
-  assert(sync.status().summaryRefreshes>=1025);assert(sync.status().historyRefreshes>0);
-  console.log('PASS: offscreen summaries, deferred native-interest catch-up, drafts, lifetime/invalidation races, host isolation and bounded dirty history');
+  assert(sync.status().dirtyOnly>=1025);assert.equal(sync.status().summaryRefreshes,0);assert(sync.status().historyRefreshes>0);
+  console.log('PASS: no reads for tasks that are not open, deferred native-interest catch-up, drafts, lifetime/invalidation races, host isolation and bounded dirty history');
 })().catch(error=>{console.error(error);process.exitCode=1});

@@ -6,7 +6,11 @@
   const deletedKeys=new Set();
   const archivedKeys=new Set();
   const counters = {refreshes:0, failures:0, unavailable:0, deferred:0, draftDeferred:0,
-    ipcMessages:0,ipcCoalesced:0,summaryRefreshes:0,historyRefreshes:0};
+    ipcMessages:0,ipcCoalesced:0,summaryRefreshes:0,historyRefreshes:0,dirtyOnly:0,liveNotices:0};
+  // Transcript reads happen only for tasks open in this (visible) window: once
+  // per delivered change, and at most every LIVE_MS while a peer keeps
+  // streaming. Other tasks are marked dirty and read when they are opened.
+  const LIVE_MS=2000,readAt=new Map(),liveAt=new Map();
   const signals=new Set(['thread/started','thread/name/updated','thread/settings/updated','thread/project/updated','thread/archived','thread/unarchived','thread/deleted','turn/started','turn/completed','item/started','item/completed','item/agentMessage/delta']);
   let running = false;
   let composing = false;
@@ -199,36 +203,46 @@
       for(const [key,state] of [...pending].filter(([,s])=>s.due<=Date.now()&&hosts.has(s.host)).slice(0,8)) {
         const {id,host,deleted}=state;
         if(deleted){for(const m of liveManagers())if(m.hostId===host)m.handleThreadDeletion([id]);pending.delete(key);continue;}
+        // Registration is injected before some native constructors assign
+        // threadStore. Install lazily once that field becomes available.
+        const owners=[...liveManagers()].filter(m=>!m.disposed&&m.hostId===host&&m.threadStore);
+        for(const m of owners)trackHistory(m.threadStore);
+        // Not open here: no summary or transcript read. The task stays dirty
+        // and the native activation hook reads it when it is opened.
+        if(owners.length&&owners.every(m=>histories.get(m.threadStore)?.installed&&!m.threadStore.isConversationActive(id))){
+          for(const m of owners)dirtyHistory(m.threadStore,key);
+          pending.delete(key);counters.dirtyOnly++;continue;
+        }
         let deferred=false, failed=false, applied=false;
         if(hasDraft(id)){state.due=Date.now()+400;counters.draftDeferred++;continue;}
+        state.reading=true;
         for(const m of liveManagers()) {
           if(m.disposed || m.hostId!==host || !m.threadStore) continue;
           if(active(m,id)){deferred=true;counters.deferred++;continue;}
           const store=m.threadStore;
-          // Registration is injected before some native constructors assign
-          // threadStore. Install lazily once that field becomes available.
           trackHistory(store);
           const tracked=histories.get(store),history=tracked?.installed?tracked:undefined;
           const includeTurns=!history||store.isConversationActive(id);
-          if(state.historyOnly&&!includeTurns){applied=true;continue;}
           dirtyHistory(store,key);
+          if(!includeTurns){applied=true;continue;}
           refreshing.set(store,{m,id,history,includeTurns});
+          readAt.delete(key);readAt.set(key,Date.now());
+          while(readAt.size>512)readAt.delete(readAt.keys().next().value);
           try {
             store.backgroundThreadLookups?.delete(id);
             store.threadReadStates?.delete(id);
-            await store.hydrateThreads([id],{addToRecentConversations:true,includeTurns,...includeTurns?{maxTurns:8}:{},
+            await store.hydrateThreads([id],{addToRecentConversations:true,includeTurns,maxTurns:8,
               retainHistoryPagination:true,notifyAnyCallbacks:true,throwOnReadError:true});
             if(m.disposed||!managers.has(m))continue;
             if(active(m,id)||hasDraft(id)||
               (history&&includeTurns!==store.isConversationActive(id))){deferred=true;continue;}
-            if(includeTurns){
-              counters.historyRefreshes++;
-              if(history&&pending.get(key)===state)cleanHistory(history,key);
-            }else counters.summaryRefreshes++;
+            counters.historyRefreshes++;
+            if(history&&pending.get(key)===state)cleanHistory(history,key);
             applied=true;counters.refreshes++;
           } catch(error) { failed=true;if(/thread not loaded|thread.*not found/i.test(String(error?.message||error)))counters.unavailable++;else counters.failures++; }
           finally {refreshing.delete(store);}
         }
+        state.reading=false;
         if(pending.get(key)!==state)continue;
         state.due=Date.now()+(failed?2500:700);
         if(failed){if(++state.failures>=3)pending.delete(key);}
@@ -289,8 +303,8 @@
   window.addEventListener('message',event=>{
     const data=event.data;
     if(data?.type!=='manager-record-invalidated'||!Array.isArray(data.threadIds))return;
-    // The main-process adapter already retries durable reads three times. Each
-    // successful delivery needs one renderer merge, not another three reads.
+    // The main-process adapter delivers each settled change once. It needs one
+    // renderer merge when the task is open here, and none otherwise.
     // A new state object preserves invalidations arriving during an in-flight read.
     const host=data.hostId||'local';
     if(typeof host!=='string'||host.length>256)return;
@@ -302,10 +316,21 @@
       archivedKeys.delete(host+'\0'+id);
       for(const m of liveManagers())if(m.hostId===host)m.handleThreadUnarchived(id);
     }
+    // A task with a recent live notice is still streaming: even its periodic
+    // settled deliveries keep the LIVE_MS bound. Others read at once.
+    const throttled=key=>Date.now()-(liveAt.get(key)??-Infinity)<2*LIVE_MS?Math.max(Date.now(),(readAt.get(key)??-Infinity)+LIVE_MS):Date.now();
     for(const id of data.threadIds.slice(0,32))if(uuid.test(id)&&!deletedKeys.has(host+'\0'+id)&&!archivedKeys.has(host+'\0'+id)){
       const key=host+'\0'+id;
       for(const m of liveManagers())if(m.hostId===host)dirtyHistory(m.threadStore,key);
-      pending.set(key,{id,host,failures:0,due:Date.now()});
+      pending.set(key,{id,host,failures:0,due:throttled(key)});
+    }
+    // A peer is still streaming into these tasks. An open one may refresh once
+    // per LIVE_MS; a queued read already covers the notice.
+    for(const id of (Array.isArray(data.liveThreadIds)?data.liveThreadIds:[]).slice(0,32))if(uuid.test(id)&&!deletedKeys.has(host+'\0'+id)&&!archivedKeys.has(host+'\0'+id)){
+      const key=host+'\0'+id,prev=pending.get(key);counters.liveNotices++;
+      liveAt.delete(key);liveAt.set(key,Date.now());while(liveAt.size>512)liveAt.delete(liveAt.keys().next().value);
+      for(const m of liveManagers())if(m.hostId===host)dirtyHistory(m.threadStore,key);
+      if(!prev||prev.reading)pending.set(key,{id,host,failures:0,due:throttled(key)});
     }
     for(const id of (data.deletedThreadIds||[]).slice(0,256))if(uuid.test(id)){deletedKeys.add(host+'\0'+id);pending.set(host+'\0'+id,{id,host,deleted:true,due:Date.now()});}
     while(deletedKeys.size>4096)deletedKeys.delete(deletedKeys.values().next().value);

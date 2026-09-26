@@ -18,17 +18,31 @@ sync.register({hostId:'local',hasInFlightConversationResume:()=>false,requestCli
     applyThreadTitleUpdate(){},async hydrateThreads(_,options){assert.equal(options.includeTurns,false);reads++;observed.push(seq);}}});
 (async()=>{
   await sync.tick();assert.equal(reads,1);
-  for(let n=0;n<19;n++){now+=100;seq++;await sync.tick();}
+  // A hidden peer stream (a delta every 100 ms) is coalesced, yet re-read with
+  // its latest revision within the 5 s settle bound.
+  const streamStart=now+100;
+  for(let n=0;n<50;n++){now+=100;seq++;await sync.tick();}
   assert.equal(reads,1,'hidden streaming updates are coalesced, not re-read on every tick');
   assert.equal(sync.status().pending,1);assert.equal(sync.status().failures,0);
-  now+=100;seq++;await sync.tick();assert.equal(reads,2);assert.equal(observed.at(-1),seq);
-  now+=100;seq++;visible=true;await sync.tick();
-  assert.equal(reads,3,'selection bypasses the hidden timer and reads the latest revision immediately');
-  visible=false;now+=100;seq++;kind='archived';await sync.tick();assert.equal(archived,1);
-  assert.equal(reads,3,'archive changes bypass batching without hydrating missing history');
-  seq++;kind='unarchived';await sync.tick();assert.equal(restored,1);assert.equal(reads,4);
-  seq++;kind='deleted';await sync.tick();assert.equal(deleted,1);assert.equal(reads,4);
-  seq++;kind='changed';await sync.tick();assert.equal(reads,4,'late delta cannot resurrect a deletion');
+  now+=100;seq++;await sync.tick();
+  assert.equal(reads,2,'a hidden stream is still re-read within 5 s');assert.equal(observed.at(-1),seq);
+  assert(now-streamStart<=5000);
+  for(let n=0;n<10;n++){now+=100;seq++;await sync.tick();}
+  assert.equal(reads,2);
+  visible=true;now+=100;seq++;await sync.tick();
+  assert.equal(reads,3,'selection mid-stream bypasses the timers and reads the latest revision immediately');
+  assert.equal(observed.at(-1),seq);
+  visible=false;now+=100;seq++;await sync.tick();now+=1500;await sync.tick();
+  assert.equal(reads,4,'a single change is read once it is quiet');
+  now+=100;seq++;await sync.tick();now+=1600;await sync.tick();
+  assert.equal(reads,4,'a settled change still waits for the hidden refresh timer');
+  now+=300;await sync.tick();assert.equal(reads,5);assert.equal(observed.at(-1),seq);
+  now+=100;seq++;kind='archived';await sync.tick();assert.equal(archived,1);
+  assert.equal(reads,5,'archive changes bypass batching without hydrating missing history');
+  seq++;kind='unarchived';await sync.tick();assert.equal(restored,1);assert.equal(reads,5);
+  now+=2000;await sync.tick();assert.equal(reads,6,'a restore reads its summary once it settles');
+  seq++;kind='deleted';await sync.tick();assert.equal(deleted,1);assert.equal(reads,6);
+  seq++;kind='changed';await sync.tick();now+=2400;await sync.tick();assert.equal(reads,6,'late delta cannot resurrect a deletion');
   assert(messages.some(m=>m.deletedThreadIds.includes(id)));
   sync.stop();console.log('PASS: hidden catalog coalescing, latest-state selection, immediate archive/restore/deletion and no stale resurrection');
 })().catch(error=>{console.error(error);process.exitCode=1});
