@@ -66,6 +66,43 @@ def renderer_patches_for(data):
     return RENDERER_PATCHES if all(data.count(key)==1 for key in RENDERER_PATCHES) else None
 
 
+# Renderer names: selected host, host managers, archived IDs per host, catalog
+# enabled, unique catalog host, catalog state, derived atom, its store and the
+# constructor of the catalog-enabled atom.
+_HOST_IDENTITY_VARIANTS = (
+    (b'RE', b'WE', b'n5n', b'AT', b'QZn', b'MT', b'uf', b'$', b'rf'),  # 26.915
+    (b'oE', b'pE', b'KRn', b'Fw', b'Ckn', b'Rw', b'ns', b'X', b'Go'),  # 26.917
+)
+
+
+def renderer_host_identity_patches(data):
+    # Verified 26.915 and 26.917 renderers: archive suppression falls back to ANY
+    # host when a task has not been opened in this window. A migrated task can
+    # keep its ID on Windows while its SSH original is archived. Prefer the
+    # unique active catalog host before that fallback; an explicitly selected
+    # host still wins. The catalog helper already returns null for ambiguous IDs
+    # and excludes ChatGPT entries.
+    patches = {}
+    for selected, managers, archived, enabled, unique, catalog_state, atom, store, ctor in _HOST_IDENTITY_VARIANTS:
+        before = (b'let n=%s(t,e);return n==null?t(%s).some(n=>t(%s,n.getHostId()).includes(e)):'
+                  b't(%s,n).includes(e)' % (selected, managers, archived, archived))
+        after = before.replace(b'let n=%s(t,e);' % selected,
+                               b'let n=%s(t,e)??(t(%s)?t(%s,e):null);' % (selected, enabled, unique))
+        catalog = (b'%s=%s(%s,(e,{get:t})=>{let n=null;for(let r of t(%s).entriesByKey.values())'
+                   b'if(r.sourceKind!==`chatgpt`&&r.threadId===e){if(n!=null&&n!==r.hostId)'
+                   b'return null;n=r.hostId}return n})' % (unique, atom, store, catalog_state))
+        if data.count(before) > 1:
+            raise ValueError('Ambiguous desktop host-specific archive filter.')
+        # The replacement also reads the catalog-enabled atom; it must be this
+        # renderer's own declaration, not a name that happens to be absent.
+        declared = len(re.findall(rb'(?<![\w$])' + re.escape(b'%s=%s(%s,!1)' % (enabled, ctor, store)), data))
+        if data.count(before) == 1 and data.count(catalog) == 1 and declared == 1:
+            patches[before] = after
+    if len(patches) > 1:
+        raise ValueError('Ambiguous desktop host-specific archive filter.')
+    return patches
+
+
 # Verified in 26.908, 26.911 and 26.915. Keep the complete expression, including its
 # cancellation checks; a renamed/minified binding is not a protocol change.
 def patches_for(data):
@@ -107,6 +144,8 @@ def patch_archive(source, destination):
                 updated = updated.replace(pattern, replacement)
             if module.startswith('webview/'):
                 for pattern, replacement in renderer_plugin_patches(data).items():
+                    updated = updated.replace(pattern, replacement)
+                for pattern, replacement in renderer_host_identity_patches(data).items():
                     updated = updated.replace(pattern, replacement)
             helper = 'desktop_renderer_record_sync.cjs' if module.startswith('webview/') else 'desktop_record_sync.cjs'
             updated = Path(__file__).with_name(helper).read_bytes() + b'\n' + updated

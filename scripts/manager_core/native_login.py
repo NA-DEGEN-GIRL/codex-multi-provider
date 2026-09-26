@@ -200,9 +200,9 @@ class NativeLogin:
         tokens=read_existing_tokens(home)
         fingerprint=account_fingerprint(tokens.account_id)
         if fingerprint!=status['account_fingerprint']:raise RuntimeError('확인 중 로그인 계정이 변경되었습니다.')
-        from desktop_launch import find_app
+        from desktop_launch import cached_app
         from .login_probe import verify,verification_runtime
-        app=find_app();result=verify(self.root,verification_runtime(self.root,app),tokens,timeout=timeout)
+        app=cached_app();result=verify(self.root,verification_runtime(self.root,app),tokens,timeout=timeout)
         if account_fingerprint(read_existing_tokens(home).account_id)!=fingerprint:
             raise RuntimeError('확인 중 로그인 계정이 변경되었습니다.')
         from .runtime_build import resolve

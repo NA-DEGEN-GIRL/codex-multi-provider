@@ -159,6 +159,11 @@ def migrate(root, home=None):
     root = Path(root).resolve()
     home = canonical_path(home or Path.home() / '.codex')
     store = Store(root)
+    # The complete marker is published atomically once and never reverted.
+    # Parallel profile launches read it without the guard below, which admits
+    # one caller and rejects the others immediately instead of waiting.
+    if ready(root, home):
+        return json.loads(marker_path(root).read_text(encoding='utf8'))
     # Serialize startup from the original launcher and the manager. SQLite and
     # the manager state have independent locks; never hold a GUI thread here.
     from .authority import _authority_guard

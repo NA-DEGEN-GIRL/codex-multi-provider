@@ -238,6 +238,29 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(self.profile_for(account), before)
         self.assertEqual(len(self.manager.read()['profiles']), 1)
 
+    def test_unchanged_periodic_sync_never_rewrites_the_store(self):
+        account = self.add_account('Stable alias')
+        native = self.add_account('Native import')
+        self.usage_store.snapshots[account.id] = fake_snapshot(account, used=17)
+        self.accounts.sync(self.manager)
+        self.manager.mutate(lambda data: self.manager.profile(self.profile_for(native)['id'], data).update(
+            auth_mode='native', alias='Windows alias'))
+        before = self.manager.path.read_bytes()
+        with patch('manager_core.store.atomic_json', side_effect=AssertionError('rewrote unchanged store')):
+            result = self.accounts.sync(self.manager)
+            self.accounts.sync(self.manager)
+        self.assertEqual(result['accounts'], 2)
+        self.assertEqual(self.manager.path.read_bytes(), before)
+        revision = self.manager.read()['revision']
+        account.alias = 'Renamed alias'
+        self.accounts.sync(self.manager)
+        self.assertEqual(self.manager.read()['revision'], revision + 1)
+        self.assertEqual(self.profile_for(account)['alias'], 'Renamed alias')
+        self.usage_store.accounts.remove(account)
+        self.accounts.sync(self.manager)
+        self.assertTrue(self.profile_for(account)['account_missing'])
+        self.assertEqual(self.manager.read()['revision'], revision + 2)
+
     def test_native_profile_without_usage_link_is_not_bound_by_equal_alias(self):
         profile = self.manager.add_profile('Same alias')
         self.manager.mutate(lambda data: self.manager.profile(profile['id'], data).update(

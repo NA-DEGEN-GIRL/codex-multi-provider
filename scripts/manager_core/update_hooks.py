@@ -9,7 +9,8 @@ Wiring:
     hooks = UpdateHooks(root, store, instances)
     updater = UpdateManager(root, **hooks.callbacks())
     # instances.launch_admission = hooks.launch_admission fences preparation
-    # and process publication; ordinary window waits happen after release.
+    # and process publication against updates; different profiles share it.
+    # Ordinary window waits happen after release.
     # hooks.restore_instance() uses its own scoped restoration permit.
 
 Compatibility evidence is deliberately not inferred from a version string.
@@ -148,6 +149,10 @@ class UpdateHooks:
         self._mutex = threading.RLock()
         from .launch_queue import LaunchQueue
         self._launch_queue = LaunchQueue()
+        # Launches admitted together share one hold of the cross-process lock.
+        self._external_lock = threading.Lock()
+        self._external = None
+        self._external_users = 0
         self._restoration = threading.local()
         self._admission = threading.local()
 
@@ -208,20 +213,43 @@ class UpdateHooks:
     def prioritize_launch(self, profile_id):
         self._launch_queue.prefer(identifier(profile_id))
 
+    def _launch_exclusive(self):
+        required = getattr(self.instances, 'launch_requires_exclusive', None)
+        return bool(required is not None and required())
+
     def _acquire_launch_admission_lock(self, profile_id=None):
-        # Queue this service's parallel preparations before starting the OS-lock
-        # timeout. A cold desktop bundle can take longer than ten seconds; it
-        # must not turn the other warmup workers into spurious launch failures.
-        self._launch_queue.acquire(profile_id)
+        # Different profiles prepare, spawn and publish together; the same
+        # profile, maintenance (profile_id None) and a pending one-time
+        # migration still run alone. Queue this service's requests before
+        # starting the OS-lock timeout, so a slow launch cannot turn other
+        # warmup workers into spurious launch failures.
+        if self._launch_queue.holding():
+            # Nested requests use launch_admission(); a second hold here would
+            # wait for this worker's own launch, as the separate OS handle did.
+            raise UpdateError('profile_launch_busy',
+                              '다른 프로필을 여는 작업이 아직 진행 중입니다. 잠시 후 다시 시도해 주세요.')
+        profile_id = None if profile_id is None else identifier(profile_id)
+        exclusive = profile_id is None or self._launch_exclusive()
+        self._launch_queue.acquire(profile_id, exclusive=exclusive)
         try:
-            return self._acquire_external_launch_lock()
+            with self._external_lock:
+                if not self._external_users:
+                    self._external = self._acquire_external_launch_lock()
+                self._external_users += 1
+                return self._external
         except BaseException:
             self._launch_queue.release()
             raise
 
     def _release_launch_admission_lock(self, lock):
         try:
-            _unlock_file(lock)
+            with self._external_lock:
+                self._external_users -= 1
+                if not self._external_users:
+                    self._external = None
+                    # Released before the queue: maintenance admitted next
+                    # takes the cross-process lock itself.
+                    _unlock_file(lock)
         finally:
             self._launch_queue.release()
 
@@ -247,7 +275,7 @@ class UpdateHooks:
         return self.begin_remote_reconcile(profile_id, ensure_local=True)
 
     def begin_remote_reconcile(self, profile_id, *, ensure_local=False, force_runtime_update=False,
-                               transaction_id=None):
+                               transaction_id=None, graceful_drain=False, stop_only=False):
         """Freeze SSH enrollment atomically; an update never opens/closes local work."""
         requested_transaction_id = identifier(transaction_id) if transaction_id else None
         profile_id = identifier(profile_id)
@@ -310,7 +338,7 @@ class UpdateHooks:
                 if existing and existing.get('state') != 'released':
                     if existing.get('remote_update'):
                         raise UpdateError('ssh_update_in_progress', 'SSH 업데이트가 진행 중입니다. 로컬 작업은 계속할 수 있습니다.')
-                    if not ensure_local:
+                    if not ensure_local and not graceful_drain:
                         raise UpdateError('ssh_maintenance', 'Another SSH operation owns this profile.')
                     transaction_id = identifier(existing['transaction_id'])
                     saved = _read_json(self._lease_path(transaction_id))
@@ -336,6 +364,8 @@ class UpdateHooks:
                                 bindings.update({b['alias']: validate_binding(b, profile_id)
                                                  for b in manifest.get('bindings', [])})
                         hosts = data.get('ssh_inventory', {}).get(profile_id, {}).get('hosts', [])
+                        if graceful_drain:
+                            hosts = sorted(set(hosts) | set(bindings))
                         records = [dict(binding=bindings.get(alias), alias=alias, state='unobserved')
                                    for alias in sorted(set(hosts))]
                     lease = dict(transaction_id=transaction_id, ssh_only=True, state='held',
@@ -347,6 +377,10 @@ class UpdateHooks:
                         # Keep the full previous sources even after preparation
                         # saves a new binding. A failed start is never published.
                         lease['previous_bindings'] = copy.deepcopy(profile.get('remote_bindings', []))
+                if graceful_drain:
+                    # Explicit user action only; ordinary opens never signal.
+                    lease['graceful_drain'] = True
+                    lease['stop_only'] = bool(stop_only)
                 # Retry remote evidence with the current helper, never an old saved
                 # next_binding start. A fresh inspect proves exit or the actual PID.
                 for record in lease['profiles'][0].get('remotes', []):
@@ -410,6 +444,26 @@ class UpdateHooks:
             raise
 
     def reconcile_opened_remotes(self, profile_id, transaction_id, *, target_guard=None):
+        try:
+            return self._reconcile_opened_remotes(profile_id, transaction_id, target_guard=target_guard)
+        except UpdateError as error:
+            from .ssh_deferred_settings import DEFERRED_MESSAGE, UNSUPPORTED_IDLE, resume_previous
+            if error.code not in UNSUPPORTED_IDLE or self.remote_maintenance is None:
+                raise
+            lease = _read_json(self._lease_path(transaction_id))
+            try:
+                resumed = resume_previous(self.store, self.remote_maintenance, self._profile(profile_id), lease,
+                                          error.code, journal_path=self._lease_path(transaction_id))
+            except (RuntimeError, ValueError, OSError, KeyError):
+                # An unavailable/changed old listener cannot be restored. Keep
+                # the original typed failure and fence instead of reclassifying
+                # it as busy or claiming the desired settings were applied.
+                raise error from None
+            if resumed:
+                raise UpdateError('ssh_settings_deferred', DEFERRED_MESSAGE) from None
+            raise
+
+    def _reconcile_opened_remotes(self, profile_id, transaction_id, *, target_guard=None):
         """Advance only SSH; the newly opened local process is never closed."""
         lease = _read_json(self._lease_path(transaction_id))
         if not lease.get('ssh_only') or lease.get('profile_scope') != [profile_id]:
@@ -444,10 +498,10 @@ class UpdateHooks:
                     or set(coverage.get('hosts', [])[1:]) != {r.get('alias') for r in records}):
                 return False
         reusable = getattr(self.remote_maintenance, 'reuse_unchanged', None)
-        reused = (not lease.get('force_runtime_update') and callable(reusable)
+        reused = (not lease.get('graceful_drain') and not lease.get('force_runtime_update') and callable(reusable)
                   and reusable(current(), records) is True)
         adopted = None
-        if not reused and not lease.get('force_runtime_update'):
+        if not reused and not lease.get('graceful_drain') and not lease.get('force_runtime_update'):
             # An unchanged reconnect keeps a live listener even when that
             # listener publishes no idle inventory. Only a verified settings
             # change may enter the exit-verified lifecycle below.
@@ -461,7 +515,10 @@ class UpdateHooks:
                 binding = record.get('next_binding') or record.get('active_binding') or record.get('binding')
                 if not binding:
                     raise UpdateError('remote_binding_unknown', '저장된 SSH 연결 설정을 확인해야 합니다.')
-                observed = self.remote_maintenance.request(binding, 'inspect', discover_active=True)
+                inspect_options = dict(discover_active=True)
+                if lease.get('graceful_drain'):
+                    inspect_options['observe_only'] = True
+                observed = self.remote_maintenance.request(binding, 'inspect', **inspect_options)
                 record.update(process=observed['process'], idle=observed['idle'], exited=observed['exited'],
                               active_binding=observed.get('active_binding', binding),
                               state='observed' if observed['process'] is not None else 'closed')
@@ -470,7 +527,19 @@ class UpdateHooks:
                 record.pop('target_policy_revision', None)
                 self._save_lease(lease)
                 current()
-            if record.get('state') == 'observed':
+            if lease.get('graceful_drain') and record.get('state') in ('observed', 'drain_requested'):
+                # Write ahead; recovery always targets the same process birth.
+                record['state'] = 'drain_requested'
+                self._save_lease(lease)
+                current()
+                proof = self.remote_maintenance.request(record.get('active_binding', record['binding']),
+                    'drain', expected_process=record['process'])
+                current()
+                if proof['exited'] is not True or proof['idle'] is not True:
+                    return False
+                record.update(state='closed', exit_proof=proof)
+                self._save_lease(lease)
+            elif record.get('state') == 'observed':
                 observed = self.remote_maintenance.request(record.get('active_binding', record['binding']), 'inspect')
                 if observed['process'] != record['process']:
                     raise UpdateError('remote_process_changed', 'SSH 실행 식별자가 변경되어 종료하지 않았습니다.')
@@ -488,10 +557,11 @@ class UpdateHooks:
             pending_close = {**entry, 'remotes': [r for r in records if r.get('state') in ('observed', 'closed')]}
             self._close_remotes(lease, pending_close, lifecycle_guard=current)
             profile = current()
-            self.remote_maintenance.prepare_and_start(profile, records, lambda: self._save_lease(lease),
-                                                      lifecycle_guard=current)
-            profile = current()
-            self.remote_maintenance.publish_started(profile, records)
+            if not lease.get('stop_only'):
+                self.remote_maintenance.prepare_and_start(profile, records, lambda: self._save_lease(lease),
+                                                          lifecycle_guard=current)
+                profile = current()
+                self.remote_maintenance.publish_started(profile, records)
         def release(data):
             gate = data['ssh_maintenance'][profile_id]
             profile = self.store.profile(profile_id, data)
@@ -519,10 +589,20 @@ class UpdateHooks:
 
     @contextmanager
     def launch_admission(self, profile_id):
-        """Fence launch preparation, process creation and identity publication."""
+        """Fence launch preparation, process creation and identity publication.
+
+        Other profiles' launches share this fence; updates and maintenance
+        wait for all of them and then exclude new launches (guard_launch).
+        """
         if getattr(self._admission, "depth", 0):
-            self.guard_launch(profile_id)
-            yield
+            # The outer admission (restore, SSH, conversation) holds the update
+            # fence. Still wait for another worker opening this profile.
+            self._launch_queue.acquire(identifier(profile_id), exclusive=False)
+            try:
+                self.guard_launch(profile_id)
+                yield
+            finally:
+                self._launch_queue.release()
             return
         lock = self._acquire_launch_admission_lock(profile_id)
         try:
@@ -1059,13 +1139,13 @@ class UpdateHooks:
             if selected is not None and entry['profile_id'] not in selected:
                 continue
             for remote in entry.get('remotes', []):
-                if remote.get('state') in ('stop_requested', 'start_requested') and self.remote_maintenance is not None:
+                if remote.get('state') in ('stop_requested', 'start_requested', 'drain_requested') and self.remote_maintenance is not None:
                     try:
                         self.remote_maintenance.reconcile(remote)
                         self._save_lease(saved)
                     except (RuntimeError, ValueError, OSError, KeyError, TypeError):
                         pass
-            if any(remote.get('state') in ('stop_requested', 'start_requested') for remote in entry.get('remotes', [])):
+            if any(remote.get('state') in ('stop_requested', 'start_requested', 'drain_requested') for remote in entry.get('remotes', [])):
                 unresolved.append(entry['profile_id'])
                 continue
             if self.remote_maintenance is not None:

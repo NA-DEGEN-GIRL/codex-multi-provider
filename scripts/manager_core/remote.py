@@ -224,8 +224,6 @@ class RemoteManager:
                       message="읽기 전용 검사 완료. 관리 프로필의 인증과 앱 연결은 별도로 확인합니다.")
         if platform != "linux" or not arch:
             result["blockers"].append("platform_not_supported")
-        if not observed["cli"]:
-            result["blockers"].append("stock_cli_missing")
         if not observed["python"] or not observed["python"].startswith("/"):
             result["blockers"].append("python3_missing")
         else:
@@ -244,6 +242,10 @@ class RemoteManager:
                 result["blockers"].append(exc.code)
                 result["message"] = str(exc)
         result["preparation_supported"] = not result["blockers"]
+        # Managed operation runs only the profile runtime's own codex, never the
+        # stock CLI (terminal use, stock updates), so its absence is only recorded.
+        if not observed["cli"]:
+            result["blockers"].append("stock_cli_missing")
         # Upload support and native application routing are independent capabilities.
         result["blockers"].append("native_gui_ssh_binding_unverified")
         return result

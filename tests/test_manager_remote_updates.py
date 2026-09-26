@@ -1,14 +1,15 @@
 """SSH update coordinator uses simulated processes and no network or installers."""
 from copy import deepcopy
 import json
+import threading
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 from uuid import uuid4
 
 import test_manager_update_hooks as fixtures
 from test_manager_remote_restore import Fleet
 from manager_core.remote_updates import RemoteUpdates
-from manager_core.store import atomic_json
+from manager_core.store import atomic_json, now
 from manager_core.updates import UpdateError
 
 
@@ -90,6 +91,41 @@ class RemoteUpdateTests(unittest.TestCase):
         self.probe.assert_not_called()
         self.assertEqual(self.fleet.calls, [])
         self.assertEqual(self.pending, [])
+
+    def test_restart_clears_stale_checking_in_one_write_before_the_scheduler(self):
+        self.service._save(self.profile_id, 'fixture-a', checking=True)
+        self.service._save(self.profile_id, 'fixture-b', checking=False)
+        revision = self.store.read()['revision']
+        seen, looped = [], threading.Event()
+        def loop():
+            seen.append({v['alias']: v['checking'] for v in self.store.read()['remote_updates'].values()})
+            looped.set()
+        restarted = self.make_service()
+        restarted._loop = loop
+        restarted.start()
+        self.assertTrue(looped.wait(3))
+        self.assertEqual(seen, [{'fixture-a': False, 'fixture-b': False}])
+        self.assertEqual(self.store.read()['revision'], revision + 1)
+        self.assertFalse(restarted.status_all()['worker_active'])
+        again = self.make_service()
+        again._loop = lambda: None
+        with patch('manager_core.store.atomic_json', side_effect=AssertionError('rewrote unchanged store')):
+            again.start()
+        self.assertEqual(self.store.read()['revision'], revision + 1)
+        self.assertEqual(self.pending, [])
+        self.probe.assert_not_called()
+        self.stock_update.assert_not_called()
+
+    def test_state_poll_status_all_reads_only_its_snapshot(self):
+        self.service._save(self.profile_id, 'fixture-a', checking=True)
+        snapshot = self.store.read()
+        with patch.object(self.store, 'read', side_effect=AssertionError('store re-read')):
+            value = self.service.status_all(state=snapshot)
+        self.assertTrue(value['worker_active'])
+        value['items'][0]['managed']['state'] = 'caller edit'
+        self.assertNotEqual(snapshot['remote_updates'][self.profile_id + ':fixture-a']['managed']['state'],
+                            'caller edit')
+        self.assertEqual(self.service.status_all(state={})['items'], [])
 
     def test_shutdown_preserves_remote_journal_but_cancels_queued_callbacks(self):
         self.schedule()
@@ -546,6 +582,60 @@ class RemoteUpdateTests(unittest.TestCase):
         self.probe.assert_called_once_with(self.root, self.remote, 'fixture-a')
         self.stock_update.assert_not_called()
         self.assertEqual(self.status()['job']['state'], 'waiting')
+
+    def defer(self):
+        """The profile relaunched with its previous SSH settings still running."""
+        profile = self.store.profile(self.profile_id)
+        transaction = str(uuid4())
+        def write(data):
+            data.setdefault('profile_restarts', {})[self.profile_id] = dict(
+                id=str(uuid4()), profile_id=self.profile_id, phase='attention',
+                code='ssh_settings_deferred', connections_restored=True,
+                generation=profile['generation'], transaction_id=transaction,
+                requested_revision=profile['policy']['desired_revision'],
+                remote_background=True, message='fixture deferred', updated_at=now())
+        self.store.mutate(write)
+        manifest = json.loads(self.manifest.read_text())
+        manifest.update(pending_policy_hosts=['fixture-a', 'fixture-b'],
+                        deferred_policy_hosts=['fixture-a', 'fixture-b'])
+        atomic_json(self.manifest, manifest)
+
+    def notice(self):
+        return self.store.read()['profile_restarts'][self.profile_id]
+
+    def test_successful_managed_update_retires_the_deferred_notice(self):
+        self.defer()
+        self.schedule()
+        self.drain()
+        self.assertEqual(self.status()['job']['state'], 'complete')
+        notice = self.notice()
+        self.assertEqual(notice['phase'], 'complete')
+        self.assertNotIn('code', notice)
+        self.assertNotIn('connections_restored', notice)
+        manifest = json.loads(self.manifest.read_text())
+        self.assertEqual(manifest['pending_policy_hosts'], [])
+        self.assertEqual(manifest['deferred_policy_hosts'], [])
+        self.assertEqual({b['revision'] for b in manifest['bindings']}, {'b' * 64})
+        self.assertEqual(self.fixture.instances.show_calls, [])
+        self.assertEqual(self.fixture.closes, [])
+
+    def test_failed_managed_update_keeps_the_deferred_notice(self):
+        self.defer()
+        before = self.manifest.read_bytes()
+        request = self.fleet.request
+        def fail(binding, operation, **params):
+            if operation == 'start':
+                raise UpdateError('remote_start_timeout', 'simulated timeout')
+            return request(binding, operation, **params)
+        self.fleet.request = fail
+        self.schedule()
+        self.drain()
+        self.assertEqual(self.status()['job']['state'], 'attention')
+        self.assertEqual(self.manifest.read_bytes(), before)
+        notice = self.notice()
+        self.assertEqual(notice['phase'], 'attention')
+        self.assertEqual(notice['code'], 'ssh_settings_deferred')
+        self.assertTrue(notice['connections_restored'])
 
 
 if __name__ == '__main__':

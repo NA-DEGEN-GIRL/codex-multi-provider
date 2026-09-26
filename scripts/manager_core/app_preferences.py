@@ -9,7 +9,7 @@ from pathlib import Path
 import re
 import tomllib
 
-from .common import _atomic_write, _assert_owned_path, toml_value
+from .common import _atomic_write, _assert_owned_path, config_lock, toml_value
 from .store import atomic_json
 
 _DESKTOP_KEYS = ('appearanceTheme', 'appearanceDarkCodeThemeId', 'appearanceLightCodeThemeId',
@@ -78,18 +78,19 @@ def prepare(home, source, *, account_id=None, ssh_ready_aliases=None, canonical=
     source_config = source / 'config.toml'
     donor = tomllib.loads(source_config.read_text(encoding='utf-8-sig')) if source_config.is_file() else {}
     values = {k: v for k, v in donor.get('desktop', {}).items() if k in _DESKTOP_KEYS}
-    text = config.read_text(encoding='utf-8-sig') if config.exists() else ''
-    owned = json.loads(metadata.read_text(encoding='utf-8')) if metadata.exists() else {}
-    if values:
-        updated = merge_desktop(text, values)
-        if text != updated:
-            if (config.read_text(encoding='utf-8-sig') if config.exists() else '') != text:
-                raise ValueError('설정이 변경 중입니다. 이 프로필을 종료한 뒤 다시 열어주세요.')
-            _atomic_write(config, updated)
-            result['desktop'] = 'updated'
-        owned.pop('desktop_hash', None)
-        owned['desktop_keys'] = sorted(values)
-        result['theme'] = values.get('appearanceTheme', 'system')
+    with config_lock(home):
+        text = config.read_text(encoding='utf-8-sig') if config.exists() else ''
+        owned = json.loads(metadata.read_text(encoding='utf-8')) if metadata.exists() else {}
+        if values:
+            updated = merge_desktop(text, values)
+            if text != updated:
+                if (config.read_text(encoding='utf-8-sig') if config.exists() else '') != text:
+                    raise ValueError('설정이 변경 중입니다. 이 프로필을 종료한 뒤 다시 열어주세요.')
+                _atomic_write(config, updated)
+                result['desktop'] = 'updated'
+            owned.pop('desktop_hash', None)
+            owned['desktop_keys'] = sorted(values)
+            result['theme'] = values.get('appearanceTheme', 'system')
     donor_state = source / '.codex-global-state.json'
     original = json.loads(donor_state.read_text(encoding='utf-8-sig')) if donor_state.is_file() else {}
     current = json.loads(state.read_text(encoding='utf-8-sig')) if state.exists() else {}

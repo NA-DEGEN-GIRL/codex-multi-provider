@@ -5,6 +5,7 @@ from contextlib import contextmanager, nullcontext
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import threading
 import time
@@ -98,6 +99,26 @@ def main_window(pid, remembered=None):
     return max(windows)[2] if windows else None
 
 
+SERVICE_PIPE = re.compile(r'CodexControlCenter\.service\.[0-9A-F]{32}')
+
+
+def records_pipe():
+    """The manager service pipe for content-free record polls, else None.
+
+    Record polls need no broker token, so a profile never receives one."""
+    name = os.environ.get('CODEX_MANAGER_SERVICE_PIPE', '')
+    return name if SERVICE_PIPE.fullmatch(name) else None
+
+
+def runtime_temp(profile_id):
+    """This profile's runtime TEMP/TMP, a small folder under the user's TEMP.
+
+    The Windows sandbox grants its temp root on first setup and Windows applies
+    that to every file already inside, so a shared, large TEMP made it slow."""
+    import tempfile
+    return Path(tempfile.gettempdir()) / 'codex-manager' / identifier(profile_id)
+
+
 def embedded_startup(enabled):
     """Let the manager attach a new window before making its host visible."""
     if not enabled or os.name != 'nt':
@@ -106,6 +127,46 @@ def embedded_startup(enabled):
     startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
     startup.wShowWindow = subprocess.SW_HIDE
     return {'startupinfo': startup}
+
+
+class SharedCheck:
+    """Run a check once for every caller that asked before it started.
+
+    Parallel launches otherwise validate the same desktop copy one after
+    another under its publication lock. A caller never reuses a check that was
+    already running when it asked; it joins, or starts, the next one.
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.entries = {}  # key -> [one-at-a-time lock, batch not yet started]
+
+    def __call__(self, key, check):
+        with self.lock:
+            entry = self.entries.setdefault(key, [threading.Lock(), None])
+            batch = entry[1]
+            leader = batch is None
+            if leader:
+                batch = entry[1] = dict(done=threading.Event())
+        if not leader:
+            batch['done'].wait()
+            if 'error' in batch:
+                raise batch['error']
+            return batch['value']
+        try:
+            with entry[0]:
+                with self.lock:
+                    entry[1] = None  # Starts now: later callers form the next batch.
+                batch['value'] = check()
+                return batch['value']
+        except BaseException as error:
+            batch['error'] = error
+            with self.lock:
+                if entry[1] is batch:  # Interrupted before it started.
+                    entry[1] = None
+            raise
+        finally:
+            batch['done'].set()
 
 
 class Instances:
@@ -120,6 +181,7 @@ class Instances:
         self._app_lock=threading.Lock()
         self._app_cache=None
         self._app_checked=0.0
+        self._desktop_checks=SharedCheck()
         from .launch_metrics import LaunchMetrics
         self.metrics = LaunchMetrics(store.directory)
         from .personal_skills import PersonalSkills
@@ -133,13 +195,14 @@ class Instances:
 
     def installed_app(self):
         # Package discovery starts PowerShell. Share it briefly across launch
-        # preparation and SSH environment construction, never across services.
-        from desktop_launch import find_app
+        # preparation and SSH environment construction. Beyond that, the
+        # service-wide lookup re-validates the package files and registration.
+        from desktop_launch import cached_app
         with self._app_lock:
             if (self._app_cache and time.monotonic()-self._app_checked < 5
                     and Path(self._app_cache.get('executable', '')).is_file()):
                 return dict(self._app_cache)
-            app = find_app()
+            app = cached_app()
             self._app_cache = dict(app)
             self._app_checked = time.monotonic()
             return dict(app)
@@ -238,11 +301,10 @@ class Instances:
         if profile.get('auth_mode') in ('native', 'source', 'external'):
             env={name:value for name,value in env.items() if not name.upper().startswith(('OPENAI_','AZURE_OPENAI_','CHATGPT_'))}
         if profile.get('runtime_channel')=='packaged':
-            from desktop_launch import find_app
             from .login_probe import verification_runtime
             # An unpackaged desktop cannot reliably execute an MSIX CLI in
             # WindowsApps. Use the verified official copy used by login probes.
-            runtime=verification_runtime(self.root,find_app())
+            runtime=verification_runtime(self.root,self.installed_app())
             env.update(CODEX_HOME=str(home),CODEX_ELECTRON_USER_DATA_PATH=str(ui),CODEX_CLI_PATH=str(runtime))
             return env
         from .runtime_build import resolve
@@ -264,13 +326,18 @@ class Instances:
         from .workspace_seed import ensure as seed_ssh_projects
         seed_ssh_projects(self.root)
         env['CODEX_MANAGER_RECORD_SIGNALS'] = str(self.root / 'work/control-center/record-signals')
+        # The adapter long-polls the service's record hub instead of scanning
+        # every peer file; without it the adapter stays on the files.
+        if pipe := records_pipe():
+            env['CODEX_MANAGER_RECORDS_PIPE'] = pipe
         if (home / '.manager-project-aliases.json').is_file():
             env['CODEX_MANAGER_PROJECT_ALIASES'] = str(home / '.manager-project-aliases.json')
         if proxy.is_file():
             env.update(CODEX_MANAGER_ROOT=str(self.root),CODEX_MANAGER_PROFILE_ID=profile['id'],
                        CODEX_MANAGER_GENERATION=profile['generation'],CODEX_MANAGER_REAL_RUNTIME=str(runtime),
                        CODEX_MANAGER_PYTHON=os.sys.executable,
-                       CODEX_MANAGER_OBSERVER_PATH=str(self.store.directory/'instances'/profile['id']/'runtime-state.json'))
+                       CODEX_MANAGER_OBSERVER_PATH=str(self.store.directory/'instances'/profile['id']/'runtime-state.json'),
+                       CODEX_MANAGER_RUNTIME_TEMP=str(runtime_temp(profile['id'])))
             if profile.get('source_home') and profile.get('auth_mode')!='native':
                 env['CODEX_MANAGER_AUTH_SOURCE']=str(Path(profile['source_home']))
             if profile.get('account_fingerprint'):
@@ -334,10 +401,26 @@ class Instances:
                 env['CODEX_MANAGER_SSH_SCRIPT'] = str(frozen_shim)
         return env
 
+    def launch_requires_exclusive(self):
+        """True while a launch may still run the one-time history migration.
+
+        That migration admits one caller and requires every profile to be
+        closed, so launches run one at a time until it has completed once.
+        """
+        from .canonical_storage import ready
+        try:
+            if ready(self.root):
+                return False
+            from .runtime_build import resolve
+            return bool(resolve(self.root).get('capabilities', {}).get('canonical_record_storage', False))
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+            return True
+
     @contextmanager
     def _admitted(self, profile_id):
         # Only preparation, spawning and identity publication need the global
-        # update fence. Chromium can initialize after this fence is released.
+        # update fence; other profiles' launches share it (launch_queue).
+        # Chromium can initialize after this fence is released.
         started = time.perf_counter()
         with self.launch_admission(profile_id) if self.launch_admission else nullcontext():
             self.metrics.record(profile_id, 'admission_wait', started)
@@ -385,6 +468,8 @@ class Instances:
         from .login_health import require as require_login
         active=self.observe(profile)
         if active['status']=='running':
+            from .browser_bundle import ensure as ensure_browser
+            ensure_browser(profile['home'], active['executable_path'])
             if not reopen_existing:
                 return dict(profile_id=profile['id'],profile={**profile,**active},state='existing')
             # Ask Electron itself to restore/show the existing profile. Merely
@@ -420,7 +505,14 @@ class Instances:
             preparation = self.prepare(profile)
         from .desktop_bundle import prepare as prepare_desktop
         with self.metrics.phase(profile_id, 'desktop_bundle'):
-            app=prepare_desktop(self.root, self.installed_app())
+            installed=self.installed_app()
+            # Different profiles launch together; they share one validation of
+            # the same version-scoped copy that started after each one asked.
+            app=dict(self._desktop_checks((installed.get('executable'),installed.get('Version')),
+                                          lambda: prepare_desktop(self.root, installed)))
+        from .browser_bundle import ensure as ensure_browser
+        with self.metrics.phase(profile_id, 'browser_bundle'):
+            preparation['browser_plugin'] = ensure_browser(profile['home'], app['executable'])
         profile['generation']=str(uuid4())
         profile['shared_catalog_path']=None
         if profile.get('view_only'):
@@ -459,33 +551,56 @@ class Instances:
             # selects the Codex composer without creating or submitting a task.
             from . import rust_service
             self._require_launch_open()
-            process=rust_service.launch(profile,app['executable'],env,embed=self.embed_windows) if rust_service.enabled() else subprocess.Popen([app['executable'],f'--user-data-dir={profile["ui_home"]}',
+            brokered=rust_service.enabled()
+            process=rust_service.launch(profile,app['executable'],env,embed=self.embed_windows) if brokered else subprocess.Popen([app['executable'],f'--user-data-dir={profile["ui_home"]}',
                                       'codex://threads/new?mode=codex'],cwd=self.root,
                                      env=env,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
                                      creationflags=subprocess.CREATE_NEW_PROCESS_GROUP, **embedded_startup(self.embed_windows))
         finally:
             env.clear()
-        self.processes[profile['id']]=process
-        current=process_identity(process.pid)
-        if not current:
-            raise RuntimeError('인스턴스 시작을 확인하지 못했습니다. 다른 계정으로 전환하지 않았습니다.')
-        def save(data):
-            p=self.store.profile(profile['id'],data)
-            p.update(current,generation=profile['generation'],app_version=app['Version'],started_at=now(),status='running')
-            p['desktop_isolation_revision'] = app['desktop_isolation_revision']
-            p['desktop_compatibility_notice'] = app.get('desktop_compatibility_notice', '')
-            p['shared_catalog_path']=profile.get('shared_catalog_path')
-            p['manager_release']=profile.get('manager_release')
-            p['manager_runtime_revision']=profile.get('manager_runtime_revision')
-            if profile.get('view_only'):p['record_catalog_path']=profile['record_catalog_path']
-            if profile.get('runtime_channel'):p['runtime_channel']=profile['runtime_channel']
-            p['policy']['launched_revision']=profile['policy']['desired_revision']
-            p['policy']['effective_revision']=None
-            from .profile_restart import supersede_previous_notice
-            supersede_previous_notice(data, p)
-            return p
-        profile=self.store.mutate(save)
+        try:
+            self.processes[profile['id']]=process
+            current=process_identity(process.pid)
+            if not current:
+                raise RuntimeError('인스턴스 시작을 확인하지 못했습니다. 다른 계정으로 전환하지 않았습니다.')
+            def save(data):
+                p=self.store.profile(profile['id'],data)
+                p.update(current,generation=profile['generation'],app_version=app['Version'],started_at=now(),status='running')
+                p['desktop_isolation_revision'] = app['desktop_isolation_revision']
+                p['desktop_compatibility_notice'] = app.get('desktop_compatibility_notice', '')
+                p['shared_catalog_path']=profile.get('shared_catalog_path')
+                p['manager_release']=profile.get('manager_release')
+                p['manager_runtime_revision']=profile.get('manager_runtime_revision')
+                if profile.get('view_only'):p['record_catalog_path']=profile['record_catalog_path']
+                if profile.get('runtime_channel'):p['runtime_channel']=profile['runtime_channel']
+                p['policy']['launched_revision']=profile['policy']['desired_revision']
+                p['policy']['effective_revision']=None
+                from .profile_restart import supersede_previous_notice
+                supersede_previous_notice(data, p)
+                return p
+            profile=self.store.mutate(save)
+        except BaseException:
+            # Until its identity is saved nothing owns this desktop: state,
+            # full exit and the next launch only see recorded processes.
+            self._abort_launch(profile, process, brokered)
+            raise
         return dict(profile_id=profile['id'],profile=profile,state='launched', preparation=preparation)
+
+    def _abort_launch(self, profile, process, brokered):
+        """Stop exactly the process tree this failed launch spawned (best effort)."""
+        if self.processes.get(profile['id']) is process:
+            self.processes.pop(profile['id'], None)
+        try:
+            with self.metrics.phase(profile['id'], 'launch_abort'):
+                if brokered:
+                    from . import rust_service
+                    rust_service.abort_launch(profile, process)
+                else:
+                    process.kill()
+        except Exception:
+            # The launch's own failure is the one to report. Full exit still
+            # sweeps this profile's --user-data-dir.
+            pass
 
     def finish_show(self, result):
         if result.get('state') != 'launched':

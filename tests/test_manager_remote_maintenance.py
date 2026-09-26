@@ -573,8 +573,12 @@ class RemoteMaintenanceTests(unittest.TestCase):
         self.assertEqual(other['state'], 'start_requested')
 
     def test_unused_diagnostic_gauges_are_optional_but_current_request_is_required(self):
+        class MissingEvidence(RuntimeError):
+            def __init__(self, code):
+                self.code = code
         native = types.SimpleNamespace(_running=MagicMock(return_value={'pid': 12}),
-                                       _instance_lock_released=MagicMock(return_value=True))
+                                       _instance_lock_released=MagicMock(return_value=True),
+                                       RemoteMaintenanceError=MissingEvidence)
         module_spec = importlib.util.spec_from_file_location('maintenance_fixture', ROOT / 'scripts/remote_helpers/maintenance.py')
         module = importlib.util.module_from_spec(module_spec)
         with patch.dict(sys.modules, {'native_controller': native,
@@ -583,7 +587,7 @@ class RemoteMaintenanceTests(unittest.TestCase):
             module_spec.loader.exec_module(module)
         (self.root / 'native-start.lock').write_bytes(b'')
         for values, idle in [({'requests.pending_completion': 1}, True),
-                             ({}, False), ({'requests.pending_completion': 2}, False),
+                             ({}, None), ({'requests.pending_completion': 2}, False),
                              ({'requests.pending_completion': 1, 'logins.running': 1}, False),
                              ({'requests.pending_completion': 1, 'processes.running': 1}, False)]:
             @contextmanager
@@ -597,7 +601,12 @@ class RemoteMaintenanceTests(unittest.TestCase):
                     raise AssertionError(method)
                 yield request
             with self.subTest(values=values), patch.object(module, 'connection', connection):
-                self.assertEqual(module.inspect(self.root, 'a' * 64)['idle'], idle)
+                if idle is None:
+                    with self.assertRaises(MissingEvidence) as raised:
+                        module.inspect(self.root, 'a' * 64)
+                    self.assertEqual(raised.exception.code, 'remote_idle_diagnostics_unavailable')
+                else:
+                    self.assertEqual(module.inspect(self.root, 'a' * 64)['idle'], idle)
 
     def test_remote_discovery_validates_actual_descriptor_before_opening_runtime(self):
         process = dict(pid=12, revision='b' * 64)

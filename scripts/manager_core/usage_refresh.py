@@ -1,10 +1,16 @@
 """Bounded, background quota refresh. Never starts a task or changes a login."""
 from copy import deepcopy
 from pathlib import Path
+import subprocess
 import threading
 import time
 
-from .native_usage import newer, observed_timestamp
+from .native_usage import REFRESH_INTERVAL, newer, observed_timestamp
+from .store import Unchanged
+
+# An idle profile's saved observation is still rewritten this often, so a
+# restarted service does not start from an hours-old value.
+_REWRITE_AFTER = 1800
 
 
 def _binding(profile):
@@ -12,17 +18,55 @@ def _binding(profile):
                  ('auth_mode', 'home', 'source_home', 'account_fingerprint', 'usage_account_id'))
 
 
+def _marked(usage):
+    return isinstance(usage, dict) and bool(usage.get('error') or usage.get('freshness') == 'stale')
+
+
+def _unchanged(stored, result):
+    """True when saving result would only move a recent observed_at of a clean value."""
+    return (isinstance(stored, dict) and not _marked(stored)
+            and stored.get('windows') == result.get('windows')
+            and (not result.get('reset_credits') or stored.get('reset_credits') == result.get('reset_credits'))
+            and time.time() - observed_timestamp(stored) < _REWRITE_AFTER)
+
+
+_purges = {}
+_purges_lock = threading.Lock()
+_PURGE_DELAY = 120
+_PURGE_EVERY = 6 * 3600
+
+
+def _purge_due(root):
+    """Start the stale probe-home purge for root when its last run is 6 h old."""
+    key, now = str(root), time.monotonic()
+    with _purges_lock:
+        started, worker = _purges.get(key, (None, None))
+        if worker is not None and (worker.is_alive() or now - started < _PURGE_EVERY):
+            return
+        def run():
+            from .login_probe import purge_in_child
+            time.sleep(_PURGE_DELAY)  # Let startup profile launches finish their disk work first.
+            try:
+                purge_in_child(root)  # a child process, off this backend's GIL
+            except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+                pass  # The next periodic run retries; never disturb quota refresh.
+        # A long-running service still removes homes a locked probe left behind.
+        worker = threading.Thread(target=run, daemon=True, name='codex-probe-purge')
+        _purges[key] = (now, worker)
+    worker.start()
+
+
 def read_quota(root, profile):
     from .proxy_auth import read_existing_tokens, account_fingerprint
     from .login_probe import verify, verification_runtime
-    from desktop_launch import find_app
+    from desktop_launch import cached_app
     home = Path(profile['home'] if profile.get('auth_mode') == 'native' else
                 profile.get('source_home') or profile['home'])
     expected = profile.get('account_fingerprint')
     tokens = read_existing_tokens(home)
     if not expected or account_fingerprint(tokens.account_id) != expected:
         raise RuntimeError('계정 연결 확인이 필요합니다.')
-    result = verify(root, verification_runtime(root, find_app()), tokens, timeout=18)
+    result = verify(root, verification_runtime(root, cached_app()), tokens, timeout=18)
     if account_fingerprint(read_existing_tokens(home, minimum_validity=0).account_id) != expected:
         raise RuntimeError('조회 중 계정이 변경되었습니다.')
     if not result.get('quota_read') or not result.get('usage', {}).get('windows'):
@@ -31,7 +75,12 @@ def read_quota(root, profile):
 
 
 class UsageRefresh:
-    def __init__(self, root, store, *, probe=None, interval=60):
+    # Each background probe starts a codex app-server in a new CODEX_HOME. The
+    # backend does not know which profile is on screen, so every account uses
+    # one slower cadence. refresh_all and login verification stay immediate.
+    INTERVAL = REFRESH_INTERVAL
+
+    def __init__(self, root, store, *, probe=None, interval=INTERVAL):
         self.root, self.store = Path(root), store
         self.probe = probe or (lambda profile: read_quota(self.root, profile))
         self.interval = interval
@@ -40,12 +89,21 @@ class UsageRefresh:
         self.latest = {}
 
     def value(self, profile):
+        stored = profile.get('usage')
         with self.lock:
             binding, value = self.latest.get(profile['id'], (None, None))
-            return deepcopy(newer(profile.get('usage'), value if binding == _binding(profile) else None))
+            shown = deepcopy(newer(stored, value if binding == _binding(profile) else None))
+        if _marked(stored) and isinstance(shown, dict) and not _marked(shown):
+            # A clean reply is kept in memory only while the saved value was
+            # clean, so a saved stale or error mark is the later event.
+            shown.update(freshness='stale', error=deepcopy(stored.get('error')))
+        return shown
 
-    def schedule(self):
-        profiles = self.store.read()['profiles']
+    def schedule(self, profiles=None):
+        """Start due probes; profiles are raw store profiles when the caller has them."""
+        _purge_due(self.root)
+        if profiles is None:
+            profiles = self.store.read()['profiles']
         with self.lock:
             for profile in profiles:
                 if len(self.running) >= 2:
@@ -77,12 +135,24 @@ class UsageRefresh:
                 current = self.store.profile(profile['id'], data)
                 if current.get('removed_at') or _binding(current) != _binding(profile):
                     return False
+                if _unchanged(current.get('usage'), result):
+                    # Same windows as the value saved now (not at poll start, so
+                    # a mark written during the probe is replaced): skip the
+                    # whole-state rewrite. state() shows the newer observation
+                    # from memory; a restarted service re-probes.
+                    return Unchanged(True)
                 current['usage'] = deepcopy(newer(current.get('usage'), result))
                 return True
             if self.store.mutate(save):
                 with self.lock:
                     self.latest[profile['id']] = (_binding(profile), deepcopy(result))
         except (ValueError, RuntimeError, OSError):
+            with self.lock:
+                # A reply kept only in memory must turn stale like the saved one.
+                binding, cached = self.latest.get(profile['id'], (None, None))
+                if cached is not None and binding == _binding(profile):
+                    cached.update(freshness='stale', error=dict(code='refresh_failed',
+                        message='사용량 조회에 실패해 이전 값을 표시합니다.'))
             def fail(data):
                 current = self.store.profile(profile['id'], data)
                 if current.get('removed_at') or _binding(current) != _binding(profile):

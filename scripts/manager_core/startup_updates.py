@@ -40,11 +40,13 @@ class StartupUpdates:
     def shutdown(self):
         self.stopping.set()
 
-    def status(self):
+    def status(self, state=None, jobs=None):
+        """state/jobs let the state poll reuse its one snapshot and restart status."""
         with self.lock:
             value = deepcopy(self.result)
-        jobs = self.restarts.status() if hasattr(self.restarts, 'status') else {}
-        profiles = {p['id']: p for p in self.store.read()['profiles']}
+        if jobs is None:
+            jobs = self.restarts.status() if hasattr(self.restarts, 'status') else {}
+        profiles = {p['id']: p for p in (self.store.read() if state is None else state)['profiles']}
         counts = dict(current=0, pending=0, attention=0)
         for entry in value['profiles']:
             profile = profiles.get(entry['profile_id'], {})

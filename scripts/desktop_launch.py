@@ -5,14 +5,17 @@ The ordinary app, its authentication, and its files are never modified.
 """
 import argparse
 import ctypes
+import functools
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import sys
+import threading
 import time
 import tomllib
 from urllib.parse import urlsplit
@@ -44,6 +47,97 @@ def find_app():
     if not Path(app['executable']).is_file():
         raise RuntimeError('The installed Codex desktop executable is missing.')
     return app
+
+
+APP_CACHE_SECONDS = 180
+_app_lock = threading.Lock()
+_app_cache = None
+
+
+def _app_stamp(app):
+    """Size and mtime of the executable and its app.asar; None if unusable."""
+    try:
+        executable = Path(app['executable'])
+        stamps = []
+        for path in (executable, executable.parent / 'resources/app.asar'):
+            info = path.stat()
+            if not stat.S_ISREG(info.st_mode):
+                return None
+            stamps.append((str(path), info.st_size, info.st_mtime_ns))
+        return tuple(stamps)
+    except (OSError, KeyError, TypeError, ValueError):
+        return None
+
+
+@functools.cache
+def _package_query():
+    from ctypes import wintypes
+    query = ctypes.WinDLL('kernel32', use_last_error=True).GetPackagesByPackageFamily
+    query.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(wintypes.LPWSTR),
+                      ctypes.POINTER(ctypes.c_uint32), wintypes.LPWSTR]
+    query.restype = wintypes.LONG
+    return query
+
+
+def _registered_packages(app):
+    """Full names registered for this user in the package's family, or None.
+
+    GetPackagesByPackageFamily answers in about a millisecond, so a package
+    update or Store auto-update invalidates the cache without PowerShell.
+    """
+    if os.name != 'nt':
+        return None
+    parts = Path(str(app.get('InstallLocation', ''))).name.split('_')
+    if (len(parts) != 5 or parts[0] != app.get('Name') or parts[1] != str(app.get('Version'))
+            or not re.fullmatch(r'[a-z0-9]{13}', parts[4])):
+        return None  # Not a standard package folder; stat and age still apply.
+    from ctypes import wintypes
+    family = parts[0] + '_' + parts[4]
+    try:
+        query = _package_query()
+        count, length = ctypes.c_uint32(0), ctypes.c_uint32(0)
+        status = query(family, ctypes.byref(count), None, ctypes.byref(length), None)
+        if status not in (0, 122):  # ERROR_INSUFFICIENT_BUFFER reports the sizes.
+            return None
+        if not count.value:
+            return ()
+        names = (wintypes.LPWSTR * count.value)()
+        buffer = ctypes.create_unicode_buffer(length.value)
+        if query(family, ctypes.byref(count), names, ctypes.byref(length), buffer):
+            return None  # Changed between calls; the next use asks again.
+        return tuple(sorted(names[index] for index in range(count.value)))
+    except (AttributeError, OSError, ValueError, ctypes.ArgumentError):
+        return None  # Unknown registration never blocks a launch; it only forces a lookup.
+
+
+def cached_app():
+    """find_app() shared across this service while the package is unchanged.
+
+    Reused only while the executable and app.asar keep their size and mtime,
+    the user's registered package versions stay the same, and the lookup is
+    younger than APP_CACHE_SECONDS. Anything else runs PowerShell again.
+    Update checks keep their own uncached package query.
+    """
+    global _app_cache
+    with _app_lock:
+        if _app_cache is not None:
+            app, stamp, registered, checked = _app_cache
+            if (time.monotonic() - checked < APP_CACHE_SECONDS and _app_stamp(app) == stamp
+                    and _registered_packages(app) == registered):
+                return dict(app)
+            _app_cache = None
+        app = find_app()
+        stamp = _app_stamp(app)
+        if stamp is not None:
+            _app_cache = (dict(app), stamp, _registered_packages(app), time.monotonic())
+        return dict(app)
+
+
+def forget_app():
+    """Drop the shared lookup, e.g. after an update installed another version."""
+    global _app_cache
+    with _app_lock:
+        _app_cache = None
 
 
 def provider_settings():

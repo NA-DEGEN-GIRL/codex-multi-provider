@@ -4,6 +4,7 @@ Only manager-marked MCP blocks and an unchanged manager-generated AGENTS.md are
 updated. Authentication files, plugin connection state and conversation stores
 are never read or copied. MCP values never appear in returned status or metadata.
 """
+from contextlib import contextmanager
 import hashlib
 import json
 import math
@@ -12,6 +13,8 @@ from pathlib import Path
 import re
 import subprocess
 import tempfile
+import threading
+import time
 import tomllib
 
 
@@ -20,6 +23,25 @@ _BEGIN = '# BEGIN CODEX MANAGER COMMON MCP '
 _END = '# END CODEX MANAGER COMMON MCP '
 _BLOCK = re.compile(r'^' + re.escape(_BEGIN) + r'([0-9a-f]{24})\r?\n.*?^'
                     + re.escape(_END) + r'\1(?:\r?\n|$)', re.MULTILINE | re.DOTALL)
+_config_locks = {}
+_config_locks_guard = threading.Lock()
+
+
+@contextmanager
+def config_lock(home):
+    """Serialize this service's read-modify-write of one home's config.toml.
+
+    Parallel launches run the shared skill and plugin passes, which rewrite
+    every home, while another profile edits its own config. Hold this from
+    reading the file until it is replaced and take no other lock inside it;
+    pass locks come first. The desktop app and other processes do not take
+    it, so every writer still compares the file before replacing it.
+    """
+    key = os.path.normcase(str(Path(home).resolve()))
+    with _config_locks_guard:
+        lock = _config_locks.setdefault(key, threading.Lock())
+    with lock:
+        yield
 
 
 def toml_value(value):
@@ -48,6 +70,21 @@ def _hash(text):
     return hashlib.sha256(text.replace('\r\n', '\n').encode('utf-8')).hexdigest()
 
 
+def _replace(temporary, path):
+    deadline = time.monotonic() + 1
+    while True:
+        try:
+            os.replace(temporary, path)
+            return
+        except PermissionError as error:
+            # A Windows reader (the desktop app, a scanner) may briefly deny
+            # replacing its open file. The old complete file stays until then.
+            if (os.name != 'nt' or getattr(error, 'winerror', None) not in (5, 32, 33)
+                    or time.monotonic() >= deadline):
+                raise
+            time.sleep(.01)
+
+
 def _atomic_write(path, text):
     descriptor, temporary = tempfile.mkstemp(prefix=path.name + '.', suffix='.tmp', dir=path.parent)
     try:
@@ -55,7 +92,7 @@ def _atomic_write(path, text):
             output.write(text)
             output.flush()
             os.fsync(output.fileno())
-        os.replace(temporary, path)
+        _replace(temporary, path)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
@@ -223,32 +260,33 @@ def prepare_common(home, source):
     _assert_owned_path(config, home)
     _assert_owned_path(state_path, home)
     state = _load_state(state_path, result['warnings'])
-    original = _read(config) if config.exists() else None
-    text = original if original is not None else 'model = "gpt-6-astra"\ncli_auth_credentials_store = "file"\n'
-    try:
-        tomllib.loads(text)
-    except tomllib.TOMLDecodeError:
-        raise ValueError('프로필 설정을 해석하지 못해 공통 설정을 변경하지 않았습니다.') from None
-    donor = source / 'config.toml'
-    if donor.is_file():
+    with config_lock(home):
+        original = _read(config) if config.exists() else None
+        text = original if original is not None else 'model = "gpt-6-astra"\ncli_auth_credentials_store = "file"\n'
         try:
-            definitions = tomllib.loads(_read(donor)).get('mcp_servers', {})
-            if not isinstance(definitions, dict) or not all(isinstance(v, dict) for v in definitions.values()):
-                raise ValueError()
-        except (OSError, ValueError):
-            result['warnings'].append('원본 MCP 설정을 읽지 못해 기존 공통 MCP 설정은 유지했습니다.')
-        else:
+            tomllib.loads(text)
+        except tomllib.TOMLDecodeError:
+            raise ValueError('프로필 설정을 해석하지 못해 공통 설정을 변경하지 않았습니다.') from None
+        donor = source / 'config.toml'
+        if donor.is_file():
             try:
-                text = _refresh_mcp(text, definitions, state, result)
-            except (ValueError, TypeError):
-                result['warnings'].append('기존 TOML 구조와 공통 MCP 정의를 합칠 수 없어 프로필 설정은 유지했습니다.')
-    else:
-        result['warnings'].append('원본 설정 파일이 없어 기존 공통 MCP 설정은 유지했습니다.')
-    if text != original:
-        observed = _read(config) if config.exists() else None
-        if observed != original:
-            raise ValueError('프로필 설정이 준비 중에 변경되어 덮어쓰지 않았습니다. 다시 실행하세요.')
-        _atomic_write(config, text)
+                definitions = tomllib.loads(_read(donor)).get('mcp_servers', {})
+                if not isinstance(definitions, dict) or not all(isinstance(v, dict) for v in definitions.values()):
+                    raise ValueError()
+            except (OSError, ValueError):
+                result['warnings'].append('원본 MCP 설정을 읽지 못해 기존 공통 MCP 설정은 유지했습니다.')
+            else:
+                try:
+                    text = _refresh_mcp(text, definitions, state, result)
+                except (ValueError, TypeError):
+                    result['warnings'].append('기존 TOML 구조와 공통 MCP 정의를 합칠 수 없어 프로필 설정은 유지했습니다.')
+        else:
+            result['warnings'].append('원본 설정 파일이 없어 기존 공통 MCP 설정은 유지했습니다.')
+        if text != original:
+            observed = _read(config) if config.exists() else None
+            if observed != original:
+                raise ValueError('프로필 설정이 준비 중에 변경되어 덮어쓰지 않았습니다. 다시 실행하세요.')
+            _atomic_write(config, text)
     _share_skills(home, source, result)
     _share_instructions(home, source, state, result)
     metadata = json.dumps(state, ensure_ascii=False, indent=2) + '\n'

@@ -242,6 +242,248 @@ class InventoryTests(unittest.TestCase):
         self.assertEqual(coverage['operations'], [])
         self.assertFalse(coverage['complete'] or coverage['maintenance_complete'])
 
+    # Fixture liveness is encoded in process_created so one stub serves every profile.
+    STATES = {1: 'alive', 2: 'unknown', 3: 'exited', 4: 'reused'}
+
+    def add_peer(self, alias):
+        peer = self.store.add_profile(alias)
+        peer['generation'] = str(uuid4())
+        self.inventory.prepare(peer['id'], peer['generation'])
+        return peer
+
+    def seed(self, plan, hosts=('remote-dev',)):
+        """Write every fixture operation in one transaction, like the leaked store."""
+        seeded, created = {}, {state: value for value, state in self.STATES.items()}
+        def write(data):
+            for profile, states in plan:
+                record = data['ssh_inventory'][profile['id']]
+                record['hosts'] = list(hosts)
+                for index, state in enumerate(states):
+                    operation_id = str(uuid4())
+                    record['operations'][operation_id] = seeded[operation_id] = dict(
+                        operation='native-proxy', alias='remote-dev', revision='a' * 64, pid=10000 + index,
+                        process_created=created[state], generation=profile['generation'],
+                        started_at='2026-09-24T00:00:00+00:00')
+        self.store.mutate(write)
+        return seeded
+
+    def fixture_liveness(self, identity):
+        return self.STATES[identity['created']]
+
+    def stored(self, profile):
+        return self.store.read()['ssh_inventory'][profile['id']]
+
+    def test_reconcile_all_retires_only_proven_exits_for_every_profile(self):
+        peer, flagged = self.add_peer('peer'), self.add_peer('flagged')
+        self.add_peer('idle')
+        self.store.mutate(lambda data: data['ssh_inventory'][flagged['id']].update(unclassified=True))
+        seeded = self.seed([(self.profile, ['alive', 'unknown', 'exited', 'reused', 'exited']),
+                            (peer, ['exited', 'unknown']), (flagged, ['reused'])])
+        self.inventory.liveness = self.fixture_liveness
+        self.assertEqual(self.inventory.reconcile_all(), 5)
+        inventories = self.store.read()['ssh_inventory']
+        remaining = {op_id for record in inventories.values() for op_id in record['operations']}
+        self.assertEqual(remaining, {op_id for op_id, op in seeded.items()
+                                     if self.STATES[op['process_created']] in ('alive', 'unknown')})
+        for profile in (self.profile, peer, flagged):
+            self.assertEqual(inventories[profile['id']]['hosts'], ['remote-dev'])
+            self.assertEqual(inventories[profile['id']]['generation'], profile['generation'])
+        self.assertTrue(inventories[flagged['id']]['unclassified'])
+        self.assertFalse(inventories[peer['id']]['unclassified'])
+        # Remote proof is still required even after the local leases are gone.
+        self.assertEqual(self.inventory.coverage(flagged)['hosts'], ['local', 'remote-dev'])
+        self.assertFalse(self.inventory.coverage(flagged)['maintenance_complete'])
+
+    def test_reconcile_all_probes_a_large_leak_off_lock_with_one_read_and_one_mutate(self):
+        self.seed([(self.profile, ['exited'] * 15000 + ['alive'] * 3)])
+        events, read, mutate = [], self.inventory.store.read, self.inventory.store.mutate
+        def tracked_read():
+            events.append('read'); return read()
+        def tracked_mutate(operation):
+            events.append('mutate'); return mutate(operation)
+        def probe(identity):
+            events.append('probe'); return self.fixture_liveness(identity)
+        self.inventory.liveness = probe
+        with patch.object(self.inventory.store, 'read', side_effect=tracked_read), \
+             patch.object(self.inventory.store, 'mutate', side_effect=tracked_mutate):
+            self.assertEqual(self.inventory.reconcile_all(), 15000)
+        committed = events.index('mutate')
+        self.assertEqual(events[:committed], ['read'] + ['probe'] * 15003)
+        self.assertEqual(events.count('mutate'), 1)
+        self.assertNotIn('probe', events[committed:])
+        self.assertEqual(len(self.stored(self.profile)['operations']), 3)
+        self.assertEqual(self.stored(self.profile)['hosts'], ['remote-dev'])
+
+    def test_reconcile_all_keeps_concurrent_enrollment_generation_and_record_changes(self):
+        seeded = list(self.seed([(self.profile, ['exited', 'exited', 'reused'])]).items())
+        (gone_id, _), (updated_id, updated), (reused_id, _) = seeded
+        generation, enrolled_id = str(uuid4()), str(uuid4())
+        enrolled = dict(updated, pid=20000, process_created=3, generation=generation)
+        def concurrent(data):
+            record = data['ssh_inventory'][self.profile['id']]
+            record['generation'] = generation
+            record['hosts'].append('second-dev')
+            record['operations'][updated_id] = dict(updated, process_created=1)
+            record['operations'][enrolled_id] = enrolled
+        calls = []
+        def observe(identity):
+            if not calls:
+                # A separate Store contends on the real file lock, so this
+                # would time out if the probes ran inside the transaction.
+                self.store.mutate(concurrent)
+            calls.append(identity)
+            return self.fixture_liveness(identity)
+        self.inventory.liveness = observe
+        self.assertEqual(self.inventory.reconcile_all(), 2)
+        record = self.stored(self.profile)
+        self.assertEqual(set(record['operations']), {updated_id, enrolled_id})
+        self.assertEqual(record['operations'][updated_id]['process_created'], 1)
+        self.assertEqual(record['generation'], generation)
+        self.assertEqual(record['hosts'], ['remote-dev', 'second-dev'])
+        self.assertNotIn(gone_id, record['operations'])
+        self.assertNotIn(reused_id, record['operations'])
+
+    def test_reconcile_all_does_not_recreate_a_removed_profile_inventory(self):
+        peer = self.add_peer('removed peer')
+        self.seed([(self.profile, ['exited']), (peer, ['exited'])])
+        def observe(identity):
+            self.store.mutate(lambda data: data['ssh_inventory'].pop(peer['id'], None))
+            return self.fixture_liveness(identity)
+        self.inventory.liveness = observe
+        self.assertEqual(self.inventory.reconcile_all(), 1)
+        inventories = self.store.read()['ssh_inventory']
+        self.assertNotIn(peer['id'], inventories)
+        self.assertEqual(inventories[self.profile['id']]['operations'], {})
+
+    def test_reconcile_all_without_proven_exit_leaves_the_store_untouched(self):
+        self.seed([(self.profile, ['alive', 'unknown'])])
+        revision = self.store.read()['revision']
+        self.inventory.liveness = self.fixture_liveness
+        self.assertEqual(self.inventory.reconcile_all(), 0)
+        with patch.object(self.inventory, 'liveness', side_effect=OSError('fixture access failure')):
+            self.assertEqual(self.inventory.reconcile_all(), 0)
+        self.assertEqual(self.store.read()['revision'], revision)
+        self.assertEqual(len(self.stored(self.profile)['operations']), 2)
+
+    def test_retire_raced_by_a_peer_does_not_rewrite_the_store(self):
+        for path, run in (('reconcile_all', lambda: self.assertEqual(self.inventory.reconcile_all(), 0)),
+                          ('coverage', lambda: self.assertEqual(self.inventory.coverage(self.profile)['operations'], []))):
+            with self.subTest(path=path):
+                seeded, raced = self.seed([(self.profile, ['exited', 'reused'])]), []
+                def peer_retire(data):
+                    for operation_id in seeded:
+                        data['ssh_inventory'][self.profile['id']]['operations'].pop(operation_id)
+                def observe(identity):
+                    if not raced:
+                        # A separate Store, like a shim's finally, retires the same records first.
+                        raced.append(self.store.mutate(peer_retire))
+                    return self.fixture_liveness(identity)
+                self.inventory.liveness = observe
+                revision = self.store.read()['revision']
+                run()
+                self.assertEqual(raced, [None])
+                self.assertEqual(self.store.read()['revision'], revision + 1)
+                self.assertEqual(self.stored(self.profile)['hosts'], ['remote-dev'])
+
+    def test_reconcile_all_abandons_the_scan_when_the_sweeper_stops(self):
+        self.seed([(self.profile, ['exited'] * 3)])
+        revision, stopping = self.store.read()['revision'], threading.Event()
+        def observe(identity):
+            stopping.set()
+            return self.fixture_liveness(identity)
+        self.inventory.liveness = observe
+        self.assertEqual(self.inventory.reconcile_all(stopping=stopping), 0)
+        self.assertEqual(self.store.read()['revision'], revision)
+        self.assertEqual(len(self.stored(self.profile)['operations']), 3)
+
+    def test_ssh_connect_path_never_runs_the_bulk_reconcile(self):
+        self.seed([(self.profile, ['exited'] * 3)])
+        self.inventory.identity = lambda _: {}
+        self.inventory.liveness = lambda _: self.fail('prepare/execution must not probe leaked leases')
+        self.profile['generation'] = str(uuid4())
+        self.inventory.prepare(self.profile['id'], self.profile['generation'])
+        with self.execute('native-proxy'):
+            pass
+        self.assertEqual(len(self.stored(self.profile)['operations']), 3)
+
+    def test_sweeper_waits_for_startup_repeats_and_stops_promptly(self):
+        self.addCleanup(self.inventory.stop_sweeper)
+        passes, repeated = [], threading.Event()
+        def reconcile_all(stopping=None):
+            passes.append(time.monotonic())
+            if len(passes) >= 3:
+                repeated.set()
+            return 0
+        with patch.object(self.inventory, 'reconcile_all', side_effect=reconcile_all):
+            started = time.monotonic()
+            self.assertTrue(self.inventory.start_sweeper(interval=.02, delay=.3))
+            worker = self.inventory._sweeper
+            self.assertFalse(self.inventory.start_sweeper(interval=.02, delay=.3))
+            self.assertIs(self.inventory._sweeper, worker)
+            self.assertTrue(repeated.wait(5))
+            self.assertGreaterEqual(passes[0] - started, .2)
+            began = time.monotonic()
+            self.inventory.stop_sweeper()
+            self.assertLess(time.monotonic() - began, 1)
+            self.assertFalse(worker.is_alive())
+            count = len(passes)
+            time.sleep(.1)
+            self.assertEqual(len(passes), count)
+
+    def test_sweeper_hands_its_stop_event_to_reconcile_all(self):
+        self.addCleanup(self.inventory.stop_sweeper)
+        received, called = [], threading.Event()
+        def reconcile_all(*, stopping=None):
+            received.append(stopping)
+            called.set()
+            return 0
+        with patch.object(self.inventory, 'reconcile_all', side_effect=reconcile_all):
+            self.assertTrue(self.inventory.start_sweeper(interval=60, delay=0))
+            self.assertTrue(called.wait(5))
+            # Without the Event a shutdown would wait on a full leaked-store scan.
+            self.assertIsInstance(received[0], threading.Event)
+            self.assertIs(received[0], self.inventory._sweeper_stop)
+            self.assertFalse(received[0].is_set())
+            self.inventory.stop_sweeper()
+        self.assertTrue(received[0].is_set())
+        self.assertEqual(len(received), 1)
+
+    def test_sweeper_stops_during_its_startup_delay_and_can_restart(self):
+        self.addCleanup(self.inventory.stop_sweeper)
+        with patch.object(self.inventory, 'reconcile_all') as reconcile_all:
+            self.assertTrue(self.inventory.start_sweeper(interval=60, delay=60))
+            first = self.inventory._sweeper
+            began = time.monotonic()
+            self.inventory.stop_sweeper()
+            self.assertLess(time.monotonic() - began, 1)
+            self.assertFalse(first.is_alive())
+            self.assertTrue(self.inventory.start_sweeper(interval=60, delay=60))
+            self.assertIsNot(self.inventory._sweeper, first)
+            self.inventory.stop_sweeper()
+            reconcile_all.assert_not_called()
+
+    def test_sweeper_survives_transient_store_errors_and_retires_leaks(self):
+        self.addCleanup(self.inventory.stop_sweeper)
+        self.seed([(self.profile, ['exited', 'alive'])])
+        self.inventory.liveness = self.fixture_liveness
+        read, failures = self.inventory.store.read, [
+            RuntimeError('다른 관리 작업이 상태를 저장 중입니다. 다시 시도하세요.'),
+            PermissionError(13, 'fixture sharing violation'), json.JSONDecodeError('fixture', '', 0)]
+        def flaky_read():
+            if failures:
+                raise failures.pop(0)
+            return read()
+        with patch.object(self.inventory.store, 'read', side_effect=flaky_read):
+            self.inventory.start_sweeper(interval=.02, delay=0)
+            deadline = time.monotonic() + 5
+            while len(self.stored(self.profile)['operations']) != 1:
+                self.assertLess(time.monotonic(), deadline, 'sweeper did not retire the leaked lease')
+                time.sleep(.02)
+            self.inventory.stop_sweeper()
+        self.assertEqual(failures, [])
+        self.assertEqual([op['process_created'] for op in self.stored(self.profile)['operations'].values()], [1])
+        self.assertEqual(self.stored(self.profile)['hosts'], ['remote-dev'])
+
     @unittest.skipUnless(os.name == 'nt', 'Windows process identity')
     def test_real_python_crash_skips_finally_and_cleanup_preserves_active_peer(self):
         code = '''import os,sys

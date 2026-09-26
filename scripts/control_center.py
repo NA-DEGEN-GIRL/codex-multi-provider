@@ -1,5 +1,6 @@
 """Codex Control Center backend. JSON RPC plus an opt-in loopback skill worker."""
 import argparse
+from copy import deepcopy
 import json
 import os
 from pathlib import Path
@@ -28,9 +29,18 @@ from manager_core.remote_maintenance import RemoteMaintenance
 from manager_core.remote_updates import RemoteUpdates
 
 ROOT=Path(__file__).resolve().parents[1]
+INTERNAL_ERROR='관리 요청을 처리하지 못했습니다. 잠시 후 다시 시도해 주세요.'
 
 
 class ControlCenter:
+    # A state poll may reuse a computation that started at most this long ago
+    # (half the shell's 4 s poll). Rust stop/drain checks never share one: they
+    # run only with no backend request pending.
+    STATE_SHARE_SECONDS=2.0
+    # Completed non-state requests. A poll joins only a computation that
+    # started after the latest one finished, so it sees that request's writes.
+    _request_epoch=0
+
     def __init__(self,root=ROOT,*,supervisor_protocol=None):
         self.root=Path(root).resolve(); self.store=Store(self.root)
         self.supervisor_protocol=supervisor_protocol
@@ -69,16 +79,22 @@ class ControlCenter:
         self._mutex=threading.RLock()
         self._request_gates={}
         self._request_gate_lock=threading.Lock()
+        self._state_ready=threading.Condition()
+        self._state_flight=None
         self.personal_skills=self.instances.personal_skills
         from manager_core.skill_bridge import SkillBridge
         self.skill_bridge=SkillBridge(self.root,self.store,self.personal_skills,self.remote)
         self.shared_plugins=self.instances.shared_plugins
         from manager_core.profile_warmup import ProfileWarmup
-        self.profile_warmup=ProfileWarmup(self.store,self.instances,self._open_profile_locally)
+        self.profile_warmup=ProfileWarmup(self.store,self.instances,self._open_profile_locally,
+                                          metrics=self.instances.metrics)
 
     def _open_profile_locally(self, profile_id):
         profile=self.store.profile(profile_id)
         observed=self.instances.observe(profile)
+        if observed.get('status') == 'running' and observed.get('executable_path'):
+            from manager_core.browser_bundle import ensure as ensure_browser
+            ensure_browser(profile['home'], observed['executable_path'])
         ssh_gate=self.store.read().get('ssh_maintenance',{}).get(profile_id,{})
         if ssh_gate.get('remote_update') and ssh_gate.get('state') != 'released':
             if observed.get('status')=='running':
@@ -191,6 +207,9 @@ class ControlCenter:
             def register(data):
                 Store._source(data,Path.home()/'.codex','original:local','기존 Codex')
             self.store.mutate(register);state=self.store.read()
+        # This one snapshot serves the whole poll. Quota refresh gets the saved
+        # profiles before this view adds observations to them below.
+        saved_profiles=deepcopy(state['profiles'])
         # Forked tasks copy their source memo into an independent document; the
         # note service reads this mapping instead of opening state databases.
         try:
@@ -198,9 +217,9 @@ class ControlCenter:
             refresh_note_forks(self.root,state)
         except (ValueError,RuntimeError,OSError):
             pass
-        state['profile_restarts']=self.restarts.status()
-        state['startup_updates']=self.startup_updates.status()
-        state['remote_updates']=self.remote_updates.status_all()
+        state['profile_restarts']=self.restarts.status(state=state)
+        state['startup_updates']=self.startup_updates.status(state=state,jobs=state['profile_restarts'])
+        state['remote_updates']=self.remote_updates.status_all(state=state)
         state['profile_warmup']=self.profile_warmup.status()
         state['local_launches']=self.instances.launch_status()
         registry=self.providers.list()
@@ -245,7 +264,7 @@ class ControlCenter:
             elif p.get('usage_account_id') and p['account_verification']!='verified':
                 p['status_message']='연결 계정 확인 대기' if p['status']=='running' else 'llm-usage 계정 연결'
         state['updates']=self.update_jobs.status()
-        self.usage_refresh.schedule()
+        self.usage_refresh.schedule(profiles=saved_profiles)
         from manager_core.native_usage import presentation
         for p in state['profiles']:
             p['usage'] = presentation(self.usage_refresh.value(p), refreshing=self.usage_refresh.active(p['id']))
@@ -258,7 +277,7 @@ class ControlCenter:
         if (state['view_instances'] and built.get('native_record_catalog')) or shared_running:
             catalog_refresh.refresh(state['sources'],include_paginated=built.get('paginated_record_catalog',False))
         state['catalog_refresh']=catalog_refresh.status()
-        state['capabilities']=dict(original_gui_hosting=True,exact_navigation='request_then_verify',
+        state['capabilities']=dict(remote_profile_lifecycle=True,original_gui_hosting=True,exact_navigation='request_then_verify',
                                    native_catalog=built.get('native_record_catalog',False),
                                    shared_native_catalog=built.get('shared_record_catalog',False),
                                    paginated_catalog=built.get('paginated_record_catalog',False),
@@ -266,6 +285,9 @@ class ControlCenter:
                                        'managed_store_binding','managed_close_idle','managed_idle_status','managed_reload_binding')),
                                    cross_account_hosts=['local'],automatic_restart='verified_local_scope',
                                    ssh_external='native_transport_requires_host_preparation',provider_protocols=['responses'])
+        # SSH enrollment records are most of the store and no state client
+        # reads them (shell, Rust drain/stop checks); they stay in the store.
+        state.pop('ssh_inventory',None)
         state['notices']=notices
         return state
 
@@ -291,7 +313,14 @@ class ControlCenter:
         if command=='manager.startup':
             result=self.startup_updates.start(retry_failed=args.get('retry_failed') is True)
             if getattr(self.instances,'embed_windows',False):
-                self.profile_warmup.start()
+                # The profile the shell restores starts first; the other warmup
+                # launches wait briefly for it (profile_warmup leader gate).
+                try:selected=identifier(args.get('selected_profile_id'))
+                except ValueError:selected=None
+                if selected and not self.profile_warmup.started:
+                    # Ordered first if launches are still exclusive (migration).
+                    self.update_hooks.prioritize_launch(selected)
+                self.profile_warmup.start(leader=selected)
             return result
         if command=='manager.stop_warmup':
             self.instances.stop_launches()
@@ -340,6 +369,9 @@ class ControlCenter:
         if command=='profile.restore':return self.profile_lifecycle.restore(args['profile_id'],args.get('alias'))
         if command=='profile.move':return self.store.move_profile(args['profile_id'],args['target_profile_id'],args['position'])
         if command=='profile.restart':return self.restarts.schedule(args['profile_id'])
+        if command in ('profile.remote_restart', 'profile.remote_stop'):
+            return self.restarts.schedule_remote(args['profile_id'],
+                expected_generation=args['generation'], stop_only=command=='profile.remote_stop')
         if command=='profile.recover':
             from manager_core.profile_recovery import stop_profile
             return stop_profile(self.store, self.instances, args['profile_id'],
@@ -347,10 +379,17 @@ class ControlCenter:
                                 interrupt_running_work=args.get('interrupt_running_work') is True)
         if command=='profile.login':
             if self.store.profile(args['profile_id']).get('auth_mode')=='external':raise ValueError('외부 API 프로필은 공급자 설정에서 API 키를 관리합니다.')
-            with self.update_hooks.launch_admission(args['profile_id']):return self.native_login.open(args['profile_id'])
+            try:
+                with self.update_hooks.launch_admission(args['profile_id']):return self.native_login.open(args['profile_id'])
+            finally:
+                # An explicit open never waits at the warmup gate. Once it has
+                # launched (or failed) its queued warmup entry leads, so the
+                # gate need not hold the other profiles for the restored one.
+                self.profile_warmup.promote(args['profile_id'])
         if command=='profile.login_status':
-            if self.store.profile(args['profile_id']).get('auth_mode')=='external':return dict(state='api_key',message='외부 API 프로필 · 공급자 설정에서 API 키를 관리합니다.')
-            if self.store.profile(args['profile_id']).get('auth_mode') == 'source':
+            auth_mode=self.store.profile(args['profile_id']).get('auth_mode')
+            if auth_mode=='external':return dict(state='api_key',message='외부 API 프로필 · 공급자 설정에서 API 키를 관리합니다.')
+            if auth_mode == 'source':
                 from manager_core.current_account import status
                 return status(self.store, args['profile_id'], verify_server=args.get('verify_server') is True, root=self.root)
             return self.native_login.verify(args['profile_id']) if args.get('verify_server') is True else self.native_login.status(args['profile_id'])
@@ -390,6 +429,10 @@ class ControlCenter:
                 self.update_hooks.prioritize_launch(profile['id'])
                 return dict(profile_id=profile['id'], profile={**profile,**observed},
                             state='opening')
+            if warmup['worker_active'] and pending and pending['state'] in ('checking','opening'):
+                # Spawned by warmup, its launch not yet returned: selecting it
+                # again makes it the newest leader of a waiting gate again.
+                self.profile_warmup.prioritize(profile['id'])
             return self._open_profile_locally(profile['id'])
         if command=='shortcut.add':
             host=args.get('host_id','local');source_id=args['source_store_id']
@@ -577,12 +620,51 @@ class ControlCenter:
             return result
         raise ValueError('지원하지 않는 관리 명령입니다.')
 
+    def _shared_state(self):
+        """Serve concurrent state polls from one computation.
+
+        A poll joins the running computation only while it is younger than
+        STATE_SHARE_SECONDS and no other request finished after it started;
+        otherwise it waits for that work to end and gets a fresh one. Nothing
+        is cached once a computation completes, and a published result is
+        never modified again.
+        """
+        with self._state_ready:
+            while True:
+                flight=self._state_flight
+                if flight is None:
+                    flight=self._state_flight=dict(started=time.monotonic(),epoch=self._request_epoch,done=False)
+                    leader=True;break
+                if (flight['epoch']==self._request_epoch
+                        and time.monotonic()-flight['started']<=self.STATE_SHARE_SECONDS):
+                    leader=False;break
+                self._state_ready.wait()
+            while not leader and not flight['done']:
+                self._state_ready.wait()
+        if leader:
+            try:
+                flight['result']=self.state()
+            except Exception as error:
+                flight['error']=error
+                raise
+            finally:
+                with self._state_ready:
+                    flight['done']=True;self._state_flight=None
+                    self._state_ready.notify_all()
+        elif 'result' not in flight:
+            raise flight.get('error') or RuntimeError('관리 상태를 확인하지 못했습니다. 다시 시도하세요.')
+        return flight['result']
+
     def request(self,request):
         rid=request.get('id') if isinstance(request,dict) else None
         try:
             if not isinstance(request,dict) or not isinstance(request.get('command'),str):raise ValueError('올바른 관리 요청이 아닙니다.')
             from manager_core import rust_service
             if rust_service.enabled():
+                if request['command']=='state' and isinstance(request.get('args',{}),dict):
+                    # Concurrent polls share one computation instead of each
+                    # queueing on the command gate to recompute it.
+                    return dict(id=rid,ok=True,result=self._shared_state())
                 # Same-profile mutations stay ordered. Slow work for another
                 # profile must not hold a global UI/notes/connection lock.
                 profile_id=request.get('args',{}).get('profile_id')
@@ -590,12 +672,21 @@ class ControlCenter:
                 with self._request_gate_lock:
                     gate=self._request_gates.setdefault(key,threading.RLock())
             else:gate=self._mutex
-            with gate:result=self.dispatch(request['command'],request.get('args',{}))
+            try:
+                with gate:result=self.dispatch(request['command'],request.get('args',{}))
+            finally:
+                # Counted before the reply leaves, so the caller's next poll
+                # never joins a computation that missed this request.
+                with self._request_gate_lock:self._request_epoch+=1
             return dict(id=rid,ok=True,result=result)
         except (ValueError,RuntimeError,OSError,KeyError,TypeError,AttributeError) as error:
             message=('필수 입력 항목이 없습니다.' if isinstance(error,KeyError) else
                      '입력 항목의 형식이 올바르지 않습니다.' if isinstance(error,(TypeError,AttributeError)) else str(error))
             return dict(id=rid,ok=False,error=dict(code=getattr(error,'code','request_failed'),message=message))
+        except Exception:
+            # Unexpected errors keep the request id so the caller does not wait
+            # for a timeout. Their text may carry paths or credentials.
+            return dict(id=rid,ok=False,error=dict(code='internal_error',message=INTERNAL_ERROR))
 
 
 def main():
@@ -604,6 +695,10 @@ def main():
     parser.add_argument('--root',type=Path,default=ROOT)
     args=parser.parse_args()
     protocol=os.environ.get('CODEX_MANAGER_PROTOCOL_VERSION','0')
+    if args.serve:
+        # Counts where the first minutes of CPU go (construction included).
+        from manager_core import startup_profile
+        startup_profile.start(args.root)
     center=ControlCenter(args.root,supervisor_protocol=int(protocol) if protocol.isdecimal() else 0)
     if args.serve:
         center.remote_updates.start()
@@ -613,6 +708,7 @@ def main():
         center.catalog_refresh.start(center.catalog_sources)
         center.source_catalog_refresh.start(center.native_catalog_sources)
         center.remote_catalog.start()
+        center.ssh_inventory.start_sweeper()
     try:
         from concurrent.futures import ThreadPoolExecutor
         from manager_core import rust_service
@@ -620,14 +716,29 @@ def main():
         executor=ThreadPoolExecutor(max_workers=8) if concurrent else None
         output_lock=threading.Lock()
         slots=threading.BoundedSemaphore(64)
+        def encoded(response):return (json.dumps(response,ensure_ascii=False,allow_nan=False)+'\n').encode('utf-8')
         def respond(raw):
+            rid=None
             try:
-                if len(raw)>1024*1024:
-                    response=dict(id=None,ok=False,error=dict(code='request_too_large',message='요청이 너무 큽니다.'))
-                else:
-                    try:response=center.request(json.loads(raw))
-                    except ValueError:response=dict(id=None,ok=False,error=dict(code='invalid_json',message='JSON 요청을 해석하지 못했습니다.'))
-                with output_lock:print(json.dumps(response,ensure_ascii=False,allow_nan=False),flush=True)
+                try:
+                    if len(raw)>1024*1024:
+                        response=dict(id=None,ok=False,error=dict(code='request_too_large',message='요청이 너무 큽니다.'))
+                    else:
+                        try:request=json.loads(raw)
+                        except ValueError:response=dict(id=None,ok=False,error=dict(code='invalid_json',message='JSON 요청을 해석하지 못했습니다.'))
+                        else:
+                            rid=request.get('id') if isinstance(request,dict) else None
+                            response=center.request(request)
+                    # Encoded inside the try: json.dumps accepts a lone surrogate, UTF-8 does not.
+                    data=encoded(response)
+                except Exception:
+                    # Always answer with the id: an unanswered id stays pending in
+                    # the service. Exception text may carry paths or credentials.
+                    safe=rid if isinstance(rid,str) or type(rid) is int else None
+                    failed=dict(ok=False,error=dict(code='internal_error',message=INTERNAL_ERROR))
+                    try:data=encoded(dict(id=safe,**failed))
+                    except UnicodeEncodeError:data=encoded(dict(id=None,**failed))  # Rust never sends such an id.
+                with output_lock:sys.stdout.buffer.write(data);sys.stdout.buffer.flush()
             finally:
                 if concurrent:slots.release()
         for raw in sys.stdin:
@@ -649,6 +760,7 @@ def main():
             center.catalog_refresh.stop()
             center.source_catalog_refresh.stop()
             center.remote_catalog.stop()
+            center.ssh_inventory.stop_sweeper()
 
 
 if __name__=='__main__':

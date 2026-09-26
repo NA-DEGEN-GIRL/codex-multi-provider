@@ -3,6 +3,7 @@ from copy import deepcopy
 from contextlib import closing
 import hashlib
 import os
+import ntpath
 from pathlib import Path
 import sqlite3
 
@@ -21,6 +22,13 @@ def _confirmed_threads(signals):
 
 
 def workspace_path(value):
+    # Preserve WSL history paths without contacting an absent UNC provider.
+    if os.name == 'nt':
+        lexical = ntpath.normcase(ntpath.normpath(os.fspath(value)))
+        if lexical.startswith('\\\\?\\unc\\'):
+            lexical = '\\\\' + lexical[8:]
+        if lexical.startswith(('\\\\wsl.localhost\\', '\\\\wsl$\\')):
+            return lexical
     path = os.path.normcase(str(Path(value).resolve()))
     if path.startswith('\\\\?\\unc\\'):
         return '\\\\' + path[8:]

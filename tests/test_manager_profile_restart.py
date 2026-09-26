@@ -239,6 +239,20 @@ class RestartTests(unittest.TestCase):
         self.pending.pop()()
         self.assertEqual(recovered.status()[self.profile['id']]['phase'], 'complete')
 
+    def test_status_of_a_poll_snapshot_does_not_reread_the_store(self):
+        job = self.restarts.schedule(self.profile['id'])
+        self.pending.clear()
+        recovered = ProfileRestarts(self.store, self.instances, self.hooks, spawn=self.pending.append,
+                                    owner_alive=lambda job: False)
+        snapshot = self.store.read()
+        with patch.object(self.store, 'read', side_effect=AssertionError('store re-read')):
+            jobs = recovered.status(state=snapshot)
+        # The dead-owner view is applied to the caller's snapshot, never saved.
+        self.assertIs(jobs, snapshot['profile_restarts'])
+        self.assertEqual(jobs[self.profile['id']]['phase'], 'attention')
+        self.assertEqual(self.store.read()['profile_restarts'][self.profile['id']]['phase'], job['phase'])
+        self.assertEqual(recovered.status(state={}), {})
+
     def test_another_live_backend_cannot_replace_or_release_the_worker(self):
         job = self.restarts.schedule(self.profile['id'])
         second = ProfileRestarts(self.store, self.instances, self.hooks, spawn=self.pending.append,

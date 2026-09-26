@@ -58,6 +58,19 @@ _hash_lock = threading.Lock()
 _HASH_MIN_AGE_NS = 1_000_000_000
 _FILETIME_UNIX_EPOCH_100NS = 116_444_736_000_000_000
 
+if os.name == 'nt':
+    import msvcrt
+    from ctypes import wintypes
+
+    class _BasicInfo(ctypes.Structure):
+        _fields_ = [(name, ctypes.c_longlong) for name in
+                    ('created', 'accessed', 'written', 'changed')] + [('attributes', wintypes.DWORD)]
+
+    # Built once: a per-call class and prototype cost more than the query itself.
+    _query_basic_info = ctypes.WinDLL('kernel32', use_last_error=True).GetFileInformationByHandleEx
+    _query_basic_info.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+    _query_basic_info.restype = wintypes.BOOL
+
 
 def _content_stamp(stream):
     info = os.fstat(stream.fileno())
@@ -65,16 +78,8 @@ def _content_stamp(stream):
     if os.name == 'nt':
         # Python's Windows ctime is creation time, not last metadata/content
         # change. NTFS ChangeTime also detects writes with a restored mtime.
-        import msvcrt
-        from ctypes import wintypes
-        class BasicInfo(ctypes.Structure):
-            _fields_ = [(name, ctypes.c_longlong) for name in
-                        ('created', 'accessed', 'written', 'changed')] + [('attributes', wintypes.DWORD)]
-        query = ctypes.WinDLL('kernel32', use_last_error=True).GetFileInformationByHandleEx
-        query.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
-        query.restype = wintypes.BOOL
-        basic = BasicInfo()
-        if not query(msvcrt.get_osfhandle(stream.fileno()), 0, ctypes.byref(basic), ctypes.sizeof(basic)):
+        basic = _BasicInfo()
+        if not _query_basic_info(msvcrt.get_osfhandle(stream.fileno()), 0, ctypes.byref(basic), ctypes.sizeof(basic)):
             return None  # An unavailable change stamp must never permit reuse.
         changed = basic.changed
     return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, changed
@@ -111,15 +116,18 @@ def _cache_eligible(stamp, *, now_ns=None):
     return changed <= now - _HASH_MIN_AGE_NS
 
 
-def _hash(path):
+def _hash(path, cache=None, limit=64):
+    # Callers that scan large trees pass their own cache, so a scan never
+    # evicts the desktop and login-runtime digests kept in the shared one.
+    cache = _hashes if cache is None else cache
     with path.open('rb') as stream:
         before = _content_stamp(stream)
         key = str(path.absolute()), before
         eligible = _cache_eligible(before)
         with _hash_lock:
-            cached = _hashes.get(key) if eligible else None
+            cached = cache.get(key) if eligible else None
             if cached is not None:
-                _hashes.move_to_end(key)
+                cache.move_to_end(key)
                 return cached
         digest = hashlib.file_digest(stream, 'sha256').hexdigest()
         after = _content_stamp(stream)
@@ -127,9 +135,9 @@ def _hash(path):
             raise OSError('Desktop program changed while checking its content.')
         if _cache_eligible(after):
             with _hash_lock:
-                _hashes[key] = digest
-                while len(_hashes) > 64:
-                    _hashes.popitem(last=False)
+                cache[key] = digest
+                while len(cache) > limit:
+                    cache.popitem(last=False)
         return digest
 
 

@@ -148,7 +148,7 @@ class LaunchDrainTests(unittest.TestCase):
 
     def test_stop_during_reopen_preparation_prevents_native_launch(self):
         self.instances._show = Instances._show.__get__(self.instances)
-        self.instances.store.profile.return_value = dict(id='fixture', ui_home='unused')
+        self.instances.store.profile.return_value = dict(id='fixture', ui_home='unused', home=str(self.instances.root))
         self.instances.observe = Mock(return_value=dict(status='running', executable_path='unused'))
         environment = dict(fixture='temporary')
         def prepare_environment(_):

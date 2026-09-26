@@ -88,6 +88,8 @@ def ensure_binding(arguments, manifest, path, *, remote=None):
                 current['bindings'] = [b for b in current.get('bindings', []) if b.get('alias') != alias] + [binding]
                 if 'pending_policy_hosts' in current:
                     current['pending_policy_hosts'] = [a for a in current['pending_policy_hosts'] if a != alias]
+                if 'deferred_policy_hosts' in current:
+                    current['deferred_policy_hosts'] = [a for a in current['deferred_policy_hosts'] if a != alias]
                 atomic_json(expected, current)
             finally:
                 _unlock_file(write_lock)

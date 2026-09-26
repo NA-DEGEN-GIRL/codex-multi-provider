@@ -100,6 +100,13 @@ class NativeLoginTests(unittest.TestCase):
         self.assertEqual(saved['desired_runtime_channel'],'managed')
         self.assertNotIn('post_login_runtime_channel',saved)
 
+    def test_verification_reuses_the_service_package_lookup(self):
+        self.prepare();self.auth()
+        with patch('desktop_launch.cached_app',return_value={'Version':'fixture'}) as lookup,patch('desktop_launch.find_app',side_effect=AssertionError('uncached package lookup')),patch('manager_core.login_probe.verification_runtime',return_value=self.root/'fixture.exe') as runtime,patch('manager_core.login_probe.verify',return_value={'quota_read':True}):
+            self.assertEqual(self.login.verify(self.p['id'])['state'],'signed_in')
+        lookup.assert_called_once_with()
+        self.assertEqual(runtime.call_args.args[1],{'Version':'fixture'})
+
     def test_first_verified_login_prepares_shared_runtime_for_next_open_without_restarting(self):
         self.prepare();self.auth()
         auth=Path(self.p['home'])/'auth.json';before=auth.read_bytes()

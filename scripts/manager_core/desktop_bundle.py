@@ -27,6 +27,17 @@ _NOTIFICATION_CLICK = b'l.on(`click`,()=>{let t=n({notificationId:e.id,actionId:
 _NOTIFICATION_REPLACEMENT = _NOTIFICATION_CLICK + b'globalThis.__codexManagerNotificationClick?.(e,t);'
 _NOTIFICATION_SHOW = b'this.emitCompletedThreadsChanged(),l.show()}stageNotificationSoundIfNeeded()'
 _NOTIFICATION_SHOW_REPLACEMENT = b'this.emitCompletedThreadsChanged(),(globalThis.__codexManagerNotificationShow?globalThis.__codexManagerNotificationShow(e,t,()=>l.show()):l.show())}stageNotificationSoundIfNeeded()'
+# 26.917 names the toast d (l is now the sound setting). Its Windows toast is
+# silent and f plays the bundled sound beside it, after the optional sound
+# staging and still-current/destroyed guard. An accepted workspace toast brings
+# its own Windows sound, as 26.915's native toast did, so the hook replaces f's
+# whole presentation; a declined one runs f's native body unchanged.
+_NOTIFICATION_PRESENT = (b'd.show(),this.options.platform!==`darwin`&&l!==`none`&&'
+    b'this.playBundledNotificationSound(l===`classic`?`classic`:`default`)')
+_NOTIFICATION_STAGED_SHOW = (b'this.emitCompletedThreadsChanged();let f=()=>{' + _NOTIFICATION_PRESENT +
+    b'},p=l==="default"||l===`classic`?this.stageNotificationSoundIfNeeded(l):void 0;p==null?f():p.then(()=>{'
+    b'if(this.notifications.get(e.id)?.notification===d){if(t.isDestroyed()){this.removeNotification(e.id);return}f()}})}'
+    b'playBundledNotificationSound(e){')
 _WINDOW_MESSAGE = b'sendMessageToWebContents(e,t,n){if(e.isDestroyed()'
 _WINDOW_MESSAGE_REPLACEMENT = b'sendMessageToWebContents(e,t,n){globalThis.__codexManagerNavigation?.register(this,e);if(e.isDestroyed()'
 _CONTEXT_MAIN = b'if(s.type===`remote-hosted-pip-active-thread-changed`){'
@@ -40,6 +51,15 @@ _CONTEXT_RENDERER_REPLACEMENT = (_CONTEXT_RENDERER + b'(0,t7.useEffect)(()=>{win
 _BROWSER_RUNTIME = b'rawValue:e.CODEX_CLI_PATH,resolveWindowsAppsPath:a}'
 _BROWSER_RUNTIME_REPLACEMENT = b'rawValue:e.CODEX_MANAGER_REAL_RUNTIME??e.CODEX_CLI_PATH,resolveWindowsAppsPath:a}'
 
+_NOTIFICATION_CLICK_VARIANTS = {_NOTIFICATION_CLICK: _NOTIFICATION_REPLACEMENT,
+    _NOTIFICATION_CLICK.replace(b'l.on', b'd.on'): _NOTIFICATION_REPLACEMENT.replace(b'l.on', b'd.on')}
+_NOTIFICATION_SHOW_VARIANTS = {_NOTIFICATION_SHOW: _NOTIFICATION_SHOW_REPLACEMENT,
+    _NOTIFICATION_STAGED_SHOW: _NOTIFICATION_STAGED_SHOW.replace(b'let f=()=>{' + _NOTIFICATION_PRESENT + b'}',
+        # The hook may decline after its pipe wait; re-check that this toast is
+        # still current, as 26.917's own staged path does, before falling back.
+        b'let f=()=>{let m=()=>{' + _NOTIFICATION_PRESENT + b'};globalThis.__codexManagerNotificationShow?'
+        b'globalThis.__codexManagerNotificationShow(e,t,()=>{if(this.notifications.get(e.id)?.notification===d){'
+        b'if(t.isDestroyed()){this.removeNotification(e.id);return}m()}}):m()}')}
 _PIPE_VARIANTS = {_ORIGINAL: _REPLACEMENT,
     _ORIGINAL.replace(b'return i.join', b'return s.join'): _REPLACEMENT.replace(b'return i.join', b'return s.join')}
 _RENDERER_VARIANTS = {_CONTEXT_RENDERER: _CONTEXT_RENDERER_REPLACEMENT,
@@ -103,7 +123,7 @@ def read_header(stream):
 
 def patch_archive(source, destination):
     """Patch exact native entry points and preserve unrelated archive assets."""
-    from .original_sync_bundle import patches_for, renderer_patches_for, renderer_plugin_patches
+    from .original_sync_bundle import patches_for, renderer_patches_for, renderer_plugin_patches, renderer_host_identity_patches
     with Path(source).open('rb') as src:
         header, base = read_header(src)
         entries = list(_entries(header))
@@ -125,10 +145,9 @@ def patch_archive(source, destination):
                 pipe_pattern = _matching_variant(data, _PIPE_VARIANTS)
                 if pipe_pattern:
                     matches.append((name, item, data, pipe_pattern))
-                if _NOTIFICATION_CLICK in data:
-                    if data.count(_NOTIFICATION_CLICK) != 1:
-                        raise ValueError('Ambiguous desktop notification implementation.')
-                    notifications.append((name, item, data))
+                click_pattern = _matching_variant(data, _NOTIFICATION_CLICK_VARIANTS)
+                if click_pattern:
+                    notifications.append((name, item, data, click_pattern))
                 context_pattern = _matching_variant(data, _CONTEXT_VARIANTS)
                 if context_pattern:
                     contexts.append((name, item, data, context_pattern))
@@ -146,7 +165,8 @@ def patch_archive(source, destination):
         name, target, data, pipe_pattern = matches[0]
         if len(notifications) != 1:
             raise ValueError('이 Codex 버전의 알림 클릭 연결 위치를 확인하지 못했습니다.')
-        if notifications[0][2].count(_NOTIFICATION_SHOW) != 1 or notifications[0][2].count(_WINDOW_MESSAGE) != 1:
+        show_pattern = _matching_variant(notifications[0][2], _NOTIFICATION_SHOW_VARIANTS)
+        if not show_pattern or notifications[0][2].count(_WINDOW_MESSAGE) != 1:
             raise ValueError('이 Codex 버전의 작업공간 알림·작업 이동 경로를 확인하지 못했습니다.')
         if len(contexts) != 1 or len(renderers) != 1:
             raise ValueError('이 Codex 버전의 선택한 작업 연결 위치를 확인하지 못했습니다.')
@@ -159,11 +179,11 @@ def patch_archive(source, destination):
         browser_name, browser_target, browser_data = browser_runtimes[0]
         browser_data = changed.get(browser_name, (None, browser_data))[1]
         changed[browser_name] = (browser_target, browser_data.replace(_BROWSER_RUNTIME, _BROWSER_RUNTIME_REPLACEMENT))
-        notification_name, notification_target, notification_data = notifications[0]
+        notification_name, notification_target, notification_data, click_pattern = notifications[0]
         notification_data = changed.get(notification_name, (None, notification_data))[1]
         changed[notification_name] = (notification_target, notification_adapter + b'\n' +
-            notification_data.replace(_NOTIFICATION_CLICK, _NOTIFICATION_REPLACEMENT)
-            .replace(_NOTIFICATION_SHOW, _NOTIFICATION_SHOW_REPLACEMENT).replace(_WINDOW_MESSAGE, _WINDOW_MESSAGE_REPLACEMENT))
+            notification_data.replace(click_pattern, _NOTIFICATION_CLICK_VARIANTS[click_pattern])
+            .replace(show_pattern, _NOTIFICATION_SHOW_VARIANTS[show_pattern]).replace(_WINDOW_MESSAGE, _WINDOW_MESSAGE_REPLACEMENT))
         context_adapter = Path(__file__).with_name('desktop_task_context.cjs').read_bytes()
         for context_name, context_target, context_data, context_pattern in contexts:
             context_data = changed.get(context_name, (None, context_data))[1]
@@ -172,6 +192,8 @@ def patch_archive(source, destination):
             renderer_data = changed.get(renderer_name, (None, renderer_data))[1]
             renderer_data = renderer_data.replace(renderer_pattern, _RENDERER_VARIANTS[renderer_pattern])
             for before, after in renderer_plugin_patches(renderer_data).items():
+                renderer_data = renderer_data.replace(before, after)
+            for before, after in renderer_host_identity_patches(renderer_data).items():
                 renderer_data = renderer_data.replace(before, after)
             changed[renderer_name] = (renderer_target, renderer_data)
         if len(sync_modules) != 1:

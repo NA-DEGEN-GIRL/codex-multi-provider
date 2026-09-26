@@ -19,8 +19,19 @@ from ws_client import WebSocketPipe
 UNAVAILABLE_OBSERVATIONS = (
     'remote_idle_binding_missing',
     'remote_idle_status_unavailable',
+    'remote_idle_diagnostics_unavailable',
     'remote_listener_unavailable',
 )
+
+# Explicit shared-mode graceful drain. These codes must also be listed in the
+# manager's ALLOWED_REMOTE_CODES, otherwise the in-memory bootstrap collapses
+# them into remote_maintenance_unverified:
+#   remote_drain_unsupported   - unknown binary or SIGHUP would terminate it
+#   remote_drain_identity_changed - never signals a different process
+#   remote_drain_unverified    - exit without an instance-lock release
+#   remote_drain_unaudited     - binary digest outside the audited allowlist
+DRAIN_ERROR_CODES = ('remote_drain_unsupported', 'remote_drain_identity_changed',
+                     'remote_drain_unverified', 'remote_drain_unaudited')
 
 
 @contextmanager
@@ -156,6 +167,12 @@ def inspect(profile, revision, *, discover_active=False):
             if diagnostics.get('process', {}).get('id') != process['pid']:
                 raise RuntimeError('Runtime diagnostics identity changed.')
             gauges = {item['name']: item['value'] for item in diagnostics.get('gauges', [])}
+            # Shared-record workers do not enable the exclusive managed-source
+            # counters. Missing evidence is unsupported, not an active request
+            # that another poll can drain. In particular an empty loaded list
+            # must not turn this into an endless "busy" result.
+            if 'app.managed.requests.pending_completion' not in gauges:
+                raise native.RemoteMaintenanceError('remote_idle_diagnostics_unavailable')
             # codex-diagnostics registers gauges on first increment. The current
             # request gauge must exist; unused process/login/setup gauges may
             # be absent. This is advisory; managedShutdown rechecks real state.
@@ -234,6 +251,27 @@ def dispatch(payload):
         if result['exited'] is not True or result['idle'] is not True:
             raise RuntimeError('Remote shutdown remains unverified.')
         return result
+    if operation == 'drain':
+        # Shared-catalog listeners cannot answer managedIdleStatus or
+        # managedShutdown. This explicit request is the weaker, named
+        # alternative: one exact-pidfd SIGHUP, pending request persisted
+        # before the signal, active turns preserved until exit, and success
+        # only from process exit plus instance-lock release. It never reports
+        # idle and it never escalates a repeated call into a forced signal.
+        observed = payload.get('expected_process')
+        if not isinstance(observed, dict) or observed.get('revision') != revision:
+            raise ValueError('Drain requires an observed process.')
+        # Only audited artifacts drain. The manager may supply the digest from
+        # its own verified manifest; the helper still requires allowlist membership.
+        trusted = payload.get('expected_runtime_sha256')
+        if trusted is not None and (not isinstance(trusted, str)
+                                    or not re.fullmatch(r'[0-9a-f]{64}', trusted)):
+            raise ValueError('Drain requires an audited runtime digest.')
+        bundle = payload.get('expected_runtime_bundle')
+        if bundle is not None and Path(native._descriptor(profile, revision)['runtime']).name != bundle:
+            raise native.RemoteDrainError('remote_drain_unaudited')
+        return native.drain(profile, revision, expected_process=observed,
+                            wait_seconds=payload.get('wait_seconds'), trusted_sha256=trusted)
     if operation == 'start':
         native.start(profile, revision)
         try:
@@ -244,7 +282,7 @@ def dispatch(payload):
             # revision identity instead. This is what lets an unchanged
             # connection reuse the listener it already has; it never reports
             # idle, and a restart that needs an exit proof still fails closed.
-            if error.code != 'remote_idle_status_unavailable':
+            if error.code not in ('remote_idle_status_unavailable', 'remote_idle_diagnostics_unavailable'):
                 raise
             observed = _read_only_identity(profile, revision)
             if observed is None:

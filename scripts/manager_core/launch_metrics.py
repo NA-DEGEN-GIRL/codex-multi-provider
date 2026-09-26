@@ -14,17 +14,25 @@ class LaunchMetrics:
 
     @contextmanager
     def phase(self, profile_id, name):
-        started, success = time.perf_counter(), False
+        started, error = time.perf_counter(), None
         try:
             yield
-            success = True
+        except BaseException as failure:
+            # The exception class only: its message can carry paths or text.
+            error = type(failure).__name__
+            raise
         finally:
-            self.record(profile_id, name, started, success)
+            self.record(profile_id, name, started, error is None, error=error)
 
-    def record(self, profile_id, name, started, success=True):
+    def record(self, profile_id, name, started, success=True, *, error=None, released_by=None):
         event = dict(at=datetime.now(timezone.utc).isoformat(), profile_id=profile_id,
                      phase=name, elapsed_ms=round((time.perf_counter()-started)*1000, 2),
                      success=success)
+        if error:
+            event['error'] = error
+        if released_by:
+            # A fixed code from profile_warmup (warmup_gate), never free text.
+            event['released_by'] = released_by
         try:
             with self._lock:
                 self.path.parent.mkdir(parents=True, exist_ok=True)

@@ -14,8 +14,8 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
-from manager_core.ssh_shim import (ADAPTER_VERSION, MarkerGate, ShimError, decode_native, main,
-                                   native_bodies, native_command, parse_invocation,
+from manager_core.ssh_shim import (ADAPTER_VERSION, MarkerGate, ShimError, decode_native, local_forward,
+                                   main, native_bodies, native_command, parse_invocation,
                                    prepare_environment, quote_always, route_arguments,
                                    validate_binding)
 from manager_core.updates import UpdateError
@@ -24,6 +24,7 @@ from manager_core.updates import UpdateError
 PROFILE = '00000000-0000-4000-9000-000000000007'
 OTHER = '00000000-0000-4000-9000-000000000008'
 FIXTURE = json.loads((Path(__file__).parent / 'fixtures/native_ssh_26_903_9818.json').read_text())
+NATIVE_917 = json.loads((Path(__file__).parent / 'fixtures/native_ssh_26_917_9434.json').read_text(encoding='utf-8-sig'))
 OPERATIONS = {
     'codex_path_probe': 'native-probe', 'codex_version_probe': 'native-version',
     'app_server_bootstrap': 'native-start', 'remote_codex_kill': 'native-stop',
@@ -79,7 +80,7 @@ class NativeFixtureTests(unittest.TestCase):
             self.assertNotIn('a'*64,execute.call_args.args[1][-1])
 
     def test_updated_installed_app_routes_exact_captured_start_and_proxy(self):
-        for version in ('26_908_4834', '26_911_7940'):
+        for version in ('26_908_4834', '26_911_7940', '26_917_9434'):
             fixture=json.loads((Path(__file__).parent/f'fixtures/native_ssh_{version}.json').read_text(encoding='utf-8-sig'))
             for name,command in fixture['commands'].items():
                 rewritten,event=route_arguments(['-T','remote-dev',command],manifest())
@@ -152,6 +153,71 @@ class NativeFixtureTests(unittest.TestCase):
         routed, event = route_arguments(['remote-dev', native_command('uname -s', bytes(8))], manifest())
         self.assertEqual(event['operation'], 'native-platform')
         self.assertTrue(unwrap(routed[-1]).endswith('exec /bin/uname -s'))
+
+    def test_26_917_start_routes_exactly_like_the_previous_start(self):
+        # 26.917 groups the detached launch and closes its stdin. The body is
+        # replaced whole, so the routed command must equal the 26.911 route.
+        previous = json.loads((Path(__file__).parent / 'fixtures/native_ssh_26_911_7940.json').read_text(encoding='utf-8-sig'))
+        self.assertEqual(previous['marker'], NATIVE_917['marker'])
+        self.assertEqual(previous['commands']['proxy'], NATIVE_917['commands']['proxy'])
+        self.assertNotEqual(previous['commands']['start'], NATIVE_917['commands']['start'])
+        unverified = {**manifest(), 'native_compatible': False, 'native_command_validation': 1}
+        for data in (manifest(), unverified):
+            with self.subTest(native_compatible=data.get('native_compatible')):
+                routed, event = route_arguments(['-T', 'remote-dev', NATIVE_917['commands']['start']], data)
+                self.assertEqual((routed, event), route_arguments(['-T', 'remote-dev', previous['commands']['start']], data))
+                self.assertEqual(event['operation'], 'native-start')
+                self.assertEqual(shlex.split(routed[-1])[2], shlex.split(NATIVE_917['commands']['start'])[2])
+                self.assertTrue(unwrap(routed[-1]).endswith('a' * 64 + ' native-start'))
+                self.assertNotIn('nohup', routed[-1])
+
+    def test_26_917_installer_and_near_miss_starts_stay_blocked(self):
+        body = unwrap(NATIVE_917['commands']['start']).split('; export PATH; ', 1)[1]
+        self.assertTrue(body.endswith(') && { SSH_AUTH_SOCK="${CODEX_HOME:-$HOME/.codex}/app-server-control/forwarded-ssh-agent.sock"'
+                                      ' nohup codex -c features.code_mode_host=true app-server --listen unix:// </dev/null'
+                                      ' >"${CODEX_HOME:-$HOME/.codex}/app-server-control/app-server.log" 2>&1 & }'))
+        installer = NATIVE_917['rejected']['install']
+        self.assertIn('https://chatgpt.com/codex/install.sh', installer)
+        # Each edit must change the body; an unchanged body would be accepted and fail below.
+        changed = [body.replace(' 2>&1 & }', ' 2>&1 & echo changed; }'),
+                   body.replace('{ SSH_AUTH_SOCK', '{ echo changed; SSH_AUTH_SOCK'),
+                   body.replace(' </dev/null', ''),
+                   body.replace('--listen unix://', '--listen ws://0.0.0.0:4222'),
+                   body.replace('--listen unix://', "--listen 'unix:///tmp/other.sock'"),
+                   body + '; echo changed', body + ' && echo changed',
+                   body.replace(') && { ', ') && ').replace(' & }', ' &'),
+                   body.replace(' & }', ' ; }')]
+        unverified = {**manifest(), 'native_compatible': False, 'native_command_validation': 1}
+        for command in [installer] + [native_command(item, bytes(8)) for item in changed]:
+            for data in (manifest(), unverified):
+                with self.subTest(tail=command[-60:], native_compatible=data.get('native_compatible')):
+                    with self.assertRaises(ShimError) as raised:
+                        route_arguments(['-T', 'remote-dev', command], data)
+                    self.assertEqual(raised.exception.code, 'native_command_changed')
+
+    def test_main_spawns_openssh_for_26_917_start_on_unverified_desktop(self):
+        # Before the variant, every fresh 26.917 connection exited 125 here.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / PROFILE).mkdir()
+            real = root / 'ssh.exe'
+            real.touch()
+            data = {**manifest(), 'native_compatible': False, 'native_command_validation': 1,
+                    'real_ssh': str(real), 'original_path': 'original-path', 'generation': OTHER,
+                    'inventory_root': str(root)}
+            path = root / PROFILE / 'ssh-bindings.json'
+            path.write_text(json.dumps(data), encoding='utf-8')
+            args = ['-T', 'remote-dev', NATIVE_917['commands']['start']]
+            with patch.dict(os.environ, {'CODEX_MANAGER_SSH_BINDINGS': str(path)}), \
+                    patch('manager_core.ssh_connection_wait.wait_for_settings'), \
+                    patch('manager_core.ssh_inventory.SshInventory.execution', return_value=nullcontext()), \
+                    patch('manager_core.ssh_shim.subprocess.Popen') as spawn:
+                spawn.return_value.wait.return_value = 0
+                self.assertEqual(main(['--', *args]), 0)
+            self.assertEqual(spawn.call_args.args[0], [str(real), *route_arguments(args, data)[0]])
+            audit = [json.loads(line) for line in path.with_name('ssh-routing.jsonl').read_text().splitlines()]
+            self.assertEqual([entry['operation'] for entry in audit], ['native-start'] * 2)
+            self.assertEqual(audit[-1]['exit_code'], 0)
 
 
 class ArgumentTests(unittest.TestCase):
@@ -481,6 +547,105 @@ class ShimStartFailureTests(unittest.TestCase):
         self.assertEqual(blocked[0]['code'],'shim_start_failed')
         self.assertEqual(blocked[0]['stage'],'enroll_ssh')
         self.assertEqual(blocked[0].get('error_type'),'RuntimeError')
+
+
+# The exact argv the desktop Browser sends for http://127.0.0.1:3412 on an SSH host.
+FORWARD_OPTIONS = ['-o', 'ExitOnForwardFailure=yes', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
+                   '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=4']
+FORWARD = ['remote-dev', '-N', '-L', '51234:127.0.0.1:3412', *FORWARD_OPTIONS]
+CANCEL = ['remote-dev', '-O', 'cancel', '-L', '51234:127.0.0.1:3412']
+
+
+def forward_manifest(compatible):
+    data = {**manifest(), 'native_command_validation': 1, 'auto_prepare_aliases': ['remote-dev', 'saved-only']}
+    if compatible is not None:
+        data['native_compatible'] = compatible
+    return data
+
+
+class BrowserForwardTests(unittest.TestCase):
+    def test_desktop_browser_forward_and_cancel_route_unchanged_in_every_mode(self):
+        cases = [(FORWARD, 'local-forward', 'remote-dev'), (CANCEL, 'local-forward-cancel', 'remote-dev'),
+                 (['-i', 'C:/Users/me/.ssh/id key', '-p', '2222', *FORWARD], 'local-forward', 'remote-dev'),
+                 (['-p', '2222', *CANCEL], 'local-forward-cancel', 'remote-dev'),
+                 (['-i', 'id_ed25519', *FORWARD], 'local-forward', 'remote-dev'),
+                 (['saved-only', *FORWARD[1:]], 'local-forward', 'saved-only')]
+        for compatible in (False, True, None):
+            for args, operation, alias in cases:
+                with self.subTest(compatible=compatible, args=args):
+                    self.assertEqual(route_arguments(args, forward_manifest(compatible)),
+                                     (args, {'operation': operation, 'alias': alias}))
+
+    def test_near_miss_forwards_keep_the_fail_closed_rules(self):
+        spec = '51234:127.0.0.1:3412'
+        cases = [FORWARD + ['echo hi'], ['remote-dev', '-N', '-L', '51234:10.0.0.5:3412', *FORWARD_OPTIONS],
+                 ['remote-dev', '-N', '-L', '51234:localhost:3412', *FORWARD_OPTIONS],
+                 ['remote-dev', '-N', '-L', '0.0.0.0:' + spec, *FORWARD_OPTIONS],
+                 ['remote-dev', '-N', '-L', '99999:127.0.0.1:3412', *FORWARD_OPTIONS],
+                 ['remote-dev', '-N', '-L', '0:127.0.0.1:3412', *FORWARD_OPTIONS],
+                 ['remote-dev', '-N', '-L', '51234:127.0.0.1:03412', *FORWARD_OPTIONS],
+                 ['remote-dev', '-N', '-L', spec, *FORWARD_OPTIONS[:-2]],
+                 ['remote-dev', '-N', '-L', spec, *FORWARD_OPTIONS, '-o', 'ProxyCommand=calc'],
+                 ['remote-dev', '-N', '-L', spec, *FORWARD_OPTIONS[:-1], 'RemoteCommand=x'],
+                 ['remote-dev', '-N', '-L', spec, *FORWARD_OPTIONS[2:], *FORWARD_OPTIONS[:2]],
+                 ['remote-dev', '-N', '-R', spec, *FORWARD_OPTIONS], ['remote-dev', '-N', '-D', '51234', *FORWARD_OPTIONS],
+                 ['remote-dev', '-f', '-N', '-L', spec, *FORWARD_OPTIONS], ['remote-dev', '-N', '-L', spec],
+                 ['other-host', *FORWARD[1:]], ['-o', 'ProxyCommand=calc', *FORWARD], ['-J', 'jump', *FORWARD],
+                 ['-v', *FORWARD], ['-p', 'x22', *FORWARD], ['-i', 'id', '-i', 'id2', *FORWARD], ['--', *FORWARD],
+                 ['remote-dev', '-O', 'exit', '-L', spec], ['remote-dev', '-O', 'forward', '-L', spec],
+                 ['remote-dev', '-O', 'cancel', '-R', spec], CANCEL + ['-v'], ['remote-dev', '-O', 'cancel', '-L', '1:10.0.0.5:2'],
+                 ['remote-dev'], ['remote-dev', 'echo unsafe']]
+        for args in cases:
+            with self.subTest(args=args):
+                self.assertIsNone(local_forward(args, forward_manifest(False)))
+                with self.assertRaises(ShimError):
+                    route_arguments(args, forward_manifest(False))
+                # Verified desktops keep ordinary OpenSSH as enrolled passthrough.
+                self.assertEqual(route_arguments(args, forward_manifest(True))[1], {'operation': 'passthrough'})
+        # A native management command is never read as a forward.
+        command = native_command(native_bodies()['native-proxy'], bytes(8))
+        self.assertEqual(route_arguments(['remote-dev', command], forward_manifest(False))[1]['operation'], 'native-proxy')
+
+    def test_main_runs_browser_forward_without_settings_wait_or_enrollment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / PROFILE).mkdir()
+            real = root / 'ssh.exe'
+            real.touch()
+            data = {**forward_manifest(False), 'real_ssh': str(real), 'original_path': 'original-path',
+                    'generation': OTHER, 'inventory_root': str(root / 'no-state')}
+            path = root / PROFILE / 'ssh-bindings.json'
+            path.write_text(json.dumps(data), encoding='utf-8')
+            environment = {'CODEX_MANAGER_SSH_BINDINGS': str(path), 'CODEX_MANAGER_PROFILE_ID': PROFILE,
+                           'CODEX_MANAGER_AUTH_SOURCE': 'fixture-source'}
+            for args in (FORWARD, CANCEL):
+                with self.subTest(args=args), patch.dict(os.environ, environment), \
+                        patch('manager_core.ssh_connection_wait.wait_for_settings',
+                              side_effect=AssertionError('forward waited for SSH settings')), \
+                        patch('manager_core.ssh_inventory.SshInventory',
+                              side_effect=AssertionError('forward enrolled in SSH inventory')), \
+                        patch('manager_core.ssh_shim.subprocess.Popen') as spawn:
+                    spawn.return_value.wait.return_value = 0
+                    self.assertEqual(main(['--', *args]), 0)
+                    self.assertEqual(spawn.call_args.args[0], [str(real), *args])
+                    spawned = spawn.call_args.kwargs['env']
+                    self.assertFalse([key for key in spawned if key.upper().startswith('CODEX_MANAGER_')])
+                    self.assertEqual(spawned['PATH'], 'original-path')
+            text = path.with_name('ssh-routing.jsonl').read_text(encoding='utf-8')
+            audit = [json.loads(line) for line in text.splitlines()]
+            self.assertEqual([(entry['operation'], entry['alias']) for entry in audit],
+                             [('local-forward', 'remote-dev')] * 2 + [('local-forward-cancel', 'remote-dev')] * 2)
+            self.assertEqual([entry.get('exit_code') for entry in audit], [None, 0, None, 0])
+            self.assertTrue(all(set(entry) <= {'operation', 'alias', 'at', 'proxy_pid', 'exit_code'} for entry in audit))
+            for private in ('51234', '3412', '127.0.0.1'):
+                self.assertNotIn(private, text)
+            # Any other shape still waits for settings and fails closed without spawning.
+            with patch.dict(os.environ, environment), \
+                    patch('manager_core.ssh_connection_wait.wait_for_settings') as wait, \
+                    patch('manager_core.ssh_shim.subprocess.Popen') as spawn, patch('sys.stderr'):
+                self.assertEqual(main(['--', *FORWARD, 'echo hi']), 125)
+            wait.assert_called_once()
+            spawn.assert_not_called()
 
 
 if __name__ == '__main__':

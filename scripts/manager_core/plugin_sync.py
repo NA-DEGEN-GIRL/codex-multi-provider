@@ -33,7 +33,7 @@ import time
 import tomllib
 from uuid import uuid4
 
-from .common import _atomic_write, toml_value
+from .common import _atomic_write, config_lock, toml_value
 from .store import atomic_json
 from .updates import UpdateError, _lock_file, _unlock_file
 
@@ -633,13 +633,14 @@ class PluginSync:
                 entries[plugin_id] = None
         config = _home_config(home)
         root = self.shared_root if any(value is not None for value in entries.values()) else None
-        text = _read(config)
-        updated = edit_config(text, marketplace_root=root, plugin_states=entries)
-        if updated != text:
-            if _read(config) != text:
-                raise ValueError('Shared plugin config changed during preparation; retrying later.')
-            _atomic_write(config, updated)
-            changes += 1
+        with config_lock(home):
+            text = _read(config)
+            updated = edit_config(text, marketplace_root=root, plugin_states=entries)
+            if updated != text:
+                if _read(config) != text:
+                    raise ValueError('Shared plugin config changed during preparation; retrying later.')
+                _atomic_write(config, updated)
+                changes += 1
         return changes
 
     def reconcile(self, force=False):

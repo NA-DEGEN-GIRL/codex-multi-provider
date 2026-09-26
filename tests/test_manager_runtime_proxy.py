@@ -127,6 +127,27 @@ raise SystemExit(proxy(Path(sys.executable),[sys.argv[2]],Path(sys.argv[3]),sys.
         self.assertEqual(environment['CODEX_MANAGER_SHARED_CATALOG'], 'shared-catalog')
         self.assertEqual(environment['CODEX_EXTERNAL_PROVIDER_KEY'], 'runtime-needs-this')
 
+    def test_runtime_temp_replaces_every_inherited_temp_spelling(self):
+        with tempfile.TemporaryDirectory() as directory:
+            temp = os.path.join(directory, 'codex-manager', 'profile')
+            environment = runtime_environment({'TEMP': 'C:/big', 'Tmp': 'C:/big', 'CODEX_MANAGER_REAL_RUNTIME': 'real',
+                                               'CODEX_MANAGER_RUNTIME_TEMP': temp})
+            self.assertTrue(os.path.isdir(temp))
+            self.assertEqual({name: value for name, value in environment.items() if name.upper() in ('TEMP', 'TMP')},
+                             {'TEMP': temp, 'TMP': temp})
+            self.assertNotIn('CODEX_MANAGER_RUNTIME_TEMP', environment)
+
+    def test_runtime_keeps_inherited_temp_without_a_usable_profile_temp(self):
+        with tempfile.TemporaryDirectory() as directory:
+            blocker = os.path.join(directory, 'file')
+            Path(blocker).write_text('x')
+            for value in (None, os.path.join(blocker, 'temp')):
+                with self.subTest(value=value):
+                    source = {'TEMP': 'C:/big', 'CODEX_MANAGER_REAL_RUNTIME': 'real'}
+                    if value:
+                        source['CODEX_MANAGER_RUNTIME_TEMP'] = value
+                    self.assertEqual(runtime_environment(source)['TEMP'], 'C:/big')
+
     def test_frame_limit_checked_during_read(self):
         with self.assertRaises(ValueError):
             list(read_frames(io.BytesIO(b'x' * 100_000), limit=1024))

@@ -20,6 +20,7 @@ import time
 import tomllib
 import uuid
 from . import model_settings
+from .common import _replace, config_lock
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit, unquote
 from urllib.request import Request, build_opener, HTTPRedirectHandler
@@ -132,7 +133,7 @@ def _atomic_bytes(path: Path, value: bytes):
             output.write(value)
             output.flush()
             os.fsync(output.fileno())
-        os.replace(temporary, path)
+        _replace(temporary, path)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
@@ -738,22 +739,30 @@ class ProviderRegistry:
             raise ProviderError('Profile path must be the manager-owned profiles/<UUID>/codex directory.')
         _uuid(home.parent.name, 'Profile ID')
         config = home / 'config.toml'
-        existing = config.read_text(encoding='utf-8-sig') if config.is_file() else ''
-        result = self.render_for_host(home, enabled, model_ids, existing, primary_model_id=primary_model_id,
-                                      primary_settings=primary_settings, selection_mode=selection_mode)
-        for relative in result['files']:
-            path = (home / relative).resolve()
-            if not path.is_relative_to(home):
-                raise ProviderError('A generated profile path points outside its managed home.')
-        # Write immutable role/catalog revisions first; config is the final commit.
-        for relative, content in result['files'].items():
-            path = home / relative
-            if path.exists() and path.read_text(encoding='utf-8-sig') == content:
-                continue
-            _atomic_bytes(path, content.encode('utf-8'))
-        _retire_unselected_roles(home, result['files'])
-        metadata = {key: value for key, value in result.items() if key != 'files'}
-        _atomic_bytes(home / 'manager-provider-binding.json', _json(metadata).encode('utf-8'))
+        # The skill/plugin passes of other profiles' launches rewrite this
+        # config too; config_lock keeps their edit from landing in between.
+        with config_lock(home):
+            existing = config.read_text(encoding='utf-8-sig') if config.is_file() else ''
+            result = self.render_for_host(home, enabled, model_ids, existing, primary_model_id=primary_model_id,
+                                          primary_settings=primary_settings, selection_mode=selection_mode)
+            for relative in result['files']:
+                path = (home / relative).resolve()
+                if not path.is_relative_to(home):
+                    raise ProviderError('A generated profile path points outside its managed home.')
+            # Write immutable role/catalog revisions first; config is the final commit.
+            for relative, content in result['files'].items():
+                path = home / relative
+                current = path.read_text(encoding='utf-8-sig') if path.exists() else None
+                if current == content:
+                    continue
+                if relative == 'config.toml' and (current or '') != existing:
+                    # Another process wrote it after it was read; never drop that edit.
+                    raise ProviderError('Profile settings changed while they were prepared and were not '
+                                        'overwritten; open the profile again.')
+                _atomic_bytes(path, content.encode('utf-8'))
+            _retire_unselected_roles(home, result['files'])
+            metadata = {key: value for key, value in result.items() if key != 'files'}
+            _atomic_bytes(home / 'manager-provider-binding.json', _json(metadata).encode('utf-8'))
         return {**metadata, 'files': list(result['files'])}
 
     def verify(self, model_id):

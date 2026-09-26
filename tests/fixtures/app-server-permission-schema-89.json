@@ -1,0 +1,45 @@
+{
+  "note": "Sanitized excerpt of the deployed app-server JSON schema for revision 89. Only the permission-relevant properties are kept.",
+  "ThreadResumeParams": {
+    "properties": {
+      "threadId": {"type": "string"},
+      "cwd": {"type": ["string", "null"]},
+      "model": {"type": ["string", "null"]},
+      "modelProvider": {"type": ["string", "null"]},
+      "serviceTier": {"type": ["string", "null"]},
+      "personality": {"type": ["string", "null"]},
+      "config": {"type": ["object", "null"]},
+      "sandbox": {"enum": ["read-only", "workspace-write", "danger-full-access"]},
+      "approvalPolicy": {"enum": ["untrusted", "on-failure", "on-request", "never"]},
+      "approvalsReviewer": {"enum": ["user", "auto_review"]}
+    }
+  },
+  "ThreadSettings": {
+    "properties": {
+      "cwd": {"type": "string"},
+      "approvalPolicy": {"enum": ["untrusted", "on-failure", "on-request", "never"]},
+      "approvalsReviewer": {"enum": ["user", "auto_review"]},
+      "sandboxPolicy": {"type": "object"},
+      "activePermissionProfile": {"type": ["object", "null"]},
+      "model": {"type": "string"},
+      "modelProvider": {"type": "string"},
+      "effort": {"type": ["string", "null"]}
+    }
+  },
+  "ConfigRequirements": {
+    "properties": {
+      "allowedPermissionProfiles": {
+        "type": ["object", "null"],
+        "additionalProperties": {"type": "boolean"}
+      },
+      "allowedSandboxModes": {
+        "type": ["array", "null"],
+        "items": {"enum": ["read-only", "workspace-write", "danger-full-access"]}
+      },
+      "allowedApprovalPolicies": {
+        "type": ["array", "null"],
+        "items": {"enum": ["untrusted", "on-failure", "on-request", "never"]}
+      }
+    }
+  }
+}

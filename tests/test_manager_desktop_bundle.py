@@ -1,7 +1,9 @@
 import hashlib
 import json
 from pathlib import Path
+import shutil
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -37,6 +39,21 @@ def archive(path, source=None, notification=None):
     payload = struct.pack('<I', len(header)) + header + b'\0' * (-len(header) % 4)
     path.write_bytes(struct.pack('<III', 4, len(payload) + 4, len(payload)) + payload + b''.join(data for _, data in chunks))
     return body
+
+
+def entry(path, name):
+    with Path(path).open('rb') as stream:
+        header, base = bundle.read_header(stream)
+        item = dict(bundle._entries(header))[name]
+        stream.seek(base + int(item['offset']))
+        return stream.read(item['size'])
+
+
+# 26.917 renamed the toast l -> d (l became the sound setting) and moved show()
+# into a closure that also plays the bundled sound after optional staging.
+CLICK_917 = bundle._NOTIFICATION_CLICK.replace(b'l.on', b'd.on')
+NOTICES = {'26.915': bundle._NOTIFICATION_CLICK + b'originalCallback();})' + bundle._NOTIFICATION_SHOW + bundle._WINDOW_MESSAGE,
+           '26.917': CLICK_917 + b'originalCallback();})' + bundle._NOTIFICATION_STAGED_SHOW + b'}' + bundle._WINDOW_MESSAGE}
 
 
 class DesktopBundleTests(unittest.TestCase):
@@ -104,6 +121,132 @@ class DesktopBundleTests(unittest.TestCase):
         archive(self.path, notification=b'changed notification callback')
         with self.assertRaises(ValueError): bundle.patch_archive(self.path, self.root / 'patched.asar')
         self.assertFalse((self.root / 'patched.asar').exists())
+
+    def test_each_verified_notification_shape_gets_both_hooks_once(self):
+        for version, notice in NOTICES.items():
+            with self.subTest(version):
+                archive(self.path, notification=notice)
+                target = self.root / (version + '.asar')
+                bundle.patch_archive(self.path, target)
+                content = entry(target, '.vite/build/notifications.js')
+                for variants in (bundle._NOTIFICATION_CLICK_VARIANTS, bundle._NOTIFICATION_SHOW_VARIANTS):
+                    (before,) = [key for key in variants if key in notice]
+                    self.assertEqual(content.count(variants[before]), 1)
+                    for other in variants:
+                        if other != before: self.assertNotIn(variants[other], content)
+                self.assertEqual(content.count(b'globalThis.__codexManagerNotificationClick?.(e,t);'), 1)
+                self.assertEqual(content.count(b'globalThis.__codexManagerNotificationShow(e,t,'), 1)
+                self.assertIn(b'originalCallback();', content)
+
+    def test_notification_shapes_fail_closed_before_publication(self):
+        for variants in (bundle._NOTIFICATION_CLICK_VARIANTS, bundle._NOTIFICATION_SHOW_VARIANTS):
+            keys = list(variants)
+            self.assertEqual(bundle._matching_variant(keys[1], variants), keys[1])
+            with self.assertRaises(ValueError): bundle._matching_variant(b';'.join(keys), variants)
+            with self.assertRaises(ValueError): bundle._matching_variant(keys[1] * 2, variants)
+        show, tail = bundle._NOTIFICATION_STAGED_SHOW, b'originalCallback();})'
+        cases = {
+            'show missing': CLICK_917 + tail + bundle._WINDOW_MESSAGE,
+            'both show shapes': CLICK_917 + tail + show + bundle._NOTIFICATION_SHOW + bundle._WINDOW_MESSAGE,
+            'repeated show': CLICK_917 + tail + show + show + bundle._WINDOW_MESSAGE,
+            'both click shapes': CLICK_917 + bundle._NOTIFICATION_CLICK + tail + show + bundle._WINDOW_MESSAGE,
+            'repeated click': CLICK_917 + CLICK_917 + tail + show + bundle._WINDOW_MESSAGE,
+            'changed destroyed guard': CLICK_917 + tail + show.replace(b'if(t.isDestroyed()){this.removeNotification(e.id);return}', b'') + bundle._WINDOW_MESSAGE,
+            'changed sound choice': CLICK_917 + tail + show.replace(b'l!==`none`&&', b'') + bundle._WINDOW_MESSAGE,
+            'window message missing': CLICK_917 + tail + show,
+        }
+        for label, notice in cases.items():
+            with self.subTest(label):
+                archive(self.path, notification=notice)
+                with self.assertRaises(ValueError): bundle.patch_archive(self.path, self.root / 'patched.asar')
+                self.assertFalse((self.root / 'patched.asar').exists())
+
+    @unittest.skipUnless(shutil.which('node'), 'Node.js required for notification behavior')
+    def test_accepted_workspace_toast_replaces_whole_native_presentation_once(self):
+        # present(e=notice, t=webContents, toast, sound) holds each version's exact native tail.
+        shapes = {'26.915': (b'present(e,t,l){', bundle._NOTIFICATION_SHOW, b'{}'),
+                  '26.917': (b'present(e,t,d,l){this.notifications.set(e.id,{notification:d});', bundle._NOTIFICATION_STAGED_SHOW,
+                             b"log.push('sound:'+e)}")}
+        sources = {version: {'native': (head + key + tail).decode(),
+                             'patched': (head + bundle._NOTIFICATION_SHOW_VARIANTS[key] + tail).decode()}
+                   for version, (head, key, tail) in shapes.items()}
+        scenarios = {'26.915': [{'platform': 'win32'}],
+                     '26.917': [{'platform': 'win32', 'sound': 'default'}, {'platform': 'win32', 'sound': 'classic'},
+                                {'platform': 'win32', 'sound': 'none'}, {'platform': 'win32', 'sound': {'fileName': 'custom.aiff'}},
+                                {'platform': 'darwin', 'sound': 'default', 'staged': True},
+                                {'platform': 'darwin', 'sound': 'default', 'staged': True, 'after': 'replace'},
+                                {'platform': 'darwin', 'sound': 'classic', 'staged': True, 'after': 'destroy'}]}
+        program = r'''
+const sources = SOURCES, scenarios = SCENARIOS, results = {};
+(async () => {
+  for (const [version, shape] of Object.entries(sources)) for (const [index, scenario] of scenarios[version].entries())
+    for (const mode of ['native', 'patched', 'accept', 'decline']) {
+      const log = [], calls = [];
+      const Manager = new Function('log', 'return class{constructor(o){this.options={platform:o.platform};' +
+        'this.staged=o.staged?Promise.resolve():void 0;this.notifications=new Map}' +
+        "emitCompletedThreadsChanged(){log.push('emit')}stageNotificationSoundIfNeeded(l){log.push('stage:'+l);return this.staged}" +
+        "removeNotification(id){log.push('remove:'+id)}" + shape[mode === 'native' ? 'native' : 'patched'] + '}')(log);
+      const e = {id: 'n1'}, t = {isDestroyed: () => scenario.after === 'destroy'}, toast = {show: () => log.push('show')};
+      if (mode === 'accept' || mode === 'decline') globalThis.__codexManagerNotificationShow = async (notice, contents, fallback) => {
+        calls.push(notice === e && contents === t); if (mode === 'decline') fallback(); };
+      else delete globalThis.__codexManagerNotificationShow;
+      const manager = new Manager(scenario);
+      manager.present(e, t, toast, scenario.sound);
+      if (scenario.after === 'replace') manager.notifications.set('n1', {notification: {}});
+      await new Promise(resolve => setImmediate(resolve));
+      results[version + '/' + index + '/' + mode] = {log, calls};
+    }
+  console.log(JSON.stringify(results));
+})().catch(error => { console.error(error); process.exitCode = 1; });
+'''.replace('SOURCES', json.dumps(sources)).replace('SCENARIOS', json.dumps(scenarios))
+        result = subprocess.run(['node', '-e', program], capture_output=True, text=True, check=True)
+        results = json.loads(result.stdout)
+        expected_native = {'26.915/0': ['emit', 'show'],
+            '26.917/0': ['emit', 'stage:default', 'show', 'sound:default'], '26.917/1': ['emit', 'stage:classic', 'show', 'sound:classic'],
+            '26.917/2': ['emit', 'show'], '26.917/3': ['emit', 'show', 'sound:default'], '26.917/4': ['emit', 'stage:default', 'show'],
+            '26.917/5': ['emit', 'stage:default'], '26.917/6': ['emit', 'stage:classic', 'remove:n1']}
+        for case, native in expected_native.items():
+            with self.subTest(case):
+                self.assertEqual(results[case + '/native'], {'log': native, 'calls': []})
+                self.assertEqual(results[case + '/patched'], {'log': native, 'calls': []})
+                offered = [True] if 'show' in native else []
+                self.assertEqual(results[case + '/decline'], {'log': native, 'calls': offered})
+                self.assertEqual(results[case + '/accept'], {'calls': offered,
+                    'log': [step for step in native if step != 'show' and not step.startswith('sound:')]})
+
+    @unittest.skipUnless(shutil.which('node'), 'Node.js required for notification behavior')
+    def test_late_decline_never_shows_a_replaced_or_destroyed_26_917_toast(self):
+        # The hook answers after its pipe wait; by then the toast may be stale.
+        source = (b'present(e,t,d,l){this.notifications.set(e.id,{notification:d});'
+                  + bundle._NOTIFICATION_SHOW_VARIANTS[bundle._NOTIFICATION_STAGED_SHOW] + b"log.push('sound:'+e)}").decode()
+        program = r'''
+const results = {};
+(async () => {
+  for (const change of ['none', 'replace', 'destroy']) {
+    const log = [];
+    const Manager = new Function('log', 'return class{constructor(){this.options={platform:"win32"};this.notifications=new Map}' +
+      "emitCompletedThreadsChanged(){log.push('emit')}stageNotificationSoundIfNeeded(l){log.push('stage:'+l)}" +
+      "removeNotification(id){log.push('remove:'+id)}" + SOURCE + '}')(log);
+    let destroyed = false;
+    const e = {id: 'n1'}, t = {isDestroyed: () => destroyed}, manager = new Manager();
+    globalThis.__codexManagerNotificationShow = async (notice, contents, fallback) => {
+      await new Promise(resolve => setImmediate(resolve));
+      if (change === 'replace') manager.notifications.set('n1', {notification: {}});
+      if (change === 'destroy') destroyed = true;
+      fallback();
+    };
+    manager.present(e, t, {show: () => log.push('show')}, 'default');
+    await new Promise(resolve => setTimeout(resolve, 5));
+    results[change] = log;
+  }
+  console.log(JSON.stringify(results));
+})().catch(error => { console.error(error); process.exitCode = 1; });
+'''.replace('SOURCE', json.dumps(source))
+        result = subprocess.run(['node', '-e', program], capture_output=True, text=True, check=True)
+        self.assertEqual(json.loads(result.stdout), {
+            'none': ['emit', 'stage:default', 'show', 'sound:default'],
+            'replace': ['emit', 'stage:default'],
+            'destroy': ['emit', 'stage:default', 'remove:n1']})
 
     def test_unknown_browser_runtime_fails_before_publication(self):
         self.path.write_bytes(self.path.read_bytes().replace(bundle._BROWSER_RUNTIME, b'x' * len(bundle._BROWSER_RUNTIME)))

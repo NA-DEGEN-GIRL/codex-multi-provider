@@ -4,6 +4,8 @@ import hashlib
 from pathlib import Path
 
 # Native commands captured and exercised by tests/fixtures/native_ssh_*.json.
+# A fixture alone does not verify a source: 26.917 has one for its decoded
+# commands but still runs validate-each-native-command until it is listed here.
 VERIFIED_SOURCES = frozenset({
     'a509a763f6e70e5076c7907ef3871418b47dc6adcd6b47692ffac5c8e0e1c266',
     '471f06dfcda15de10196f701504244c6f412d7ed401c155efc56a427a89a3195',

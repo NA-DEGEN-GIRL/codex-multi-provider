@@ -62,6 +62,16 @@ class CurrentAccountTests(unittest.TestCase):
         self.assertEqual(self.store.profile(profile['id'])['login_state'], 'signed_in')
         self.assertEqual((self.source / 'auth.json').read_bytes(), before)
 
+    def test_server_check_reuses_the_service_package_lookup(self):
+        profile = current_account.register(self.store, '03', self.source)
+        with patch('desktop_launch.cached_app', return_value={'Version': 'fixture'}) as lookup, \
+             patch('desktop_launch.find_app', side_effect=AssertionError('uncached package lookup')), \
+             patch('manager_core.login_probe.verification_runtime', return_value='fixture') as runtime, \
+             patch('manager_core.login_probe.verify', return_value={'quota_read': True}):
+            current_account.status(self.store, profile['id'], verify_server=True, root=self.root)
+        lookup.assert_called_once_with()
+        self.assertEqual(runtime.call_args.args[1], {'Version': 'fixture'})
+
     def test_usage_refresh_includes_current_login_reference(self):
         from manager_core.native_login import NativeLogin
         profile = current_account.register(self.store, '03', self.source)

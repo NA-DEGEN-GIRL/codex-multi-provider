@@ -313,9 +313,18 @@ class LocalFirstRemoteTests(unittest.TestCase):
         generation = shown['profile']['generation']
         transaction = self.gate()['transaction_id']
         live = deepcopy(self.fleet.running)
-        records = json.loads(self.hooks._lease_path(transaction).read_text())['profiles'][0]['remotes']
         self.assertEqual(self.gate()['state'], 'held')
-        adopted = self.fleet.reuse_equivalent(self.store.profile(self.profile['id']), records)
+        # A journal that drifted from this generation's publication is refused
+        # before any write; the repair cohort is rebuilt from the manifest.
+        stale = [dict(record, binding=dict(record['binding'], revision='d' * 64))
+                 for record in json.loads(self.hooks._lease_path(transaction).read_text())
+                 ['profiles'][0]['remotes']]
+        profile = self.store.profile(self.profile['id'])
+        self.assertIsNone(self.fleet.reuse_equivalent(profile, stale))
+        published = json.loads(self.manifest.read_text())['bindings']
+        records = [dict(binding=dict(binding), alias=binding['alias'], state='unobserved')
+                   for binding in published]
+        adopted = self.fleet.reuse_equivalent(profile, records)
         self.assertEqual(adopted, {'fixture-a': '0' * 64, 'fixture-b': '0' * 64})
         def release(data):
             gate = data['ssh_maintenance'][self.profile['id']]

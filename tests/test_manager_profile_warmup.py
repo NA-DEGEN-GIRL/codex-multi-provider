@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
-from manager_core.profile_warmup import ProfileWarmup
+from manager_core.profile_warmup import ProfileWarmup, default_workers
 from manager_core.store import Store
 
 
@@ -96,8 +96,9 @@ class ProfileWarmupTests(unittest.TestCase):
             worker = threading.Thread(target=fn)
             workers.append(worker)
             worker.start()
-        warmup = ProfileWarmup(self.store, self, launch, spawn=spawn,
-                               health=lambda _: dict(blocks_launch=False))
+        with patch('manager_core.profile_warmup.default_workers', return_value=4):
+            warmup = ProfileWarmup(self.store, self, launch, spawn=spawn,
+                                   health=lambda _: dict(blocks_launch=False))
         try:
             warmup.start()
             for profile in self.profiles[:4]:
@@ -196,6 +197,15 @@ class ProfileWarmupTests(unittest.TestCase):
         result = self.run_worker()
         self.assertEqual(self.launched, [])
         self.assertEqual(result['counts']['cancelled'], 3)
+
+    def test_default_pool_scales_with_processors_within_bounds(self):
+        self.assertEqual([default_workers(n) for n in (1, 4, 6, 8, 12, 16, 64)], [2, 2, 4, 5, 8, 8, 8])
+        with patch('manager_core.profile_warmup.os.cpu_count', return_value=None), \
+             patch('manager_core.profile_warmup.os.process_cpu_count', return_value=None, create=True):
+            self.assertEqual(default_workers(), 2)
+        with patch('manager_core.profile_warmup.default_workers', return_value=6):
+            self.assertEqual(ProfileWarmup(self.store, self, self.launch).max_workers, 6)
+        self.assertEqual(ProfileWarmup(self.store, self, self.launch, max_workers=3).max_workers, 3)
 
     def test_selected_profile_gets_next_slot_without_second_worker(self):
         def launch(profile_id):

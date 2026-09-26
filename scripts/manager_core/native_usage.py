@@ -3,6 +3,11 @@ from datetime import datetime, timezone
 from copy import deepcopy
 import math
 
+# Background quota cadence (usage_refresh imports it). A value turns stale only
+# after a whole refresh cycle was missed, not while the next probe is due.
+REFRESH_INTERVAL = 300
+STALE_AFTER = 2 * REFRESH_INTERVAL
+
 
 def observed_timestamp(usage):
     try:
@@ -55,7 +60,7 @@ def presentation(usage, *, refreshing=False):
     result['refreshing'] = refreshing
     if not result.get('windows'):
         result['freshness'] = 'unknown'
-    elif age > 120:
+    elif age > STALE_AFTER:
         result['freshness'] = 'stale'
     return result
 

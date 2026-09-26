@@ -43,7 +43,8 @@ def probe(**overrides):
               "machine": "test-host", "cli": "/usr/local/bin/codex", "cli_version": "codex-cli 0.153.4",
               "stock_login": "true", "python": "/usr/bin/python3", "python_version": "Python 3.11.9", "host_identity": "f" * 64}
     values.update(overrides)
-    return "".join(f"CODEX_MANAGER_INSPECT_V1\t{k}\t{v}\n" for k, v in values.items()).encode()
+    # None omits a line, as the probe does for cli_version/stock_login without a CLI.
+    return "".join(f"CODEX_MANAGER_INSPECT_V1\t{k}\t{v}\n" for k, v in values.items() if v is not None).encode()
 
 
 def make_artifact(root, *, arch="x86_64", wrong_format=False):
@@ -102,7 +103,7 @@ class RemoteTests(unittest.TestCase):
             return callback(args, kwargs) if callback else subprocess.CompletedProcess(args, 0, probe(), b"")
         return RemoteManager(self.root, ssh_config=self.config, runner=runner, ssh_executable="ssh.exe", registry=Registry())
 
-    def prepared_settings_fixture(self):
+    def prepared_settings_fixture(self, inspection=None):
         artifact = make_artifact(self.root)
         helpers = self.root / 'scripts/remote_helpers'
         helpers.mkdir(parents=True)
@@ -111,7 +112,7 @@ class RemoteTests(unittest.TestCase):
         remote = self.root / 'simulated-settings-remote'
         def runner(args, options):
             if args[-1] == INSPECT_COMMAND:
-                return subprocess.CompletedProcess(args, 0, probe(), b'')
+                return subprocess.CompletedProcess(args, 0, inspection or probe(), b'')
             if args[-1].endswith('--preflight'):
                 result = INSTALL.preflight(json.loads(options['input']), remote)
             elif 'stdin' in options:
@@ -213,11 +214,29 @@ class RemoteTests(unittest.TestCase):
         self.assertEqual(result["status"], "connection_failed")
         self.assertNotIn("secret", json.dumps(result))
 
-    def test_os_or_missing_cli_cannot_prepare(self):
+    def test_unsupported_os_cannot_prepare(self):
         result = self.manager(lambda a, k: subprocess.CompletedProcess(a, 0, probe(os="MINGW64_NT", cli=""), b"")).prepare("production", PROFILE, self.root, [])
         self.assertFalse(result["prepared"])
         self.assertEqual(len(self.calls), 1)
         self.assertIn("platform_not_supported", result["blockers"])
+        self.assertIn("stock_cli_missing", result["blockers"])
+
+    def test_host_without_stock_cli_but_python311_still_prepares(self):
+        # Managed operation runs only runtime/codex; a missing stock CLI is recorded, not blocking.
+        observed = probe(cli="", cli_version=None, stock_login=None, python_version="Python 3.11.4")
+        _, _, binding, _, _ = self.prepared_settings_fixture(observed)
+        self.assertEqual(binding["status"], "prepared_not_connected")
+        self.assertEqual(binding["remote_python"], "/usr/bin/python3")
+        result = self.manager(lambda a, k: subprocess.CompletedProcess(a, 0, observed, b"")).inspect("staging")
+        self.assertTrue(result["preparation_supported"])
+        self.assertEqual((result["cli_path"], result["cli_version"], result["stock_cli_authenticated"]), ("", None, False))
+        self.assertIn("stock_cli_missing", result["blockers"])
+        self.assertIn("runtime_bundle", result)
+        # A host that also lacks Python 3.11 is still blocked.
+        old = probe(cli="", cli_version=None, stock_login=None, python_version="Python 3.10.12")
+        result = self.manager(lambda a, k: subprocess.CompletedProcess(a, 0, old, b"")).prepare("staging", PROFILE, self.root, [])
+        self.assertFalse(result["prepared"])
+        self.assertIn("python311_required", result["blockers"])
 
     def test_windows_executable_cannot_be_deployed_as_linux(self):
         make_artifact(self.root, wrong_format=True)

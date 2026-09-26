@@ -116,14 +116,18 @@ class LaunchConcurrencyTests(unittest.TestCase):
             with metrics.phase(self.profiles[0]['id'], 'fixture'):
                 raise RuntimeError('private diagnostic')
         event = json.loads(metrics.path.read_text())
-        self.assertEqual(set(event), {'at', 'profile_id', 'phase', 'elapsed_ms', 'success'})
+        # A failure names only the exception class, never its message.
+        self.assertEqual(set(event), {'at', 'profile_id', 'phase', 'elapsed_ms', 'success', 'error'})
         self.assertFalse(event['success'])
+        self.assertEqual(event['error'], 'RuntimeError')
         self.assertNotIn('private', metrics.path.read_text())
         metrics.path.write_text('x'*(2*1024*1024))
         with metrics.phase(self.profiles[0]['id'], 'fixture'):
             pass
         self.assertTrue(metrics.path.with_suffix('.jsonl.1').exists())
-        self.assertTrue(json.loads(metrics.path.read_text())['success'])
+        event = json.loads(metrics.path.read_text())
+        self.assertTrue(event['success'])
+        self.assertNotIn('error', event)
 
 
 if __name__ == '__main__':

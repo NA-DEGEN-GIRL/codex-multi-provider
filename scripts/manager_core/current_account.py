@@ -48,9 +48,9 @@ def status(store, profile_id, *, verify_server=False, root=None, timeout=25):
                   account_fingerprint=profile['account_fingerprint'], alias=profile['alias'],
                   message='원본 앱의 현재 로그인에 연결되어 있습니다. 원본 로그인 파일은 유지됩니다.')
     if verify_server:
-        from desktop_launch import find_app
+        from desktop_launch import cached_app
         from .login_probe import verify, verification_runtime
-        result.update(verify(root, verification_runtime(root, find_app()), tokens, timeout=timeout))
+        result.update(verify(root, verification_runtime(root, cached_app()), tokens, timeout=timeout))
         if account_fingerprint(read_existing_tokens(profile['source_home']).account_id) != profile['account_fingerprint']:
             raise RuntimeError('확인 중 원본 앱의 계정이 변경되었습니다.')
         result.update(state='signed_in', server_verified=True, message='현재 계정의 서버 인증과 사용량 조회를 확인했습니다.')

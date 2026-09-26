@@ -68,6 +68,8 @@ def launch(root, *, check=False, prepare_only=False):
     if prepare_only: return result
     if running:
         raise ValueError('본앱이 실행 중입니다. 진행 중인 작업이 끝난 뒤 본앱을 정상 종료하고 이 바로가기를 다시 실행하세요. 강제 종료하지 않습니다.')
+    from manager_core.browser_bundle import ensure as ensure_browser
+    result['browser_plugin'] = ensure_browser(original_home, executable)
     runtime = resolve(root)
     if not all(runtime.get('capabilities', {}).get(name) for name in
                ('shared_append_envelopes', 'shared_history_refresh')):

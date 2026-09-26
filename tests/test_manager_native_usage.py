@@ -1,7 +1,8 @@
 import sys,unittest
+from datetime import datetime,timedelta,timezone
 from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'scripts'))
-from manager_core.native_usage import newer, normalize
+from manager_core.native_usage import STALE_AFTER, newer, normalize, presentation
 
 
 class UsageTests(unittest.TestCase):
@@ -47,6 +48,15 @@ class UsageTests(unittest.TestCase):
         self.assertEqual(newer(older,latest),latest)
         self.assertEqual(newer(latest,older),latest)
         self.assertEqual(older['reset_credits'],{'available':2,'expires_at':9})
+
+    def test_usage_turns_stale_only_after_a_missed_refresh_cycle(self):
+        from manager_core.usage_refresh import UsageRefresh
+        self.assertEqual(STALE_AFTER,2*UsageRefresh.INTERVAL)
+        def shown(seconds):
+            observed=(datetime.now(timezone.utc)-timedelta(seconds=seconds)).isoformat()
+            return presentation({'windows':[{'remaining_percent':50}],'observed_at':observed,'freshness':'live'})
+        self.assertEqual(shown(UsageRefresh.INTERVAL+60)['freshness'],'live')  # next probe due, not missed
+        self.assertEqual(shown(STALE_AFTER+60)['freshness'],'stale')
 
     def test_newer_snapshot_keeps_credit_count_from_older_reply(self):
         older={'windows':[{'label':'주간','used_percent':50,'remaining_percent':50,'resets_at':1}],

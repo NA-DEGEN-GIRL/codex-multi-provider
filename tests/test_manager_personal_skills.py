@@ -90,6 +90,29 @@ class PersonalSkillsTests(unittest.TestCase):
         self.manager.reconcile()
         self.assert_enabled('old-skill', False)
 
+    def test_a_reconcile_pass_resolves_each_path_once(self):
+        from unittest.mock import patch
+        from manager_core import personal_skills
+        self.change(self.source, 'old-skill', False)
+        resolved, original = [], Path.resolve
+        def counting(path, *args, **kwargs):
+            resolved.append(str(path))
+            return original(path, *args, **kwargs)
+        with patch.object(Path, 'resolve', counting):
+            self.manager.reconcile(force=True)
+        keys = [path for path in resolved]
+        # sync_home's own junction checks may repeat; every _key() path is resolved once.
+        self.assertGreater(len(keys), 0)
+        with patch.object(Path, 'resolve', counting):
+            resolved.clear()
+            with personal_skills._resolved_once():
+                personal_skills._key(self.source / 'skills')
+                personal_skills._key(self.source / 'skills')
+            self.assertEqual(resolved, [str(self.source / 'skills')])
+            personal_skills._key(self.source / 'skills')  # outside a pass: never cached
+            self.assertEqual(len(resolved), 2)
+        self.assert_enabled('old-skill', False)
+
     def test_no_rewrite_on_idle_polls(self):
         self.manager.list()
         before = [(home / 'config.toml').stat().st_mtime_ns for home in self.homes]

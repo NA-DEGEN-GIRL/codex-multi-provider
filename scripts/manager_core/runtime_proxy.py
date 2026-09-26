@@ -20,6 +20,7 @@ try:
     from .app_transport import RuntimeObserver
     from .proxy_auth import AuthProxy
     from .native_account_guard import NativeAccountGuard
+    from .permission_selection import PermissionSelectionProxy
     from .runtime_admin import AdminError, AdminRpcBroker, AdminServer, MaintenanceBarrier
     from .notification_policy import NotificationPolicy
     from .pipe_writer import PipeWriter
@@ -31,6 +32,7 @@ except ImportError:
     from manager_core.app_transport import RuntimeObserver
     from manager_core.proxy_auth import AuthProxy
     from manager_core.native_account_guard import NativeAccountGuard
+    from manager_core.permission_selection import PermissionSelectionProxy
     from manager_core.runtime_admin import AdminError, AdminRpcBroker, AdminServer, MaintenanceBarrier
     from manager_core.notification_policy import NotificationPolicy
     from manager_core.pipe_writer import PipeWriter
@@ -60,9 +62,35 @@ def runtime_environment(source: dict) -> dict:
             env[name] = source[name]
     if source.get('CODEX_MANAGER_PROJECT_ALIASES'):
         env['CODEX_MANAGER_PROJECT_ALIASES'] = source['CODEX_MANAGER_PROJECT_ALIASES']
+    # The Windows sandbox grants its writable temp root (TEMP/TMP) on first
+    # setup, and Windows propagates that ACE to every file already below it.
+    # A small per-profile temp keeps that setup fast whatever the user's TEMP
+    # holds; without the directory the runtime keeps the inherited TEMP.
+    if temp := source.get('CODEX_MANAGER_RUNTIME_TEMP'):
+        try:
+            os.makedirs(temp, exist_ok=True)
+        except OSError:
+            temp = None
+        if temp:
+            for name in tuple(env):
+                if name.upper() in ('TEMP', 'TMP'):
+                    env.pop(name)
+            env['TEMP'] = env['TMP'] = temp
     env['CODEX_CLI_PATH'] = source['CODEX_MANAGER_REAL_RUNTIME']
     env.pop('ELECTRON_RUN_AS_NODE', None)
     return env
+
+
+def managed_client_message(message, external, permission=None):
+    """Apply the profile model binding, then the remembered permission choice.
+
+    The permission decoration only re-attaches a selection that this profile
+    observed before; a request that carries its own selection is untouched.
+    """
+    message = external.request(message)
+    if permission is not None:
+        message = permission.to_runtime(message)
+    return message
 
 
 def read_frames(stream, limit=MAX_FRAME_BYTES):
@@ -90,6 +118,8 @@ def proxy(runtime: Path, arguments: list[str], observer_path: Path, profile_id: 
     native_guard = NativeAccountGuard(source_environment)
     from manager_core.external_profile import ExternalProfile
     external = ExternalProfile(source_environment)
+    permission = (PermissionSelectionProxy(source_environment['CODEX_MANAGER_ROOT'], profile_id)
+                  if source_environment.get('CODEX_MANAGER_ROOT') else None)
     storage_args = (['-c', 'sqlite_home=' + json.dumps(source_environment['CODEX_RECORD_HOME'])]
                     if source_environment.get('CODEX_RECORD_HOME') else [])
     child = subprocess.Popen([str(runtime), *arguments, *storage_args],
@@ -111,6 +141,15 @@ def proxy(runtime: Path, arguments: list[str], observer_path: Path, profile_id: 
     protocol_lock = threading.RLock()
     runtime_output = PipeWriter(child.stdin, observer.gap)
     frontend_output = PipeWriter(sys.stdout.buffer, observer.gap)
+    from manager_core.windows_sandbox_setup import SandboxSetupRecovery
+
+    def emit_setup(message):
+        with protocol_lock:
+            observer.consume('server', message)
+            frontend_output.write(json.dumps(message, ensure_ascii=False).encode('utf-8') + b'\n')
+
+    sandbox_setup = (SandboxSetupRecovery(runtime, [*arguments, *storage_args],
+                     runtime_environment(source_environment), emit_setup) if os.name == 'nt' else None)
     admin_server = None
     admin_state = 'disabled'
     app_bridge_state = 'pending' if source_environment.get('CODEX_APP_TOOLS_PIPE_PATH') else 'not_provided'
@@ -126,7 +165,7 @@ def proxy(runtime: Path, arguments: list[str], observer_path: Path, profile_id: 
 
     def write_message(message, direction, before_write=None):
         if direction == 'client':
-            message = notifications.to_runtime(external.request(message))
+            message = notifications.to_runtime(managed_client_message(message, external, permission))
         body = json.dumps(message, separators=(',', ':'), ensure_ascii=False).encode('utf-8') + b'\n'
         runtime_output.write(body, before_write)
         observer.consume(direction, message)
@@ -262,6 +301,8 @@ def proxy(runtime: Path, arguments: list[str], observer_path: Path, profile_id: 
                     if direction == 'runtime':
                         if record_signals is not None:
                             record_signals.observe(message)
+                        if permission is not None:
+                            permission.from_runtime(message)
                         observer.consume('server', message)
                         if maintenance is not None:
                             maintenance.observe_runtime(message)
@@ -278,6 +319,8 @@ def proxy(runtime: Path, arguments: list[str], observer_path: Path, profile_id: 
                         continue
                     outcome = auth.process(direction, message)
                     for outgoing in outcome.runtime:
+                        if sandbox_setup is not None and sandbox_setup.request(outgoing):
+                            continue
                         edits = (record_edits.handle(outgoing) if record_edits.catalog
                                  and outgoing.get('method') == 'thread/name/set'
                                  and observer.initialized and account_ready() else None)
@@ -291,6 +334,8 @@ def proxy(runtime: Path, arguments: list[str], observer_path: Path, profile_id: 
                             continue
                         write_message(outgoing, 'client')
                     for outgoing in outcome.frontend:
+                        if sandbox_setup is not None and not sandbox_setup.response(outgoing):
+                            continue
                         if not notifications.to_frontend(outgoing):
                             continue
                         # Runtime messages have already been observed above. Proxy

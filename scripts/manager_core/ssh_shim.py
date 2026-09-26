@@ -91,23 +91,42 @@ def native_command(body: str, marker: bytes) -> str:
     return 'sh -c ' + quote_always(native_wrapper()) + ' sh ' + quote_always(payload)
 
 
+def _native_start_parts(cli: str) -> tuple[str, str]:
+    """The app-server bootstrap's setup and its detached launch command."""
+    setup = ('if [ "${CODEX_SSH_SKIP_APP_SERVER_BOOT:-}" = "true" ]; then exit 0; fi; '
+             '(umask 077; mkdir -p -- ' + CONTROL + ' && (pkill -9 -U "$(id -u)" -f '
+             + native_quote(cli + '.*[d]esktop-ssh-websocket-v0.sock') + ' || true) && '
+             + AGENT_FORWARD + ' && : >' + LOG + ') && ')
+    launch = ('SSH_AUTH_SOCK=' + AGENT_SOCKET + ' nohup ' + native_quote(cli)
+              + ' -c features.code_mode_host=true app-server --listen ' + native_quote('unix://'))
+    return setup, launch
+
+
 def native_bodies(cli: str = "codex") -> dict[str, str]:
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", cli):
         raise ValueError("Only a bare native CLI command is supported.")
     command = native_quote(cli)
+    setup, launch = _native_start_parts(cli)
     return {
         'native-probe': 'if command -v ' + command + ' >/dev/null 2>&1; then exit 0; fi; exit 86',
         'native-version': command + ' --version',
-        'native-start': ('if [ "${CODEX_SSH_SKIP_APP_SERVER_BOOT:-}" = "true" ]; then exit 0; fi; '
-                         '(umask 077; mkdir -p -- ' + CONTROL + ' && (pkill -9 -U "$(id -u)" -f '
-                         + native_quote(cli + '.*[d]esktop-ssh-websocket-v0.sock') + ' || true) && '
-                         + AGENT_FORWARD + ' && : >' + LOG + ') && SSH_AUTH_SOCK=' + AGENT_SOCKET
-                         + ' nohup ' + command + ' -c features.code_mode_host=true app-server --listen '
-                         + native_quote('unix://') + ' >' + LOG + ' 2>&1 &'),
+        'native-start': setup + launch + ' >' + LOG + ' 2>&1 &',
         'native-proxy': AGENT_FORWARD + ' && exec ' + command + ' app-server proxy',
         'native-stop': 'pkill -9 -U "$(id -u)" -f ' + native_quote(cli + '.* app-server.* --listen'),
         'native-platform': 'uname -s',
     }
+
+
+def native_body_variants(cli: str = "codex") -> dict[str, tuple[str, ...]]:
+    """Every exact body accepted per operation; native_bodies() holds the first.
+
+    26.917.9434 groups the detached launch and closes its stdin. The whole body
+    is replaced, so both spellings route to the same native-start operation.
+    """
+    variants = {operation: (body,) for operation, body in native_bodies(cli).items()}
+    setup, launch = _native_start_parts(cli)
+    variants['native-start'] += (setup + '{ ' + launch + ' </dev/null >' + LOG + ' 2>&1 & }',)
+    return variants
 
 
 @dataclass(frozen=True)
@@ -176,8 +195,8 @@ def decode_native(command: str, cli: str = 'codex') -> tuple[str, str, str]:
     if not remainder.startswith(PATH_PREFIX + '; '):
         raise ShimError('native_path_prefix_changed', 'The native SSH command prefix is not recognized.')
     body = remainder[len(PATH_PREFIX) + 2:]
-    for operation, expected in native_bodies(cli).items():
-        if body == expected:
+    for operation, expected in native_body_variants(cli).items():
+        if body in expected:
             return operation, prefix, tokens[2]
     raise ShimError('native_command_changed', 'This native SSH operation requires an updated management adapter.')
 
@@ -207,10 +226,53 @@ def validate_binding(binding: dict, profile_id: str) -> dict:
     return {'alias': alias, 'profile_id': profile_id, 'revision': revision, **paths}
 
 
+# The desktop Browser opens a remote localhost URL through its own OpenSSH
+# forward: terminal command + `-N -L <local>:127.0.0.1:<remote>` + these options,
+# and later `-O cancel -L <same>`. `-N` runs no remote command, so this exact
+# shape cannot carry a native management payload in any desktop version.
+FORWARD_SPEC = re.compile(r'([1-9][0-9]{0,4}):127\.0\.0\.1:([1-9][0-9]{0,4})')
+FORWARD_OPTIONS = tuple(value for option in ('ExitOnForwardFailure=yes', 'BatchMode=yes', 'ConnectTimeout=10',
+                                             'ServerAliveInterval=15', 'ServerAliveCountMax=4')
+                        for value in ('-o', option))
+
+
+def local_forward(arguments: list[str], manifest: dict) -> dict | None:
+    """Return the audit event for the exact desktop Browser forward, else None."""
+    invocation = parse_invocation(arguments)
+    if not invocation.understood or invocation.configuration_only or invocation.command_index is None:
+        return None
+    prefix, tail = arguments[:invocation.command_index - 1], arguments[invocation.command_index:]
+    # The stock terminal command for a host is [-i identity] [-p port] host.
+    if prefix[:1] == ['-i'] and len(prefix) >= 2:
+        prefix = prefix[2:]
+    if prefix and not (len(prefix) == 2 and prefix[0] == '-p' and re.fullmatch(r'[0-9]{1,5}', prefix[1])):
+        return None
+    alias = invocation.destination
+    bound = [item.get('alias') for item in manifest.get('bindings') or [] if isinstance(item, dict)]
+    saved = manifest.get('auto_prepare_aliases')
+    if not ALIAS.fullmatch(alias) or not (alias in bound or isinstance(saved, list) and alias in saved):
+        return None
+    if tail[:2] == ['-N', '-L'] and tuple(tail[3:]) == FORWARD_OPTIONS:
+        operation, spec = 'local-forward', tail[2]
+    elif tail[:3] == ['-O', 'cancel', '-L'] and len(tail) == 4:
+        operation, spec = 'local-forward-cancel', tail[3]
+    else:
+        return None
+    match = FORWARD_SPEC.fullmatch(spec)
+    if not match or any(int(port) > 65535 for port in match.groups()):
+        return None
+    # Ports and URLs stay out of the audit trail.
+    return {'operation': operation, 'alias': alias}
+
+
 def route_arguments(arguments: list[str], manifest: dict) -> tuple[list[str], dict]:
     invocation = parse_invocation(arguments)
     if invocation.configuration_only:
         return list(arguments), {'operation': 'passthrough'}
+    forward = local_forward(arguments, manifest)
+    if forward is not None:
+        # Unchanged argv for real OpenSSH, even while native commands are unverified.
+        return list(arguments), forward
     if manifest.get('native_compatible') is False:
         # A desktop update need not change SSH. For unknown app bundles accept
         # only a fully decoded native command; never fall through to passthrough.
@@ -705,7 +767,11 @@ def main(arguments: list[str] | None = None) -> int:
     stage = 'load_manifest'
     try:
         manifest, path = _load_manifest(os.environ)
-        if manifest.get('generation'):
+        # A Browser forward starts no remote work and must listen within the
+        # desktop's 5 s window, so it neither waits for SSH settings nor
+        # enrolls: an enrolled forward would hold off remote maintenance.
+        forward = local_forward(args, manifest) is not None
+        if manifest.get('generation') and not forward:
             from manager_core.ssh_connection_wait import wait_for_settings
             generation = manifest['generation']
             stage = 'wait_for_settings'
@@ -729,7 +795,7 @@ def main(arguments: list[str] | None = None) -> int:
             rewritten, event = route_arguments(args, manifest)
         _audit(path, event)
         admission = nullcontext()
-        if manifest.get('generation') and not parse_invocation(args).configuration_only:
+        if manifest.get('generation') and not forward and not parse_invocation(args).configuration_only:
             from manager_core.ssh_inventory import SshInventory
             admission = SshInventory(manifest['inventory_root']).execution(
                 manifest['profile_id'], manifest['generation'], event)

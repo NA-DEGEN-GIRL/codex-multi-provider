@@ -115,11 +115,14 @@ class AppCatalogCacheTests(unittest.TestCase):
     def test_showing_a_running_profile_does_not_touch_its_cache(self):
         from manager_core.instances import Instances
         instance = Instances.__new__(Instances)
-        instance.store = SimpleNamespace(profile=lambda _: dict(id='profile'))
-        instance.observe = lambda _: dict(status='running', window_handle=123)
-        with patch('manager_core.app_catalog_cache.prepare') as migration:
+        instance.store = SimpleNamespace(profile=lambda _: dict(id='profile', home=str(self.home)))
+        instance.observe = lambda _: dict(status='running', window_handle=123,
+                                          executable_path='test-desktop.exe')
+        with patch('manager_core.app_catalog_cache.prepare') as migration, \
+                patch('manager_core.browser_bundle.ensure') as browser:
             self.assertEqual(instance._show('profile', reopen_existing=False)['state'], 'existing')
             migration.assert_not_called()
+            browser.assert_called_once_with(str(self.home), 'test-desktop.exe')
 
     def remote_rows(self, host):
         return [row for row in self.rows('local_thread_catalog') if row[0] == host]

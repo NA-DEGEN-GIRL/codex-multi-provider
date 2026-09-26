@@ -1,4 +1,5 @@
 """Personal skill inventory and shared enablement. Never edits plugin/system skills."""
+from contextlib import contextmanager
 from copy import deepcopy
 import hashlib
 import json
@@ -9,7 +10,7 @@ import threading
 import tomllib
 from uuid import uuid4
 
-from .common import _atomic_write, toml_value
+from .common import _atomic_write, config_lock, toml_value
 from .store import atomic_json
 
 
@@ -17,8 +18,32 @@ def _read(path):
     return path.read_text(encoding='utf-8-sig') if path.exists() else ''
 
 
+_pass = threading.local()
+
+
 def _key(path):
-    return os.path.normcase(str(Path(path).resolve()))
+    # resolve() is a filesystem walk. One reconcile pass compares every rule
+    # with every skill in every profile while holding the state lock, so each
+    # distinct path is resolved once per pass; the next pass re-resolves links.
+    cache = getattr(_pass, 'keys', None)
+    if cache is None:
+        return os.path.normcase(str(Path(path).resolve()))
+    text = str(path)
+    if text not in cache:
+        cache[text] = os.path.normcase(str(Path(path).resolve()))
+    return cache[text]
+
+
+@contextmanager
+def _resolved_once():
+    if getattr(_pass, 'keys', None) is not None:
+        yield
+        return
+    _pass.keys = {}
+    try:
+        yield
+    finally:
+        _pass.keys = None
 
 
 def _roots(source):
@@ -124,24 +149,25 @@ def sync_home(home, source, rows=None):
     path = home / 'config.toml'
     if path.is_symlink() or (path.exists() and not path.resolve().is_relative_to(home.resolve())):
         raise ValueError('프로필 밖의 설정 파일은 수정하지 않습니다.')
-    original = _read(path)
-    rules = [r for r in _rules(original) if not any(_matches(r, row, home) for row in rows)]
-    for row in rows:
-        # Shared junctions canonicalize to the same file. Also cover a legacy
-        # profile-local copy without taking ownership of unrelated local skills.
-        paths = {str(Path(row['path']).resolve())}
-        local = home / 'skills' / row['directory'] / 'SKILL.md'
-        if local.is_file():
-            paths.add(str(local.resolve()))
-        rules.extend(dict(path=p, enabled=row['enabled']) for p in sorted(paths))
-    updated = replace_rules(original, rules)
-    if updated == original:
-        return False
-    home.mkdir(parents=True, exist_ok=True)
-    if _read(path) != original:
-        raise ValueError('설정이 동시에 변경되어 다음 확인 때 다시 적용합니다.')
-    _atomic_write(path, updated)
-    return True
+    with config_lock(home):
+        original = _read(path)
+        rules = [r for r in _rules(original) if not any(_matches(r, row, home) for row in rows)]
+        for row in rows:
+            # Shared junctions canonicalize to the same file. Also cover a legacy
+            # profile-local copy without taking ownership of unrelated local skills.
+            paths = {str(Path(row['path']).resolve())}
+            local = home / 'skills' / row['directory'] / 'SKILL.md'
+            if local.is_file():
+                paths.add(str(local.resolve()))
+            rules.extend(dict(path=p, enabled=row['enabled']) for p in sorted(paths))
+        updated = replace_rules(original, rules)
+        if updated == original:
+            return False
+        home.mkdir(parents=True, exist_ok=True)
+        if _read(path) != original:
+            raise ValueError('설정이 동시에 변경되어 다음 확인 때 다시 적용합니다.')
+        _atomic_write(path, updated)
+        return True
 
 
 class PersonalSkills:
@@ -198,7 +224,7 @@ class PersonalSkills:
             self.worker.join(timeout=3)
 
     def reconcile(self, force=False):
-        with self.lock, self.store.locked():
+        with self.lock, self.store.locked(), _resolved_once():
             homes = self._homes()
             paths = [self.registry, *_roots(self.source), *(h / 'config.toml' for _, h in homes)]
             stamp = tuple((str(p), p.stat().st_mtime_ns, p.stat().st_size) if p.exists() else (str(p), None) for p in paths)
@@ -268,7 +294,7 @@ class PersonalSkills:
     def set(self, skill_id, enabled):
         if type(enabled) is not bool:
             raise ValueError('스킬 사용 여부가 올바르지 않습니다.')
-        with self.lock, self.store.locked():
+        with self.lock, self.store.locked(), _resolved_once():
             self.reconcile(force=True)
             rows = inventory(self.source)
             row = next((r for r in rows if r['id'] == skill_id), None)
@@ -292,7 +318,7 @@ class PersonalSkills:
         return path
 
     def delete(self, skill_id):
-        with self.lock, self.store.locked():
+        with self.lock, self.store.locked(), _resolved_once():
             row = next((r for r in inventory(self.source) if r['id'] == skill_id), None)
             if row is None:
                 raise ValueError('삭제할 개인 스킬을 찾지 못했습니다.')
@@ -310,7 +336,7 @@ class PersonalSkills:
     def restore(self, deleted_id):
         if not isinstance(deleted_id, str) or not re.fullmatch('[a-f0-9]{32}', deleted_id):
             raise ValueError('복구 항목이 올바르지 않습니다.')
-        with self.lock, self.store.locked():
+        with self.lock, self.store.locked(), _resolved_once():
             entry = self.trash / deleted_id
             if not entry.resolve().is_relative_to(self.source.resolve()):
                 raise ValueError('복구 경로가 올바르지 않습니다.')

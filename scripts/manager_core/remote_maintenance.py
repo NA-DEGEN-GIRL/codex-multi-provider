@@ -7,18 +7,78 @@ import re
 import shlex
 
 from .ssh_shim import ShimError, validate_binding
-from .store import atomic_json, identifier
+from .store import atomic_json, identifier, now
 from .updates import UpdateError
 
 
 # Only these codes may cross the SSH boundary; the helper never returns raw text.
 ALLOWED_REMOTE_CODES = ('remote_configuration_changed', 'remote_runtime_exited', 'remote_start_timeout',
                         'remote_idle_binding_missing', 'remote_idle_status_unavailable',
+                        'remote_idle_diagnostics_unavailable',
                         'remote_listener_unavailable', 'remote_shutdown_unavailable',
-                        'remote_revision_conflict')
+                        'remote_revision_conflict', 'remote_drain_unsupported',
+                        'remote_drain_identity_changed', 'remote_drain_unverified', 'remote_drain_unaudited')
 # Typed answers that describe a live listener without claiming an idle proof.
 IDLE_OBSERVATIONS = ('remote_idle_binding_missing', 'remote_idle_status_unavailable',
+                     'remote_idle_diagnostics_unavailable',
                      'remote_listener_unavailable')
+# A deferred notice promises the old settings keep running until the new ones
+# are verified. Only a proven apply may retire it, and only these fields are
+# the notice itself.
+DEFERRED_NOTICE_FIELDS = ('settings_deferred', 'deferred_reason', 'deferred_policy_hosts', 'code', 'message')
+DEFERRED_APPLIED_MESSAGE = 'SSH 설정 적용이 확인되어 보류 안내를 정리했습니다.'
+
+
+def retire_deferred_settings_notice(store, profile_id, *, generation, revision, gate, job=None):
+    """Retire a same-generation deferred-settings notice after a proven apply.
+
+    The caller owns the apply proof: it may call this only after every host the
+    notice kept on the old settings was verified running the new ones, and it
+    must pass the exact ``gate``/``job`` snapshots it pinned before that proof
+    (``job`` is None only when the pinned state carried no notice at all). This
+    function owns the claim: inside one state transaction it re-compares both
+    snapshots, revalidates the generation and the desired revision, and then
+    retires only that deferred notice. A newer transaction, a newer job -- or
+    any notice appearing where the caller pinned absence -- a changed policy, a
+    partial cohort or a failed proof leaves every notice untouched and returns
+    False.
+
+    A gate this apply still holds proves the notice is older: a newer deferral
+    must rewrite the gate to its own transaction first, and a remote update
+    refuses a gate another transaction already holds. A released gate must be
+    the notice's own transaction, or the pairing is unverified and nothing is
+    cleared. A stop-only or drain-only lifecycle never reaches here: without a
+    verified new start there is no apply to prove.
+    """
+    def retire(data):
+        profile = store.profile(profile_id, data)
+        current = data.get('ssh_maintenance', {}).get(profile_id)
+        notice = data.get('profile_restarts', {}).get(profile_id)
+        if (profile.get('generation') != generation or profile.get('removed_at') or profile.get('view_only')
+                or profile['policy']['desired_revision'] != revision or current != gate
+                or notice != job):
+            return False
+        if (not isinstance(current, dict) or current.get('generation') != generation
+                or current.get('target_revision') != revision
+                or current.get('state') not in ('held', 'released')):
+            return False
+        deferred = current.get('state') == 'released' and current.get('settings_deferred') is True
+        record = (isinstance(notice, dict) and notice.get('phase') == 'attention'
+                  and notice.get('code') == 'ssh_settings_deferred' and notice.get('generation') == generation)
+        if record and current.get('state') != 'held' and notice.get('transaction_id') != current.get('transaction_id'):
+            return False
+        if not record and not deferred:
+            return False
+        if record:
+            notice.update(phase='complete', message=DEFERRED_APPLIED_MESSAGE, updated_at=now())
+            notice.pop('code', None)
+            notice.pop('connections_restored', None)
+        if deferred:
+            for field in DEFERRED_NOTICE_FIELDS:
+                current.pop(field, None)
+            current.update(state='released', updated_at=now())
+        return True
+    return store.mutate(retire)
 
 BOOTSTRAP = '''import json,sys,types
 try:
@@ -391,11 +451,16 @@ class RemoteMaintenance:
             if response.get('ok') is False:
                 code = response.get('code')
                 messages = {
+                    'remote_drain_unaudited': '검증 목록에 없는 원격 실행 버전이라 자동 종료하지 않았습니다. 해당 버전의 종료 방식 확인이 필요합니다.',
+                    'remote_drain_unsupported': '이 원격 버전의 작업 유지 종료 기능을 확인할 수 없어 종료하지 않았습니다.',
+                    'remote_drain_identity_changed': '종료 대상 원격 프로세스가 바뀌었습니다. 새 실행을 종료하지 않았습니다.',
+                    'remote_drain_unverified': '원격 종료 요청 결과를 확인해야 합니다. 강제 종료하지 않았습니다.',
                     'remote_configuration_changed': 'SSH 생성 설정 파일이 변경되어 시작하지 못했습니다. 프로필의 원격 설정 충돌을 확인하세요.',
                     'remote_runtime_exited': 'SSH 런타임이 준비되기 전에 종료되었습니다. 원격 프로필 실행 로그를 확인하세요.',
                     'remote_start_timeout': 'SSH 런타임이 제한 시간 안에 준비되지 않았습니다.',
                     'remote_idle_binding_missing': '기존 SSH 작업의 안전한 종료 여부를 확인할 수 없어 적용을 기다립니다.',
                     'remote_idle_status_unavailable': '공유 카탈로그 모드의 SSH 실행은 작업 상태 자동 확인을 제공하지 않습니다. 설정이 같은 연결은 그대로 유지하고, 변경된 설정은 적용을 보류합니다.',
+                    'remote_idle_diagnostics_unavailable': '기존 SSH 실행이 작업 상태 확인을 지원하지 않아 새 설정 적용을 보류합니다. 네트워크 연결 오류가 아닙니다.',
                     'remote_listener_unavailable': 'SSH 실행 프로세스는 남아 있지만 연결 소켓이 닫혔습니다. 종료 결과를 확인해야 합니다.',
                     'remote_shutdown_unavailable': '공유 카탈로그 모드의 SSH 실행은 관리 종료 증명을 지원하지 않아 종료 결과를 확인할 수 없습니다. 실행 중인 원격 작업은 그대로 유지합니다.',
                     'remote_revision_conflict': '다른 SSH 실행 버전이 아직 작업 중입니다. 그 작업이 끝난 뒤 다시 시도해 주세요.',
@@ -455,7 +520,12 @@ class RemoteMaintenance:
 
     def reconcile(self, entry):
         """Read evidence after a lost result; never replay a lifecycle mutation."""
-        if entry.get('state') == 'stop_requested':
+        if entry.get('state') == 'drain_requested':
+            # Read-only reconciliation of an explicit, possibly lost request.
+            proof = self.request(entry.get('active_binding', entry['binding']), 'inspect', observe_only=True)
+            if proof['exited'] and proof['idle']:
+                entry.update(state='closed', exit_proof=proof)
+        elif entry.get('state') == 'stop_requested':
             proof = self.request(entry.get('active_binding', entry['binding']), 'inspect')
             if proof['exited'] and proof['idle']:
                 entry.update(state='closed', exit_proof=proof)
@@ -567,7 +637,12 @@ class RemoteMaintenance:
             return
         path = self.store.directory / 'profiles' / identifier(profile['id']) / 'ssh-bindings.json'
         with self.store.locked():
-            current = self.store.profile(profile['id'], self.store.read())
+            data = self.store.read()
+            current = self.store.profile(profile['id'], data)
+            # Pin the exact gate and restart notice this publication may retire;
+            # any newer transaction or notice fails the comparison later.
+            gate = deepcopy(data.get('ssh_maintenance', {}).get(profile['id']))
+            notice = deepcopy(data.get('profile_restarts', {}).get(profile['id']))
             if current.get('generation') != profile.get('generation'):
                 raise UpdateError('remote_generation_changed', 'SSH 설정 반영 중 프로필 실행이 변경되었습니다.')
             if path.is_symlink() or path.resolve() != path or path.stat().st_size > 256000:
@@ -599,7 +674,22 @@ class RemoteMaintenance:
                     raise UpdateError('remote_binding_changed', 'SSH 연결 설정이 별도로 변경되어 덮어쓰지 않았습니다.')
                 applied.add(new['alias'])
             updated = {**manifest, 'bindings': bindings}
+            waiting = set(manifest.get('pending_policy_hosts') or [])
+            waiting.update(manifest.get('deferred_policy_hosts') or [])
             if 'pending_policy_hosts' in updated:
                 updated['pending_policy_hosts'] = [alias for alias in updated['pending_policy_hosts'] if alias not in applied]
+            if 'deferred_policy_hosts' in updated:
+                updated['deferred_policy_hosts'] = [alias for alias in updated['deferred_policy_hosts'] if alias not in applied]
             if updated != manifest:
                 atomic_json(path, updated)
+            # A publication retires the deferred notice only when the whole
+            # recorded cohort reached one verified start of exactly the desired
+            # revision and no waiting host is left. A stop-only, drain-only or
+            # partial lease publishes no such proof and keeps the notice.
+            revision = current['policy']['desired_revision']
+            if (waiting and waiting <= applied and len(started) == len(entries)
+                    and all(entry.get('target_policy_revision') == revision for entry in started)
+                    and not updated.get('pending_policy_hosts')
+                    and not updated.get('deferred_policy_hosts')):
+                retire_deferred_settings_notice(self.store, profile['id'], generation=current['generation'],
+                    revision=revision, gate=gate, job=notice)

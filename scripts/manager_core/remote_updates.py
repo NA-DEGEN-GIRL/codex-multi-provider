@@ -18,7 +18,7 @@ import threading
 import time
 from uuid import uuid4
 
-from .store import identifier, now
+from .store import Unchanged, identifier, now
 from .updates import UpdateError, _lock_file, _unlock_file
 
 
@@ -26,9 +26,12 @@ ACTIVE = frozenset({'queued', 'waiting', 'applying', 'recovering'})
 STOCK_ACTIVE = frozenset({'dispatching', 'pending', 'queued', 'starting', 'applying', 'running', 'unknown'})
 # A reservation is terminal once nothing may be dispatched for its transaction.
 FINISHED = frozenset({'complete', 'cancelled', 'superseded'})
-# Records in these states never crossed a stop/start request boundary.
+# Records in these states never crossed a stop/start/drain request boundary.
+# An explicit graceful drain is a dispatched lifecycle request, so
+# 'drain_requested' is deliberately not unmoved: only read-only observation may
+# hand a gate back, and a verified drain leaves its exit proof behind.
 UNMOVED = frozenset({'unobserved', 'observed', 'closed'})
-# Keys that only exist once a stop/start was requested, prepared, or resumed.
+# Keys that only exist once a stop, start, drain or resume was requested.
 UNTOUCHED = ('exit_proof', 'next_binding', 'started', 'reinspect')
 # Refusals that keep the SSH gate until the preserved evidence is reviewed.
 REVIEW = frozenset({'lifecycle_pending', 'journal_missing', 'journal_unverified',
@@ -136,8 +139,9 @@ class RemoteUpdates:
         # Internal generation/target pins never become UI claims of activity.
         return {key: deepcopy(item) for key, item in value.items() if not key.startswith('_')}
 
-    def status_all(self):
-        values = self.store.read().get('remote_updates', {}).values()
+    def status_all(self, state=None):
+        # state() passes the snapshot it already read for this poll.
+        values = (self.store.read() if state is None else state).get('remote_updates', {}).values()
         items = [{key: deepcopy(item) for key, item in value.items() if not key.startswith('_')}
                  for value in values]
         return dict(worker_active=any(v.get('checking') or (v.get('job') or {}).get('state') in ACTIVE
@@ -672,9 +676,14 @@ class RemoteUpdates:
                 return
             self.started = True
         # A process restart only resumes managed journals and read-only probes.
-        # It never resubmits the explicit stock update operation.
-        for value in self.store.read().get('remote_updates', {}).values():
-            self._save(value['profile_id'], value['alias'], checking=False)
+        # It never resubmits the explicit stock update operation. Clear stale
+        # checking claims in one write, and only when one is actually set.
+        def clear(data):
+            stale = [value for value in data.get('remote_updates', {}).values() if value.get('checking') is not False]
+            for value in stale:
+                value['checking'] = False
+            return len(stale) if stale else Unchanged(0)
+        self.store.mutate(clear)
         threading.Thread(target=self._loop, name='ssh-update-scheduler', daemon=True).start()
 
     def tick(self):

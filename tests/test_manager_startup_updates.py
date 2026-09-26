@@ -4,6 +4,7 @@ import json
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from uuid import uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
@@ -204,6 +205,20 @@ class StartupUpdateTests(unittest.TestCase):
         self.assertEqual(after['state'], 'complete')
         self.assertEqual(after['counts'], dict(current=3, pending=0, attention=0))
         self.assertEqual(len(self.scheduled), 2)
+
+    def test_state_poll_status_uses_its_snapshot_and_jobs_without_rereading(self):
+        first = self.run_startup()
+        job_id = first['profiles'][0]['job_id']
+        snapshot = self.store.read()
+        self.store.mutate(lambda d: self.store.profile(self.profile['id'], d).update(alias='renamed later'))
+        jobs = {self.profile['id']: dict(id=job_id, phase='complete', message='applied')}
+        self.jobs = {}  # restarts.status() must not be consulted when jobs are passed.
+        with patch.object(self.store, 'read', side_effect=AssertionError('store re-read')):
+            value = self.startup.status(state=snapshot, jobs=jobs)
+        self.assertEqual(value['profiles'][0]['alias'], 'selected')
+        self.assertEqual(value['profiles'][0]['state'], 'complete')
+        self.assertEqual(value['counts'], dict(current=1, pending=0, attention=0))
+        self.assertEqual(self.startup.status()['profiles'][0]['alias'], 'renamed later')
 
     def legacy(self, *profiles):
         candidates = []

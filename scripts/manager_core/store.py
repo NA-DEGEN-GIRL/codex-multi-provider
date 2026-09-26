@@ -31,12 +31,14 @@ def label(value):
 
 def atomic_json(path, data):
     path = Path(path)
+    # json.dumps uses the C encoder; streaming json.dump falls back to the
+    # pure-Python encoder and many small writes. The bytes are identical.
+    payload = (json.dumps(data, ensure_ascii=False, indent=2, allow_nan=False) + '\n').encode('utf-8')
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=path.name+'.', suffix='.tmp', dir=path.parent)
     try:
-        with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as stream:
-            json.dump(data, stream, ensure_ascii=False, indent=2, allow_nan=False)
-            stream.write('\n')
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())
         deadline = time.monotonic() + 1
@@ -54,6 +56,18 @@ def atomic_json(path, data):
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
+
+
+class Unchanged:
+    """Mutation result for an operation that deliberately changed nothing.
+
+    Store.mutate then keeps the file and its revision. The operation must not
+    have modified the document it was given.
+    """
+    __slots__ = ('value',)
+
+    def __init__(self, value=None):
+        self.value = value
 
 
 class Store:
@@ -127,6 +141,8 @@ class Store:
         with self.locked():
             data = self.read()
             result = operation(data)
+            if isinstance(result, Unchanged):
+                return deepcopy(result.value)
             data['revision'] += 1
             data['updated_at'] = now()
             atomic_json(self.path, data)
@@ -138,7 +154,8 @@ class Store:
             usage_account_id = identifier(usage_account_id)
         def add(data):
             if usage_account_id and any(p.get('usage_account_id') == usage_account_id for p in data['profiles']):
-                return next(p for p in data['profiles'] if p.get('usage_account_id') == usage_account_id)
+                # Periodic llm-usage sync re-adds every account; a known one is a no-op.
+                return Unchanged(next(p for p in data['profiles'] if p.get('usage_account_id') == usage_account_id))
             pid = str(uuid4())
             directory = self.directory / 'profiles' / pid
             profile = dict(id=pid, alias=alias, usage_account_id=usage_account_id,

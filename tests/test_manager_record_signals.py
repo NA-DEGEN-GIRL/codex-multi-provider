@@ -5,6 +5,7 @@ import sys
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 from uuid import uuid4
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'scripts'))
 from manager_core.record_signals import RecordSignals
@@ -87,6 +88,38 @@ class RecordSignalTests(unittest.TestCase):
             value=json.loads((Path(directory)/(profile+'.json')).read_text())
             self.assertEqual(len(value['changes']),256)
             self.assertEqual(value['changes'][-1],[thread,1600,'local','changed'])
+
+
+class RecordsPipeEnvironmentTests(unittest.TestCase):
+    def test_managed_profile_receives_only_a_validated_service_pipe_never_the_token(self):
+        from manager_core.instances import Instances
+        from manager_core.runtime_proxy import runtime_environment
+        from manager_core.store import Store
+        pipe = 'CodexControlCenter.service.' + '0123456789ABCDEF' * 2
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ('artifacts/runtime/codex.exe', 'artifacts/manager/Codex.ControlCenter.RuntimeProxy.exe'):
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
+                (root / name).touch()
+            store = Store(root)
+            profile = store.add_profile('01')
+            instances = Instances(root, store, None)
+            for value, expected in [(pipe, pipe), (pipe.lower(), None), (pipe + 'A', None),
+                                    ('..\CodexControlCenter.service.' + '0' * 32, None), ('', None), (None, None)]:
+                with self.subTest(value=value), patch.dict(os.environ, {'CODEX_MANAGER_BROKER_TOKEN': 'SECRET-TOKEN'}):
+                    os.environ.pop('CODEX_MANAGER_SERVICE_PIPE', None)
+                    if value is not None:
+                        os.environ['CODEX_MANAGER_SERVICE_PIPE'] = value
+                    env = instances.environment({**store.profile(profile['id']), 'generation': str(uuid4())})
+                    self.assertEqual(env.get('CODEX_MANAGER_RECORDS_PIPE'), expected)
+                    self.assertEqual(env['CODEX_MANAGER_PROFILE_ID'], profile['id'])
+                    self.assertEqual(Path(env['CODEX_MANAGER_RUNTIME_TEMP']),
+                                     Path(tempfile.gettempdir()) / 'codex-manager' / profile['id'])
+                    self.assertNotIn('SECRET-TOKEN', json.dumps(env))
+                    self.assertNotIn('CODEX_MANAGER_BROKER_TOKEN', env)
+                    self.assertNotIn('CODEX_MANAGER_SERVICE_PIPE', env)
+                    # The Codex runtime behind the proxy never sees it either.
+                    self.assertNotIn('CODEX_MANAGER_RECORDS_PIPE', runtime_environment({**env, 'CODEX_MANAGER_REAL_RUNTIME': 'codex.exe'}))
 
 
 if __name__=='__main__':unittest.main()

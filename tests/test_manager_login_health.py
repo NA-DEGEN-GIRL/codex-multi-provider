@@ -81,7 +81,7 @@ class LoginRecoveryTests(unittest.TestCase):
 
     def test_show_existing_window_does_not_revalidate_launch_credentials(self):
         self.auth(self.source, '03', expired=True)
-        with patch.object(self.instances, 'observe', return_value={'status':'running'}), \
+        with patch.object(self.instances, 'observe', return_value={'status':'running', 'executable_path':'unused'}), \
                 patch('manager_core.instances.subprocess.Popen') as spawn:
             result = self.instances.show(self.profile['id'], reopen_existing=False)
         self.assertEqual(result['state'], 'existing')

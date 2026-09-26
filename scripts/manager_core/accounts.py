@@ -5,6 +5,8 @@ from pathlib import Path
 import sys
 import threading
 
+from .store import Unchanged
+
 
 _REFRESH_BUDGET = 45.0
 _MIN_START_BUDGET = 35.0
@@ -116,6 +118,12 @@ class Accounts:
             manager_store.add_profile(account['alias'], account['id'], account['home'])
         by_id = {a['id']: a for a in accounts}
         def sync(data):
+            changed = False
+            def assign(profile, key, value):
+                nonlocal changed
+                if key not in profile or profile[key] != value:
+                    profile[key] = value
+                    changed = True
             for profile in data['profiles']:
                 # A legacy usage ID is an import reference, not proof that the
                 # account later logged into this Windows profile is the same
@@ -127,12 +135,14 @@ class Accounts:
                 if not uid:
                     continue
                 account = by_id.get(uid)
-                profile['account_missing'] = account is None
+                assign(profile, 'account_missing', account is None)
                 if account:
-                    profile['alias'] = account['alias']
+                    assign(profile, 'alias', account['alias'])
                     from .native_usage import newer
-                    profile['usage'] = newer(profile.get('usage'), account['usage'])
-            return dict(accounts=len(accounts), message='llm-usage의 계정 목록과 저장된 사용량을 확인했습니다.')
+                    assign(profile, 'usage', newer(profile.get('usage'), account['usage']))
+            result = dict(accounts=len(accounts), message='llm-usage의 계정 목록과 저장된 사용량을 확인했습니다.')
+            # The state poll runs this every 30 s; rewrite the store only on a change.
+            return result if changed else Unchanged(result)
         return manager_store.mutate(sync)
 
     @staticmethod
