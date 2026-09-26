@@ -302,13 +302,15 @@ DRAIN_MARKERS = (
 #   version 0.153.4-managed-e29fcb2680f61520, build_source_sha256 e29fcb26...
 #   version 0.153.4-managed-308e564225e01416, build_source_sha256 308e5642...
 #   version 0.153.4-managed-d7ab12a792bcd355, build_source_sha256 d7ab12a7...
-#   (revisions 94-95: app-server/src/lib.rs still maps SIGHUP to GracefulOnly)
+#   version 0.153.4-managed-98ad6b88cd3ca441, build_source_sha256 98ad6b88...
+#   (revisions 94-96: app-server/src/lib.rs still maps SIGHUP to GracefulOnly)
 # The manager may pass the digest from its own verified manifest; that digest
 # must still be in this allowlist, so an unknown bundle always refuses.
 DRAIN_AUDITED_SHA256 = frozenset({
     "4c6ca2dd15f100ea740ac01d956bb1898c1b37f6c5d9bfc269b405640cc6249a",
     "37fdb54943696c8048ecdac72a102423147e3a039dcc9e53ebfa97bcf7ebc938",
     "e85e7046798622783e66ee9ea97b2e36c8c53bea05b04252f80a8396261b727a",
+    "40f5b129ca8e01983854e38ed6d629e5ba10f11da8b66e8134b12a2d34c9ecc2",
 })
 DRAIN_HASH_BYTES = 1024 * 1024 * 1024
 # The helper is deployed to Linux only; these stay import-safe elsewhere so a

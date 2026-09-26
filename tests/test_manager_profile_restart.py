@@ -1,7 +1,9 @@
 from copy import deepcopy
 from unittest.mock import patch
 from pathlib import Path
+from uuid import uuid4
 import tempfile
+import threading
 import unittest
 
 from manager_core.profile_restart import ProfileRestarts, supersede_previous_notice
@@ -65,6 +67,40 @@ class FakeHooks:
                 self.change_during_open = False
         self.store.mutate(save)
         return {'verified': self.restore_verified}
+
+    # Explicit SSH drain: one transaction; a stop flag only ever turns on.
+    remote_busy = False
+    during_start = None
+
+    def begin_remote_reconcile(self, profile_id, *, graceful_drain=False, stop_only=False):
+        self.calls.append(('begin_remote', stop_only))
+        self.remote = dict(transaction_id=str(uuid4()), stop_only=stop_only, committed=False)
+        return self.remote['transaction_id']
+
+    def downgrade_remote_reconcile_to_stop(self, profile_id, transaction_id):
+        self.calls.append(('downgrade', transaction_id))
+        if self.remote['transaction_id'] != transaction_id or self.remote['committed']:
+            return False
+        self.remote['stop_only'] = True
+        return True
+
+    def reconcile_opened_remotes(self, profile_id, transaction_id):
+        self.calls.append(('reconcile', transaction_id))
+        if self.remote['transaction_id'] != transaction_id:
+            raise UpdateError('ssh_generation_changed', 'released transaction reused')
+        if self.remote_busy:
+            return False
+        if not self.remote['stop_only']:
+            self.remote['committed'] = True
+            if self.during_start:
+                self.during_start, during = None, self.during_start
+                during()
+            self.calls.append(('remote_start', transaction_id))
+        self.remote['transaction_id'] = None  # released
+        return True
+
+    def remote_open_failed(self, profile_id, transaction_id, code):
+        self.calls.append(('remote_failed', code))
 
 
 class RestartTests(unittest.TestCase):
@@ -277,3 +313,170 @@ class RestartTests(unittest.TestCase):
         self.pending.pop()()
         self.assertEqual(self.restarts.status()[self.profile['id']]['phase'], 'attention')
         self.assertEqual(self.hooks.calls, [])
+
+
+class RemoteDrainConversionTests(unittest.TestCase):
+    """Full exit (profile.remote_stop) while "SSH 작업 종료 후 설정 적용" is pending."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.store = Store(Path(temp.name))
+        self.profile = self.store.add_profile('selected')
+        self.store.mutate(lambda d: self.store.profile(self.profile['id'], d).update(generation='gen-1'))
+        self.instances = FakeInstances(self.store)
+        self.hooks = FakeHooks(self.store, self.instances)
+        self.pending = []
+        self.restarts = ProfileRestarts(self.store, self.instances, self.hooks, spawn=self.pending.append)
+
+    def remote(self, stop_only=False):
+        return self.restarts.schedule_remote(self.profile['id'], expected_generation='gen-1', stop_only=stop_only)
+
+    def step(self, job):
+        return self.restarts.step(self.profile['id'], job['id'])
+
+    def job(self):
+        return self.store.read()['profile_restarts'][self.profile['id']]
+
+    def names(self):
+        return [name for name, _ in self.hooks.calls]
+
+    def test_full_exit_converts_waiting_reopen_drain_into_the_same_stop_job(self):
+        self.hooks.remote_busy = True
+        job = self.remote()
+        self.assertFalse(self.step(job))
+        # A repeated "SSH 작업 종료 후 설정 적용" still joins the same reopen.
+        self.assertEqual(self.remote()['id'], job['id'])
+        stopped = self.remote(stop_only=True)
+        self.assertEqual(stopped['id'], job['id'])
+        self.assertEqual((stopped['stop_only'], stopped['stop_requested'], stopped['stop_converted']),
+                         (True, True, True))
+        self.assertTrue(self.hooks.remote['stop_only'], 'the drain transaction itself must become stop-only')
+        self.assertEqual(self.hooks.calls[-1], ('downgrade', job['transaction_id']))
+        # A repeated full exit joins the converted job; no second transaction.
+        self.assertEqual(self.remote(stop_only=True)['id'], job['id'])
+        self.assertEqual(self.names().count('downgrade'), 1)
+        self.assertEqual(self.names().count('begin_remote'), 1)
+        self.assertEqual(len(self.pending), 1)
+        self.hooks.remote_busy = False
+        self.assertTrue(self.step(job))
+        done = self.job()
+        self.assertEqual((done['id'], done['phase']), (job['id'], 'complete'))
+        self.assertIn('종료를 확인했습니다', done['message'])
+        self.assertNotIn('remote_start', self.names())
+
+    def test_stop_after_reopen_began_drains_again_before_completing(self):
+        job = self.remote()
+        converted = []
+        def full_exit_during_start():
+            converted.append(self.remote(stop_only=True))
+            # Retrying full exit joins; a restart request cannot cancel the stop.
+            self.assertEqual(self.remote(stop_only=True)['id'], job['id'])
+            with self.assertRaises(UpdateError):
+                self.remote()
+        self.hooks.during_start = full_exit_during_start
+        self.assertFalse(self.step(job), 'the job must not complete after only reopening')
+        self.assertEqual(self.names().count('downgrade'), 1)
+        self.assertEqual(converted[0]['id'], job['id'])
+        self.assertEqual((converted[0]['stop_only'], converted[0]['stop_requested']), (False, True))
+        waiting = self.job()
+        self.assertEqual((waiting['phase'], waiting['stop_only']), ('waiting', True))
+        self.assertNotEqual(waiting['transaction_id'], job['transaction_id'])
+        self.assertEqual(self.hooks.calls[-1], ('begin_remote', True))
+        self.assertTrue(self.step(job))
+        done = self.job()
+        self.assertEqual((done['id'], done['phase']), (job['id'], 'complete'))
+        self.assertIn('종료를 확인했습니다', done['message'])
+        self.assertEqual(self.names().count('remote_start'), 1)
+        self.assertNotIn('remote_failed', self.names())
+
+    def test_conversion_racing_completion_reports_instead_of_claiming_stop(self):
+        job = self.remote()
+        self.restarts._write(self.profile['id'], job['id'], phase='complete')
+        with self.assertRaises(UpdateError) as raised:
+            self.restarts._convert_to_stop(self.profile['id'], job['id'])
+        self.assertEqual(raised.exception.code, 'profile_prepare_busy')
+        self.assertIn('방금 끝났습니다', str(raised.exception))
+        self.assertNotIn('downgrade', self.names())
+
+    def test_worker_completion_cannot_slip_between_conversion_check_and_write(self):
+        # The worker's completion write must wait for an in-flight conversion
+        # (state.lock); completing first would report a stop that never ran.
+        job = self.remote()
+        finished, workers = [], []
+        downgrade = self.hooks.downgrade_remote_reconcile_to_stop
+        def reopen_released_meanwhile(profile_id, transaction_id):
+            # The reopen already committed and released; its worker now tries
+            # to complete while this conversion is between check and write.
+            self.hooks.remote['committed'] = True
+            worker = threading.Thread(target=lambda: finished.append(
+                self.restarts._finish_remote(profile_id, job['id'])))
+            workers.append(worker)
+            worker.start()
+            worker.join(0.5)
+            return downgrade(profile_id, transaction_id)
+        self.hooks.downgrade_remote_reconcile_to_stop = reopen_released_meanwhile
+        converted = self.remote(stop_only=True)
+        workers[0].join(10)
+        self.assertFalse(workers[0].is_alive())
+        self.assertEqual((converted['phase'], converted['stop_only'], converted['stop_requested']),
+                         ('waiting', False, True))
+        self.assertEqual(finished, [False], 'completion must see the stop request and chain a drain')
+        self.assertEqual(self.job()['phase'], 'waiting')
+
+    def test_failed_stop_after_reopen_reports_precisely_and_full_exit_can_retry(self):
+        job = self.remote()
+        self.hooks.during_start = lambda: self.remote(stop_only=True)
+        begin = self.hooks.begin_remote_reconcile
+        def admission_busy(profile_id, **options):
+            self.hooks.calls.append(('begin_refused', options.get('stop_only')))
+            raise UpdateError('profile_launch_busy', '다른 프로필을 여는 작업이 아직 진행 중입니다.')
+        self.hooks.begin_remote_reconcile = admission_busy
+        self.assertTrue(self.step(job))
+        self.assertEqual(self.hooks.calls[-1], ('begin_refused', True))
+        failed = self.job()
+        self.assertEqual((failed['id'], failed['phase'], failed['code']), (job['id'], 'attention', 'profile_launch_busy'))
+        self.assertTrue(failed['message'].startswith('SSH 설정은 적용했지만 이어서 원격 실행을 종료하지 못했습니다.'))
+        self.assertIn('다른 프로필을 여는 작업', failed['message'])
+        self.assertEqual(self.names().count('remote_start'), 1)
+        # Direct step fixtures do not run _run's final worker cleanup.
+        self.restarts.workers.clear()
+        self.hooks.begin_remote_reconcile = begin
+        retried = self.remote(stop_only=True)
+        self.assertNotEqual(retried['id'], job['id'])
+        self.assertTrue(retried['stop_only'])
+
+    def test_normal_busy_claim_still_refuses_remote_stop(self):
+        job = self.restarts.schedule(self.profile['id'])
+        with self.assertRaises(UpdateError) as raised:
+            self.remote(stop_only=True)
+        self.assertEqual(raised.exception.code, 'profile_prepare_busy')
+        self.assertEqual(self.job()['id'], job['id'])
+        self.assertNotIn('stop_requested', self.job())
+        # A local-first open's SSH job is not an explicit drain either.
+        self.store.mutate(lambda d: d['profile_restarts'][self.profile['id']].update(
+            remote_background=True, transaction_id=str(uuid4())))
+        with self.assertRaises(UpdateError):
+            self.remote(stop_only=True)
+        self.assertEqual(self.hooks.calls, [])
+
+    def test_pending_stop_is_never_upgraded_to_reopen(self):
+        self.hooks.remote_busy = True
+        job = self.remote(stop_only=True)
+        with self.assertRaises(UpdateError) as raised:
+            self.remote()
+        self.assertEqual(raised.exception.code, 'profile_prepare_busy')
+        self.assertTrue(self.job()['stop_only'])
+        self.assertTrue(self.hooks.remote['stop_only'])
+        self.assertEqual(self.names(), ['begin_remote'])
+        self.assertEqual(self.remote(stop_only=True)['id'], job['id'])
+
+    def test_converted_reopen_is_not_reopened_by_a_later_restart_request(self):
+        self.hooks.remote_busy = True
+        job = self.remote()
+        self.remote(stop_only=True)
+        with self.assertRaises(UpdateError):
+            self.remote()
+        self.hooks.remote_busy = False
+        self.assertTrue(self.step(job))
+        self.assertNotIn('remote_start', self.names())

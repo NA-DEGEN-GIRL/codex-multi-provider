@@ -19,9 +19,13 @@ async function check(renderer){
     const p=await m.requestClient.sendRequest(method,original);
     assert.equal(p.modelProvider,'openai');assert.equal(p.model,'gpt-6-astra');assert.equal(p.config.model,'gpt-6-astra');
     assert.equal(p.config.model_reasoning_effort,'high');assert.equal(original.config.model_provider,'cc_deepseek');
+    // A provider return is marked for the managed proxy, which restores this
+    // provider's last effort/tier for the thread; the caller object stays clean.
+    assert.equal(p.codexManagerProviderReturn,true);assert.equal(Object.hasOwn(original,'codexManagerProviderReturn'),false);
   }
   sourceProvider='openai';const same=await m.requestClient.sendRequest('thread/resume',{threadId:id,model:'gpt-other',config:{model_reasoning_effort:'low'}});
   assert.equal(same.model,'gpt-other');assert.equal(same.config.model_reasoning_effort,'low');
+  assert.equal(Object.hasOwn(same,'codexManagerProviderReturn'),false,'same-provider opens are not provider returns');
   for(const method of ['thread/resume','thread/fork']){
     const ordinary=await m.requestClient.sendRequest(method,{threadId:id});
     assert.equal(ordinary.modelProvider,'openai');

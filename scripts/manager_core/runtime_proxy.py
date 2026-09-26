@@ -24,6 +24,7 @@ try:
     from .runtime_admin import AdminError, AdminRpcBroker, AdminServer, MaintenanceBarrier
     from .notification_policy import NotificationPolicy
     from .pipe_writer import PipeWriter
+    from .serve_ledger import ProviderReturn, ServeLedger, account_tag
 except ImportError:
     # The native bootstrap invokes this file by path. Load the package from its
     # sibling scripts directory so admin's shared process/DPAPI helpers retain
@@ -36,6 +37,7 @@ except ImportError:
     from manager_core.runtime_admin import AdminError, AdminRpcBroker, AdminServer, MaintenanceBarrier
     from manager_core.notification_policy import NotificationPolicy
     from manager_core.pipe_writer import PipeWriter
+    from manager_core.serve_ledger import ProviderReturn, ServeLedger, account_tag
 
 MAX_FRAME_BYTES = 32 * 1024 * 1024
 
@@ -81,12 +83,19 @@ def runtime_environment(source: dict) -> dict:
     return env
 
 
-def managed_client_message(message, external, permission=None):
-    """Apply the profile model binding, then the remembered permission choice.
+def managed_client_message(message, external, permission=None, provider_return=None):
+    """Restore a returning provider's settings, apply the profile model binding,
+    then the remembered permission choice.
 
+    The provider return only acts on resumes the desktop adapter marked as a
+    return from another provider; the binding then still validates the effort.
+    proxy() resolves it earlier, on its frontend reader outside protocol_lock,
+    and passes None here.
     The permission decoration only re-attaches a selection that this profile
     observed before; a request that carries its own selection is untouched.
     """
+    if provider_return is not None:
+        message = provider_return(message)
     message = external.request(message)
     if permission is not None:
         message = permission.to_runtime(message)
@@ -129,7 +138,16 @@ def proxy(runtime: Path, arguments: list[str], observer_path: Path, profile_id: 
     from manager_core.catalog_projection import CatalogProjectionIds
     projections = CatalogProjectionIds(source_environment.get('CODEX_MANAGER_SHARED_CATALOG')
                                        or source_environment.get('CODEX_MANAGER_RECORD_CATALOG'))
-    observer = RuntimeObserver(profile_id, runtime_pid=child.pid, read_only_projection=projections)
+    # Content-free per-request usage rows beside the observer snapshot. An
+    # instances directory is only searched for other profiles' settings when
+    # the observer lives in the managed layout (never an arbitrary parent).
+    try:
+        usage = ServeLedger(observer_path.parent, profile_id, account_tag(source_environment))
+    except (OSError, ValueError, RuntimeError):
+        usage = None
+    instances = observer_path.parent.parent if observer_path.parent.parent.name == 'instances' else None
+    provider_return = ProviderReturn(instances, usage, account_tag(source_environment), observer_path.parent.name)
+    observer = RuntimeObserver(profile_id, runtime_pid=child.pid, read_only_projection=projections, usage=usage)
     from manager_core.record_edits import RecordEdits
     record_edits = RecordEdits(source_environment, projections.origins)
     notifications = NotificationPolicy()
@@ -165,6 +183,8 @@ def proxy(runtime: Path, arguments: list[str], observer_path: Path, profile_id: 
 
     def write_message(message, direction, before_write=None):
         if direction == 'client':
+            # A marked provider return was already resolved on the frontend
+            # reader (pump), outside protocol_lock.
             message = notifications.to_runtime(managed_client_message(message, external, permission))
         body = json.dumps(message, separators=(',', ':'), ensure_ascii=False).encode('utf-8') + b'\n'
         runtime_output.write(body, before_write)
@@ -243,6 +263,8 @@ def proxy(runtime: Path, arguments: list[str], observer_path: Path, profile_id: 
             value['transport'] = {'to_runtime': runtime_output.snapshot(),
                                   'to_app': frontend_output.snapshot()}
             value['shared_execution_version'] = 1 if source_environment.get('CODEX_MANAGER_SHARED_EXECUTION') == '1' else 0
+            if usage is not None:
+                value['serve_ledger'] = {**usage.status(), 'provider_returns_restored': provider_return.restored}
             if maintenance is not None:
                 # Status has no lease token or pipe authentication material.
                 value['maintenance'] = maintenance.status(value, account_ready())
@@ -297,6 +319,15 @@ def proxy(runtime: Path, arguments: list[str], observer_path: Path, profile_id: 
                     target = runtime_output if direction == 'frontend' else frontend_output
                     target.write(frame)
                     continue
+                if direction == 'frontend':
+                    # Restoring a returning provider's settings reads other
+                    # profiles' files. Only this reader waits for it; the
+                    # runtime-to-app stream needs protocol_lock and never does.
+                    # On failure the runtime ignores the unknown marker field.
+                    try:
+                        message = provider_return(message)
+                    except (ValueError, TypeError, KeyError, AttributeError, RecursionError):
+                        pass
                 with protocol_lock:
                     if direction == 'runtime':
                         if record_signals is not None:
@@ -401,6 +432,8 @@ def proxy(runtime: Path, arguments: list[str], observer_path: Path, profile_id: 
     frontend_output.close()
     frontend_output.thread.join(timeout=5)
     observer.disconnected()
+    if usage is not None:
+        usage.close()
     projections.close()
     try:
         snapshot()

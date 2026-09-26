@@ -271,6 +271,7 @@ class ControlCenter:
         state['hosts']=self.remote.list_hosts()
         state['view_instances']=[p for p in state['profiles'] if p.get('view_only')]
         state['profiles']=[p for p in state['profiles'] if not p.get('view_only')]
+        state['cache_warmth']=self._cache_warmth_summary(state['profiles'],registry)
         built=runtime_build(self.root).get('capabilities',{})
         shared_running=built.get('shared_record_catalog') and any(p['status']=='running' and p.get('runtime_channel')!='packaged' for p in state['profiles'])
         catalog_refresh=self.current_catalog_refresh(built)
@@ -290,6 +291,50 @@ class ControlCenter:
         state.pop('ssh_inventory',None)
         state['notices']=notices
         return state
+
+    def _cache_warmth_summary(self,profiles,registry):
+        """Per recent thread and profile: cache warmth, minutes left, first-request cost.
+
+        Read-only over the proxies' serve ledgers; a failure only hides the
+        profile-card cache line, never the rest of the state poll.
+        """
+        try:
+            from manager_core.cache_warmth import CacheWarmth
+            from manager_core.providers import ProviderRegistry
+            warmth=getattr(self,'_cache_warmth',None)
+            if warmth is None:
+                # The first read of every ledger runs on a worker thread; the
+                # poll never waits for it (the card line appears one poll later).
+                warmth=self._cache_warmth=CacheWarmth(self.store.directory/'instances',self.store.directory/'cache-prices.json',background=True)
+            models={m.get('id'):m for m in registry.get('models',[]) if isinstance(m,dict)}
+            providers={p.get('id'):p for p in registry.get('providers',[]) if isinstance(p,dict)}
+            families={}
+            for p in profiles:
+                model=models.get(p.get('external_model_id')) if p.get('auth_mode')=='external' else None
+                provider=providers.get(model.get('provider_id')) if model else None
+                if provider:
+                    families[p['id']]=(ProviderRegistry._runtime_provider_id(provider),model.get('wire_model_id'))
+            return warmth.summary(profiles,families,self._cache_warmth_pinned(profiles))
+        except (OSError,ValueError,TypeError,KeyError,AttributeError):
+            return {'version':1,'threads':{}}
+
+    def _cache_warmth_pinned(self,profiles):
+        """Threads every card may need however old or crowded out: each profile's
+        last opened task and the task its desktop window currently shows."""
+        from uuid import UUID
+        pinned=[]
+        for p in profiles:
+            observed=p.get('runtime_state')
+            opened=observed.get('opened_task') if isinstance(observed,dict) else None
+            if isinstance(opened,dict) and isinstance(opened.get('thread_id'),str):pinned.append(opened['thread_id'])
+            try:
+                path=self.store.directory/'instances'/str(UUID(str(p.get('id'))))/'active-task.json'
+                if path.stat().st_size<=8192:
+                    selected=json.loads(path.read_text(encoding='utf-8')).get('thread_id')
+                    if isinstance(selected,str):pinned.append(selected)
+            except (OSError,ValueError,TypeError,AttributeError):
+                pass
+        return pinned
 
     def dispatch(self,command,args):
         if not isinstance(args,dict):raise ValueError('명령 인수가 올바르지 않습니다.')

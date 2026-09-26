@@ -8,7 +8,7 @@ import threading
 from time import monotonic
 from uuid import uuid4
 
-from .store import identifier, now
+from .store import Unchanged, identifier, now
 from .updates import UpdateError, _lock_file, _unlock_file
 from .instances import process_identity
 from .update_hooks import _process_liveness
@@ -145,8 +145,15 @@ class ProfileRestarts:
                 raise ValueError('사용할 계정 프로필을 선택하세요.')
             old = self.store.read().get('profile_restarts', {}).get(profile_id)
             if profile_id in self.workers or (old and old['phase'] not in TERMINAL and self.owner_alive(old)):
-                if old and old.get('graceful_drain') and old.get('stop_only') == stop_only:
-                    return deepcopy(old)
+                if old and old.get('graceful_drain'):
+                    stopping = bool(old.get('stop_only') or old.get('stop_requested'))
+                    if stopping == stop_only:
+                        return deepcopy(old)
+                    if stop_only and old['phase'] not in TERMINAL:
+                        # Full exit during an explicit drain-and-reopen: keep
+                        # waiting for the same turns, then stop instead. A stop
+                        # is never turned back into a reopen.
+                        return self._convert_to_stop(profile_id, old['id'])
                 raise UpdateError('profile_prepare_busy', '이 프로필의 다른 설정 적용이 끝난 뒤 다시 시도하세요.')
             transaction_id = self.hooks.begin_remote_reconcile(profile_id, graceful_drain=True, stop_only=stop_only)
             job = dict(id=str(uuid4()), profile_id=profile_id, phase='waiting', remote_background=True,
@@ -166,6 +173,53 @@ class ProfileRestarts:
                 self._write(profile_id, job['id'], phase='attention', message='SSH 종료 처리기를 시작하지 못했습니다.')
                 raise
             return deepcopy(job)
+
+    def _convert_to_stop(self, profile_id, job_id):
+        """Make a live drain-and-reopen job end stopped; same job id for pollers."""
+        # state.lock orders this against the worker's reopen commit and its
+        # completion write, so the stop is either taken before any start or
+        # recorded before the job can complete.
+        with self.store.locked():
+            job = self.store.read().get('profile_restarts', {}).get(profile_id)
+            if not job or job['id'] != job_id or job['phase'] in TERMINAL:
+                raise UpdateError('profile_prepare_busy',
+                                  '이 프로필의 SSH 설정 적용이 방금 끝났습니다. 다시 종료하면 원격 실행을 종료합니다.')
+            before_start = self.hooks.downgrade_remote_reconcile_to_stop(profile_id, job['transaction_id'])
+            return self._write(profile_id, job_id, stop_only=before_start, stop_requested=True, stop_converted=True,
+                               message=('SSH 설정 적용 대신, 이 프로필의 SSH 작업이 끝나면 원격 실행을 종료합니다.'
+                                        if before_start else
+                                        '이 프로필의 SSH 설정 적용을 마무리하는 중입니다. 끝나는 대로 원격 실행을 종료합니다.'))
+
+    def _finish_remote(self, profile_id, job_id):
+        """Complete, or return False when a stop arrived after the reopen began."""
+        def finish(data):
+            job = data.setdefault('profile_restarts', {}).get(profile_id)
+            if job is None or job['id'] != job_id:
+                raise RuntimeError('재시작 요청이 변경되었습니다.')
+            if job.get('stop_requested') and not job.get('stop_only'):
+                return Unchanged(False)
+            job.update(phase='complete', updated_at=now(),
+                       message='이 프로필의 원격 Codex 종료를 확인했습니다.' if job.get('stop_only') else
+                               '로컬 창과 SSH 연결 준비를 완료했습니다.')
+            return True
+        return self.store.mutate(finish)
+
+    def _stop_after_reopen(self, profile_id, job_id):
+        """Drain the listener a converted job just reopened; never start another."""
+        job = self.store.read()['profile_restarts'][profile_id]
+        try:
+            if self.store.profile(profile_id).get('generation') != job.get('generation'):
+                raise UpdateError('ssh_generation_changed', '프로필 실행이 변경되어 SSH 종료를 중지했습니다.')
+            transaction_id = self.hooks.begin_remote_reconcile(profile_id, graceful_drain=True, stop_only=True)
+        except (RuntimeError, ValueError, OSError, KeyError) as error:
+            # The reopen transaction is already released; only the job reports.
+            self._write(profile_id, job_id, phase='attention', code=getattr(error, 'code', 'remote_stop_failed'),
+                        message='SSH 설정은 적용했지만 이어서 원격 실행을 종료하지 못했습니다. ' +
+                                (str(error) if isinstance(error, UpdateError) else 'SSH 연결 상태를 확인해 주세요.'))
+            return True
+        self._write(profile_id, job_id, transaction_id=transaction_id, stop_only=True, phase='waiting',
+                    message='SSH 설정 적용 후 이 프로필의 원격 실행 종료를 확인하고 있습니다.')
+        return False
 
     def open_local(self, profile_id):
         """Return the local window first; reconcile its SSH hosts independently."""
@@ -255,9 +309,7 @@ class ProfileRestarts:
                         self._write(profile_id, job_id, phase='waiting',
                                     message='로컬 창은 사용할 수 있습니다. 진행 중인 SSH 작업이 끝나기를 기다립니다.')
                         return False
-                    self._write(profile_id, job_id, phase='complete',
-                                message='이 프로필의 원격 Codex 종료를 확인했습니다.' if job.get('stop_only') else
-                                        '로컬 창과 SSH 연결 준비를 완료했습니다.')
+                    finished = self._finish_remote(profile_id, job_id)
                 except (RuntimeError, ValueError, OSError, KeyError) as error:
                     code = getattr(error, 'code', 'remote_prepare_failed')
                     restored = code == 'ssh_settings_deferred'
@@ -268,7 +320,8 @@ class ProfileRestarts:
                                 message=('로컬 창은 사용할 수 있습니다. ' + str(error)
                                          if isinstance(error, UpdateError) else
                                          '로컬 창은 사용할 수 있습니다. SSH 연결 준비 상태를 확인해 주세요.'))
-                return True
+                    return True
+                return finished or self._stop_after_reopen(profile_id, job_id)
             if (job.get('automatic_key') and not job.get('transaction_id')
                     and profile.get('generation') != job.get('generation')):
                 self._write(profile_id, job_id, phase='superseded',

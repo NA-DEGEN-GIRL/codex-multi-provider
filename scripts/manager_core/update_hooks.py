@@ -45,7 +45,7 @@ import threading
 import time
 from uuid import UUID, uuid4
 
-from .store import atomic_json, identifier, now
+from .store import Unchanged, atomic_json, identifier, now
 from .updates import UpdateError, version_tuple, _lock_file, _unlock_file
 from .instances import process_identity
 from .process_state import process_liveness as _process_liveness
@@ -557,6 +557,11 @@ class UpdateHooks:
             pending_close = {**entry, 'remotes': [r for r in records if r.get('state') in ('observed', 'closed')]}
             self._close_remotes(lease, pending_close, lifecycle_guard=current)
             profile = current()
+            if (lease.get('graceful_drain') and not lease.get('stop_only')
+                    and self._commit_remote_reopen(profile_id, transaction_id)):
+                # A full exit converted this explicit drain before any start.
+                lease['stop_only'] = True
+                self._save_lease(lease)
             if not lease.get('stop_only'):
                 self.remote_maintenance.prepare_and_start(profile, records, lambda: self._save_lease(lease),
                                                           lifecycle_guard=current)
@@ -586,6 +591,38 @@ class UpdateHooks:
                 gate.update(state='attention', code=code,
                             message='로컬 창은 사용할 수 있습니다. SSH 연결 준비 상태를 확인해 주세요.', updated_at=now())
         self.store.mutate(attention)
+
+    def downgrade_remote_reconcile_to_stop(self, profile_id, transaction_id):
+        """Turn a held explicit drain-and-reopen into drain-then-stop.
+
+        One-way only: nothing upgrades a stop-only reconcile to a reopen, and
+        only a graceful-drain journal honours the flag. False means the start
+        was already committed or this transaction no longer holds the gate;
+        the caller must then stop after the reconcile finishes.
+        """
+        profile_id, transaction_id = identifier(profile_id), identifier(transaction_id)
+        def downgrade(data):
+            gate = data.get('ssh_maintenance', {}).get(profile_id)
+            if (not gate or gate.get('transaction_id') != transaction_id
+                    or gate.get('state') != 'held' or gate.get('reopen_committed')):
+                return Unchanged(False)
+            if gate.get('stop_only'):
+                return Unchanged(True)
+            gate.update(stop_only=True, updated_at=now())
+            return True
+        return self.store.mutate(downgrade)
+
+    def _commit_remote_reopen(self, profile_id, transaction_id):
+        """Atomically choose reopen or a requested stop; True means stop."""
+        def commit(data):
+            gate = data.get('ssh_maintenance', {}).get(profile_id, {})
+            if gate.get('transaction_id') != transaction_id or gate.get('state') != 'held':
+                raise UpdateError('ssh_generation_changed', 'SSH 적용 기록이 변경되어 원격 실행을 다시 열지 않았습니다.')
+            if gate.get('stop_only'):
+                return Unchanged(True)
+            gate['reopen_committed'] = True
+            return False
+        return self.store.mutate(commit)
 
     @contextmanager
     def launch_admission(self, profile_id):

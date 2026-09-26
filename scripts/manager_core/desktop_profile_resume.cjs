@@ -30,6 +30,10 @@ globalThis.__codexProfileResume = async function(manager, send, receiver, method
     result.model = config.model || 'gpt-6-astra';
     result.config.model = result.model;
     result.config.model_reasoning_effort = config.model_reasoning_effort || 'medium';
+    // The managed runtime proxy replaces these defaults with the effort/tier
+    // this provider last used for the thread (same model only) and strips the
+    // marker; without that proxy the runtime ignores the unknown field.
+    result.codexManagerProviderReturn = true;
   }
   return result;
 };

@@ -305,10 +305,14 @@ class RuntimeObserver:
     _MUTATING = ('turn/', 'thread/queue/', 'thread/realtime/', 'review/',
                  'process/', 'command/', 'mcpServer/tool/', 'thread/shellCommand')
 
-    def __init__(self, profile_id: str, *, runtime_pid: int | None = None, read_only_projection=None):
+    def __init__(self, profile_id: str, *, runtime_pid: int | None = None, read_only_projection=None,
+                 usage=None):
         self.profile_id = str(UUID(profile_id))
         self.runtime_pid = runtime_pid
         self.read_only_projection = read_only_projection or (lambda _: False)
+        # Optional serve ledger (serve_ledger.ServeLedger): sees the same
+        # mirrored messages and keeps content-free per-request usage rows.
+        self.usage = usage
         self.lock = threading.RLock()
         self.initialized = False
         self.initialize_succeeded = False
@@ -370,6 +374,8 @@ class RuntimeObserver:
                 self._taint('invalid_message')
                 return
             self.messages += 1
+            if self.usage is not None:
+                self.usage.consume(direction, message)
             method = message.get('method')
             params = message.get('params')
             params = params if isinstance(params, dict) else {}

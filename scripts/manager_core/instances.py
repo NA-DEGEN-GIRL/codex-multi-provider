@@ -296,6 +296,15 @@ class Instances:
         from .desktop_bundle import pipe_name
         env['CODEX_MANAGER_DESKTOP_PIPE'] = pipe_name(profile['id'])
         env['CODEX_MANAGER_ROOT'] = str(self.root)
+        # One desktop registers the Chrome extension's native host (the first
+        # own-login profile in list order); the others never touch it.
+        from .desktop_chrome_host import ENV as chrome_host, owner as chrome_host_owner
+        env.pop(chrome_host, None)
+        try:
+            if chrome_host_owner(self.store.read()['profiles']) == profile['id']:
+                env[chrome_host] = '1'
+        except (OSError, RuntimeError, KeyError, TypeError, ValueError):
+            pass  # Chrome registration is optional; it never blocks a launch.
         if self.embed_windows:
             env['CODEX_MANAGER_PRELOAD_HIDDEN'] = '1'
         if profile.get('auth_mode') in ('native', 'source', 'external'):

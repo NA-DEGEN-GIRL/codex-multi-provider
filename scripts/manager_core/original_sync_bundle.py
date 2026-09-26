@@ -103,6 +103,88 @@ def renderer_host_identity_patches(data):
     return patches
 
 
+# Renderer names in the sidebar grouping function (DXr in 26.917): same-machine
+# host test, git origins for a host, groupBy, Codex worktree project lookup,
+# worktree-root test, linked git worktree test, worktree remap, and the exact
+# and canonical (pwd -P) remote project root lookups.
+_REMOTE_ROOT_VARIANTS = (
+    (b'TYr', b'gXr', b'wXr', b'hXr', b'R', b'_Xr', b'vXr', b'CYr', b'dXr'),  # 26.917
+)
+
+
+def _remote_root_section(affinity, origins, group_by, codex_worktree, worktree, linked, remap, exact, canonical):
+    # The whole remote part of the grouping function, from the remote-host flag
+    # p and the remote projects m to the placement lookup after the remap, so
+    # every binding the guard reads is this function's own.
+    condition = b'%s(d,a,s?.worktreesRootsByHostId?.[c])||p&&%s(d,_)' % (worktree, linked)
+    before = (b'let p=c!==o,m=s?.remoteProjects,h=s?.remoteConnections?.find(e=>e.hostId===c),'
+              b'g=(m??[]).filter(e=>{if(e.hostId===c)return!1;let t=s?.remoteConnections?.find(t=>t.hostId===e.hostId);'
+              b'return %s(h,t)});if(p&&g.length===0&&!m?.some(e=>e.hostId===c))return;'
+              b'let _=%s({gitOrigins:r,gitOriginsByHostId:i,hostId:c??void 0,primaryHostId:o}),'
+              b'v=[...p?Object.entries((0,%s.default)(g,e=>e.hostId)).flatMap(([e,t])=>'
+              b'%s(t,e,d,s?.codexHomesByHostId?.[e],s?.worktreesRootsByHostId?.[e])):[]];'
+              b'if(v.length===1){(t.find(e=>e.projectId===v[0]?.id)??null)?.threadKeys.push(e.key);return}'
+              b'if(v.length>1)return;if(%s){let r=%s(d,e.conversationId,t,n,_,s?.threadWorkspaceRootHints,'
+              b'e.summary!=null);r&&(f=r)}let y=(m??[]).filter(e=>e.hostId===c),'
+              b'b=%s(m,c,f)??%s(y,f,s?.canonicalProjectPathsByHostId)??%s(g,f,s?.canonicalProjectPathsByHostId);'
+              % (affinity, origins, group_by, codex_worktree, condition, remap, exact, canonical, canonical))
+    guard = (b'!(p&&(%s(m,c,d)??%s((m??[]).filter(e=>e.hostId===c),d,s?.canonicalProjectPathsByHostId)))'
+             % (exact, canonical))
+    return before, before.replace(b'if(%s){' % condition, b'if(%s&&(%s)){' % (guard, condition))
+
+
+def renderer_remote_root_patches(data):
+    # Verified 26.917 renderer: when a remote thread's cwd is a linked git
+    # worktree and git origins are known for that directory (a selected, live
+    # thread has no summary, so its cwd is queried), the remap compares the
+    # declared project paths with git's physical toplevel. A project declared
+    # through a symlink (/home/<user>/x for /srv/x) then never matches exactly
+    # and every thread of the worktree project falls back to the first project
+    # sharing the git common dir in this profile's sidebar order. Native code
+    # guards local project roots only (uXr). Give remote roots the same guard:
+    # when the cwd is exactly, or canonically, a project root declared on its
+    # host, that project wins and the remap is skipped. Local threads (p false)
+    # and remote cwds that are no declared root keep the native path.
+    patches = {}
+    for names in _REMOTE_ROOT_VARIANTS:
+        before, after = _remote_root_section(*names)
+        if data.count(before) > 1:
+            raise ValueError('Ambiguous desktop remote project grouping.')
+        if data.count(before) == 1:
+            patches[before] = after
+    if len(patches) > 1:
+        raise ValueError('Ambiguous desktop remote project grouping.')
+    return patches
+
+
+# Main process (t8e in 26.917, B6e in 26.915): before a local project gains
+# folders (create, add folder, edit folders), the desktop pins every unassigned
+# task in those folders as projectless, so the project starts empty. Only the
+# window that made the change keeps the pin. Peers get only the shared
+# declaration and group those tasks under the project by folder. The pins go
+# through the membership adapter, which drops them in shared profiles.
+# Explicit assignments to existing projects stay as they are. Without the
+# adapter, the pins are unchanged.
+_PROJECTLESS_PINS = re.compile(
+    rb'(await [A-Za-z_$][\w$]*\.assignIfUnassigned\(\[\.\.\.Object\.entries\([A-Za-z_$][\w$]*\)'
+    rb'\.flatMap\(\(\[e,t\]\)=>t==null\?\[\]:\[\{threadId:([A-Za-z_$][\w$]*\.[A-Za-z_$][\w$]*)\(e\),'
+    rb'assignment:t,projectless:!1\}\]\),\.\.\.)([A-Za-z_$][\w$]*)'
+    rb'(\.map\(e=>\(\{threadId:\2\(e\),assignment:null,projectless:!0\}\)\)\]\))')
+
+
+def main_projectless_pin_patches(data):
+    matches = list(_PROJECTLESS_PINS.finditer(data))
+    if len(matches) > 1:
+        raise ValueError('Ambiguous desktop project folder assignment.')
+    if not matches:
+        # Already patched, or a version without the verified expression: the
+        # creating window keeps the native pins.
+        return {}
+    head, _, pins, tail = matches[0].groups()
+    return {matches[0].group(0): head + b'(globalThis.__codexProjectMembership?.projectlessPins?.(' + pins +
+            b')??' + pins + b')' + tail}
+
+
 # Verified in 26.908, 26.911 and 26.915. Keep the complete expression, including its
 # cancellation checks; a renamed/minified binding is not a protocol change.
 def patches_for(data):
@@ -117,7 +199,7 @@ def patches_for(data):
         for key, value in PATCHES.items()
     })
     matches = [patches for patches in variants if all(data.count(key) == 1 for key in patches)]
-    return matches[0] if len(matches) == 1 else None
+    return {**matches[0], **main_projectless_pin_patches(data)} if len(matches) == 1 else None
 
 
 def patch_archive(source, destination):
@@ -146,6 +228,8 @@ def patch_archive(source, destination):
                 for pattern, replacement in renderer_plugin_patches(data).items():
                     updated = updated.replace(pattern, replacement)
                 for pattern, replacement in renderer_host_identity_patches(data).items():
+                    updated = updated.replace(pattern, replacement)
+                for pattern, replacement in renderer_remote_root_patches(data).items():
                     updated = updated.replace(pattern, replacement)
             helper = 'desktop_renderer_record_sync.cjs' if module.startswith('webview/') else 'desktop_record_sync.cjs'
             updated = Path(__file__).with_name(helper).read_bytes() + b'\n' + updated

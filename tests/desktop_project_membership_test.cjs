@@ -20,6 +20,7 @@ const backend={cache:{hostId:'local',getProjects:()=>({[project]:{id:project}})}
  }},threadAssignments:{matches:(t,p)=>(state.get('thread-project-assignments')[t]?.projectId||null)===p,
  adopt(t,p){const a={...state.get('thread-project-assignments')};if(p)a[t]={projectKind:'local',projectId:p};else delete a[t];state.set('thread-project-assignments',a);}}};
 const sync=context.__codexProjectMembership;sync.register(backend);
+assert.equal(sync.projectlessPins([id]).length,0,'a new or widened local project does not pin its folder tasks as projectless in one window only');
 const assignment={projectKind:'local',projectId:project};
 const commit=async()=>{commits++;state.set('thread-project-assignments',{[id]:assignment});};
 (async()=>{

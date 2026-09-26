@@ -35,7 +35,15 @@
     }catch{/* Keep legacy membership while storage is unavailable; retry later. */}
     finally{proofRunning=false;}
   }
-  globalThis.__codexProjectMembership={refresh:backend=>drainers.get(backend)?.(),tick:proofTick,register(backend){
+  globalThis.__codexProjectMembership={refresh:backend=>drainers.get(backend)?.(),tick:proofTick,
+  // Before a local project gains folders, the desktop marks every unassigned
+  // task in them as projectless, so the project starts empty. Only the window
+  // that made the change keeps that mark. Native membership has no projectless
+  // value, and peers get only the shared declaration. They group those tasks
+  // under the project by folder. Skip the mark so every window agrees. Tasks
+  // already in an existing project are still assigned to it natively.
+  projectlessPins:()=>[],
+  register(backend){
     if(registered.has(backend)||backend.cache.hostId!=='local'||!backend.threadAssignments)return;
     registered.add(backend);
     const nativeWrite=backend.writeThreadAssignment,nativeObserve=backend.observeThreads;

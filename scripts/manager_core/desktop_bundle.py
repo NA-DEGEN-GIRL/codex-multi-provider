@@ -123,7 +123,9 @@ def read_header(stream):
 
 def patch_archive(source, destination):
     """Patch exact native entry points and preserve unrelated archive assets."""
-    from .original_sync_bundle import patches_for, renderer_patches_for, renderer_plugin_patches, renderer_host_identity_patches
+    from .original_sync_bundle import (patches_for, renderer_patches_for, renderer_plugin_patches,
+        renderer_host_identity_patches, renderer_remote_root_patches)
+    from .desktop_chrome_host import Plan as ChromeHostPlan
     with Path(source).open('rb') as src:
         header, base = read_header(src)
         entries = list(_entries(header))
@@ -134,10 +136,12 @@ def patch_archive(source, destination):
         sync_modules = []
         sync_renderers = []
         browser_runtimes = []
+        chrome_host = ChromeHostPlan()
         for name, item in entries:
             if (name.startswith('.vite/build/') or name.startswith('webview/assets/app-initial')) and name.endswith('.js') and item['size'] <= 32 * 1024 * 1024:
                 src.seek(base + int(item['offset']))
                 data = src.read(item['size'])
+                chrome_host.scan(name, item, data)
                 if _BROWSER_RUNTIME in data:
                     if data.count(_BROWSER_RUNTIME) != 1:
                         raise ValueError('Ambiguous desktop browser helper runtime.')
@@ -195,6 +199,8 @@ def patch_archive(source, destination):
                 renderer_data = renderer_data.replace(before, after)
             for before, after in renderer_host_identity_patches(renderer_data).items():
                 renderer_data = renderer_data.replace(before, after)
+            for before, after in renderer_remote_root_patches(renderer_data).items():
+                renderer_data = renderer_data.replace(before, after)
             changed[renderer_name] = (renderer_target, renderer_data)
         if len(sync_modules) != 1:
             # A previously sync-patched archive is used by the isolated desktop
@@ -222,6 +228,9 @@ def patch_archive(source, destination):
             from .desktop_reasoning_ui import patch as patch_reasoning
             sync_data=patch_reasoning(sync_data)
             changed[sync_name]=(sync_target,Path(__file__).with_name('desktop_profile_resume.cjs').read_bytes()+b'\n'+Path(__file__).with_name('desktop_renderer_record_sync.cjs').read_bytes()+b'\n'+Path(__file__).with_name('desktop_plugin_renderer_sync.cjs').read_bytes()+b'\n'+sync_data)
+        # Bundled marketplace add with a '#' root, and one Chrome registration
+        # (see desktop_chrome_host). Applied last, onto every earlier change.
+        chrome_native_host = chrome_host.apply(changed)
         segments = []
         for item, updated in changed.values():
             offset, old_size = int(item['offset']), item['size']
@@ -256,7 +265,8 @@ def patch_archive(source, destination):
                 src.seek(base + position)
             shutil.copyfileobj(src, dst, 1024 * 1024)
     return dict(module=name, source_sha256=hashlib.sha256(data).hexdigest(),
-        patched_sha256=hashlib.sha256(changed[name][1]).hexdigest(), notification_module=notification_name)
+        patched_sha256=hashlib.sha256(changed[name][1]).hexdigest(), notification_module=notification_name,
+        chrome_native_host=chrome_native_host)
 
 
 def prepare(root, app):
@@ -270,7 +280,7 @@ def prepare(root, app):
     adapters = ['desktop_network_policy.cjs', 'desktop_window_host.cjs', 'desktop_window_health.cjs', 'desktop_notification_activation.cjs', 'desktop_task_context.cjs',
         'desktop_signal_files.cjs', 'desktop_record_sync.cjs', 'desktop_renderer_record_sync.cjs', 'desktop_plugin_renderer_sync.cjs', 'desktop_profile_resume.cjs',
         'desktop_workspace_sync.cjs', 'desktop_project_membership.cjs', 'desktop_local_workspace_sync.cjs', 'desktop_plugin_sync.cjs', 'desktop_reasoning_ui.py', 'original_sync_bundle.py',
-        'desktop_publication.py']
+        'desktop_publication.py', 'desktop_chrome_host.py']
     identity = dict(version=version, source=str(source), size=stat.st_size, modified=stat.st_mtime_ns, revision=REVISION,
         patch=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         adapters={name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest() for name in adapters})
