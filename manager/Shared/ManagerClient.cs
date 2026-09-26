@@ -15,16 +15,37 @@ public sealed class ManagerClient : IAsyncDisposable
     private readonly CancellationTokenSource lifetime = new();
     private bool disposed;
 
-    private ManagerClient(NamedPipeClientStream connection)
+    private ManagerClient(NamedPipeClientStream connection, ExecutionAuthority authority)
     {
         pipe = connection;
         reader = new JsonLineReader(pipe, ManagerProtocol.MaxResponseBytes);
+        ServiceAuthority = authority;
+        ServiceElevated = authority.Elevated;
         _ = ReadResponsesAsync();
     }
 
     public bool IsConnected => !disposed && pipe.IsConnected;
     public bool ServiceUpdateDeferred { get; private set; }
     public bool PreservesBackgroundProfiles { get; private set; }
+    /// <summary>OS-probed elevation of the connected service; null until verified.</summary>
+    public bool? ServiceElevated { get; private set; }
+    public ExecutionAuthority ServiceAuthority { get; private set; } = WindowsExecutionIdentity.UnknownAuthority;
+
+    /// <summary>Read OS evidence only. Never starts a service or sends an RPC.</summary>
+    public static async Task<ExecutionAuthority?> ProbeExistingAuthorityAsync(string root, CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            using var pipe = await TryConnectAsync(ManagerProtocol.PipeName(root), 350, cancellationToken).ConfigureAwait(false);
+            return pipe is null ? null : WindowsExecutionIdentity.ProbePipeServer(pipe.SafePipeHandle);
+        }
+        catch (ManagerException error) when (error.Code == "supervisor_access_denied")
+        {
+            // An elevated pipe may reject the normal bootstrap at the OS level.
+            // Unknown is not absence and never authorizes a service replacement.
+            return WindowsExecutionIdentity.UnknownAuthority;
+        }
+    }
 
     public static async Task<ManagerClient> ConnectAsync(string root, CancellationToken cancellationToken = default)
     {
@@ -33,7 +54,9 @@ public sealed class ManagerClient : IAsyncDisposable
         var initial = await TryConnectAsync(pipeName, 350, cancellationToken).ConfigureAwait(false);
         if (initial is not null)
         {
-            var existing = new ManagerClient(initial);
+            // Actual OS evidence, checked before the first request: an older
+            // normal service must never be reused by an admin window silently.
+            var existing = new ManagerClient(initial, AdoptAuthority(initial));
             try
             {
                 var status = await existing.RequestAsync("supervisor.status", cancellationToken: cancellationToken).ConfigureAwait(false);
@@ -91,7 +114,7 @@ public sealed class ManagerClient : IAsyncDisposable
             var connection = await TryConnectAsync(pipeName, 650, cancellationToken).ConfigureAwait(false);
             if (connection is not null)
             {
-                var client = new ManagerClient(connection);
+                var client = new ManagerClient(connection, AdoptAuthority(connection));
                 try
                 {
                     var status = await client.RequestAsync("supervisor.status", cancellationToken: cancellationToken).ConfigureAwait(false);
@@ -125,10 +148,33 @@ public sealed class ManagerClient : IAsyncDisposable
         return Exited(profiles) && (!state.TryGetProperty("view_instances", out var viewers) || Exited(viewers));
     }
 
+    /// <summary>
+    /// Probes the pipe server process token and requires the same Windows user
+    /// and elevation as this process. The connection is dropped on mismatch and
+    /// nothing is stopped, restarted or replayed.
+    /// </summary>
+    private static ExecutionAuthority AdoptAuthority(NamedPipeClientStream connection)
+    {
+        try
+        {
+            var peer = WindowsExecutionIdentity.ProbePipeServer(connection.SafePipeHandle);
+            WindowsExecutionIdentity.RequireMatchingAuthority(WindowsExecutionIdentity.ProbeCurrent(), peer);
+            return peer;
+        }
+        catch
+        {
+            connection.Dispose();
+            throw;
+        }
+    }
+
     private static async Task<NamedPipeClientStream?> TryConnectAsync(string name, int timeout, CancellationToken cancellationToken)
     {
+        // CurrentUserOnly compares TokenOwner (often Administrators under UAC),
+        // not TokenUser. Our OS peer-token check verifies the exact user and
+        // elevation before any RPC, independently of a pipe's default owner.
         var connection = new NamedPipeClientStream(".", name, PipeDirection.InOut,
-            PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
+            PipeOptions.Asynchronous, System.Security.Principal.TokenImpersonationLevel.Identification);
         try
         {
             await connection.ConnectAsync(timeout, cancellationToken).ConfigureAwait(false);
@@ -142,7 +188,7 @@ public sealed class ManagerClient : IAsyncDisposable
         catch (UnauthorizedAccessException)
         {
             connection.Dispose();
-            throw new ManagerException("supervisor_access_denied", "관리자 창과 연결 구성요소를 같은 Windows 계정·실행 권한으로 실행해 주세요.");
+            throw new ManagerException("supervisor_access_denied", "실행 중인 관리 서비스에 Windows가 접근을 허용하지 않았습니다. 관리자 서비스가 남아 있다면 Open-Control-Center-Admin.cmd로 다시 여세요. 권한을 바꾸려면 기존 창에서 작업을 마친 뒤 완전 종료해야 합니다. 기존 작업은 유지했습니다.");
         }
         catch { connection.Dispose(); throw; }
     }

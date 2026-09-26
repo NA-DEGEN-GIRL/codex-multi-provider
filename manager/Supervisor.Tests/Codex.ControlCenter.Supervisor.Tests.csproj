@@ -10,6 +10,7 @@
     <Compile Include="../Shell/ClipboardTextCopy.cs" Link="ClipboardTextCopy.cs" />
     <Compile Include="../Shell/WorkspaceSession.cs" Link="WorkspaceSession.cs" />
     <Compile Include="../Shell/InstalledManagerRelease.cs" Link="InstalledManagerRelease.cs" />
+    <Compile Include="../Shell/WorkspaceExecutionMode.cs" Link="WorkspaceExecutionMode.cs" />
     <Compile Include="../Shell/ManagerUpdateCompatibility.cs" Link="ManagerUpdateCompatibility.cs" />
     <ProjectReference Include="../Shared/Codex.ControlCenter.Shared.csproj" />
   </ItemGroup>

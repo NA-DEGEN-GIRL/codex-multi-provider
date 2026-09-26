@@ -7,7 +7,7 @@ using Codex.ControlCenter.Shell;
 
 // Real transport against a disposable, synthetic Python backend. No original Codex,
 // credentials, SSH connection, package updater, or actual manager state is touched.
-internal static class Program
+internal static partial class Program
 {
     private static int checks;
     private static readonly List<string> roots = [];
@@ -17,6 +17,10 @@ internal static class Program
     {
         try
         {
+            if (args.Contains("--verify-uac-transition"))
+                return await VerifyUacTransitionAsync(args);
+            if (args.Contains("--admin-transition-fixture"))
+                return await AdminTransitionFixtureAsync(args);
             if (args.Contains("--shell-lifetime-fixture"))
                 return await RunShellLifetimeFixtureAsync(args);
             if (args.Contains("--clipboard-isolated"))
@@ -24,13 +28,33 @@ internal static class Program
                 IsolatedClipboardTest.Run();
                 return 0;
             }
+            if (args.Contains("--execution-identity-fixture"))
+            {
+                TestExecutionIdentity();
+                Console.WriteLine($"PASS: {checks} assertions; execution identity probes only.");
+                return 0;
+            }
+            if (args.Contains("--service-authority-fixture"))
+                return await RunServiceAuthorityFixtureAsync();
+            if (args.Contains("--workspace-execution-mode-fixture"))
+            {
+                WorkspaceExecutionModeTests.Run();
+                Console.WriteLine("PASS: workspace execution mode preference and elevation bootstrap.");
+                return 0;
+            }
             await TestFramesAsync();
             TestSupportLog();
             TestWorkspaceSession();
             TestUpdateCompatibility();
+            TestExecutionIdentity();
+            WorkspaceExecutionModeTests.Run();
             await TestLogCopyAsync();
             var root = FixtureRoot();
+            Check(await ManagerClient.ProbeExistingAuthorityAsync(root) is null,
+                "authority preflight on an empty fixture never starts a service");
             await TestConcurrentClientsAsync(root);
+            Check(await ManagerClient.ProbeExistingAuthorityAsync(root) == WindowsExecutionIdentity.Current(),
+                "authority preflight probes an existing service without changing its token");
             await TestNotesBypassSlowRequestAsync(root);
             await TestProtocolRejectionAsync(root);
             await TestDisconnectDrainsAsync(root);
@@ -61,30 +85,36 @@ internal static class Program
         Directory.CreateDirectory(Path.GetDirectoryName(newShell)!);
         File.WriteAllBytes(newShell, []); // Data fixture only; never executed.
         void Select(string path) => File.WriteAllText(pointer, JsonSerializer.Serialize(new { shell = path }));
+        var staleService = new string('a', 64);
+        var nextService = new string('b', 64);
         void Metadata(int revision = 75, int protocol = 27, int version = 1) => File.WriteAllText(manifest,
-            JsonSerializer.Serialize(new { version = 1, service_revision = "next-service", shell_compatibility = new { version, revision, service_protocol = protocol } }));
-        var live = JsonSerializer.SerializeToElement(new { version = 27, service_revision = "old-service", preserves_background_profiles = true });
+            JsonSerializer.Serialize(new { version = 1, service_revision = nextService, shell_compatibility = new { version, revision, service_protocol = protocol } }));
+        var live = JsonSerializer.SerializeToElement(new { version = 27, service_revision = nextService, preserves_background_profiles = true });
+        var stale = JsonSerializer.SerializeToElement(new { version = 27, service_revision = staleService, preserves_background_profiles = true });
         ManagerUpdateState Inspect(JsonElement? status = null, bool current = false) =>
             ManagerUpdateCompatibility.Inspect(root, current ? newShell : oldShell, 74, status ?? live).State;
         Check(Inspect() == ManagerUpdateState.Unknown, "missing release pointer cannot promise work-preserving update");
         Select(newShell);
         Check(Inspect() == ManagerUpdateState.Unknown, "legacy release without metadata cannot be guessed compatible");
         Metadata();
-        Check(Inspect() == ManagerUpdateState.Ready, "same IPC and work-preserving service allow newer UI with a different service hash");
+        Check(Inspect() == ManagerUpdateState.Ready, "same IPC, same service revision and work-preserving service allow a close-only update");
         Metadata(protocol: 28);
         Check(Inspect() == ManagerUpdateState.NeedsStop, "different IPC is announced before closing the current UI");
         Metadata();
-        Check(Inspect(JsonSerializer.SerializeToElement(new { version = 27, service_revision = "old-service" })) == ManagerUpdateState.NeedsStop,
+        Check(Inspect(stale) == ManagerUpdateState.NeedsStop,
+            "an older live service revision still requires one full stop before the selected release applies");
+        Check(Inspect(JsonSerializer.SerializeToElement(new { version = 27, service_revision = staleService })) == ManagerUpdateState.NeedsStop,
             "legacy service requires first-time shutdown");
-        Check(Inspect(JsonSerializer.SerializeToElement(new { version = 27, service_revision = "old-service", preserves_background_profiles = false })) == ManagerUpdateState.NeedsStop,
+        Check(Inspect(JsonSerializer.SerializeToElement(new { version = 27, service_revision = staleService, preserves_background_profiles = false })) == ManagerUpdateState.NeedsStop,
             "service explicitly lacking background support cannot promise a safe close");
-        Check(Inspect(JsonSerializer.SerializeToElement(new { version = 27, service_revision = "old-service", preserves_background_profiles = "true" })) == ManagerUpdateState.Unknown,
+        Check(Inspect(JsonSerializer.SerializeToElement(new { version = 27, service_revision = staleService, preserves_background_profiles = "true" })) == ManagerUpdateState.Unknown,
             "malformed capability cannot certify compatibility");
         Check(ManagerUpdateCompatibility.Inspect(root, oldShell, 74, null).State == ManagerUpdateState.Unknown,
             "lost service connection invalidates the previous green result");
         Metadata(revision: 74);
-        Check(Inspect(current: true) == ManagerUpdateState.Deferred, "latest UI reports deferred service separately from update availability");
-        Check(Inspect(JsonSerializer.SerializeToElement(new { version = 27, service_revision = "next-service", preserves_background_profiles = true }), current: true) == ManagerUpdateState.Current,
+        Check(Inspect(stale, current: true) == ManagerUpdateState.NeedsStop,
+            "latest UI with an older live service must still require a full stop");
+        Check(Inspect(JsonSerializer.SerializeToElement(new { version = 27, service_revision = nextService, preserves_background_profiles = true }), current: true) == ManagerUpdateState.Current,
             "matching installed UI and service report current");
         Metadata(version: 2);
         Check(Inspect() == ManagerUpdateState.Unknown, "future compatibility schema fails closed");
@@ -96,7 +126,77 @@ internal static class Program
         Check(Inspect() == ManagerUpdateState.Unknown, "release outside installed releases is rejected");
         Select(newShell); Metadata(); File.Delete(newShell);
         Check(Inspect() == ManagerUpdateState.Unknown, "missing target executable invalidates a previously compatible update");
-        Console.WriteLine("PASS: read-only update compatibility, missing metadata, legacy services and deferred service updates");
+        Console.WriteLine("PASS: read-only update compatibility, missing metadata, legacy services and full-stop service updates");
+    }
+
+    private static async Task<int> RunServiceAuthorityFixtureAsync()
+    {
+        // Disposable fixture service only: no real manager state, profiles or
+        // credentials. Proves ManagerClient admits a matching authority and
+        // exposes the OS-probed elevation to the UI.
+        await using var client = await ManagerClient.ConnectAsync(FixtureRoot());
+        Check(client.IsConnected, "fixture service connects under a matching authority");
+        Check(client.ServiceAuthority.Known, "fixture service authority is OS-probed");
+        Check(client.ServiceElevated == WindowsExecutionIdentity.IsElevated,
+            "fixture service elevation matches this process authority");
+        Console.WriteLine($"PASS: {checks} assertions; fixture service authority.");
+        return 0;
+    }
+
+    private static void TestExecutionIdentity()
+    {
+        var current = WindowsExecutionIdentity.ProbeCurrent();
+        Check(current.Known, "current process token user is readable");
+        Check(current.Elevated is not null && WindowsExecutionIdentity.IsElevated == (current.Elevated == true),
+            "IsElevated matches the token elevation probe");
+        var expectedSid = System.Security.Principal.WindowsIdentity.GetCurrent().User?.Value;
+        Check(expectedSid is not null && string.Equals(current.UserSid, expectedSid, StringComparison.OrdinalIgnoreCase),
+            "token user SID matches the framework identity");
+        Check(WindowsExecutionIdentity.ProbeProcess(Environment.ProcessId) == current,
+            "own process id probes the same authority");
+        Check(WindowsExecutionIdentity.ProbeProcess(0) == WindowsExecutionIdentity.UnknownAuthority,
+            "invalid process id is unknown authority");
+        Check(WindowsExecutionIdentity.ProbeProcess(int.MaxValue) == WindowsExecutionIdentity.UnknownAuthority,
+            "unreachable process id is unknown authority");
+        Check(WindowsExecutionIdentity.ProbePipeServer(null) == WindowsExecutionIdentity.UnknownAuthority,
+            "missing pipe handle is unknown authority");
+        WindowsExecutionIdentity.RequireMatchingAuthority(current, current);
+        checks++;
+        Check(WindowsExecutionIdentity.RequireCurrentMatches(current) == current,
+            "verified peer authority is returned to the caller");
+        // A private loopback pipe pair: proves the pipe probes resolve the real
+        // peer process without any live manager service.
+        var pipeName = "CodexControlCenter.test." + Guid.NewGuid().ToString("N");
+        using var server = new NamedPipeServerStream(pipeName, PipeDirection.InOut, 1, PipeTransmissionMode.Byte,
+            PipeOptions.Asynchronous);
+        var waiting = server.WaitForConnectionAsync();
+        using var client = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
+        client.Connect(2000);
+        waiting.GetAwaiter().GetResult();
+        Check(WindowsExecutionIdentity.ProbePipeServer(client.SafePipeHandle) == current,
+            "private pipe peer probe resolves the server process authority");
+        Check(!new ExecutionAuthority(null, current.UserSid).Known, "unreadable elevation is not a known authority");
+        Check(new ExecutionAuthority(null, current.UserSid).Mode == "unknown", "unreadable elevation reports unknown mode");
+        Check(ThrowsManager(() => WindowsExecutionIdentity.RequireMatchingAuthority(current, new ExecutionAuthority(null, current.UserSid)), "authority_mismatch"),
+            "unreadable peer elevation is rejected instead of treated as normal");
+        Check(ThrowsManager(() => WindowsExecutionIdentity.RequireMatchingAuthority(new ExecutionAuthority(null, current.UserSid), current), "authority_mismatch"),
+            "unreadable current elevation is rejected instead of treated as normal");
+        var mismatchedElevation = new ExecutionAuthority(current.Elevated != true, current.UserSid);
+        Check(ThrowsManager(() => WindowsExecutionIdentity.RequireMatchingAuthority(current, mismatchedElevation), "authority_mismatch"),
+            "elevation mismatch is rejected");
+        var foreignSid = new ExecutionAuthority(current.Elevated, "S-1-5-21-1111111111-2222222222-3333333333-1001");
+        Check(ThrowsManager(() => WindowsExecutionIdentity.RequireMatchingAuthority(current, foreignSid), "authority_mismatch"),
+            "different user SID is rejected");
+        Check(ThrowsManager(() => WindowsExecutionIdentity.RequireMatchingAuthority(current, WindowsExecutionIdentity.UnknownAuthority), "authority_mismatch"),
+            "unknown peer authority is rejected");
+        Check(ThrowsManager(() => WindowsExecutionIdentity.RequireMatchingAuthority(WindowsExecutionIdentity.UnknownAuthority, current), "authority_mismatch"),
+            "unknown current authority is rejected");
+        var message = ManagerMessage(() => WindowsExecutionIdentity.RequireMatchingAuthority(current, foreignSid));
+        Check(message.Contains("실행 권한이 다릅니다") && message.Contains("기존 작업은 그대로 유지됩니다")
+              && message.Contains("작업을 모두 마친 뒤") && message.Contains("완전 종료"),
+            "mismatch message names the actionable recovery without stopping work");
+        Check(!message.Contains(foreignSid.UserSid!), "mismatch message never echoes a peer SID");
+        Console.WriteLine("PASS: OS token probes, authority comparison and fail-closed mismatch");
     }
 
     private static void TestWorkspaceSession()
@@ -188,6 +288,10 @@ internal static class Program
             foreach (var status in statuses) RegisterStatusProcesses(status);
             Check(statuses.Select(x => x.GetProperty("supervisor_pid").GetInt32()).Distinct().Count() == 1, "startup race results in one supervisor");
             Check(statuses.Select(x => x.GetProperty("backend_pid").GetInt32()).Distinct().Count() == 1, "one compatibility backend serves clients");
+            // The fixture service runs as this user and at this elevation, so
+            // the OS-probed authority must accept it and expose that state.
+            Check(clients.All(client => client.ServiceElevated == WindowsExecutionIdentity.IsElevated),
+                "connected fixture service reports its OS-probed elevation");
         }
         finally { foreach (var client in clients) await client.DisposeAsync(); }
         Console.WriteLine("PASS: concurrent clients and startup race");
@@ -535,6 +639,21 @@ internal static class Program
     {
         if (!condition) throw new Exception(message);
         checks++;
+    }
+
+    private static bool ThrowsManager(Action action, string code)
+    {
+        try { action(); }
+        catch (ManagerException exception) { return exception.Code == code; }
+        catch { return false; }
+        return false;
+    }
+
+    private static string ManagerMessage(Action action)
+    {
+        try { action(); }
+        catch (ManagerException exception) { return exception.Message; }
+        return "";
     }
 
     private static async Task ThrowsAsync<T>(Func<Task> action, string message) where T : Exception
