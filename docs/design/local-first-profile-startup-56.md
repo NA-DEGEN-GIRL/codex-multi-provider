@@ -53,3 +53,5 @@ Validation covered 964 manager Python tests (one environment-dependent skip),
 Node fixtures, and the packaged Windows self-tests. These checks use isolated
 profiles and native fixture windows. Live accounts and remote listeners were
 not restarted for validation; live reconnection remains a post-reopen check.
+
+> Revision 94: different profiles now launch in parallel (serially only while the one-time history migration is pending). See [parallel profile launch](parallel-profile-launch-94.md).

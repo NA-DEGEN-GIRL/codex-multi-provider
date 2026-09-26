@@ -38,7 +38,7 @@ python3 scripts/remote_helpers/package_runtime.py --build
 
 생성된 `artifacts/remote/linux-<CPU>` 폴더를 Windows의 같은 저장소 경로 아래에 놓으면 관리창의 원격 준비 단계에서 검사합니다. 빌드 도구 자체가 CLI를 설치하거나 SSH로 전송하지는 않습니다. 빌드 성공만으로 실제 앱·모델·SSH 호환 시험을 통과했다고 표시하지 않습니다.
 
-Linux 묶음에는 `codex`, `codex-code-mode-host`, `bwrap` 세 실행 파일이 필요합니다. 빌드 도구는 upstream 순서대로 bubblewrap을 먼저 만들고 해시를 계산한 다음 그 해시를 Codex에 넣습니다. `libcap` 개발 헤더 등 Linux 빌드 의존성이 필요하며, 샌드박스 파일이 없거나 해시가 다르면 준비를 거절합니다.
+Linux 묶음에는 `codex`, `codex-code-mode-host`, `bwrap` 세 실행 파일이 필요합니다. 빌드 도구는 upstream 순서대로 bubblewrap을 먼저 만들고 해시를 계산한 다음 그 해시를 Codex에 넣습니다. `libcap` 개발 헤더 등 Linux 빌드 의존성이 필요하며(Ubuntu: `pkg-config libcap-dev`, upstream CI와 같음), 샌드박스 파일이 없거나 해시가 다르면 준비를 거절합니다. 묶음 버전은 `<CLI 버전>-managed-<패치 SHA256 앞 16자>`이고 `build_source_sha256`에 패치 해시 전체를 남깁니다. 새 `codex` 해시는 `native_controller.py`의 `DRAIN_AUDITED_SHA256`에 넣어야 SSH 작업을 기다리는 안전한 재시작을 사용합니다.
 
 Ubuntu 24.04의 사용자 네임스페이스 정책 때문에 실행이 거절될 수 있습니다. 이 경우 샌드박스를 끄지 않고 원인을 표시합니다. 호스트별 관리자 정책 변경 도우미는 배포 소스에 포함하지 않으며 일반 원격 준비 과정에서도 실행하지 않습니다.
 

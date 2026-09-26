@@ -83,3 +83,5 @@ Further Electron memory reduction needs measurements of each process tree.
 Hidden renderers already defer transcript hydration and restore native background
 throttling; unloading them would trade immediate switching for reload latency.
 Rust conversion or CUDA is not a substitute for removing serialized waits.
+
+> Revision 94: the launch fence is now shared by different profiles and warmup runs up to eight launches. See [parallel profile launch](parallel-profile-launch-94.md).
