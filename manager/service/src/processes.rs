@@ -191,17 +191,39 @@ fn profile(root: &Path, args: &Value) -> Result<Value, String> {
         .ok_or("프로필을 찾지 못했습니다.".into())
 }
 
-fn verified(root: &Path, args: &Value) -> Result<(Value, Option<Process>), String> {
+fn verified(
+    root: &Path,
+    args: &Value,
+    require_pid: bool,
+) -> Result<(Value, Option<Process>), String> {
     let profile = profile(root, args)?;
     if profile["generation"] != args["generation"] || args["generation"].as_str().is_none() {
         return Err("프로필 실행이 변경되었습니다.".into());
     }
-    let pid = profile["process_id"]
-        .as_u64()
-        .ok_or("실행 프로필이 없습니다.")? as u32;
+    // `stop` treats an unrecorded main process as exited: it still sweeps the
+    // profile's own --user-data-dir. A malformed pid remains an error.
+    let pid = match &profile["process_id"] {
+        Value::Null if !require_pid => return Ok((profile, None)),
+        value => value.as_u64().ok_or("실행 프로필이 없습니다.")? as u32,
+    };
     let process = Process::open(pid, true);
     if process.is_none() && snapshot()?.contains_key(&pid) {
+        // The recorded desktop ran as this user, so a live pid that cannot be
+        // opened belongs to another process now: for `stop` the recorded one
+        // exited and Windows reused its pid. The sweep below still runs.
+        if !require_pid {
+            return Ok((profile, None));
+        }
         return Err("프로필 종료 여부를 확인하지 못했습니다.".into());
+    }
+    // A different creation time is likewise another process on a reused pid.
+    // Only the recorded lifetime with a foreign exe or folder stays an error.
+    if !require_pid
+        && process.as_ref().is_some_and(|p| {
+            Some(p.identity.process_created) != profile["process_created"].as_u64()
+        })
+    {
+        return Ok((profile, None));
     }
     if let Some(p) = &process
         && (Some(p.identity.process_created) != profile["process_created"].as_u64()
@@ -258,8 +280,9 @@ pub fn execute(root: &Path, command: &str, args: &Value) -> Result<Value, String
             args["pid"].as_u64().ok_or("PID 없음")? as u32
         ))),
         "process.launch" => launch(root, args),
+        "process.abort_launch" => abort_launch(root, args),
         "process.close" => {
-            let (_, process) = verified(root, args)?;
+            let (_, process) = verified(root, args, true)?;
             if let Some(process) = process {
                 let hwnd = args["window_handle"]
                     .as_u64()
@@ -392,12 +415,112 @@ fn launch(root: &Path, args: &Value) -> Result<Value, String> {
     }
 }
 
+fn already_stopped() -> Value {
+    json!({"state":"already_stopped","all_selected_processes_exited":true})
+}
+
 fn stop(root: &Path, args: &Value) -> Result<Value, String> {
-    let (profile, main) = verified(root, args)?;
-    let Some(main) = main else {
-        return Ok(json!({"state":"already_stopped","all_selected_processes_exited":true}));
-    };
+    let (profile, main) = verified(root, args, false)?;
     let id = profile["id"].as_str().unwrap();
+    // A null, exited or reused main process is not proof that the profile
+    // stopped: a launch that failed before its identity was saved, or a mode
+    // switch that handed the UI to another process, leaves a desktop running
+    // on this profile's own --user-data-dir. Sweep for it, but only when that
+    // folder is the manager-created one of this profile.
+    if main.is_none()
+        && !profile["ui_home"]
+            .as_str()
+            .is_some_and(|ui| under(ui, &root.join("work/control-center/profiles").join(id)))
+    {
+        return Ok(already_stopped());
+    }
+    let result = reap(root, &profile, main, true)?;
+    if result["state"] == "stopped" {
+        windows::atomic(
+            &root
+                .join("work/control-center/instances")
+                .join(id)
+                .join("last-recovery.json"),
+            &serde_json::to_vec(&result).unwrap(),
+        )
+        .map_err(|_| "종료 기록 저장 실패")?;
+    }
+    Ok(result)
+}
+
+/// Stops the tree of a launch that failed after spawning but before the
+/// adapter saved its identity; nothing else records that process. Only the
+/// exact process `launch` wrote to process-owner.json for this generation
+/// qualifies, and no --user-data-dir sweep runs.
+fn abort_launch(root: &Path, args: &Value) -> Result<Value, String> {
+    let profile = profile(root, args)?;
+    let id = protocol::uuid(args, "profile_id")?;
+    let generation = protocol::uuid(args, "generation")?;
+    let pid = args["process_id"].as_u64().ok_or("PID 없음")?;
+    let created = args["process_created"]
+        .as_u64()
+        .ok_or("실행 식별을 확인하지 못했습니다.")?;
+    let owner: Value = serde_json::from_slice(
+        &std::fs::read(
+            root.join("work/control-center/instances")
+                .join(&id)
+                .join("process-owner.json"),
+        )
+        .map_err(|_| "실행 기록을 확인하지 못했습니다.")?,
+    )
+    .map_err(|_| "실행 기록 형식 오류")?;
+    let recorded: Identity =
+        serde_json::from_value(owner["identity"].clone()).map_err(|_| "실행 기록 형식 오류")?;
+    if owner["state"] != "running"
+        || owner["profile_id"].as_str() != Some(id.as_str())
+        || owner["generation"].as_str() != Some(generation.as_str())
+        || u64::from(recorded.process_id) != pid
+        || recorded.process_created != created
+    {
+        return Err("실행 기록이 달라 시작을 취소하지 않았습니다.".into());
+    }
+    // Once state.json owns this generation the launch was saved: stop and
+    // full exit manage it from then on, never an abort.
+    if protocol::uuid(&profile, "generation").ok() == Some(generation.clone()) {
+        return Err("저장된 실행이라 시작을 취소하지 않았습니다.".into());
+    }
+    let ui = profile["ui_home"].as_str().ok_or("프로필 경로 없음")?;
+    if !under(ui, &root.join("work/control-center/profiles").join(&id)) {
+        return Err("관리 앱 전용 프로필이 아닙니다.".into());
+    }
+    let Some(main) = Process::open(recorded.process_id, true) else {
+        if snapshot()?.contains_key(&recorded.process_id) {
+            return Err("프로필 종료 여부를 확인하지 못했습니다.".into());
+        }
+        return Ok(already_stopped());
+    };
+    if main.identity.process_created != recorded.process_created
+        || !same_path(&main.identity.executable_path, &recorded.executable_path)
+        || !under(
+            &main.identity.executable_path,
+            &root.join("artifacts/managed-desktop"),
+        )
+    {
+        return Err("프로필 프로세스 식별이 달라 종료하지 않았습니다.".into());
+    }
+    let arguments = main.arguments()?;
+    let paths: Vec<_> = arguments
+        .iter()
+        .filter_map(|a| a.strip_prefix("--user-data-dir="))
+        .collect();
+    if paths.len() != 1 || !same_path(paths[0], ui) {
+        return Err("관리 앱 전용 Codex 프로필을 확인하지 못했습니다.".into());
+    }
+    let mut result = reap(root, &profile, Some(main), false)?;
+    result["generation"] = json!(generation);
+    Ok(result)
+}
+
+/// Terminates `main` with its descendants and, with `sweep`, every managed
+/// desktop process whose only --user-data-dir is this profile's. Without a
+/// main process the sweep alone selects processes.
+fn reap(root: &Path, profile: &Value, main: Option<Process>, sweep: bool) -> Result<Value, String> {
+    let id = profile["id"].as_str().ok_or("프로필 상태 확인 실패")?;
     let state: Value = serde_json::from_slice(
         &std::fs::read(root.join("work/control-center/state.json"))
             .map_err(|_| "프로필 상태 확인 실패")?,
@@ -410,10 +533,14 @@ fn stop(root: &Path, args: &Value) -> Result<Value, String> {
         .filter(|p| p["id"] != profile["id"])
         .filter_map(|p| p["process_id"].as_u64().map(|id| id as u32))
         .collect();
-    if other_profiles.contains(&main.identity.process_id) {
+    let main_pid = main.as_ref().map(|p| p.identity.process_id);
+    if main_pid.is_some_and(|pid| other_profiles.contains(&pid)) {
         return Err("다른 프로필 실행이 중복 지정되어 종료하지 않았습니다.".into());
     }
-    let mut held = HashMap::from([(main.identity.process_id, main)]);
+    let mut held: HashMap<u32, Process> = main
+        .into_iter()
+        .map(|p| (p.identity.process_id, p))
+        .collect();
     let mut preserved = HashSet::new();
     let start = std::time::Instant::now();
     let mut terminated = false;
@@ -465,8 +592,10 @@ fn stop(root: &Path, args: &Value) -> Result<Value, String> {
         // A mode switch can hand the UI to a process that is no longer a child
         // of the tracked pid, which left ChatGPT processes running after the
         // workspace app closed. Reclaim every managed process whose command
-        // line carries this profile's own --user-data-dir.
-        if let Some(ui) = profile["ui_home"].as_str() {
+        // line carries this profile's own --user-data-dir, and nothing else:
+        // Chromium honours the last of repeated switches, so a second value
+        // could name another profile's folder.
+        if sweep && let Some(ui) = profile["ui_home"].as_str() {
             let desktop = root.join("artifacts/managed-desktop");
             for pid in rows.keys() {
                 if held.contains_key(pid)
@@ -485,17 +614,23 @@ fn stop(root: &Path, args: &Value) -> Result<Value, String> {
                 let Ok(arguments) = candidate.arguments() else {
                     continue;
                 };
-                if arguments
+                let paths: Vec<_> = arguments
                     .iter()
                     .filter_map(|a| a.strip_prefix("--user-data-dir="))
-                    .any(|value| same_path(value, ui))
-                {
+                    .collect();
+                if paths.len() == 1 && same_path(paths[0], ui) {
                     held.insert(*pid, candidate);
                 }
             }
         }
+        if held.is_empty() {
+            // No main process, and nothing runs on this profile's folder.
+            return Ok(already_stopped());
+        }
         if !terminated {
-            held[&(profile["process_id"].as_u64().unwrap() as u32)].terminate()?;
+            if let Some(pid) = main_pid {
+                held[&pid].terminate()?;
+            }
             terminated = true;
         }
         for (pid, p) in &held {
@@ -519,15 +654,8 @@ fn stop(root: &Path, args: &Value) -> Result<Value, String> {
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    let result = json!({"state":"stopped","profile_id":id,"generation":profile["generation"],"all_selected_processes_exited":true,
-        "processes":held.values().map(|p|p.identity.clone()).collect::<Vec<_>>(),"preserved_infrastructure":preserved});
-    windows::atomic(
-        &root
-            .join("work/control-center/instances")
-            .join(id)
-            .join("last-recovery.json"),
-        &serde_json::to_vec(&result).unwrap(),
+    Ok(
+        json!({"state":"stopped","profile_id":id,"generation":profile["generation"],"all_selected_processes_exited":true,
+        "processes":held.values().map(|p|p.identity.clone()).collect::<Vec<_>>(),"preserved_infrastructure":preserved}),
     )
-    .map_err(|_| "종료 기록 저장 실패")?;
-    Ok(result)
 }

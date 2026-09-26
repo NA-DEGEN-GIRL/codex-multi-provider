@@ -4,13 +4,14 @@ mod note_aliases;
 mod notes;
 mod processes;
 mod protocol;
+mod records;
 mod windows;
 
 use protocol::{Request, error, ok};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -19,6 +20,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncWriteExt, BufReader},
+    net::windows::named_pipe::NamedPipeServer,
     sync::{Mutex, Notify, Semaphore},
 };
 
@@ -36,6 +38,28 @@ struct Service {
     retire: Mutex<()>,
     stopped: Notify,
     admission: tokio::sync::RwLock<()>,
+    records: Arc<records::Hub>,
+    /// Record-only connections: never counted in `clients`, so they cannot
+    /// hold retirement, idle exit or a management connection slot.
+    record_clients: AtomicUsize,
+    /// Accepted connections that have not sent a request yet. Not counted
+    /// in `clients` either: a record writer's reconnect loop must not look
+    /// like another management window to retirement or idle exit.
+    pending_clients: AtomicUsize,
+}
+
+/// Management (general) connections.
+const MAX_CLIENTS: usize = 32;
+/// Connections accepted but still waiting for their first request.
+const MAX_PENDING_CLIENTS: usize = 64;
+
+/// Takes a slot under `cap`, atomically with every other taker.
+fn try_join(counter: &AtomicUsize, cap: usize) -> bool {
+    counter
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+            (n < cap).then_some(n + 1)
+        })
+        .is_ok()
 }
 impl Service {
     async fn dispatch(self: &Arc<Self>, request: Request) -> Value {
@@ -44,6 +68,9 @@ impl Service {
         if id.is_empty() || id.len() > 128 || !request.args.is_object() {
             return error(id, "invalid_request", "관리 요청 형식이 올바르지 않습니다.");
         }
+        if command.starts_with("records.") {
+            return self.records_command(id, command, &request.args).await;
+        }
         if command == "supervisor.status" {
             let mut status = self.backend.status().await;
             status["version"] = json!(protocol::VERSION);
@@ -51,6 +78,9 @@ impl Service {
             status["service_revision"] = json!(self.revision);
             status["engine"] = json!("rust");
             status["clients"] = json!(self.clients.load(Ordering::Relaxed));
+            status["record_clients"] = json!(self.record_clients.load(Ordering::Relaxed));
+            status["pending_clients"] = json!(self.pending_clients.load(Ordering::Relaxed));
+            status["records"] = self.records.status();
             status["preserves_background_profiles"] = json!(true);
             status["graceful_shutdown"] = json!(true);
             status["shutdown_draining"] = json!(self.draining.load(Ordering::SeqCst));
@@ -217,26 +247,77 @@ impl Service {
         result["id"] = json!(id);
         // IDs, timing and status only: never log request arguments, notes, keys or tokens.
         let event = json!({"id":op,"command":command,"elapsed_ms":started.elapsed().as_millis(),"ok":result["ok"],"code":result["error"]["code"]});
-        let path = self
-            .root
-            .join("work/control-center/logs/rust-service.jsonl");
-        let _ = tokio::task::spawn_blocking(move || {
-            use std::io::Write;
-            let _ = std::fs::create_dir_all(path.parent().unwrap());
-            if std::fs::metadata(&path).is_ok_and(|m| m.len() > 2 * 1024 * 1024) {
-                let _ = std::fs::rename(&path, path.with_extension("previous.jsonl"));
-            }
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-            {
-                let _ = writeln!(f, "{event}");
-            }
-        })
-        .await;
+        let root = self.root.clone();
+        let _ = tokio::task::spawn_blocking(move || log_event(&root, &event)).await;
         result
     }
+
+    // Content-free (thread ids, hosts, kinds): no broker token and no protocol
+    // version pin (injected adapters outlive service updates), and never
+    // admission, profile gates or the backend. A long poll must not hold up
+    // retirement or any other request.
+    async fn records_command(&self, id: &str, command: &str, args: &Value) -> Value {
+        match command {
+            "records.poll" => {
+                let query = match records::Query::parse(args) {
+                    Ok(query) => query,
+                    Err(message) => return error(id, "invalid_request", &message),
+                };
+                if self.stopping.load(Ordering::SeqCst) {
+                    return ok(id, records::closing(&query));
+                }
+                ok(id, self.records.poll(query).await)
+            }
+            // Same grouping pipeline as the signal files; identity binding
+            // and the rate budget are per connection (see `records_gate`).
+            "records.publish" => {
+                let publish = match records::Publish::parse(args) {
+                    Ok(publish) => publish,
+                    Err(message) => return error(id, "invalid_request", &message),
+                };
+                if self.stopping.load(Ordering::SeqCst) {
+                    return ok(id, records::publish_closing());
+                }
+                match self.records.publish(publish, records::now_ms()) {
+                    records::Published::Accepted(n) => ok(id, json!({"accepted":n})),
+                    records::Published::Busy => error(
+                        id,
+                        "records_busy",
+                        "기록 동기화 대기열이 가득 찼습니다. 잠시 뒤 다시 보내 주세요.",
+                    ),
+                    records::Published::Closing => ok(id, records::publish_closing()),
+                }
+            }
+            _ => error(id, "unknown_command", "지원하지 않는 관리 명령입니다."),
+        }
+    }
+}
+
+// IDs, timing and status only: never request arguments, notes, keys or tokens.
+fn log_event(root: &Path, event: &Value) {
+    use std::io::Write;
+    let path = root.join("work/control-center/logs/rust-service.jsonl");
+    let _ = std::fs::create_dir_all(path.parent().unwrap());
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > 2 * 1024 * 1024) {
+        let _ = std::fs::rename(&path, path.with_extension("previous.jsonl"));
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        // One append per line: `writeln!` would emit a Value piecewise and
+        // interleave with concurrent loggers (e.g. many record connections).
+        let line = format!("{event}\n");
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
+fn log_async(root: &Path, event: Value) {
+    let root = root.to_path_buf();
+    drop(tokio::task::spawn_blocking(move || {
+        log_event(&root, &event)
+    }));
 }
 
 fn allowed(command: &str) -> bool {
@@ -279,6 +360,8 @@ fn allowed(command: &str) -> bool {
         "policy.set",
         "profile.model_settings",
         "profile.restart",
+        "profile.remote_restart",
+        "profile.remote_stop",
         "profile.recover",
         "providers.list",
         "providers.save",
@@ -362,7 +445,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Err("invalid root".into());
     }
     let pipe = windows::pipe_name(&root)?;
-    let mut listener = match windows::server(&pipe, true) {
+    let listener = match windows::server(&pipe, true) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return Ok(()),
         Err(e) => return Err(e.into()),
@@ -374,6 +457,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|v| v["service_revision"].as_str().map(str::to_string))
         .unwrap_or(format!("development-{}", protocol::VERSION));
     let token = uuid::Uuid::new_v4().to_string();
+    // Only the pipe owner reads and writes the record journal.
+    let records = Arc::new(records::Hub::open(&root));
+    records.start();
     let service = Arc::new(Service {
         root: root.clone(),
         backend: backend::Backend::new(root, bundle, pipe.clone(), token.clone()),
@@ -388,6 +474,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         retire: Mutex::new(()),
         stopped: Notify::new(),
         admission: tokio::sync::RwLock::new(()),
+        records,
+        record_clients: AtomicUsize::new(0),
+        pending_clients: AtomicUsize::new(0),
     });
     tokio::spawn({
         let service = service.clone();
@@ -428,69 +517,205 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     });
-    loop {
-        tokio::select! {result=listener.connect()=>result?,_=service.stopped.notified()=>break}
-        let connected = listener;
-        listener = windows::server(&pipe, false)?;
-        if service.clients.load(Ordering::Relaxed) >= 32 {
-            continue;
-        }
-        service.clients.fetch_add(1, Ordering::SeqCst);
-        let service = service.clone();
-        tokio::spawn(async move {
-            serve(connected, service.clone()).await;
-            service.clients.fetch_sub(1, Ordering::SeqCst);
-        });
-    }
+    listen(service.clone(), pipe, listener).await?;
     // Let the retirement response flush. No profile process is terminated.
     tokio::time::sleep(Duration::from_millis(100)).await;
     service.backend.reconnect().await;
     Ok(())
 }
-async fn serve(pipe: tokio::net::windows::named_pipe::NamedPipeServer, service: Arc<Service>) {
+
+async fn listen(
+    service: Arc<Service>,
+    pipe: String,
+    mut listener: NamedPipeServer,
+) -> std::io::Result<()> {
+    let result = loop {
+        tokio::select! {
+            result = listener.connect() => if let Err(e) = result { break Err(e) },
+            _ = service.stopped.notified() => break Ok(()),
+        }
+        let connected = listener;
+        listener = match windows::server(&pipe, false) {
+            Ok(listener) => listener,
+            Err(e) => break Err(e),
+        };
+        if !try_join(&service.pending_clients, MAX_PENDING_CLIENTS) {
+            continue;
+        }
+        let service = service.clone();
+        tokio::spawn(async move {
+            let counter = match serve(connected, service.clone()).await {
+                Connection::Pending => &service.pending_clients,
+                Connection::Records => &service.record_clients,
+                Connection::General => &service.clients,
+            };
+            counter.fetch_sub(1, Ordering::SeqCst);
+        });
+    };
+    // Pending record polls answer {closing:true} at once; groups still in
+    // their quiet window are journaled for the next service instance.
+    service.records.close();
+    let records = service.records.clone();
+    let _ = tokio::task::spawn_blocking(move || records.finish(records::now_ms())).await;
+    result
+}
+
+/// A connection is pending from accept until its first request decides
+/// whether it is a management client or a record-only (poll/publish) one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Connection {
+    Pending,
+    General,
+    Records,
+}
+
+/// Per-connection record rules, checked before dispatch. The first valid
+/// `profile` a connection sends becomes its identity (the origin its
+/// publishes carry); a later request claiming another profile is refused.
+/// Publishes also spend the connection's and the service-wide rate budget.
+/// Returns the refusal.
+fn records_gate(
+    service: &Service,
+    request: &Request,
+    identity: &mut Option<String>,
+    throttle: &mut records::Throttle,
+    pid: u32,
+) -> Option<Value> {
+    let publish = match request.command.as_str() {
+        "records.publish" => true,
+        "records.poll" => false,
+        // Answered by dispatch as unknown_command.
+        _ => return None,
+    };
+    if publish {
+        let events = request.args["events"].as_array().map_or(0, Vec::len);
+        if !service
+            .records
+            .admit_publish(throttle, events, Instant::now())
+        {
+            return Some(error(
+                &request.id,
+                "records_busy",
+                "기록 동기화 요청이 너무 많습니다. 잠시 뒤 다시 보내 주세요.",
+            ));
+        }
+    }
+    // A missing or malformed profile binds nothing; dispatch rejects it.
+    let claimed = protocol::uuid(&request.args, "profile").ok()?;
+    match identity {
+        Some(bound) if *bound != claimed => Some(error(
+            &request.id,
+            "profile_mismatch",
+            "이 기록 동기화 연결은 다른 프로필의 연결입니다.",
+        )),
+        Some(_) => None,
+        None => {
+            // Caller identity for diagnostics only, once: a PID and profile UUID.
+            log_async(
+                &service.root,
+                json!({"event":"records.connected","pid":pid,"profile":claimed}),
+            );
+            *identity = Some(claimed);
+            None
+        }
+    }
+}
+
+type PipeWriter = Arc<Mutex<tokio::io::WriteHalf<NamedPipeServer>>>;
+
+async fn write_line(writer: &PipeWriter, value: &Value) {
+    let mut response = serde_json::to_vec(value).unwrap();
+    response.push(b'\n');
+    let _ = tokio::time::timeout(Duration::from_secs(3), async {
+        writer.lock().await.write_all(&response).await
+    })
+    .await;
+}
+
+async fn serve(pipe: NamedPipeServer, service: Arc<Service>) -> Connection {
+    let Ok(pid) = windows::require_client_authority(&pipe) else {
+        return Connection::Pending;
+    };
     let (read, write) = tokio::io::split(pipe);
     let mut reader = BufReader::new(read);
     let writer = Arc::new(Mutex::new(write));
     let capacity = Arc::new(Semaphore::new(16));
+    let mut class = Connection::Pending;
+    let (connected, mut polls, mut profile) = (Instant::now(), 0u64, None);
+    let mut throttle = records::Throttle::connection();
+    let mut record_tasks: Vec<tokio::task::AbortHandle> = Vec::new();
     while let Ok(Some(bytes)) = protocol::frame(&mut reader, protocol::REQUEST_LIMIT).await {
         let request: Request = match serde_json::from_slice(&bytes) {
             Ok(r) => r,
             Err(_) => {
                 let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-                let mut response = serde_json::to_vec(&error(
+                let response = error(
                     value["id"].as_str().unwrap_or(""),
                     "invalid_request",
                     "관리 요청 형식이 올바르지 않습니다.",
-                ))
-                .unwrap();
-                response.push(b'\n');
-                let _ = tokio::time::timeout(Duration::from_secs(3), async {
-                    writer.lock().await.write_all(&response).await
-                })
-                .await;
+                );
+                write_line(&writer, &response).await;
                 continue;
             }
         };
+        let record = request.command.starts_with("records.");
+        // Every class change takes its new slot under that pool's cap before
+        // releasing the old one; a refused switch keeps the old class.
+        match (class, record) {
+            (Connection::Pending, true) => {
+                if !try_join(&service.record_clients, records::MAX_CONNECTIONS) {
+                    let response =
+                        error(&request.id, "records_busy", "기록 동기화 연결이 많습니다.");
+                    write_line(&writer, &response).await;
+                    break;
+                }
+                service.pending_clients.fetch_sub(1, Ordering::SeqCst);
+                class = Connection::Records;
+            }
+            (Connection::Pending, false) => {
+                if !try_join(&service.clients, MAX_CLIENTS) {
+                    let response = error(&request.id, "busy", "관리창 연결이 많습니다.");
+                    write_line(&writer, &response).await;
+                    break;
+                }
+                service.pending_clients.fetch_sub(1, Ordering::SeqCst);
+                class = Connection::General;
+            }
+            (Connection::Records, false) => {
+                // Mixed use counts as management again, within its 32 slots;
+                // refused, the connection stays a record connection.
+                if !try_join(&service.clients, MAX_CLIENTS) {
+                    let response = error(&request.id, "busy", "관리창 연결이 많습니다.");
+                    write_line(&writer, &response).await;
+                    continue;
+                }
+                service.record_clients.fetch_sub(1, Ordering::SeqCst);
+                class = Connection::General;
+            }
+            _ => {}
+        }
+        polls += u64::from(record);
+        if record
+            && let Some(refusal) =
+                records_gate(&service, &request, &mut profile, &mut throttle, pid)
+        {
+            write_line(&writer, &refusal).await;
+            continue;
+        }
         let permit = match capacity.clone().try_acquire_owned() {
             Ok(p) => p,
             Err(_) => {
-                let mut response = serde_json::to_vec(&error(
-                    &request.id,
-                    "busy",
-                    "진행 중인 관리 요청이 많습니다.",
-                ))
-                .unwrap();
-                response.push(b'\n');
-                let _ = tokio::time::timeout(Duration::from_secs(3), async {
-                    writer.lock().await.write_all(&response).await
-                })
-                .await;
+                let response = error(&request.id, "busy", "진행 중인 관리 요청이 많습니다.");
+                write_line(&writer, &response).await;
                 continue;
             }
         };
+        // Only a parked poll is aborted on disconnect; a publish is short and
+        // runs to completion even if its writer has already gone.
+        let poll = request.command == "records.poll";
         let service = service.clone();
         let writer = writer.clone();
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let _permit = permit;
             let result = service.dispatch(request).await;
             let mut bytes = serde_json::to_vec(&result).unwrap();
@@ -508,7 +733,22 @@ async fn serve(pipe: tokio::net::windows::named_pipe::NamedPipeServer, service: 
             })
             .await;
         });
+        if poll {
+            record_tasks.retain(|task| !task.is_finished());
+            record_tasks.push(task.abort_handle());
+        }
     }
+    // A departed poller's wait is read-only: never keep it parked.
+    for task in record_tasks {
+        task.abort();
+    }
+    if polls > 0 {
+        log_async(
+            &service.root,
+            json!({"event":"records.disconnected","pid":pid,"profile":profile,"polls":polls,"connected_ms":connected.elapsed().as_millis()}),
+        );
+    }
+    class
 }
 
 #[cfg(test)]
