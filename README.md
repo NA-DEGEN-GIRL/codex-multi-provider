@@ -29,6 +29,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-manager.
 Rust 변경 사항은 공식 기반 커밋에 적용할 수 있는 누적 패치와 트리 확인값으로 제공합니다. [복원 안내](patches/README.md)를 먼저 확인하세요. 기존 `runtime/` 작업 폴더에 패치를 다시 적용하지 마세요.
 
 - [관리 앱 구조와 사용법](manager/README.md)
+- [수정 기록 요약(에이전트·LLM용 색인)](docs/REVISIONS.md)
 - [개발 인수인계와 다음 작업](docs/HANDOFF.md)
 - [복원 합격 기준](docs/RESTORE-CHECKLIST.md)
 - [Ubuntu에서 3D·오디오·VFX 스킬과 플러그인 사용](docs/operations/ssh-native-skills.md)
