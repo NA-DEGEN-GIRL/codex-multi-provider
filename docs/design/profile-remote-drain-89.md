@@ -26,6 +26,17 @@ jobs. It cannot report completion while a remote job is pending or unverified.
 A bounded UI wait returns an explanatory message while the durable job continues.
 The title-bar X still detaches the shell only.
 
+Full exit while **SSH 작업 종료 후 설정 적용** is still pending no longer fails
+with `profile_prepare_busy`. `profile.remote_stop` converts that same job (same id,
+`stop_converted`) instead: `UpdateHooks.downgrade_remote_reconcile_to_stop` marks
+the held SSH gate `stop_only` before the reconcile commits its start
+(`reopen_committed`, taken atomically under state.lock), so the drain finishes
+and nothing restarts. If the start was already committed, the job records
+`stop_requested`, lets the reopen finish, then drains the reopened listeners
+with a new stop-only transaction before it can report complete. The conversion
+is one-way: a restart request never turns a pending stop back into a reopen, and
+other busy states (ordinary apply, local-first SSH open) are still refused.
+
 A new shell attached to an older service explicitly explains that this first
 full exit is local-only. The backend must be replaced before the new remote
 commands can run. A newly built shell does not upgrade an already-running service.

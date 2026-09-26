@@ -48,7 +48,16 @@
     공급자 표시.
   - 관리 앱: 사용량 장부, 공급자별 추론 강도·등급 복원, 프로필 카드의 캐시 상태·첫 요청 비용 표시.
   - 프로필별 런타임 임시 폴더(`%TEMP%\codex-manager\<profile>`)로 샌드박스 첫 설정 지연을 없앱니다.
-- 설계와 결과: `docs/design/switch-cache-optimization-96.md`(작성 예정).
+- 설계와 결과: `docs/design/switch-cache-optimization-96.md`(예상 절약, 적용 뒤 확인, 남은 과제),
+  `docs/design/cross-provider-context-94.md`(수정 96 절).
+- 함께 고친 실사용 문제:
+  - 공유 기록 안정성(`docs/design/shared-history-stability-96.md`): 기록 순번 중복으로 작업이 열리지 않던
+    문제의 복구 도구와 재발 방지, 작업 삭제 수십 초 지연, 하위 에이전트가 있는 작업의 전송 실패, 대기 중인
+    SSH 설정 적용이 완전 종료를 막던 문제, 작업 메모 창 상태의 프로필별 저장.
+  - SSH worktree 프로젝트의 작업이 다른 프로젝트로 옮겨 보이던 문제(`ssh-worktree-project-grouping-96.md`).
+  - 새로 만든 프로젝트에서 폴더의 예전 작업이 만든 창에만 안 보이던 문제(`new-project-thread-visibility-96.md`).
+  - 저장소 경로의 `#` 때문에 내장 플러그인(Chrome 확장 연결, computer use)이 설치되지 않던 문제
+    (`chrome-native-host-96.md`).
 
 ### 수정 95 — 선택한 프로필 먼저 시작, 요약 요청 캐시
 - 시작 때 마지막으로 선택한(또는 알림의) 프로필을 먼저 열고, 그 창이 뜨거나 시간 한도가 지나면 나머지를
@@ -77,7 +86,8 @@
 ## 보류·다음 과제
 
 - 수정 96의 나머지: 도구 목록 머리말 고정(측정 결과에 따라), 작업별 서비스 등급, 전환 전 압축(사용자
-  확인), 큰 문맥 전달 한도.
+  확인), 큰 문맥 전달 한도, 공급자별 작업 설정의 런타임 저장, 자동 압축 기준을 넘는 복귀의 처리(사용자
+  결정).
 - Claude 연동: 구독 OAuth 토큰을 꺼내 쓰는 서드파티 플러그인 방식은 약관상 하지 않습니다. 공식 Claude Code
   CLI를 외부 에이전트로 실행하는 설계 초안이 있으며, 공개 여부와 약관 해석을 사용자가 정할 때까지
   커밋하지 않습니다.
@@ -146,3 +156,4 @@
 | 92 | [responsiveness-and-ssh-browser-92](design/responsiveness-and-ssh-browser-92.md) | 응답성과 SSH 브라우저 |
 | 93 | [record-hub-93](design/record-hub-93.md) | 기록 동기화 허브 |
 | 94–95 | [parallel-profile-launch-94](design/parallel-profile-launch-94.md), [full-exit-unsaved-launch-94](design/full-exit-unsaved-launch-94.md), [cross-provider-context-94](design/cross-provider-context-94.md) | 병렬·우선 시작, 완전 종료, 공급자 간 문맥 |
+| 96 | [switch-cache-optimization-96](design/switch-cache-optimization-96.md), [shared-history-stability-96](design/shared-history-stability-96.md), [ssh-worktree-project-grouping-96](design/ssh-worktree-project-grouping-96.md), [new-project-thread-visibility-96](design/new-project-thread-visibility-96.md), [chrome-native-host-96](design/chrome-native-host-96.md) | 전환 캐시 절약, 공유 기록 안정성, SSH 프로젝트 분류, 새 프로젝트 표시, Chrome·computer use 플러그인 |
