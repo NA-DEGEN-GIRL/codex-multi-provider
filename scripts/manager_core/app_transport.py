@@ -296,6 +296,10 @@ class AppTransport:
             return {**unknown, 'reason': 'observer_unavailable'}
 
 
+THREAD_WAIT_FLAGS = ('waitingOnApproval', 'waitingOnUserInput')
+THREAD_ACTIVITY_LIMIT = 64
+
+
 class RuntimeObserver:
     """Reduce mirrored app-server RPCs without persisting prompts or credentials.
 
@@ -323,6 +327,8 @@ class RuntimeObserver:
         self.server_pending: set[str] = set()
         self.active_turns: set[tuple[str, str]] = set()
         self.active_threads: set[str] = set()
+        # activeFlags of active threads (waitingOnApproval / waitingOnUserInput).
+        self.thread_flags: dict[str, tuple[str, ...]] = {}
         self.active_tools: set[tuple[str, str]] = set()
         self.active_children: set[str] = set()
         self.active_processes: set[str] = set()
@@ -523,8 +529,26 @@ class RuntimeObserver:
         kind = status.get('type') if isinstance(status, dict) else None
         if kind == 'active':
             self.active_threads.add(thread_id)
+            flags = status.get('activeFlags')
+            self.thread_flags[thread_id] = tuple(flag for flag in flags if flag in THREAD_WAIT_FLAGS)[:2] \
+                if isinstance(flags, list) else ()
         elif kind in ('idle', 'notLoaded', 'systemError'):
             self.active_threads.discard(thread_id)
+            self.thread_flags.pop(thread_id, None)
+
+    def thread_activity(self) -> dict[str, str]:
+        """Per-thread display state: working, waiting_approval or waiting_input.
+
+        Only positive evidence is listed; an absent thread is idle or unobserved.
+        """
+        with self.lock:
+            threads = self.active_threads | {thread for thread, _ in self.active_turns}
+            activity = {}
+            for thread in sorted(threads)[:THREAD_ACTIVITY_LIMIT]:
+                flags = self.thread_flags.get(thread, ())
+                activity[thread] = ('waiting_approval' if 'waitingOnApproval' in flags else
+                                    'waiting_input' if 'waitingOnUserInput' in flags else 'working')
+            return activity
 
     def _item(self, method: str, thread_id: str | None, item: Any) -> None:
         if not isinstance(item, dict):
@@ -586,6 +610,7 @@ class RuntimeObserver:
                     'active_child_count': len(self.active_children),
                     'active_process_count': len(self.active_processes),
                     'active_thread_ids': sorted(self.active_threads),
+                    'thread_activity': self.thread_activity(),
                     'recent_diagnostics': list(self.diagnostics),
                     'pending_client_request_count': len(self.pending),
                     'pending_execution_request_count': mutating,

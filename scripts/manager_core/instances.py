@@ -237,6 +237,11 @@ class Instances:
                     state['job_state']=observer.get('activity','unknown')
             except (OSError,ValueError):
                 pass
+        # Per-task working/waiting state for the shortcut list: local runtime
+        # plus every live SSH connection of this launch.
+        from .thread_activity import merge, read_ssh
+        state['thread_activity']=merge(state.get('runtime_state',{}).get('thread_activity'),
+                                       read_ssh(status_path.parent,profile.get('generation')))
         return state
 
     def prepare(self, profile):

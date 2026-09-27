@@ -633,6 +633,7 @@ def _proxy_with_auth(executable: Path, arguments: list[str], environment: dict,
     auth_state = [auth.state]
     control = None
     admin_server = None
+    activity = None
 
     def emit(outcome):
         for data in outcome.runtime:
@@ -680,6 +681,9 @@ def _proxy_with_auth(executable: Path, arguments: list[str], environment: dict,
             _audit(path, {**event, 'operation': 'admin-ready'})
         except (AdminError, OSError, ValueError):
             _audit(path, {**event, 'operation': 'admin-unavailable'})
+        from manager_core.thread_activity import ActivityFile, activity_path
+        activity = ActivityFile(activity_path(source_environment['CODEX_MANAGER_ROOT'], event['profile_id'],
+                                              event['alias']), generation=generation)
     bridge = WebSocketAuthBridge(control or auth)
 
     def incoming():
@@ -710,6 +714,10 @@ def _proxy_with_auth(executable: Path, arguments: list[str], environment: dict,
             except (OSError, ValueError, TypeError, ShimError, WebSocketProtocolError) as error:
                 fail_transport('poll', error)
                 return
+            if activity is not None and not stop.is_set():
+                # Outside the protocol lock: the observer has its own lock and
+                # a slow file write never delays frames.
+                activity.publish(control.observer.thread_activity())
 
     # A native bootstrap Job Object ensures forced Windows termination closes the
     # local transport tree. Ctrl+C already reaches the inherited console group.
@@ -736,6 +744,8 @@ def _proxy_with_auth(executable: Path, arguments: list[str], environment: dict,
         fail_transport('runtime', error)
     finally:
         stop.set()
+        if activity is not None:
+            activity.close()
         if control is not None:
             control.close()
         if admin_server is not None:
