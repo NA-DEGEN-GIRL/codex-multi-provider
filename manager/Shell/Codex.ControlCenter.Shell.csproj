@@ -8,6 +8,8 @@
     <AssemblyName>Codex.ControlCenter</AssemblyName>
     <RootNamespace>Codex.ControlCenter.Shell</RootNamespace>
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <!-- Windows without their own Icon (all of ours) take the executable's icon. -->
+    <ApplicationIcon>Assets\app.ico</ApplicationIcon>
     <Product>Codex 작업 공간</Product>
   </PropertyGroup>
   <ItemGroup><ProjectReference Include="../Shared/Codex.ControlCenter.Shared.csproj" /></ItemGroup>

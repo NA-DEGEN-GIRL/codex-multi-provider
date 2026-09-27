@@ -250,18 +250,19 @@ public sealed class MainWindow : Window
         ScrollViewer.SetVerticalScrollBarVisibility(_shortcuts, ScrollBarVisibility.Auto);
         ScrollViewer.SetHorizontalScrollBarVisibility(_shortcuts, ScrollBarVisibility.Disabled);
         VirtualizingPanel.SetScrollUnit(_shortcuts, ScrollUnit.Pixel);
-        _shortcuts.ItemTemplate = ShortcutCards.Create(async (sender, e) =>
+        _shortcuts.ItemTemplate = ShortcutCards.Create();
+        _shortcuts.ItemContainerStyle = ProfileCards.ContainerStyle();
+        ShortcutCards.Attach(_shortcuts, async (choice, action, button) =>
         {
-            e.Handled = true;
-            if (sender is not Button { DataContext: Choice choice, Tag: string action }) return;
-            await Safe(() => action switch
+            if (action == "menu")
             {
-                "open" => OpenShortcutAsync(choice.Id),
-                "move" => MoveShortcutByIdAsync(choice.Id),
-                "rename" => RenameShortcutByIdAsync(choice.Id),
-                "delete" => DeleteShortcutByIdAsync(choice.Id),
-                _ => Task.CompletedTask
-            });
+                _contextShortcut = choice.Id;
+                _shortcuts.ContextMenu.PlacementTarget = button;
+                _shortcuts.ContextMenu.Placement = System.Windows.Controls.Primitives.PlacementMode.Bottom;
+                _shortcuts.ContextMenu.IsOpen = true;
+                return;
+            }
+            if (action == "open") await Safe(() => OpenShortcutAsync(choice.Id));
         });
         _shortcuts.ContextMenu = Menu(("열기", () => OpenShortcutAsync(RequireContextShortcut())), ("다른 프로필로 이동", () => MoveShortcutByIdAsync(RequireContextShortcut())), ("별칭 변경", () => RenameShortcutByIdAsync(RequireContextShortcut())), ("링크 삭제", () => DeleteShortcutByIdAsync(RequireContextShortcut())));
         _shortcuts.ContextMenu.Opened += (_, _) => _shortcuts.ContextMenu.Tag = _contextShortcut ?? (_shortcuts.SelectedItem as Choice)?.Id;
@@ -881,10 +882,17 @@ public sealed class MainWindow : Window
                 return ProfileCacheLine.Apply(new Choice(p.S("id"), $"{label}\n{usage} · {Status(p.S("status"))}" + suffix, p) { ProfileNotice = suffix }, _state, _selectedTask);
             }), _selectedProfile);
             var shortcuts = _state.Arr("shortcuts");
+            var shortcutOwners = _state.Arr("profiles").ToArray();
+            var taskActivity = ShortcutCardData.Activity(shortcutOwners);
+            var agentModels = _state.Arr("models").ToArray();
             using (_responsiveness?.Stage("shell.shortcut_list", 25))
-            Fill(_shortcuts, shortcuts.Select(s => new Choice(s.S("id"), s.S("alias", "이름 없는 작업") + "\n" +
-                _state.Arr("profiles").FirstOrDefault(p => p.S("id") == s.S("profile_id")).S("alias", "계정 지정 필요") +
-                " 계정에서 열기 · " + (s.S("host_id", "local") == "local" ? "Windows" : s.S("host_id")), s)), (_shortcuts.SelectedItem as Choice)?.Id);
+            Fill(_shortcuts, shortcuts.Select(s =>
+            {
+                var owner = shortcutOwners.FirstOrDefault(p => p.S("id") == s.S("profile_id"));
+                return new Choice(s.S("id"), s.S("alias", "이름 없는 작업") + "\n" + owner.S("alias", "계정 지정 필요") +
+                    " 계정에서 열기 · " + (s.S("host_id", "local") == "local" ? "Windows" : s.S("host_id")), s)
+                    { Shortcut = ShortcutCardData.Create(s, owner, taskActivity, agentModels) };
+            }), (_shortcuts.SelectedItem as Choice)?.Id);
             var p = Profile();
             if (_viewingCatalog)
             {
@@ -1022,7 +1030,7 @@ public sealed class MainWindow : Window
     {
         var items = values.ToArray();
         var old = box.Items.OfType<Choice>().ToArray();
-        static object Appearance(Choice x) => (x.Id, x.Label, x.Hint, x.AgentBadge, x.AgentHint, x.Card);
+        static object Appearance(Choice x) => (x.Id, x.Label, x.Hint, x.AgentBadge, x.AgentHint, x.Card, x.Shortcut);
         if (old.Select(x => x.Id).SequenceEqual(items.Select(x => x.Id)))
         {
             // Status/usage refreshes must not reset the virtualized panel's

@@ -31,6 +31,13 @@ public static class NativeConversationCapture
         "Chromium Web Custom MIME Data Format", "CanIncludeInClipboardHistory",
         "CanUploadToCloudClipboard", "ExcludeClipboardContentFromMonitorProcessing"
     };
+    // OleSetClipboard (WPF, WinForms, Office) adds these markers for its live
+    // IDataObject. They carry no data of their own: paste uses the rendered
+    // formats beside them, which are saved and restored as usual.
+    private static readonly HashSet<string> OleMarkerFormats = new(StringComparer.Ordinal)
+    {
+        "DataObject", "Ole Private Data"
+    };
 
     public static async Task<NativeConversationCaptureResult> CaptureAsync(nint hwnd, int pid, string expectedExecutable,
         nint manager = 0, Func<bool>? selectionIsCurrent = null)
@@ -280,6 +287,7 @@ public static class NativeConversationCapture
                     throw new Win32Exception(Marshal.GetLastPInvokeError(), "Cannot enumerate the clipboard.");
                 break;
             }
+            if (format >= 0xC000 && OleMarkerFormats.Contains(FormatName(format))) continue;
             if (formats.Count >= 64 || !IsSupportedFormat(format))
                 throw new NotSupportedException($"Clipboard format {FormatName(format)} cannot be preserved safely. Capture stopped before sending a shortcut. Copy plain text before trying again.");
             formats.Add(format);
