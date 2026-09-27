@@ -35,7 +35,18 @@
 
 ## 최근 수정
 
-### 수정 96 (진행 중) — 잦은 계정·공급자 전환의 캐시 최적화
+### 수정 97 — SSH 런타임 경량화, 서버별 실패 분리, 작업 바로가기 상태
+- 수정 96 배포 직후 한 프로필의 SSH가 모든 서버에서 막혔습니다. 원인은 디버그 정보가 든 1.45GB 원격
+  런타임, 여러 프로필의 같은 서버 동시 업로드(디스크 부족), 한 서버 실패가 프로필 전체를 막는 구조였습니다.
+- 원격 런타임에서 디버그 정보를 빼 328MB로 줄였습니다(gzip 전송 약 140MB). 서버별로 업로드를 한 번만
+  하고, 제한 시간은 크기에 비례합니다. 설정 적용 중 한 서버 준비가 실패하면 그 서버만 이전 설정으로 연결하고
+  나머지는 새 설정으로 엽니다. 1GiB 넘는 런타임의 '작업 유지 종료'가 항상 거부되던 잠재 버그도 고쳤습니다.
+- 작업 바로가기 카드: 계정 사용량 링(가운데 계정 이름), 작업 중·승인 대기·입력 대기 상태, 하위 에이전트
+  칩, `⋯` 메뉴. 작업 상태는 로컬 런타임과 SSH 프록시의 알림에서 내용 없이 모읍니다.
+- 앱 아이콘 추가, '지금 열린 작업 추가'의 OLE 클립보드 형식 오류 수정.
+- 문서: `docs/design/ssh-upload-and-task-shortcuts-97.md`.
+
+### 수정 96 — 잦은 계정·공급자 전환의 캐시 최적화
 - 전제: 사용자가 앞으로 같은 작업에서 ChatGPT 계정과 공급자(GPT↔DeepSeek 등)를 자주 바꿉니다.
 - 조사 결과(최근 2주 실제 기록, 내용 없이 토큰 수치만):
   - 프롬프트 캐시는 서버에서 계정(조직)별로 분리됩니다. 계정을 바꾸면 첫 요청 1개가 캐시 없이
@@ -92,6 +103,7 @@
   CLI를 외부 에이전트로 실행하는 설계 초안이 있으며, 공개 여부와 약관 해석을 사용자가 정할 때까지
   커밋하지 않습니다.
 - 사용 설정 선택지(사용자 결정): Fast 등급 범위, 자동 압축 기준, 쓰지 않는 플러그인·MCP 정리.
+- 수정 97의 나머지: 원격 서버의 쓰지 않는 런타임 자동 정리(현재 바인딩과 실행 중 프로세스 기준).
 
 ## 전체 목록
 
@@ -157,3 +169,4 @@
 | 93 | [record-hub-93](design/record-hub-93.md) | 기록 동기화 허브 |
 | 94–95 | [parallel-profile-launch-94](design/parallel-profile-launch-94.md), [full-exit-unsaved-launch-94](design/full-exit-unsaved-launch-94.md), [cross-provider-context-94](design/cross-provider-context-94.md) | 병렬·우선 시작, 완전 종료, 공급자 간 문맥 |
 | 96 | [switch-cache-optimization-96](design/switch-cache-optimization-96.md), [shared-history-stability-96](design/shared-history-stability-96.md), [ssh-worktree-project-grouping-96](design/ssh-worktree-project-grouping-96.md), [new-project-thread-visibility-96](design/new-project-thread-visibility-96.md), [chrome-native-host-96](design/chrome-native-host-96.md) | 전환 캐시 절약, 공유 기록 안정성, SSH 프로젝트 분류, 새 프로젝트 표시, Chrome·computer use 플러그인 |
+| 97 | [ssh-upload-and-task-shortcuts-97](design/ssh-upload-and-task-shortcuts-97.md) | SSH 런타임 경량화·서버별 실패 분리, 작업 바로가기 상태, 앱 아이콘 |
