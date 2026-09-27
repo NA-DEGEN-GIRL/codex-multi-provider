@@ -384,7 +384,7 @@ class UpdateHooks:
                 # Retry remote evidence with the current helper, never an old saved
                 # next_binding start. A fresh inspect proves exit or the actual PID.
                 for record in lease['profiles'][0].get('remotes', []):
-                    if record.get('state') in ('prepared', 'start_requested', 'stop_requested', 'started'):
+                    if record.get('state') in ('prepared', 'prepare_failed', 'start_requested', 'stop_requested', 'started'):
                         record['reinspect'] = True
                 lease['target_revision'] = profile['policy']['desired_revision']
                 self._save_lease(lease)
@@ -563,10 +563,14 @@ class UpdateHooks:
                 lease['stop_only'] = True
                 self._save_lease(lease)
             if not lease.get('stop_only'):
+                # An explicit runtime update must report its failed host; a
+                # settings apply isolates it so the other hosts still connect.
                 self.remote_maintenance.prepare_and_start(profile, records, lambda: self._save_lease(lease),
-                                                          lifecycle_guard=current)
+                                                          lifecycle_guard=current,
+                                                          isolate_host_failures=not lease.get('force_runtime_update'))
                 profile = current()
                 self.remote_maintenance.publish_started(profile, records)
+        failed = sorted(r['binding']['alias'] for r in records if r.get('state') == 'prepare_failed')
         def release(data):
             gate = data['ssh_maintenance'][profile_id]
             profile = self.store.profile(profile_id, data)
@@ -575,6 +579,11 @@ class UpdateHooks:
                     or profile['policy']['desired_revision'] != lease['target_revision']):
                 raise UpdateError('ssh_generation_changed', 'SSH 준비 중 프로필 설정이 변경되었습니다.')
             gate.update(state='released', updated_at=now())
+            if failed:
+                from .ssh_deferred_settings import HOST_PREPARE_FAILED, host_failure_message
+                gate.update(settings_deferred=True, deferred_reason=HOST_PREPARE_FAILED,
+                            code='ssh_settings_deferred', deferred_policy_hosts=failed,
+                            message=host_failure_message(records))
         self.store.mutate(release)
         if reused:
             lease['reused_unchanged'] = True

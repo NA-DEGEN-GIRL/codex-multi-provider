@@ -5,6 +5,7 @@ import unittest
 from uuid import uuid4
 
 import test_manager_update_hooks as fixtures
+from manager_core.remote import RemoteError
 from manager_core.remote_maintenance import RemoteMaintenance
 from manager_core.store import atomic_json
 from manager_core.updates import UpdateError
@@ -14,7 +15,7 @@ class Fleet(RemoteMaintenance):
     def __init__(self, root, store, profile):
         super().__init__(root, store, self)
         self.calls = []
-        self.fail_prepare = self.lose_start = self.empty_start = None
+        self.fail_prepare = self.lose_start = self.empty_start = self.fail_host = None
         self.next_pid = 100
         # Shared-catalog listeners publish no idle inventory. They still answer
         # observation-only identity, exactly like the typed remote helper.
@@ -43,6 +44,8 @@ class Fleet(RemoteMaintenance):
         self.prepared_options = options
         if alias == self.fail_prepare:
             raise OSError('fixture preparation offline')
+        if alias == self.fail_host:
+            raise RemoteError('remote_disk_full', 'SSH 서버의 디스크 공간이 부족해 런타임을 준비하지 못했습니다.')
         profile = self.store.profile(profile_id)
         revision = ('b' if profile['policy']['desired_revision'] == 0 else 'c') * 64
         return dict(self.binding(profile, alias, revision), prepared=True, model_ids=model_ids)
@@ -174,6 +177,41 @@ class RemoteRestoreTests(unittest.TestCase):
         self.assertEqual(journals[-1][0]['started']['process'], self.fleet.running['fixture-a'])
         self.assertEqual([call for call in self.fleet.calls if call[0] == 'start'], [('start', 'fixture-a')])
         self.assertIsNone(self.fleet.running['fixture-b'])
+
+    def test_host_failure_is_fatal_unless_isolated(self):
+        lease = self.close()
+        entries = self.records(lease)
+        self.fleet.fail_host = 'fixture-b'
+        with self.assertRaises(RemoteError):
+            self.fleet.prepare_and_start(self.profile, entries, lambda: None)
+        self.assertFalse(any(call[0] == 'start' for call in self.fleet.calls))
+
+    def test_isolated_host_failure_starts_the_rest_and_keeps_previous_binding(self):
+        lease = self.close()
+        entries = self.records(lease)
+        self.fleet.fail_host = 'fixture-b'
+        self.fleet.prepare_and_start(self.profile, entries, lambda: None, isolate_host_failures=True)
+        self.assertEqual([e['state'] for e in entries], ['started', 'prepare_failed'])
+        self.assertEqual(entries[1]['failure_code'], 'remote_disk_full')
+        self.assertEqual([c for c in self.fleet.calls if c[0] == 'start'], [('start', 'fixture-a')])
+        self.fleet.publish_started(self.store.profile(self.profile['id']), entries)
+        manifest = json.loads(self.manifest.read_text())
+        self.assertEqual({b['alias']: b['revision'] for b in manifest['bindings']},
+                         {'fixture-a': 'b' * 64, 'fixture-b': 'a' * 64})
+        self.assertEqual(manifest['pending_policy_hosts'], ['fixture-b'])
+        self.assertEqual(manifest['deferred_policy_hosts'], ['fixture-b'])
+        saved = {b['alias']: b for b in self.store.profile(self.profile['id']).get('remote_bindings', [])}
+        self.assertNotIn('fixture-b', saved)
+        # A later retry prepares only the failed host and clears the deferral.
+        self.fleet.fail_host = None
+        self.fleet.prepare_and_start(self.profile, entries, lambda: None, isolate_host_failures=True)
+        self.assertEqual([e['state'] for e in entries], ['started', 'started'])
+        self.assertNotIn('failure_code', entries[1])
+        self.assertEqual([c for c in self.fleet.calls if c[0] == 'prepare'].count(('prepare', 'fixture-a')), 1)
+        self.fleet.publish_started(self.store.profile(self.profile['id']), entries)
+        manifest = json.loads(self.manifest.read_text())
+        self.assertEqual({b['revision'] for b in manifest['bindings']}, {'b' * 64})
+        self.assertEqual((manifest['pending_policy_hosts'], manifest['deferred_policy_hosts']), ([], []))
 
     def test_gate_change_during_prepare_cannot_publish_or_start_old_worker_result(self):
         lease = self.close()

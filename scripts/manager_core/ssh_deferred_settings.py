@@ -17,6 +17,18 @@ UNSUPPORTED_IDLE = frozenset(('remote_idle_binding_missing', 'remote_idle_status
                               'remote_idle_diagnostics_unavailable'))
 DEFERRED_MESSAGE = ('SSH는 기존 설정으로 연결했습니다. 새 하위 에이전트·모델 설정은 SSH에 아직 적용되지 않았습니다. '
                     '기존 원격 실행이 안전한 재시작 확인을 지원하지 않아 적용을 보류합니다.')
+# One host failing preparation (disk full, unreachable, upload timeout) keeps
+# only that host on its previous settings; the others were applied.
+HOST_PREPARE_FAILED = 'host_prepare_failed'
+
+
+def host_failure_message(records):
+    failed = [r for r in records if r.get('state') == 'prepare_failed']
+    details = ' / '.join(f"{r['binding']['alias']}: {r.get('failure_message') or 'SSH 준비 실패'}" for r in failed)
+    applied = len(failed) < len(records)
+    return ('SSH 서버 일부는 새 설정을 준비하지 못해 이전 설정으로 연결합니다. ' + details + '. '
+            + ('나머지 SSH 서버는 새 설정으로 연결했습니다. ' if applied else '')
+            + '원인을 해결한 뒤 ‘SSH 작업 종료 후 설정 적용’으로 다시 적용하세요.')
 
 
 def _unmodified(lease, profile):

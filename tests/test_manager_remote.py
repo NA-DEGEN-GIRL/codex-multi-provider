@@ -408,6 +408,69 @@ class RemoteTests(unittest.TestCase):
             with self.assertRaisesRegex(RemoteError,'디스크 공간'):
                 manager.prepare('staging',str(uuid.uuid4()),self.root,[],reuse_host_runtime=True)
 
+    def test_runtime_upload_is_compressed_and_a_waiting_profile_reuses_the_finished_copy(self):
+        from manager_core.updates import _lock_file, _unlock_file
+        make_artifact(self.root)
+        helpers = self.root / 'scripts/remote_helpers'; helpers.mkdir(parents=True)
+        for name in ('install.py', 'launch.py', 'native_controller.py', 'common.py', 'managed_sources.py', 'ws_client.py'):
+            (helpers / name).write_bytes((ROOT / 'scripts/remote_helpers' / name).read_bytes())
+        remote = self.root / 'simulated-remote'; archives = []; timeouts = []; profile_ids = []; stale = []
+        def runner(args, options):
+            if args[-1] == INSPECT_COMMAND:
+                return subprocess.CompletedProcess(args, 0, probe(), b'')
+            if args[-1].endswith('--preflight'):
+                result = INSTALL.preflight(json.loads(options['input']), remote)
+                if stale:  # This profile's first preflight predates the other's upload.
+                    stale.pop(); result = {'status': 'upload'}
+            elif 'stdin' in options:
+                raw = options['stdin'].read(); archives.append(raw); timeouts.append(options['timeout'])
+                with tarfile.open(fileobj=io.BytesIO(raw)) as tar:
+                    profile_ids.append(json.load(tar.extractfile('manifest.json'))['profile_id'])
+                result = INSTALL.install(io.BytesIO(raw), remote)
+            else:
+                result = LAUNCH.configure(remote / 'profiles' / profile_ids[-1], json.loads(options['input']), expected_host='f' * 64)
+            return subprocess.CompletedProcess(args, 0, json.dumps(result).encode(), b'')
+        manager = self.manager(runner)
+        first = manager.prepare('staging', PROFILE, self.root, [])
+        self.assertFalse(first['runtime_reused'])
+        self.assertEqual(archives[0][:2], b'\x1f\x8b')
+        with tarfile.open(fileobj=io.BytesIO(archives[0])) as tar:
+            self.assertIn('runtime/codex', tar.getnames())
+        self.assertGreaterEqual(timeouts[0], 600)
+        # A profile that had to wait for the host's upload lock preflights again
+        # and reuses the runtime the lock holder just installed.
+        stale.append(True)
+        held = []
+        def wait(identity):
+            held.append(_lock_file(self.root / 'fixture-upload.lock'))
+            return held[-1], True
+        manager._wait_runtime_upload = wait
+        second = manager.prepare('staging', str(uuid.uuid4()), self.root, [])
+        self.assertTrue(second['runtime_reused'])
+        with tarfile.open(fileobj=io.BytesIO(archives[-1])) as tar:
+            self.assertFalse(any(name.startswith('runtime/') for name in tar.getnames()))
+        self.assertTrue(held[0].closed)
+
+    def test_upload_lock_serializes_one_host_and_times_out_with_a_typed_error(self):
+        from manager_core import remote as remote_module
+        from manager_core.updates import _unlock_file
+        manager = self.manager(lambda args, options: None)
+        identity = 'a' * 64
+        lock, waited = manager._wait_runtime_upload(identity)
+        self.assertFalse(waited)
+        try:
+            with patch.object(remote_module, 'UPLOAD_LOCK_WAIT', 0.2):
+                with self.assertRaises(RemoteError) as raised:
+                    manager._wait_runtime_upload(identity)
+            self.assertEqual(raised.exception.code, 'remote_upload_busy')
+            other, _ = manager._wait_runtime_upload('b' * 64)  # Another host is independent.
+            _unlock_file(other)
+        finally:
+            _unlock_file(lock)
+        self.assertEqual(RemoteManager._upload_timeout(1024), 600)
+        self.assertEqual(RemoteManager._upload_timeout(10 * 1024 ** 3), 3600)
+        self.assertEqual(RemoteManager._upload_timeout(400 * 1024 ** 2), 120 + 1600)
+
     def test_disk_full_is_a_static_actionable_error_without_remote_output(self):
         import errno
         value=INSTALL.failure(OSError(errno.ENOSPC,'PRIVATE CONTENT'))

@@ -19,10 +19,16 @@ import struct
 import subprocess
 import tarfile
 import tempfile
+import time
 import uuid
 
 
 ALIAS = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
+# Upload budget: at least this throughput over SSH, within these bounds.
+UPLOAD_MIN_RATE = 256 * 1024
+UPLOAD_TIMEOUT = (600, 3600)
+# Another profile's upload to the same host may hold the host lock this long.
+UPLOAD_LOCK_WAIT = 1800
 SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,95}\Z")
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 ARCHES = {"x86_64": "x86_64", "amd64": "x86_64", "aarch64": "aarch64", "arm64": "aarch64"}
@@ -382,8 +388,61 @@ class RemoteManager:
         observed = self.inspect(alias)
         if not observed.get("preparation_supported"):
             return {**observed, "status": "blocked", "prepared": False}
-        artifact = self._artifact(observed["platform"], observed["architecture"])
-        artifact, reused = self._select_runtime(alias, observed, artifact, reuse_host_runtime and selection_mode != 'external_only')
+        current = self._artifact(observed["platform"], observed["architecture"])
+        reuse = reuse_host_runtime and selection_mode != 'external_only'
+        artifact, reused = self._select_runtime(alias, observed, current, reuse)
+        upload_lock = None
+        if not reused:
+            # Profiles preparing together would each stage the whole runtime on
+            # the host (disk full) and share its uplink (timeouts). One uploads;
+            # the others wait, preflight again and reuse the finished copy.
+            upload_lock, waited = self._wait_runtime_upload(observed["host_identity"])
+            try:
+                if waited:
+                    artifact, reused = self._select_runtime(alias, observed, current, reuse)
+            except BaseException:
+                self._release_runtime_upload(upload_lock)
+                raise
+            if reused:
+                self._release_runtime_upload(upload_lock)
+                upload_lock = None
+        try:
+            return self._install(alias, profile_id, model_ids, observed, artifact, reused,
+                                 primary_model_id=primary_model_id, primary_settings=primary_settings,
+                                 selection_mode=selection_mode)
+        finally:
+            if upload_lock is not None:
+                self._release_runtime_upload(upload_lock)
+
+    def _wait_runtime_upload(self, host_identity):
+        from .updates import UpdateError, _lock_file
+        if not SHA256.fullmatch(host_identity or ""):
+            raise RemoteError("host_identity_unavailable", "SSH 서버 식별 정보를 확인하지 못했습니다.")
+        path = self.root / "work/control-center/remote-uploads" / (host_identity[:32] + ".lock")
+        deadline = time.monotonic() + UPLOAD_LOCK_WAIT
+        waited = False
+        while True:
+            try:
+                return _lock_file(path), waited
+            except UpdateError:
+                waited = True
+                if time.monotonic() >= deadline:
+                    raise RemoteError("remote_upload_busy", "다른 프로필이 같은 SSH 서버에 런타임을 올리고 있습니다. "
+                                      "끝난 뒤 다시 시도하세요.") from None
+                time.sleep(0.5)
+
+    @staticmethod
+    def _release_runtime_upload(lock):
+        from .updates import _unlock_file
+        _unlock_file(lock)
+
+    @staticmethod
+    def _upload_timeout(size):
+        low, high = UPLOAD_TIMEOUT
+        return max(low, min(high, 120 + size // UPLOAD_MIN_RATE))
+
+    def _install(self, alias, profile_id, model_ids, observed, artifact, reused, *,
+                 primary_model_id, primary_settings, selection_mode):
         if selection_mode == 'external_only':
             from remote_helpers.package_runtime import contains_marker
             if not contains_marker(artifact['directory'] / 'codex', b'External-only subagents:'):
@@ -445,15 +504,17 @@ class RemoteManager:
                                       "size": source.stat().st_size if isinstance(source,Path) else len(source)})
         metadata['reuse_runtime'] = reused
         # Large binaries spool to a temporary file; API keys never enter this archive.
+        # Fast gzip roughly thirds a runtime upload; the installer reads "r|*".
         with tempfile.TemporaryFile() as archive:
-            with tarfile.open(fileobj=archive, mode="w") as tar:
+            with tarfile.open(fileobj=archive, mode="w:gz", compresslevel=1) as tar:
                 self._add(tar, "manifest.json", json.dumps(metadata).encode(), 0o600)
                 for name, (source, mode) in entries.items():
                     if reused and name.startswith('runtime/'):continue
                     self._add(tar, name, source, mode)
+            size = archive.tell()
             archive.seek(0)
             command = shlex.quote(observed["python_path"]) + " -c " + shlex.quote(helper.read_text(encoding="utf-8"))
-            installed = self._run(alias, command, stdin=archive, timeout=600)
+            installed = self._run(alias, command, stdin=archive, timeout=self._upload_timeout(size))
         payload = self._json_result(installed, "remote_install_failed")
         if payload.get("status") != "prepared" or payload.get("revision") != revision:
             raise RemoteError("remote_install_failed", "원격 설치 완료를 확인하지 못했습니다. 기존 CLI는 유지됩니다.")

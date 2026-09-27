@@ -110,8 +110,20 @@ def build(root=ROOT):
     subprocess.run([cargo, "build", "--locked", "--release", "--target-dir", str(target),
                     "-p", "codex-cli", "--bin", "codex", "-p", "codex-code-mode-host",
                     "--bin", "codex-code-mode-host"], cwd=source, env=environment, check=True)
-    binary = target / "release/codex"
-    companion = target / "release/codex-code-mode-host"
+    # The release profile keeps line tables (strip = false) so packaging can
+    # archive symbols first. Shipping them made every SSH upload ~1.4 GB, so
+    # strip copies here and keep the .debug sidecars beside them on the build
+    # host; cargo's own outputs stay intact for the next incremental build.
+    staged = target / "package"
+    shutil.rmtree(staged, ignore_errors=True)
+    staged.mkdir(parents=True)
+    for name in ("codex", "codex-code-mode-host"):
+        built, copy = target / "release" / name, staged / name
+        shutil.copy2(built, copy)
+        subprocess.run(["objcopy", "--only-keep-debug", str(built), str(staged / (name + ".debug"))], check=True)
+        subprocess.run(["strip", "--strip-debug", "--strip-unneeded", str(copy)], check=True)
+    binary = staged / "codex"
+    companion = staged / "codex-code-mode-host"
     for file in (binary, companion, bwrap):
         _verify_elf(file, arch)
     if not contains_marker(binary, b"external_agents"):

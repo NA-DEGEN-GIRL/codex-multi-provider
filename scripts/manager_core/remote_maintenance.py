@@ -537,27 +537,52 @@ class RemoteMaintenance:
             if proof['process'] is not None and proof.get('active_binding') is None:
                 entry.update(state='started', started=proof)
 
-    def prepare_and_start(self, profile, entries, save_journal, *, lifecycle_guard=None):
-        """Prepare the whole cohort first; resume starts only from saved evidence."""
+    def prepare_and_start(self, profile, entries, save_journal, *, lifecycle_guard=None, isolate_host_failures=False):
+        """Prepare the whole cohort first; resume starts only from saved evidence.
+
+        With isolate_host_failures, a host whose preparation fails (unreachable,
+        disk full, upload timeout) after its old process exited is journaled as
+        prepare_failed and skipped; the rest of the cohort still starts, and
+        publish_started keeps that host on its previous binding. Lifecycle and
+        start failures stay fatal for the whole cohort.
+        """
         check_current = lifecycle_guard or (lambda: None)
         check_current()
-        if any(entry.get('state') not in ('closed', 'prepared', 'start_requested', 'started') for entry in entries):
+        allowed = ('closed', 'prepared', 'start_requested', 'started') + (
+            ('prepare_failed',) if isolate_host_failures else ())
+        if any(entry.get('state') not in allowed for entry in entries):
             raise UpdateError('remote_exit_unverified', 'SSH 서버 종료 확인 뒤 새 설정을 적용할 수 있습니다.')
         model_ids = profile['policy']['model_ids'] if profile['policy']['enabled'] else []
         revision = profile['policy']['desired_revision']
         from .model_settings import render_options
+        from .remote import RemoteError
         options = render_options(profile)
         for entry in entries:
             check_current()
-            if entry.get('state') != 'closed':
+            if entry.get('state') not in ('closed', 'prepare_failed'):
                 if entry.get('target_policy_revision') != revision:
                     raise UpdateError('policy_changed', '이전 SSH 설정 적용 결과를 확인한 뒤 최신 설정을 적용해야 합니다.')
                 continue
             alias = entry['binding']['alias']
-            binding = self.remote.prepare(alias, profile['id'], profile['home'], model_ids, **options)
+            failure = None
+            try:
+                binding = self.remote.prepare(alias, profile['id'], profile['home'], model_ids, **options)
+            except RemoteError as error:
+                if not isolate_host_failures:
+                    raise
+                failure = (error.code, str(error))
             check_current()
-            if binding.get('prepared') is not True:
-                raise UpdateError('remote_preparation_pending', 'SSH 서버에 새 설정을 준비하지 못했습니다.')
+            if failure is None and binding.get('prepared') is not True:
+                if not isolate_host_failures:
+                    raise UpdateError('remote_preparation_pending', 'SSH 서버에 새 설정을 준비하지 못했습니다.')
+                failure = ('remote_preparation_pending',
+                           binding.get('message') or 'SSH 서버에 새 설정을 준비하지 못했습니다.')
+            if failure is not None:
+                entry.update(state='prepare_failed', failure_code=failure[0], failure_message=failure[1])
+                save_journal()
+                continue
+            entry.pop('failure_code', None)
+            entry.pop('failure_message', None)
             def save(data):
                 current = self.store.profile(profile['id'], data)
                 if current.get('generation') != profile.get('generation'):
@@ -575,6 +600,8 @@ class RemoteMaintenance:
 
         for entry in entries:
             check_current()
+            if entry['state'] == 'prepare_failed':
+                continue
             binding = entry['next_binding']
             if entry['state'] == 'start_requested':
                 self.reconcile(entry)
@@ -633,7 +660,11 @@ class RemoteMaintenance:
         Merely saving provider settings or opening a task never enters this path.
         """
         started = [entry for entry in entries if entry.get('state') == 'started']
-        if not started:
+        # A host that failed preparation after its old process exited keeps the
+        # previous binding. Listing it as deferred reconnects it with the old
+        # settings until a later apply, and keeps the cohort visibly partial.
+        failed = [entry for entry in entries if entry.get('state') == 'prepare_failed']
+        if not started and not failed:
             return
         path = self.store.directory / 'profiles' / identifier(profile['id']) / 'ssh-bindings.json'
         with self.store.locked():
@@ -680,6 +711,10 @@ class RemoteMaintenance:
                 updated['pending_policy_hosts'] = [alias for alias in updated['pending_policy_hosts'] if alias not in applied]
             if 'deferred_policy_hosts' in updated:
                 updated['deferred_policy_hosts'] = [alias for alias in updated['deferred_policy_hosts'] if alias not in applied]
+            deferred = sorted({validate_binding(entry['binding'], profile['id'])['alias'] for entry in failed})
+            if deferred:
+                updated['pending_policy_hosts'] = sorted(set(updated.get('pending_policy_hosts') or []) | set(deferred))
+                updated['deferred_policy_hosts'] = sorted(set(updated.get('deferred_policy_hosts') or []) | set(deferred))
             if updated != manifest:
                 atomic_json(path, updated)
             # A publication retires the deferred notice only when the whole

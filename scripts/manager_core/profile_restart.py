@@ -12,6 +12,7 @@ from .store import Unchanged, identifier, now
 from .updates import UpdateError, _lock_file, _unlock_file
 from .instances import process_identity
 from .update_hooks import _process_liveness
+from .ssh_deferred_settings import HOST_PREPARE_FAILED
 
 TERMINAL = frozenset({'complete', 'attention', 'superseded'})
 _CLAIM_WAIT = 10.0
@@ -198,6 +199,15 @@ class ProfileRestarts:
                 raise RuntimeError('재시작 요청이 변경되었습니다.')
             if job.get('stop_requested') and not job.get('stop_only'):
                 return Unchanged(False)
+            gate = data.get('ssh_maintenance', {}).get(profile_id, {})
+            if (not job.get('stop_only') and gate.get('transaction_id') == job.get('transaction_id')
+                    and gate.get('state') == 'released' and gate.get('settings_deferred') is True
+                    and gate.get('deferred_reason') == HOST_PREPARE_FAILED):
+                # Some hosts connected with the new settings; the failed ones
+                # reconnect with their previous settings. The window stays usable.
+                job.update(phase='attention', code='ssh_settings_deferred', connections_restored=True,
+                           updated_at=now(), message='로컬 창은 사용할 수 있습니다. ' + gate['message'])
+                return True
             job.update(phase='complete', updated_at=now(),
                        message='이 프로필의 원격 Codex 종료를 확인했습니다.' if job.get('stop_only') else
                                '로컬 창과 SSH 연결 준비를 완료했습니다.')

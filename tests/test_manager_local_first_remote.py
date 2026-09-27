@@ -429,6 +429,26 @@ class LocalFirstRemoteTests(unittest.TestCase):
         self.assertEqual(self.fleet.calls.count(('prepare', 'fixture-a')), 2)
         self.assertEqual(self.fixture.closes, [])
 
+    def test_one_host_failing_preparation_does_not_block_the_other_hosts(self):
+        self.open()
+        self.fleet.fail_host = 'fixture-b'
+        self.pending.pop()()
+        gate, job = self.gate(), self.job()
+        self.assertEqual(gate['state'], 'released')
+        self.assertTrue(gate['settings_deferred'])
+        self.assertEqual(gate['deferred_policy_hosts'], ['fixture-b'])
+        self.assertEqual((job['phase'], job['code'], job['connections_restored']),
+                         ('attention', 'ssh_settings_deferred', True))
+        self.assertIn('fixture-b', job['message'])
+        self.assertIn('디스크 공간', job['message'])
+        manifest = json.loads(self.manifest.read_text())
+        self.assertEqual({b['alias']: b['revision'] for b in manifest['bindings']},
+                         {'fixture-a': 'b' * 64, 'fixture-b': 'a' * 64})
+        self.assertEqual(manifest['deferred_policy_hosts'], ['fixture-b'])
+        self.assertEqual([c for c in self.fleet.calls if c[0] == 'start'], [('start', 'fixture-a')])
+        self.assertEqual(self.fixture.closes, [])
+        self.hooks.guard_launch(self.profile['id'])
+
     def test_closed_local_old_scoped_lease_is_adopted_without_network(self):
         snapshot = self.hooks.snapshot_instances(profile_ids=[self.profile['id']])
         lease = self.hooks.acquire_maintenance(snapshot, transaction_id=str(uuid4()), profile_scope=[self.profile['id']])
