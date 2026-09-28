@@ -78,7 +78,13 @@ impl Process {
         if self.termination_requested.get() {
             return Ok(());
         }
-        if self.alive() && unsafe { TerminateProcess(self.handle.0, 1) } == 0 && self.alive() {
+        // A process that is already exiting (its window just closed) refuses
+        // TerminateProcess with ERROR_ACCESS_DENIED while still unsignaled.
+        // Give it a moment to finish instead of failing the whole exit.
+        if self.alive()
+            && unsafe { TerminateProcess(self.handle.0, 1) } == 0
+            && unsafe { WaitForSingleObject(self.handle.0, 1000) } == WAIT_TIMEOUT
+        {
             return Err("프로필 프로세스를 종료하지 못했습니다.".into());
         }
         self.termination_requested.set(true);
