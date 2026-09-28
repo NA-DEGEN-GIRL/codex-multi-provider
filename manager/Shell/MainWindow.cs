@@ -1356,6 +1356,11 @@ public sealed class MainWindow : Window
                     : "진행 중인 SSH 설정 적용이 끝나는 대로 원격 실행을 종료합니다."));
         }
         using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        // A refused remote stop (an unaudited runtime, no shutdown proof) does
+        // not resolve by waiting. Collect them and let the user leave those
+        // listeners on the server, exactly like closing only the window.
+        var refused = new List<string>();
+        var aliases = _state.Arr("profiles").ToDictionary(p => p.S("id"), p => p.S("alias", p.S("id")));
         try
         {
             while (jobs.Count > 0)
@@ -1367,7 +1372,12 @@ public sealed class MainWindow : Window
                     if (job.S("id") != jobId) throw new InvalidOperationException("SSH 종료 요청이 변경되어 종료 확인을 중지했습니다.");
                     if (job.S("phase") == "complete") { jobs.Remove(id); Log("프로필 원격 종료 확인 · " + id); }
                     else if (job.S("phase") is "attention" or "superseded")
-                        throw new InvalidOperationException(job.Message("SSH 종료 결과를 확인하지 못했습니다."));
+                    {
+                        jobs.Remove(id);
+                        var detail = job.Message("SSH 종료 결과를 확인하지 못했습니다.").Replace("로컬 창은 사용할 수 있습니다. ", "");
+                        refused.Add($"{aliases.GetValueOrDefault(id, id)} · {detail}");
+                        Log($"프로필 원격 종료 안 됨 · {aliases.GetValueOrDefault(id, id)} · {detail}");
+                    }
                 }
                 if (jobs.Count == 0) break;
                 SetStatus("SSH 작업 종료를 기다립니다. 현재 답변이 끝나면 원격 실행을 종료합니다.");
@@ -1378,6 +1388,13 @@ public sealed class MainWindow : Window
         {
             throw new InvalidOperationException("SSH 작업이 아직 진행 중이거나 종료를 확인하고 있습니다. 종료 요청은 유지됩니다. 작업이 끝난 뒤 완전 종료를 다시 눌러 주세요.");
         }
+        if (refused.Count > 0 && MessageBox.Show(this,
+                "다음 SSH 원격 실행은 자동으로 종료하지 못했습니다.\n\n" + string.Join("\n", refused) +
+                "\n\n원격 실행을 서버에 남겨 두고 완전 종료하려면 확인을 누르세요. 로컬 Codex는 모두 종료됐고, " +
+                "다음 실행 때 남은 원격 실행에 다시 연결합니다. 관리창을 유지하려면 취소를 누르세요.",
+                "SSH 원격 실행 남겨 두기", MessageBoxButton.OKCancel, MessageBoxImage.Warning, MessageBoxResult.OK) != MessageBoxResult.OK)
+            throw new InvalidOperationException("SSH 원격 실행을 종료하지 못해 관리창을 유지합니다.");
+        if (refused.Count > 0) Log("SSH 원격 실행을 서버에 남겨 두고 완전 종료");
     }
 
     private Task RecoverProfileAsync() => RecoverProfileAsync(RequireProfile());
