@@ -156,6 +156,69 @@ class RemoteMaintenanceTests(unittest.TestCase):
                 self.assertNotIn('SSH 실행 상태를 확인하지 못해', str(raised.exception))
                 self.assertNotIn('secret-value', str(raised.exception))
 
+    def test_unreachable_host_is_typed_and_fails_fast_only_within_one_wave(self):
+        from manager_core import remote_maintenance as module
+        self.service.root = ROOT
+        self.service.remote = MagicMock()
+        self.addCleanup(module._unreachable_at.clear)
+        lines = (b'ssh: connect to host h port 22: Connection timed out\r\n',
+                 b'ssh: connect to host 203.0.113.10 port 22: Host is unreachable\r\n',
+                 b'ssh: connect to host 203.0.113.10 port 22: Network unreachable\r\n',
+                 b'ssh: connect to host h port 22: Unknown error\r\n',
+                 b'banner exchange: Connection to UNKNOWN port -1: Connection refused\r\n',
+                 b'ssh: Could not resolve hostname h: \xbe\xcb',
+                 'ssh: connect to host h port 22: Connection refused')
+        for stderr in lines:
+            with self.subTest(stderr=stderr):
+                module._unreachable_at.clear()
+                self.service.remote._run.reset_mock()
+                self.service.remote._run.return_value = types.SimpleNamespace(returncode=255, stdout=b'', stderr=stderr)
+                wave = module.time.time()
+                with self.assertRaises(UpdateError) as raised:
+                    self.service.request(self.binding, 'inspect', fail_fast_since=wave)
+                self.assertEqual(raised.exception.code, 'remote_host_unreachable')
+                self.assertNotIn('port 22', str(raised.exception))
+                # Another profile of the same wave does not wait again ...
+                with self.assertRaises(UpdateError):
+                    self.service.request(self.binding, 'inspect', fail_fast_since=wave)
+                self.assertEqual(self.service.remote._run.call_count, 1)
+                # ... but a stop, a start or a later wave always tries for real.
+                with self.assertRaises(UpdateError):
+                    self.service.request(self.binding, 'stop', expected_process={})
+                with self.assertRaises(UpdateError):
+                    self.service.request(self.binding, 'inspect', fail_fast_since=module.time.time() + 1)
+                self.assertEqual(self.service.remote._run.call_count, 3)
+                self.assertNotIn('fail_fast_since', self.service.remote._run.call_args.kwargs['input'].decode())
+
+    def test_only_a_pre_exchange_client_failure_counts_as_unreachable(self):
+        from manager_core import remote_maintenance as module
+        self.service.root = ROOT
+        self.service.remote = MagicMock()
+        self.addCleanup(module._unreachable_at.clear)
+        module._unreachable_at.clear()
+        cases = (
+            # Authentication failed after the connection was up.
+            (255, b'', b'user@h: Permission denied (publickey).'),
+            # The session dropped after the helper already answered.
+            (255, json.dumps({'ok': True, 'result': {}}).encode(), b'Read from remote host h: Connection timed out'),
+            # The remote command itself failed; its stderr mentions a refusal.
+            (2, json.dumps({'ok': False, 'code': 'x'}).encode(), b'ssh: connect to host h port 22: Connection refused'),
+        )
+        for code, stdout, stderr in cases:
+            with self.subTest(code=code, stderr=stderr):
+                self.service.remote._run.return_value = types.SimpleNamespace(returncode=code, stdout=stdout, stderr=stderr)
+                with self.assertRaises(UpdateError) as raised:
+                    self.service.request(self.binding, 'inspect', fail_fast_since=0)
+                self.assertEqual(raised.exception.code, 'remote_maintenance_unverified')
+                self.assertNotIn('remote-dev', module._unreachable_at)
+        # A stale failure from before the wave never skips a real attempt.
+        module._unreachable_at['remote-dev'] = module.time.time() - 5
+        self.service.remote._run.reset_mock()
+        with self.assertRaises(UpdateError):
+            self.service.request(self.binding, 'inspect', fail_fast_since=module.time.time())
+        self.assertEqual(self.service.remote._run.call_count, 1)
+        self.assertNotIn('remote-dev', module._unreachable_at)
+
     def test_idle_status_observation_is_accepted_without_claiming_idle_or_exit(self):
         self.service.root = ROOT
         self.service.remote = MagicMock()

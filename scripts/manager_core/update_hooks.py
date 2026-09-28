@@ -384,7 +384,8 @@ class UpdateHooks:
                 # Retry remote evidence with the current helper, never an old saved
                 # next_binding start. A fresh inspect proves exit or the actual PID.
                 for record in lease['profiles'][0].get('remotes', []):
-                    if record.get('state') in ('prepared', 'prepare_failed', 'start_requested', 'stop_requested', 'started'):
+                    if record.get('state') in ('prepared', 'prepare_failed', 'unreachable', 'start_requested',
+                                               'stop_requested', 'started'):
                         record['reinspect'] = True
                 lease['target_revision'] = profile['policy']['desired_revision']
                 self._save_lease(lease)
@@ -465,6 +466,7 @@ class UpdateHooks:
 
     def _reconcile_opened_remotes(self, profile_id, transaction_id, *, target_guard=None):
         """Advance only SSH; the newly opened local process is never closed."""
+        wave = time.time()
         lease = _read_json(self._lease_path(transaction_id))
         if not lease.get('ssh_only') or lease.get('profile_scope') != [profile_id]:
             raise UpdateError('restart_scope_changed', 'SSH 준비 범위가 다릅니다.')
@@ -507,8 +509,18 @@ class UpdateHooks:
             # change may enter the exit-verified lifecycle below.
             equivalent = getattr(self.remote_maintenance, 'reuse_equivalent', None)
             if callable(equivalent):
-                adopted = equivalent(current(), records)
+                try:
+                    adopted = equivalent(current(), records)
+                except UpdateError as error:
+                    # The strict path below isolates the unreachable host.
+                    if error.code != 'remote_host_unreachable':
+                        raise
+                    adopted = None
                 reused = adopted is not None
+        # A host that cannot be reached at all (powered off, offline) is set
+        # aside instead of blocking the other hosts. An explicit runtime update
+        # still reports it.
+        isolate = not lease.get('force_runtime_update')
         for record in ([] if reused else records):
             current()
             if record.get('state') == 'unobserved' or record.get('reinspect'):
@@ -518,7 +530,25 @@ class UpdateHooks:
                 inspect_options = dict(discover_active=True)
                 if lease.get('graceful_drain'):
                     inspect_options['observe_only'] = True
-                observed = self.remote_maintenance.request(binding, 'inspect', **inspect_options)
+                if isolate:
+                    # Another profile of this wave may already have found the
+                    # host unreachable; a stale failure still gets a real try.
+                    inspect_options['fail_fast_since'] = wave
+                try:
+                    observed = self.remote_maintenance.request(binding, 'inspect', **inspect_options)
+                except UpdateError as error:
+                    if not isolate or error.code != 'remote_host_unreachable':
+                        raise
+                    # Its process can be neither observed, stopped nor replaced:
+                    # it keeps its previous binding (deferred) and a later
+                    # reconcile inspects it again.
+                    from .remote_maintenance import UNREACHABLE_MESSAGE
+                    record.update(state='unreachable', failure_code=error.code, failure_message=UNREACHABLE_MESSAGE)
+                    for key in ('reinspect', 'next_binding', 'target_policy_revision'):
+                        record.pop(key, None)
+                    self._save_lease(lease)
+                    current()
+                    continue
                 record.update(process=observed['process'], idle=observed['idle'], exited=observed['exited'],
                               active_binding=observed.get('active_binding', binding),
                               state='observed' if observed['process'] is not None else 'closed')
@@ -570,7 +600,7 @@ class UpdateHooks:
                                                           isolate_host_failures=not lease.get('force_runtime_update'))
                 profile = current()
                 self.remote_maintenance.publish_started(profile, records)
-        failed = sorted(r['binding']['alias'] for r in records if r.get('state') == 'prepare_failed')
+        failed = sorted(r['binding']['alias'] for r in records if r.get('state') in ('prepare_failed', 'unreachable'))
         def release(data):
             gate = data['ssh_maintenance'][profile_id]
             profile = self.store.profile(profile_id, data)
@@ -581,9 +611,15 @@ class UpdateHooks:
             gate.update(state='released', updated_at=now())
             if failed:
                 from .ssh_deferred_settings import HOST_PREPARE_FAILED, host_failure_message
-                gate.update(settings_deferred=True, deferred_reason=HOST_PREPARE_FAILED,
-                            code='ssh_settings_deferred', deferred_policy_hosts=failed,
-                            message=host_failure_message(records))
+                if lease.get('stop_only'):
+                    # A stop publishes nothing: no settings were deferred, the
+                    # unreachable hosts were only not stopped.
+                    gate.update(code='ssh_hosts_unreachable', unreachable_hosts=failed,
+                                message=host_failure_message(records, stop_only=True))
+                else:
+                    gate.update(settings_deferred=True, deferred_reason=HOST_PREPARE_FAILED,
+                                code='ssh_settings_deferred', deferred_policy_hosts=failed,
+                                message=host_failure_message(records))
         self.store.mutate(release)
         if reused:
             lease['reused_unchanged'] = True

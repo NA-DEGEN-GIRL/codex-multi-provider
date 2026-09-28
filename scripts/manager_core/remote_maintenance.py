@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 import re
 import shlex
+import threading
+import time
 
 from .ssh_shim import ShimError, validate_binding
 from .store import atomic_json, identifier, now
@@ -27,6 +29,36 @@ IDLE_OBSERVATIONS = ('remote_idle_binding_missing', 'remote_idle_status_unavaila
 # the notice itself.
 DEFERRED_NOTICE_FIELDS = ('settings_deferred', 'deferred_reason', 'deferred_policy_hosts', 'code', 'message')
 DEFERRED_APPLIED_MESSAGE = 'SSH 설정 적용이 확인되어 보류 안내를 정리했습니다.'
+# OpenSSH exits 255 for its own failures. These lines are printed only before
+# any SSH exchange, so the remote command cannot have run: the TCP connect
+# failed on every address (whatever the localized reason: timed out, refused,
+# "Host is unreachable", "Network unreachable"), the name did not resolve, or
+# the server closed before its banner. Authentication and later protocol
+# failures keep the generic unverified code.
+UNREACHABLE_SSH_LINES = re.compile(
+    rb'(?mi)^(ssh: connect to host \S+ port \S+: |ssh: could not resolve hostname |'
+    rb'banner exchange: |kex_exchange_identification: )')
+UNREACHABLE_MESSAGE = 'SSH 서버에 연결할 수 없습니다(꺼져 있거나 네트워크 문제).'
+# Profiles of one full exit or apply wave reach the same host concurrently;
+# after one connect failure the later inspects of that wave fail fast. Only a
+# failure recorded after the caller's wave began counts, so a stale entry
+# (an hourly check, an earlier open) never skips a real attempt.
+UNREACHABLE_TTL = 60.0
+_unreachable_lock = threading.Lock()
+_unreachable_at = {}
+
+
+def unreachable_error(alias):
+    return UpdateError('remote_host_unreachable', alias + ' · ' + UNREACHABLE_MESSAGE)
+
+
+def ssh_unreachable(result):
+    """True only for the local OpenSSH client's pre-exchange failure."""
+    if result.returncode != 255 or (result.stdout or b'').strip():
+        return False
+    stderr = getattr(result, 'stderr', b'')
+    stderr = stderr if isinstance(stderr, bytes) else str(stderr or '').encode()
+    return UNREACHABLE_SSH_LINES.search(stderr) is not None
 
 
 def retire_deferred_settings_notice(store, profile_id, *, generation, revision, gate, job=None):
@@ -156,6 +188,7 @@ class RemoteMaintenance:
                               for r in records):
             return False
         saved = {b['alias']: b for b in profile.get('remote_bindings', []) if b.get('prepared') is True}
+        aside = set()
         for record in records:
             binding = record.get('binding')
             if (not binding or binding != record.get('publication_binding')
@@ -165,6 +198,12 @@ class RemoteMaintenance:
             try:
                 verified = self.verify_settings(profile, saved[binding['alias']])
             except UpdateError as error:
+                if error.code == 'remote_host_unreachable':
+                    # A legacy binding needing remote proof on an unreachable
+                    # host: leave it published and unverified. The next open
+                    # re-verifies it; the reachable hosts are not restarted.
+                    aside.add(binding['alias'])
+                    continue
                 # Another descriptor revision is running. That is not an
                 # unverified failure: the equivalence path below may still prove
                 # the live descriptor carries exactly the desired settings.
@@ -176,9 +215,16 @@ class RemoteMaintenance:
         # Matching settings do not certify inactivity. Verify identity only;
         # normal native reconnect/start still rechecks the exact descriptor.
         for record in records:
+            if record['binding']['alias'] in aside:
+                continue
             try:
                 self.request(record['binding'], 'identity')
             except UpdateError as error:
+                if error.code == 'remote_host_unreachable':
+                    # Its settings are already verified unchanged, so nothing
+                    # waits to be applied there; a later reconnect uses this
+                    # same binding and rechecks the live descriptor.
+                    continue
                 if error.code != 'remote_revision_conflict':
                     raise
                 return False
@@ -240,7 +286,15 @@ class RemoteMaintenance:
                     or (publication is not None
                         and validate_binding(publication, profile['id']) not in (trimmed, current))):
                 return None
-            observed = self.observe_live(trimmed)
+            try:
+                observed = self.observe_live(trimmed)
+            except UpdateError as error:
+                if error.code != 'remote_host_unreachable':
+                    raise
+                # Not adopted and not restarted; its existing publication is
+                # still checked against the manifest below.
+                expected[alias] = current
+                continue
             live = observed['process']['revision'] if observed['process'] is not None else None
             files = self.remote.settings_files(profile, prepared)
             if live is None or live == trimmed['revision']:
@@ -434,7 +488,10 @@ class RemoteMaintenance:
                 raise UpdateError('remote_operation_pending', '이 프로필의 SSH 연결 처리가 끝나기를 기다립니다.')
         return sorted(selected, key=lambda b: b['alias'])
 
-    def request(self, binding, operation, **params):
+    def request(self, binding, operation, *, fail_fast_since=None, **params):
+        # fail_fast_since is local only (never sent to the helper): the wall
+        # time the caller's wave began, allowing a same-wave unreachable host
+        # to fail without another connect attempt.
         binding = validate_binding(binding, binding['profile_id'])
         self.remote._alias(binding['alias'])
         modules = {name: script_path(self.root, 'scripts/remote_helpers/' + name + '.py').read_text(encoding='utf-8')
@@ -442,8 +499,22 @@ class RemoteMaintenance:
         payload = json.dumps({'modules': modules, 'request': {'binding': binding, 'operation': operation, **params}}).encode()
         if len(payload) > 262144:
             raise UpdateError('remote_request_limit', 'SSH 설정 적용 도우미가 허용 크기를 넘었습니다.')
-        result = self.remote._run(binding['alias'], shlex.join([binding['remote_python'], '-c', BOOTSTRAP]),
+        alias = binding['alias']
+        if fail_fast_since is not None:
+            with _unreachable_lock:
+                recent = _unreachable_at.get(alias)
+            if recent is not None and recent >= fail_fast_since and time.time() - recent < UNREACHABLE_TTL:
+                raise unreachable_error(alias)
+        result = self.remote._run(alias, shlex.join([binding['remote_python'], '-c', BOOTSTRAP]),
                                   input=payload, timeout=150 if operation == 'stop' else 60)
+        if ssh_unreachable(result):
+            # Only the local client's connect line is matched; no remote
+            # output is shown.
+            with _unreachable_lock:
+                _unreachable_at[alias] = time.time()
+            raise unreachable_error(alias)
+        with _unreachable_lock:
+            _unreachable_at.pop(alias, None)
         try:
             if len(result.stdout) > 131072:
                 raise ValueError()
@@ -549,7 +620,7 @@ class RemoteMaintenance:
         check_current = lifecycle_guard or (lambda: None)
         check_current()
         allowed = ('closed', 'prepared', 'start_requested', 'started') + (
-            ('prepare_failed',) if isolate_host_failures else ())
+            ('prepare_failed', 'unreachable') if isolate_host_failures else ())
         if any(entry.get('state') not in allowed for entry in entries):
             raise UpdateError('remote_exit_unverified', 'SSH 서버 종료 확인 뒤 새 설정을 적용할 수 있습니다.')
         model_ids = profile['policy']['model_ids'] if profile['policy']['enabled'] else []
@@ -559,6 +630,9 @@ class RemoteMaintenance:
         options = render_options(profile)
         for entry in entries:
             check_current()
+            if entry.get('state') == 'unreachable':
+                # Its old process could not be observed; nothing may replace it.
+                continue
             if entry.get('state') not in ('closed', 'prepare_failed'):
                 if entry.get('target_policy_revision') != revision:
                     raise UpdateError('policy_changed', '이전 SSH 설정 적용 결과를 확인한 뒤 최신 설정을 적용해야 합니다.')
@@ -600,7 +674,7 @@ class RemoteMaintenance:
 
         for entry in entries:
             check_current()
-            if entry['state'] == 'prepare_failed':
+            if entry['state'] in ('prepare_failed', 'unreachable'):
                 continue
             binding = entry['next_binding']
             if entry['state'] == 'start_requested':
@@ -660,10 +734,10 @@ class RemoteMaintenance:
         Merely saving provider settings or opening a task never enters this path.
         """
         started = [entry for entry in entries if entry.get('state') == 'started']
-        # A host that failed preparation after its old process exited keeps the
-        # previous binding. Listing it as deferred reconnects it with the old
+        # A host that failed preparation after its old process exited, or that
+        # could not be reached at all, keeps the previous binding. Listing it as deferred reconnects it with the old
         # settings until a later apply, and keeps the cohort visibly partial.
-        failed = [entry for entry in entries if entry.get('state') == 'prepare_failed']
+        failed = [entry for entry in entries if entry.get('state') in ('prepare_failed', 'unreachable')]
         if not started and not failed:
             return
         path = self.store.directory / 'profiles' / identifier(profile['id']) / 'ssh-bindings.json'

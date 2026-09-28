@@ -16,6 +16,7 @@ class Fleet(RemoteMaintenance):
         super().__init__(root, store, self)
         self.calls = []
         self.fail_prepare = self.lose_start = self.empty_start = self.fail_host = None
+        self.unreachable = set()
         self.next_pid = 100
         # Shared-catalog listeners publish no idle inventory. They still answer
         # observation-only identity, exactly like the typed remote helper.
@@ -53,6 +54,9 @@ class Fleet(RemoteMaintenance):
     def request(self, binding, operation, **params):
         alias = binding['alias']
         self.calls.append((operation, alias))
+        if alias in self.unreachable:
+            from manager_core.remote_maintenance import unreachable_error
+            raise unreachable_error(alias)
         process = self.running.get(alias)
         active = None
         if process is not None and process['revision'] != binding['revision']:
@@ -112,7 +116,7 @@ class RemoteRestoreTests(unittest.TestCase):
         return self.hooks.restore_instance(dict(profile_id=self.profile['id'], remote_only=True))
 
     def records(self, lease):
-        return json.loads(self.hooks._lease_path(lease['transaction_id']).read_text())['profiles'][0]['remotes']
+        return json.loads(self.hooks._lease_path(lease['transaction_id']).read_text(encoding='utf-8'))['profiles'][0]['remotes']
 
     def test_preparation_failure_cannot_start_only_the_first_host(self):
         lease = self.close()

@@ -1342,9 +1342,11 @@ public sealed class MainWindow : Window
             return; // The confirmation dialog explicitly describes this legacy scope.
         }
         var jobs = new Dictionary<string, string>();
+        var maxHosts = 0;
         foreach (var profile in _state.Arr("profiles"))
         {
             if (profile.S("generation") == "" || !profile.Arr("remote_bindings").Any(b => b.B("prepared"))) continue;
+            maxHosts = Math.Max(maxHosts, profile.Arr("remote_bindings").Count(b => b.B("prepared")));
             using var requestDeadline = new CancellationTokenSource(TimeSpan.FromSeconds(20));
             var job = await _client.RequestAsync("profile.remote_stop",
                 new { profile_id = profile.S("id"), generation = profile.S("generation") }, requestDeadline.Token);
@@ -1355,7 +1357,9 @@ public sealed class MainWindow : Window
                     ? "진행 중이던 SSH 설정 적용 대신 현재 답변이 끝나면 원격 실행을 종료합니다."
                     : "진행 중인 SSH 설정 적용이 끝나는 대로 원격 실행을 종료합니다."));
         }
-        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        // Each host is checked in turn and an unreachable one costs a full
+        // connect timeout (10 s), so the wait grows with the host count.
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(30 + 11 * maxHosts));
         // A refused remote stop (an unaudited runtime, no shutdown proof) does
         // not resolve by waiting. Collect them and let the user leave those
         // listeners on the server, exactly like closing only the window.
@@ -1375,6 +1379,13 @@ public sealed class MainWindow : Window
                     {
                         jobs.Remove(id);
                         var detail = job.Message("SSH 종료 결과를 확인하지 못했습니다.").Replace("로컬 창은 사용할 수 있습니다. ", "");
+                        // An unreachable host (powered off, offline) has nothing we
+                        // could stop now; its reachable hosts were stopped. No prompt.
+                        if (job.S("code") == "ssh_hosts_unreachable")
+                        {
+                            Log($"프로필 원격 종료 · {aliases.GetValueOrDefault(id, id)} · {detail}");
+                            continue;
+                        }
                         refused.Add($"{aliases.GetValueOrDefault(id, id)} · {detail}");
                         Log($"프로필 원격 종료 안 됨 · {aliases.GetValueOrDefault(id, id)} · {detail}");
                     }

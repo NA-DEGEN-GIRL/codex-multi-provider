@@ -200,8 +200,17 @@ class ProfileRestarts:
             if job.get('stop_requested') and not job.get('stop_only'):
                 return Unchanged(False)
             gate = data.get('ssh_maintenance', {}).get(profile_id, {})
-            if (not job.get('stop_only') and gate.get('transaction_id') == job.get('transaction_id')
-                    and gate.get('state') == 'released' and gate.get('settings_deferred') is True
+            own = gate.get('transaction_id') == job.get('transaction_id') and gate.get('state') == 'released'
+            if own and gate.get('code') == 'ssh_hosts_unreachable':
+                # The lease was a stop (also when an open adopted a stop left by
+                # a failed full exit): reachable hosts were stopped, unreachable
+                # ones were not touched. A full exit logs this and moves on.
+                job.update(phase='attention', code='ssh_hosts_unreachable', updated_at=now(),
+                           message=gate['message'] if job.get('stop_only')
+                           else '로컬 창은 사용할 수 있습니다. ' + gate['message'],
+                           **({} if job.get('stop_only') else {'connections_restored': True}))
+                return True
+            if (own and gate.get('settings_deferred') is True
                     and gate.get('deferred_reason') == HOST_PREPARE_FAILED):
                 # Some hosts connected with the new settings; the failed ones
                 # reconnect with their previous settings. The window stays usable.

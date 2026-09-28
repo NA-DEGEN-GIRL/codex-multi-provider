@@ -29,7 +29,7 @@ class RemoteProfileDrainTests(unittest.TestCase):
             if process is not None and params['expected_process'] != process:
                 raise UpdateError('process_changed', 'fixture identity changed')
             gate = self.store.read()['ssh_maintenance'][self.profile['id']]
-            lease = json.loads(self.hooks._lease_path(gate['transaction_id']).read_text())
+            lease = json.loads(self.hooks._lease_path(gate['transaction_id']).read_text(encoding='utf-8'))
             record = next(r for r in lease['profiles'][0]['remotes'] if r['alias'] == alias)
             self.assertEqual(record['state'], 'drain_requested')
             self.assertEqual(record['process'], params['expected_process'])
@@ -114,7 +114,7 @@ class RemoteProfileDrainTests(unittest.TestCase):
         self.assertTrue(self.step(job))
         self.assertEqual(self.fx.job()['phase'], 'attention')
         gate = self.fx.gate()
-        lease = json.loads(self.hooks._lease_path(gate['transaction_id']).read_text())
+        lease = json.loads(self.hooks._lease_path(gate['transaction_id']).read_text(encoding='utf-8'))
         expected = lease['profiles'][0]['remotes'][0]['process']
         self.assertEqual(lease['profiles'][0]['remotes'][0]['state'], 'drain_requested')
         # Direct step fixtures do not execute _run's final worker cleanup.
@@ -123,6 +123,64 @@ class RemoteProfileDrainTests(unittest.TestCase):
         self.assertTrue(self.step(next_job))
         self.assertEqual(self.drains[1][1]['expected_process'], expected)
         self.assertEqual(self.fx.job()['phase'], 'complete')
+
+    def test_stop_skips_an_unreachable_host_and_still_drains_the_others(self):
+        self.fleet.unreachable = {'fixture-a'}
+        job = self.schedule(stop_only=True)
+        self.ready = True
+        self.assertTrue(self.step(job))
+        job = self.fx.job()
+        self.assertEqual((job['phase'], job['code']), ('attention', 'ssh_hosts_unreachable'))
+        self.assertIn('fixture-a', job['message'])
+        self.assertEqual([binding['alias'] for binding, _ in self.drains], ['fixture-b'])
+        self.assertIsNone(self.fleet.running['fixture-b'])
+        self.assertIsNotNone(self.fleet.running['fixture-a'])
+        self.assertEqual(self.fx.gate()['state'], 'released')
+        self.assertFalse(any(c[0] in ('prepare', 'start', 'stop') for c in self.fleet.calls))
+
+    def test_open_that_adopts_an_unfinished_stop_reports_unreachable_hosts_not_deferred_settings(self):
+        # A full exit started a stop that never finished (the service went away).
+        self.fleet.unreachable = {'fixture-a'}
+        job = self.schedule(stop_only=True)
+        self.assertFalse(self.step(job))
+        self.fx.restarts.workers.clear()
+        self.ready = True
+        self.fx.open()
+        self.fx.pending.pop()()
+        job = self.fx.job()
+        self.assertEqual((job['phase'], job['code'], job.get('connections_restored')),
+                         ('attention', 'ssh_hosts_unreachable', True))
+        gate = self.fx.gate()
+        self.assertEqual(gate['state'], 'released')
+        self.assertNotIn('settings_deferred', gate)
+        self.assertIsNone(self.fleet.running['fixture-b'])
+        self.assertFalse(any(c[0] in ('prepare', 'start') for c in self.fleet.calls))
+
+    def test_unreachable_host_does_not_block_a_settings_apply_on_the_others(self):
+        before = {b['alias']: b['revision'] for b in json.loads(self.fx.manifest.read_text())['bindings']}
+        self.fleet.unreachable = {'fixture-a'}
+        job = self.schedule()
+        self.ready = True
+        self.assertTrue(self.step(job))
+        job = self.fx.job()
+        self.assertEqual((job['phase'], job['code'], job['connections_restored']),
+                         ('attention', 'ssh_settings_deferred', True))
+        self.assertEqual([c for c in self.fleet.calls if c[0] in ('prepare', 'start')],
+                         [('prepare', 'fixture-b'), ('start', 'fixture-b')])
+        manifest = json.loads(self.fx.manifest.read_text())
+        after = {b['alias']: b['revision'] for b in manifest['bindings']}
+        self.assertEqual(after['fixture-a'], before['fixture-a'])
+        self.assertNotEqual(after['fixture-b'], before['fixture-b'])
+        self.assertEqual(manifest['deferred_policy_hosts'], ['fixture-a'])
+        # Once reachable, an explicit apply inspects it again and clears the deferral.
+        self.fleet.unreachable = set()
+        self.fx.restarts.workers.clear()
+        job = self.schedule()
+        self.assertTrue(self.step(job))
+        self.assertEqual(self.fx.job()['phase'], 'complete')
+        manifest = json.loads(self.fx.manifest.read_text())
+        self.assertEqual(manifest.get('deferred_policy_hosts'), [])
+        self.assertEqual(manifest.get('pending_policy_hosts'), [])
 
     def test_ordinary_open_never_authorizes_drain(self):
         shown = self.fx.open()
@@ -146,7 +204,7 @@ class RemoteProfileDrainTests(unittest.TestCase):
         self.assertFalse(any(c[0] in ('prepare', 'start') for c in self.fleet.calls))
 
     def lease(self, transaction_id):
-        return json.loads(self.hooks._lease_path(transaction_id).read_text())
+        return json.loads(self.hooks._lease_path(transaction_id).read_text(encoding='utf-8'))
 
     def test_full_exit_turns_waiting_reopen_drain_into_verified_stop(self):
         job = self.schedule()

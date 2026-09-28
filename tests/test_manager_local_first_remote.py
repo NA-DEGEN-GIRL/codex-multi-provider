@@ -191,7 +191,7 @@ class LocalFirstRemoteTests(unittest.TestCase):
             self.assertEqual(source, 'ssh')
             self.assertIsInstance(error, UpdateError)
             self.assertEqual(error.code, 'ssh_settings_pending')
-            lease = json.loads(self.hooks._lease_path(shown[0][1]).read_text())
+            lease = json.loads(self.hooks._lease_path(shown[0][1]).read_text(encoding='utf-8'))
             aliases = {record['alias'] for record in lease['profiles'][0]['remotes']}
             self.assertEqual(aliases, {'fixture-a', 'fixture-b', 'fixture-early'})
             stored = self.store.read()['ssh_inventory'][self.profile['id']]
@@ -241,7 +241,7 @@ class LocalFirstRemoteTests(unittest.TestCase):
         self.assertEqual(self.store.profile(self.profile['id'])['generation'], shown['profile']['generation'])
         self.assertEqual(self.fixture.admin.calls, [])
         self.assertEqual(self.fixture.closes, [])
-        lease = json.loads(self.hooks._lease_path(self.gate()['transaction_id']).read_text())
+        lease = json.loads(self.hooks._lease_path(self.gate()['transaction_id']).read_text(encoding='utf-8'))
         self.assertIs(lease['reused_unchanged'], True)
 
     def test_unchanged_preflight_attention_can_retry_without_touching_existing_work(self):
@@ -289,7 +289,7 @@ class LocalFirstRemoteTests(unittest.TestCase):
         self.assertEqual({b['revision'] for b in stored.values()}, {'0' * 64})
         self.assertTrue(all('settings_fingerprint' in b for b in stored.values()))
         self.assertEqual({b['revision'] for b in json.loads(self.manifest.read_text())['bindings']}, {'0' * 64})
-        lease = json.loads(self.hooks._lease_path(self.gate()['transaction_id']).read_text())
+        lease = json.loads(self.hooks._lease_path(self.gate()['transaction_id']).read_text(encoding='utf-8'))
         self.assertEqual(lease['reused_revisions'], {'fixture-a': '0' * 64, 'fixture-b': '0' * 64})
 
     def test_changed_settings_keep_the_strict_path_and_never_touch_live_work(self):
@@ -317,7 +317,7 @@ class LocalFirstRemoteTests(unittest.TestCase):
         # A journal that drifted from this generation's publication is refused
         # before any write; the repair cohort is rebuilt from the manifest.
         stale = [dict(record, binding=dict(record['binding'], revision='d' * 64))
-                 for record in json.loads(self.hooks._lease_path(transaction).read_text())
+                 for record in json.loads(self.hooks._lease_path(transaction).read_text(encoding='utf-8'))
                  ['profiles'][0]['remotes']]
         profile = self.store.profile(self.profile['id'])
         self.assertIsNone(self.fleet.reuse_equivalent(profile, stale))
@@ -354,7 +354,7 @@ class LocalFirstRemoteTests(unittest.TestCase):
         self.assertEqual(self.fleet.calls, [])
         self.assertEqual(self.gate()['transaction_id'], transaction)
         self.assertEqual(self.gate()['state'], 'held')
-        rebuilt = json.loads(self.hooks._lease_path(transaction).read_text())
+        rebuilt = json.loads(self.hooks._lease_path(transaction).read_text(encoding='utf-8'))
         self.assertEqual(rebuilt['state'], 'held')
         self.assertEqual({record['state'] for record in rebuilt['profiles'][0]['remotes']}, {'unobserved'})
         self.assertEqual({record['binding']['revision'] for record in rebuilt['profiles'][0]['remotes']},
@@ -447,6 +447,31 @@ class LocalFirstRemoteTests(unittest.TestCase):
         self.assertEqual(manifest['deferred_policy_hosts'], ['fixture-b'])
         self.assertEqual([c for c in self.fleet.calls if c[0] == 'start'], [('start', 'fixture-a')])
         self.assertEqual(self.fixture.closes, [])
+        self.hooks.guard_launch(self.profile['id'])
+
+    def test_unchanged_open_skips_an_unreachable_host_without_touching_the_others(self):
+        self.unchanged_live_fleet()
+        self.fleet.unreachable = {'fixture-b'}
+        processes = deepcopy(self.fleet.running)
+        self.open()
+        self.pending.pop()()
+        self.assertEqual(self.job()['phase'], 'complete')
+        self.assertEqual(self.gate()['state'], 'released')
+        self.assertEqual(self.fleet.running, processes)
+        self.assertFalse(any(operation in ('stop', 'prepare', 'start') for operation, _ in self.fleet.calls))
+
+    def test_changed_open_sets_an_unreachable_host_aside(self):
+        self.fleet.unreachable = {'fixture-b'}
+        self.open()
+        self.pending.pop()()
+        job = self.job()
+        self.assertEqual((job['phase'], job['code'], job['connections_restored']),
+                         ('attention', 'ssh_settings_deferred', True))
+        self.assertIn('fixture-b', job['message'])
+        self.assertEqual([c for c in self.fleet.calls if c[0] == 'start'], [('start', 'fixture-a')])
+        self.assertIsNotNone(self.fleet.running['fixture-b'])
+        manifest = json.loads(self.manifest.read_text())
+        self.assertEqual(manifest['deferred_policy_hosts'], ['fixture-b'])
         self.hooks.guard_launch(self.profile['id'])
 
     def test_closed_local_old_scoped_lease_is_adopted_without_network(self):
@@ -612,7 +637,7 @@ class LocalFirstRemoteTests(unittest.TestCase):
         self.pending.pop()()
         self.assertEqual(self.job()['code'], 'ssh_generation_changed')
         self.assertEqual([alias for operation, alias in self.fleet.calls if operation == 'stop'], ['fixture-a'])
-        lease = json.loads(self.hooks._lease_path(self.gate()['transaction_id']).read_text())
+        lease = json.loads(self.hooks._lease_path(self.gate()['transaction_id']).read_text(encoding='utf-8'))
         self.assertEqual(lease['profiles'][0]['remotes'][0]['state'], 'closed')
         self.assertTrue(lease['profiles'][0]['remotes'][0]['exit_proof']['exited'])
         self.assertFalse(any(operation in ('prepare', 'start') for operation, _ in self.fleet.calls))
