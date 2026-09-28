@@ -293,8 +293,10 @@ class ConversationOpenTests(unittest.TestCase):
             home='/home/fixture/.codex', alias='SSH fixture')))
         self.link = self.store.shortcut_add('remote work', self.b['id'], **remote_ref)
         result = self.open()
+        # Without shared execution the chosen profile is shown, but no thread
+        # link is sent and no handoff or viewer touches another store.
         self.assertEqual(result['reason'], 'exact_remote_navigation_unverified')
-        self.assertFalse(self.shown or self.launches)
+        self.assertFalse(self.launches)
         self.assertFalse(any(a.calls for a in self.admins.values()))
 
     def test_packaged_profile_keeps_ordinary_own_conversation_open(self):

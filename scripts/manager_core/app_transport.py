@@ -14,11 +14,13 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sqlite3
 import threading
 import time
 from typing import Any
+from urllib.parse import quote
 from uuid import UUID, uuid4
 
 from . import authority
@@ -72,13 +74,23 @@ class AppTransport:
                   'thread_id': thread_id, 'selection_verified': False}
         if shortcut.get('profile_id') != profile_id:
             return {**result, 'state': 'blocked', 'reason': 'profile_mismatch'}
-        if shortcut.get('host_id', 'local') != 'local':
-            return {**result, 'state': 'blocked', 'reason': 'exact_remote_navigation_unverified',
-                    'message': '원본 앱의 링크가 SSH 호스트를 지정하지 못해 정확한 연결을 확인할 수 없습니다.'}
         native_thread_id = thread_id
         canonical_home = (environment or {}).get('CODEX_RECORD_HOME')
         shared_execution = (environment or {}).get('CODEX_MANAGER_SHARED_EXECUTION') == '1' and not read_only
-        if shared_execution and canonical_home:
+        desktop_host = None
+        if shortcut.get('host_id', 'local') != 'local':
+            # A task on an SSH host lives in that host's store, not the local
+            # canonical one. The desktop opens it exactly when the thread link
+            # names its own id for that connection (?hostId=...).
+            desktop_host = self.desktop_host_id(home, shortcut['host_id'])
+            if desktop_host is None:
+                return {**result, 'state': 'blocked', 'reason': 'remote_host_not_connected',
+                        'message': '이 프로필의 Codex에 해당 SSH 연결이 없습니다. 원본 Codex에서 SSH 연결을 추가한 뒤 다시 여세요.'}
+            if not shared_execution:
+                return {**result, 'state': 'blocked', 'reason': 'exact_remote_navigation_unverified',
+                        'message': 'SSH 작업은 공유 실행이 적용된 관리용 Codex에서 열 수 있습니다. 이 프로필을 다시 열어 주세요.'}
+            result.update(readonly_projection=False, shared_execution=True, host_id=shortcut['host_id'])
+        elif shared_execution and canonical_home:
             try:
                 database = Path(canonical_home).resolve() / 'state_5.sqlite'
                 with closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True, timeout=2)) as db:
@@ -121,6 +133,8 @@ class AppTransport:
         env['CODEX_MANAGER_DESKTOP_PIPE'] = pipe_name(profile_id)
         env.pop('ELECTRON_RUN_AS_NODE', None)
         uri = 'codex://threads/' + native_thread_id
+        if desktop_host is not None:
+            uri += '?hostId=' + quote(desktop_host, safe='')
         process = self._popen([str(executable), '--user-data-dir=' + str(ui_home), uri],
                               env=env, cwd=str(self.root), stdin=subprocess.DEVNULL,
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -128,6 +142,27 @@ class AppTransport:
         return {**result, 'state': 'request_sent', 'uri': uri,
                 'launcher_process_id': process.pid, 'requested_at': utc_now(),
                 'message': '지정 프로필에 작업 열기를 요청했습니다. 화면 선택 확인은 아직 대기 중입니다.'}
+
+    @staticmethod
+    def desktop_host_id(home, host_id):
+        """The desktop's own id for an ssh:<alias> host, from its saved connections."""
+        if not isinstance(host_id, str) or not host_id.startswith('ssh:'):
+            return None
+        alias = host_id[4:]
+        try:
+            path = Path(home) / '.codex-global-state.json'
+            if path.stat().st_size > 8 * 1024 * 1024:
+                return None
+            state = json.loads(path.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            return None
+        entries = state.get('codex-managed-remote-connections') if isinstance(state, dict) else None
+        matches = [entry.get('hostId') for entry in entries or []
+                   if isinstance(entry, dict) and entry.get('alias') == alias]
+        matches = [value for value in matches
+                   if isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9:_.@-]{0,159}', value)]
+        # Two connections for one alias cannot be told apart safely.
+        return matches[0] if len(set(matches)) == 1 else None
 
     def navigation_readiness(self, profile, *, require_execution=False):
         observed = self.observe(profile)

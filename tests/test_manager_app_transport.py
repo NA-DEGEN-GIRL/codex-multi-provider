@@ -51,9 +51,34 @@ class TransportTests(unittest.TestCase):
 
     def test_foreign_or_remote_navigation_never_opens_wrong_instance(self):
         for update, reason in (({'source_store_id': 'original:local'}, 'foreign_store_binding_required'),
-                               ({'host_id': 'ssh:server'}, 'exact_remote_navigation_unverified')):
+                               ({'host_id': 'ssh:server'}, 'remote_host_not_connected')):
             result = self.transport.open_conversation(self.profile, {**self.shortcut, **update}, str(self.executable))
             self.assertEqual(result['reason'], reason)
+        self.assertFalse(self.calls)
+
+    def test_ssh_shortcut_opens_the_exact_desktop_host(self):
+        state = Path(self.profile['home']) / '.codex-global-state.json'
+        state.parent.mkdir(parents=True, exist_ok=True)
+        connections = [{'hostId': 'remote-ssh-discovered:server', 'alias': 'server'},
+                       {'hostId': 'remote-ssh-discovered:other', 'alias': 'other'}]
+        state.write_text(json.dumps({'codex-managed-remote-connections': connections}), encoding='utf-8')
+        shortcut = {**self.shortcut, 'host_id': 'ssh:server', 'source_store_id': 'remote-fixture'}
+        ready = dict(initialized=True, connected=True, canonical_storage=dict(enabled=True), shared_execution_version=1)
+        environment = {'CODEX_RECORD_HOME': str(self.root / 'no-local-copy'), 'CODEX_MANAGER_SHARED_EXECUTION': '1'}
+        with patch.object(self.transport, 'observe', return_value=ready):
+            opened = self.transport.open_conversation(self.profile, shortcut, str(self.executable), environment)
+        self.assertEqual(opened['state'], 'request_sent')
+        self.assertEqual(opened['uri'], 'codex://threads/' + self.shortcut['thread_id']
+                         + '?hostId=remote-ssh-discovered%3Aserver')
+        self.assertEqual(self.calls[0][0][2], opened['uri'])
+        # Without shared execution, or when the alias is ambiguous, nothing is sent.
+        self.calls.clear()
+        blocked = self.transport.open_conversation(self.profile, shortcut, str(self.executable), {})
+        self.assertEqual(blocked['reason'], 'exact_remote_navigation_unverified')
+        state.write_text(json.dumps({'codex-managed-remote-connections': connections + [
+            {'hostId': 'remote-ssh-manual:server', 'alias': 'server'}]}), encoding='utf-8')
+        blocked = self.transport.open_conversation(self.profile, shortcut, str(self.executable), environment)
+        self.assertEqual(blocked['reason'], 'remote_host_not_connected')
         self.assertFalse(self.calls)
 
     def test_canonical_shortcut_waits_then_opens_without_projection_manifest(self):

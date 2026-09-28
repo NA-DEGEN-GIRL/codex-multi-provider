@@ -19,12 +19,9 @@ def open_shortcut(center, shortcut_id, capabilities):
     if link is None:
         raise ValueError('바로가기를 찾을 수 없습니다.')
     profile = center.store.profile(link['profile_id'])
-    if link.get('host_id', 'local') != 'local':
-        # Native Codex still owns ordinary SSH connection/project selection.
-        # This guard concerns only an automatic exact host+thread shortcut.
-        return dict(state='blocked', access_mode='unavailable', profile_id=profile['id'],
-                    reason='exact_remote_navigation_unverified',
-                    message='SSH 대화 바로가기의 화면 연결은 아직 검증 중입니다. 지정 프로필에서 원본 Codex의 SSH 프로젝트를 열 수 있습니다.')
+    # An SSH task opens through the desktop's own thread link with its host id
+    # (AppTransport.open_conversation); only shared execution supports it.
+    remote = link.get('host_id', 'local') != 'local'
 
     foreign = link['source_store_id'] != 'manager:' + profile['id']
     if foreign and not capabilities.get('native_record_catalog'):
@@ -46,6 +43,11 @@ def open_shortcut(center, shortcut_id, capabilities):
             # The user chooses the account directly. This mode does not transfer
             # ownership, wait for another profile, or close its running actors.
             return center.navigations.begin(link, profile, link, False)
+        if remote:
+            # Handoff and read-only viewers only know local stores.
+            return dict(state='blocked', access_mode='unavailable', profile_id=profile['id'],
+                        reason='exact_remote_navigation_unverified',
+                        message='SSH 작업은 공유 실행이 적용된 관리용 Codex에서 열 수 있습니다. 이 프로필을 다시 열어 주세요.')
         if (managed and link['source_store_id'].startswith('manager:')
                 and all(capabilities.get(key) for key in CONNECT_CAPABILITIES)):
             center._wait_runtime(profile['id'])
