@@ -24,13 +24,6 @@ public static class NativeConversationCapture
     private static readonly Regex ThreadLink = new(
         @"\Acodex://threads/(?<id>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\z",
         RegexOptions.CultureInvariant | RegexOptions.NonBacktracking);
-    private static readonly HashSet<string> MemoryFormats = new(StringComparer.Ordinal)
-    {
-        "HTML Format", "Rich Text Format", "Rich Text Format Without Objects", "PNG",
-        "UniformResourceLocator", "UniformResourceLocatorW", "Preferred DropEffect",
-        "Chromium Web Custom MIME Data Format", "CanIncludeInClipboardHistory",
-        "CanUploadToCloudClipboard", "ExcludeClipboardContentFromMonitorProcessing"
-    };
     // OleSetClipboard (WPF, WinForms, Office) adds these markers for its live
     // IDataObject. They carry no data of their own: paste uses the rendered
     // formats beside them, which are saved and restored as usual.
@@ -296,9 +289,17 @@ public static class NativeConversationCapture
         foreach (uint item in formats)
         {
             if (cancelled()) throw new TimeoutException("Clipboard snapshot was cancelled before input.");
+            // Registered formats (Chromium/Electron internals, HTML, PNG, ...) are
+            // HGLOBAL memory by contract and are copied as bytes. One an app
+            // declares but cannot render, or renders empty, carries nothing to
+            // restore; standard formats stay strict.
+            bool registered = item >= 0xC000;
             nint source = GetClipboardData(item);
             if (source == 0)
+            {
+                if (registered) continue;
                 throw new InvalidOperationException($"Clipboard format {FormatName(item)} could not be materialized. Nothing was sent to Codex.");
+            }
             nint duplicate;
             if (item == 14) duplicate = CopyEnhMetaFileW(source, null);
             else
@@ -306,6 +307,7 @@ public static class NativeConversationCapture
                 if (item is not (2 or 3 or 9))
                 {
                     nuint size = GlobalSize(source);
+                    if (size == 0 && registered) continue;
                     if (size == 0 || (bytes += (ulong)size) > 64 * 1024 * 1024)
                         throw new NotSupportedException("The clipboard cannot be preserved within the 64 MiB capture limit. Nothing was sent to Codex.");
                 }
@@ -317,8 +319,11 @@ public static class NativeConversationCapture
         }
     }
 
+    // Standard formats this capture knows how to copy, and every registered
+    // format. Private (0x200-0x2FF), GDI-object (0x300-0x3FF) and owner-display
+    // formats have no copyable memory and still stop the capture.
     private static bool IsSupportedFormat(uint format) => format is 1 or 2 or 3 or 7 or 8 or 9 or 13 or 14 or 15 or 16 or 17 ||
-        format >= 0xC000 && MemoryFormats.Contains(FormatName(format));
+        format >= 0xC000;
 
     private static string FormatName(uint format)
     {

@@ -76,8 +76,12 @@
 
 - 앱 아이콘: `manager/Shell/Assets/app.ico`(16~256px). 어두운 타일에 사용량 링 두 개와 `>_`를 넣었습니다.
   작은 크기는 링을 빼고 글리프를 키웠습니다. `ApplicationIcon`으로 넣어 모든 창이 이 아이콘을 씁니다.
-- '지금 열린 작업 추가'가 `Clipboard format DataObject cannot be preserved safely`로 실패하던 문제:
-  OLE 클립보드의 표식 형식(`DataObject`, `Ole Private Data`)은 데이터가 아니므로 저장·복원에서 건너뜁니다.
+- '지금 열린 작업 추가'가 `Clipboard format … cannot be preserved safely`로 실패하던 문제:
+  - OLE 클립보드의 표식 형식(`DataObject`, `Ole Private Data`)은 데이터가 아니므로 저장·복원에서 건너뜁니다.
+  - 등록 형식을 허용 목록으로만 받아, Chromium/Electron(Codex 창 포함)에서 복사하면 넣는
+    `Chromium internal source RFH token` 같은 내부 형식에서 매번 멈췄습니다. 이제 이름이 등록된 형식은
+    모두(약속상 메모리 데이터) 바이트로 복사해 되돌립니다. 앱이 선언만 하고 내용을 주지 않는 등록 형식은
+    되돌릴 것이 없어 건너뜁니다. 표준 형식은 기존처럼 엄격하게 다루고, 개인·GDI 개체 형식은 계속 중단합니다.
 
 ## 4. 완전 종료가 끝나지 않던 문제 (수정 97 적용 과정에서 발견)
 
