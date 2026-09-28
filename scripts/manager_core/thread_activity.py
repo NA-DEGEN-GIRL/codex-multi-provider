@@ -3,7 +3,8 @@
 The local runtime proxy publishes activity inside its runtime-state snapshot.
 An SSH connection has no such snapshot, so each native SSH proxy process writes
 its own small file here; the manager merges fresh files per profile. Only thread
-ids and one of three state words leave the pump -- never titles or content.
+ids, one of three state words and the last opened task's title (as the local
+runtime-state already records) leave the pump -- never message content.
 """
 from __future__ import annotations
 
@@ -27,19 +28,26 @@ def activity_path(root, profile_id, alias, pid=None):
 
 
 class ActivityFile:
-    def __init__(self, path, *, generation, clock=time.monotonic, wall=time.time):
-        self.path, self.generation = Path(path), generation
+    def __init__(self, path, *, generation, host_id=None, clock=time.monotonic, wall=time.time):
+        self.path, self.generation, self.host_id = Path(path), generation, host_id
         self.clock, self.wall = clock, wall
         self.last = None
         self.written_at = None
 
-    def publish(self, activity):
+    def publish(self, activity, opened=None):
         activity = {thread: state for thread, state in sorted(activity.items())[:LIMIT] if state in STATES}
+        # The task this connection last opened (id, title, time) lets "add the
+        # open task" work without a keyboard shortcut or the clipboard.
+        opened = {key: opened[key] for key in ('thread_id', 'title', 'observed_at')
+                  if isinstance(opened, dict) and isinstance(opened.get(key), str)} or None
         now = self.clock()
-        if activity == self.last and self.written_at is not None and now - self.written_at < REFRESH_SECONDS:
+        if ((activity, opened) == self.last and self.written_at is not None
+                and now - self.written_at < REFRESH_SECONDS):
             return
         value = {'schema': 1, 'generation': self.generation, 'observed_at': self.wall(),
                  'thread_activity': activity}
+        if opened and self.host_id:
+            value['opened_task'] = {**opened, 'host_id': self.host_id}
         temporary = self.path.with_name(self.path.name + '.tmp')
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -48,7 +56,7 @@ class ActivityFile:
         except OSError:
             # A reader holding the file open on Windows; retry on the next poll.
             return
-        self.last, self.written_at = activity, now
+        self.last, self.written_at = (activity, opened), now
 
     def close(self):
         try:
@@ -74,11 +82,23 @@ def merge(*sources):
 
 def read_ssh(directory, generation, *, wall=time.time):
     """Fresh SSH activity files of this launch generation, merged."""
-    sources = []
+    return read_ssh_state(directory, generation, wall=wall)[0]
+
+
+def latest_opened(*candidates):
+    """The most recently opened task among local and SSH observations."""
+    valid = [c for c in candidates if isinstance(c, dict) and isinstance(c.get('thread_id'), str)
+             and isinstance(c.get('observed_at'), str)]
+    return max(valid, key=lambda c: c['observed_at']) if valid else None
+
+
+def read_ssh_state(directory, generation, *, wall=time.time):
+    """(merged activity, latest opened task) from fresh SSH files of this launch."""
+    sources, opened = [], []
     try:
         paths = list(Path(directory).glob('ssh-activity-*.json'))
     except OSError:
-        return {}
+        return {}, None
     for path in paths[:64]:
         try:
             value = json.loads(path.read_text(encoding='utf-8'))
@@ -94,4 +114,5 @@ def read_ssh(directory, generation, *, wall=time.time):
             continue
         if value.get('generation') == generation:
             sources.append(value.get('thread_activity'))
-    return merge(*sources)
+            opened.append(value.get('opened_task'))
+    return merge(*sources), latest_opened(*opened)

@@ -30,6 +30,13 @@ class RuntimeObserverActivityTests(unittest.TestCase):
         notify(self.observer, 'thread/status/changed', {'threadId': self.thread, 'status': {'type': 'idle'}})
         self.assertEqual(self.observer.thread_activity(), {})
 
+    def test_resumed_thread_is_the_opened_task(self):
+        self.observer.consume('client', {'id': 7, 'method': 'thread/resume', 'params': {'threadId': self.thread}})
+        self.observer.consume('server', {'id': 7, 'result': {'thread': {'id': self.thread, 'name': 'My  task'}}})
+        opened = self.observer.opened()
+        self.assertEqual((opened['thread_id'], opened['title']), (self.thread, 'My task'))
+        self.assertIn('observed_at', opened)
+
     def test_started_turn_counts_as_working_until_completed(self):
         turn = {'id': str(uuid4()), 'status': 'inProgress'}
         notify(self.observer, 'turn/started', {'threadId': self.thread, 'turn': turn})
@@ -63,6 +70,24 @@ class ActivityFileTests(unittest.TestCase):
         self.assertEqual(activity.read_ssh(self.directory, 'g1', wall=lambda: self.wall[0] + activity.MAX_AGE_SECONDS + 1), {})
         writer.close()
         self.assertEqual(activity.read_ssh(self.directory, 'g1', wall=lambda: self.wall[0]), {})
+
+    def test_last_opened_task_travels_with_the_ssh_file_and_the_newest_wins(self):
+        thread, other = str(uuid4()), str(uuid4())
+        writer = activity.ActivityFile(self.directory / 'ssh-activity-hp-1.json', generation='g1', host_id='ssh:hp',
+                                       clock=lambda: self.clock[0], wall=lambda: self.wall[0])
+        writer.publish({}, {'thread_id': thread, 'title': 'Task', 'observed_at': '2026-09-28T05:00:02+00:00',
+                            'source': 'ignored'})
+        merged, opened = activity.read_ssh_state(self.directory, 'g1', wall=lambda: self.wall[0])
+        self.assertEqual(merged, {})
+        self.assertEqual(opened, {'thread_id': thread, 'title': 'Task', 'observed_at': '2026-09-28T05:00:02+00:00',
+                                  'host_id': 'ssh:hp'})
+        local = {'thread_id': other, 'title': 'Local', 'observed_at': '2026-09-28T05:00:01+00:00', 'host_id': 'local'}
+        self.assertEqual(activity.latest_opened(local, opened)['thread_id'], thread)
+        self.assertEqual(activity.latest_opened({**local, 'observed_at': '2026-09-28T05:00:09+00:00'}, opened)['thread_id'], other)
+        self.assertIsNone(activity.latest_opened(None, {'title': 'no id'}))
+        # A new open is written at once, not only on the freshness refresh.
+        writer.publish({}, {'thread_id': other, 'title': 'Next', 'observed_at': '2026-09-28T05:00:05+00:00'})
+        self.assertEqual(activity.read_ssh_state(self.directory, 'g1', wall=lambda: self.wall[0])[1]['thread_id'], other)
 
     def test_unchanged_activity_is_rewritten_only_for_freshness(self):
         thread = str(uuid4())

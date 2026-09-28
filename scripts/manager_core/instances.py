@@ -239,9 +239,14 @@ class Instances:
                 pass
         # Per-task working/waiting state for the shortcut list: local runtime
         # plus every live SSH connection of this launch.
-        from .thread_activity import merge, read_ssh
-        state['thread_activity']=merge(state.get('runtime_state',{}).get('thread_activity'),
-                                       read_ssh(status_path.parent,profile.get('generation')))
+        from .thread_activity import latest_opened, merge, read_ssh_state
+        ssh_activity,ssh_opened=read_ssh_state(status_path.parent,profile.get('generation'))
+        state['thread_activity']=merge(state.get('runtime_state',{}).get('thread_activity'),ssh_activity)
+        # The task this profile's desktop opened last, local or over SSH; the
+        # shell adds it as a shortcut without a keyboard shortcut or clipboard.
+        local=state.get('runtime_state',{}).get('opened_task')
+        current=latest_opened({**local,'host_id':'local'} if isinstance(local,dict) else None,ssh_opened)
+        if current:state['current_task']=current
         return state
 
     def prepare(self, profile):

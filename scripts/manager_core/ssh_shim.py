@@ -683,7 +683,7 @@ def _proxy_with_auth(executable: Path, arguments: list[str], environment: dict,
             _audit(path, {**event, 'operation': 'admin-unavailable'})
         from manager_core.thread_activity import ActivityFile, activity_path
         activity = ActivityFile(activity_path(source_environment['CODEX_MANAGER_ROOT'], event['profile_id'],
-                                              event['alias']), generation=generation)
+                                              event['alias']), generation=generation, host_id='ssh:' + event['alias'])
     bridge = WebSocketAuthBridge(control or auth)
 
     def incoming():
@@ -717,7 +717,7 @@ def _proxy_with_auth(executable: Path, arguments: list[str], environment: dict,
             if activity is not None and not stop.is_set():
                 # Outside the protocol lock: the observer has its own lock and
                 # a slow file write never delays frames.
-                activity.publish(control.observer.thread_activity())
+                activity.publish(control.observer.thread_activity(), control.observer.opened())
 
     # A native bootstrap Job Object ensures forced Windows termination closes the
     # local transport tree. Ctrl+C already reaches the inherited console group.

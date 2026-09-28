@@ -2144,9 +2144,25 @@ public sealed class MainWindow : Window
         if (_attached is not { } window) throw new InvalidOperationException("먼저 프로필의 원본 Codex 창을 관리창 안에 표시하세요.");
         var ticket = _navigation; var profileId = _selectedProfile;
         var viewerId = _viewingCatalog ? _viewerProfile.S("id") : null;
-        var captured = await NativeConversationCapture.CaptureAsync(window.Handle, window.Pid, window.Executable,
-            new WindowInteropHelper(this).Handle, () => ticket == _navigation && profileId == _selectedProfile &&
-                !_closing && _host.HasLiveAttachment && _host.AttachedHandle == window.Handle && window.MatchesLifetime);
+        // The desktop's last task open (thread start/resume, local or over SSH)
+        // is observed by the manager. Prefer it: no keyboard shortcut, clipboard
+        // or focus change. The keyboard capture remains only when none is known.
+        var owner = _viewingCatalog ? _viewerProfile : Profile();
+        var current = owner.Get("current_task");
+        string? currentHost = null;
+        NativeConversationCaptureResult captured;
+        if (current.S("thread_id") != "")
+        {
+            captured = new(current.S("thread_id"), null, true);
+            currentHost = current.S("host_id") is { Length: > 0 } host ? host : null;
+            Log($"바로가기 추가 · 최근 연 작업 사용 · {current.S("title", current.S("thread_id"))}");
+        }
+        else
+        {
+            captured = await NativeConversationCapture.CaptureAsync(window.Handle, window.Pid, window.Executable,
+                new WindowInteropHelper(this).Handle, () => ticket == _navigation && profileId == _selectedProfile &&
+                    !_closing && _host.HasLiveAttachment && _host.AttachedHandle == window.Handle && window.MatchesLifetime);
+        }
         if (ticket != _navigation || profileId != _selectedProfile || _closing) return;
         if (!captured.Success) throw new InvalidOperationException(captured.Error ?? "현재 대화 링크를 확인하지 못했습니다.");
         JsonElement resolved = default;
@@ -2178,6 +2194,9 @@ public sealed class MainWindow : Window
         else
         {
             var matches = matchingRecords.Where(t => t.S("thread_id") == captured.ThreadId).ToArray();
+            // The observed open also names its host; it settles a same-ID match.
+            if (currentHost is not null && matches.Count(t => t.S("host_id") == currentHost) == 1)
+                matches = matches.Where(t => t.S("host_id") == currentHost).ToArray();
             if (matches.Length == 0) throw new InvalidOperationException("대화 ID는 확인했지만 원본 저장소와 호스트가 아직 색인되지 않았습니다. 전체 작업에서 해당 출처가 확인된 뒤 연결하세요.");
             if (matches.Length == 1) reference = matches[0];
             else

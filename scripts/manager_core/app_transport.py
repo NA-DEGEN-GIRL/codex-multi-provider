@@ -536,6 +536,11 @@ class RuntimeObserver:
             self.active_threads.discard(thread_id)
             self.thread_flags.pop(thread_id, None)
 
+    def opened(self) -> dict:
+        """The task the desktop last opened (start/resume/fork), title included."""
+        with self.lock:
+            return dict(self.opened_task)
+
     def thread_activity(self) -> dict[str, str]:
         """Per-thread display state: working, waiting_approval or waiting_input.
 
