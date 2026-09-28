@@ -33,7 +33,10 @@ internal static class ShortcutCards
               <ColumnDefinition Width="*"/>
               <ColumnDefinition Width="Auto"/>
             </Grid.ColumnDefinitions>
-            <Button Tag="open" Cursor="Hand" HorizontalContentAlignment="Stretch"
+            <!-- Card buttons never take keyboard focus: a click must not leave a focus
+                 rail on one card while another is the selected one. Enter opens the
+                 selected card; the menu key opens its menu. -->
+            <Button Tag="open" Cursor="Hand" HorizontalContentAlignment="Stretch" Focusable="False"
                     AutomationProperties.Name="{Binding Shortcut.Title}" ToolTip="{Binding Shortcut.Detail}">
               <Button.Template>
                 <ControlTemplate TargetType="Button">
@@ -90,7 +93,7 @@ internal static class ShortcutCards
                 </StackPanel>
               </Grid>
             </Button>
-            <Button Grid.Column="1" Tag="menu" Content="⋯" Width="28" Height="28" Margin="6,0,0,0"
+            <Button Grid.Column="1" Tag="menu" Content="⋯" Width="28" Height="28" Margin="6,0,0,0" Focusable="False"
                     VerticalAlignment="Center" FontSize="15" Cursor="Hand" ToolTip="계정 이동 · 별칭 변경 · 링크 삭제"
                     AutomationProperties.Name="바로가기 관리">
               <Button.Template>

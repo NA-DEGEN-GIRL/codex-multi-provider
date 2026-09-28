@@ -102,6 +102,10 @@ public sealed class MainWindow : Window
     private int _navigation;
     private int _stateRevision;
     private string? _contextProfile, _contextShortcut;
+    // The shortcut the user opened, its profile and that profile's task at the
+    // time. It stays highlighted until another profile is shown or Codex opens
+    // a different task there; otherwise the highlight follows the open task.
+    private (string Id, string ProfileId, string BaselineThread)? _shortcutSelection;
     private (string ProfileId, string ThreadId, string HostId)? _expectedConversation;
     private string? _expectedCanonicalThread;
     private bool _profileAlreadySelected;
@@ -266,6 +270,13 @@ public sealed class MainWindow : Window
         });
         _shortcuts.ContextMenu = Menu(("열기", () => OpenShortcutAsync(RequireContextShortcut())), ("다른 프로필로 이동", () => MoveShortcutByIdAsync(RequireContextShortcut())), ("별칭 변경", () => RenameShortcutByIdAsync(RequireContextShortcut())), ("링크 삭제", () => DeleteShortcutByIdAsync(RequireContextShortcut())));
         _shortcuts.ContextMenu.Opened += (_, _) => _shortcuts.ContextMenu.Tag = _contextShortcut ?? (_shortcuts.SelectedItem as Choice)?.Id;
+        // The card buttons are not focusable; Enter opens the selected card.
+        _shortcuts.KeyDown += async (_, e) =>
+        {
+            if (e.Key != System.Windows.Input.Key.Enter || _shortcuts.SelectedItem is not Choice selected) return;
+            e.Handled = true;
+            await Safe(() => OpenShortcutAsync(selected.Id));
+        };
         _shortcuts.PreviewMouseRightButtonDown += (_, e) =>
         {
             if (ClickedChoice(e.OriginalSource) is not { } choice) return;
@@ -892,7 +903,7 @@ public sealed class MainWindow : Window
                 return new Choice(s.S("id"), s.S("alias", "이름 없는 작업") + "\n" + owner.S("alias", "계정 지정 필요") +
                     " 계정에서 열기 · " + (s.S("host_id", "local") == "local" ? "Windows" : s.S("host_id")), s)
                     { Shortcut = ShortcutCardData.Create(s, owner, taskActivity, agentModels) };
-            }), (_shortcuts.SelectedItem as Choice)?.Id);
+            }), SelectedShortcutId(shortcuts.ToArray()));
             var p = Profile();
             if (_viewingCatalog)
             {
@@ -1025,6 +1036,24 @@ public sealed class MainWindow : Window
             using (_responsiveness?.Stage("shell.background_windows", 25)) ReconcileBackgroundWindows();
         }
         finally { _rendering = false; }
+    }
+    private string? SelectedShortcutId(JsonElement[] shortcuts)
+    {
+        if (_viewingCatalog || _selectedProfile is null) return null;
+        var current = Profile().Get("current_task").S("thread_id");
+        if (_shortcutSelection is { } chosen)
+        {
+            var link = shortcuts.FirstOrDefault(s => s.S("id") == chosen.Id);
+            if (link.ValueKind == JsonValueKind.Object && chosen.ProfileId == _selectedProfile
+                && (current == chosen.BaselineThread || current == link.S("thread_id")))
+                return chosen.Id;
+            _shortcutSelection = null;
+        }
+        if (current == "") return null;
+        var matches = shortcuts.Where(s => s.S("thread_id") == current).ToArray();
+        var own = matches.FirstOrDefault(s => s.S("profile_id") == _selectedProfile);
+        var match = own.ValueKind == JsonValueKind.Object ? own : matches.FirstOrDefault();
+        return match.S("id") is { Length: > 0 } id ? id : null;
     }
     private static void Fill(ListBox box, IEnumerable<Choice> values, string? selected)
     {
@@ -2228,6 +2257,9 @@ public sealed class MainWindow : Window
         var item = _state.Arr("shortcuts").FirstOrDefault(s => s.S("id") == id);
         var profileId = item.S("profile_id"); if (profileId == "") throw new InvalidOperationException("이 바로가기에 연결된 프로필이 없습니다.");
         using var action = _profileActions.Enter(profileId, "대화 열기");
+        _shortcutSelection = (id, profileId, _state.Arr("profiles").FirstOrDefault(p => p.S("id") == profileId)
+            .Get("current_task").S("thread_id"));
+        _shortcuts.SelectedItem = _shortcuts.Items.OfType<Choice>().FirstOrDefault(c => c.Id == id);
         var ticket = ++_navigation; if (_selectedProfile != profileId || _viewingCatalog) ParkCurrent(); _viewingCatalog = false; _selectedProfile = profileId;
         _hostDeck.Select(profileId); BeginAttach(); _profileRequestTicket = ticket;
         if (_host.IsAttached) _host.Visibility = Visibility.Visible;
