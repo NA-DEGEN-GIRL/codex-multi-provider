@@ -74,6 +74,8 @@ class ControlCenter:
         self._remote_reconcile_started = False
         from manager_core.usage_refresh import UsageRefresh
         self.usage_refresh=UsageRefresh(self.root,self.store)
+        from manager_core.claude_usage import ClaudeUsage
+        self.claude_usage=ClaudeUsage(self.root,self.store)
         self.profile_lifecycle=ProfileLifecycle(self.store,self.instances)
         self._sync_at=0
         self._mutex=threading.RLock()
@@ -95,13 +97,15 @@ class ControlCenter:
         if observed.get('status') == 'running' and observed.get('executable_path'):
             from manager_core.browser_bundle import ensure as ensure_browser
             ensure_browser(profile['home'], observed['executable_path'])
-        ssh_gate=self.store.read().get('ssh_maintenance',{}).get(profile_id,{})
+        from manager_core.remote import supports_remote_claude
+        local_only = profile.get('auth_mode') == 'claude_code' and not supports_remote_claude(self.root)
+        ssh_gate={} if local_only else self.store.read().get('ssh_maintenance',{}).get(profile_id,{})
         if ssh_gate.get('remote_update') and ssh_gate.get('state') != 'released':
             if observed.get('status')=='running':
                 return dict(profile_id=profile_id,profile={**profile,**observed},state='existing')
             return self.instances.show(profile_id,reopen_existing=False)
         if ssh_gate.get('state') not in (None,'released') or (
-                observed.get('status')!='running' and self.remote_maintenance.pending_on_open(profile)):
+                not local_only and observed.get('status')!='running' and self.remote_maintenance.pending_on_open(profile)):
             return self.restarts.open_local(profile_id)
         if observed.get('status')=='running':
             # A warmed window needs only native attachment. Re-running Electron
@@ -150,6 +154,12 @@ class ControlCenter:
 
     def _prepare_remote(self, profile, alias, models, **options):
         """Enroll preparation so an SSH update's atomic gate can wait for it."""
+        if profile.get('auth_mode') == 'claude_code':
+            from manager_core.remote import supports_remote_claude
+            if not supports_remote_claude(self.root):
+                raise ValueError('Claude SSH 실행을 지원하는 원격 런타임을 먼저 준비해 주세요.')
+            from manager_core.model_settings import render_options
+            options = {**options, **render_options(profile)}
         generation = profile.get('generation')
         with self.store.locked():
             state = self.store.read()
@@ -157,6 +167,11 @@ class ControlCenter:
             if gate.get('state') not in (None, 'released'):
                 from manager_core.updates import UpdateError
                 raise UpdateError('ssh_settings_pending', 'SSH 업데이트가 진행 중입니다. 완료 후 연결 설정을 준비해 주세요.')
+            inventory = state.get('ssh_inventory', {}).get(profile['id'], {})
+            if generation and profile.get('auth_mode') == 'claude_code' and (
+                    inventory.get('adapter') != 'tracked-ssh-v1' or inventory.get('generation') != generation):
+                from manager_core.updates import UpdateError
+                raise UpdateError('claude_remote_runtime_required', '이 Claude 프로필을 새 SSH 실행기로 다시 열어 주세요.')
             if generation and not state.get('ssh_inventory', {}).get(profile['id']):
                 # Use this Store's reentrant transaction; the inventory owns a
                 # different Store object and cannot reacquire this file lock.
@@ -222,6 +237,7 @@ class ControlCenter:
         state['remote_updates']=self.remote_updates.status_all(state=state)
         state['profile_warmup']=self.profile_warmup.status()
         state['local_launches']=self.instances.launch_status()
+        state['local_restarts']=self.restarts.shutdown_status(state=state)
         registry=self.providers.list()
         from manager_core.runtime_selection import describe as describe_runtime
         from manager_core.instances import process_identity
@@ -250,10 +266,16 @@ class ControlCenter:
                     self.store.mutate(lambda data:self.store.profile(p['id'],data).update(account_fingerprint=fingerprint))
             if observer.get('initialized') and observer.get('stream_complete'):
                 p['policy']['effective_revision']=p['policy'].get('launched_revision')
-            if p.get('auth_mode')=='external':
+            if p.get('auth_mode')=='claude_code':
+                status = p.get('claude_status', {})
+                p['status_message'] = 'Claude · ' + ('로그인됨' if status.get('logged_in') else '로그인 필요')
+                p['account_verification'] = 'claude_ready' if status.get('logged_in') else 'claude_login_needed'
+            elif p.get('auth_mode')=='external':
                 model=next((m for m in registry['models'] if m['id']==p.get('external_model_id')), {})
+                provider=next((item for item in registry['providers'] if item['id']==model.get('provider_id')), {})
+                p['external_deployment']=provider.get('deployment', 'cloud')
                 p['external_model_name']=model.get('display_name', '모델 확인 필요')
-                p['status_message']='외부 API · '+p['external_model_name']
+                p['status_message']=('로컬 모델 · ' if p['external_deployment']=='local' else '외부 API · ')+p['external_model_name']
                 p['account_verification']='api_key'
             elif p.get('auth_mode')=='native':
                 p['status_message']='직접 로그인 · 기본 런타임' if p.get('runtime_channel')=='packaged' else '직접 로그인'
@@ -265,9 +287,11 @@ class ControlCenter:
                 p['status_message']='연결 계정 확인 대기' if p['status']=='running' else 'llm-usage 계정 연결'
         state['updates']=self.update_jobs.status()
         self.usage_refresh.schedule(profiles=saved_profiles)
+        self.claude_usage.schedule(profiles=saved_profiles)
         from manager_core.native_usage import presentation
         for p in state['profiles']:
-            p['usage'] = presentation(self.usage_refresh.value(p), refreshing=self.usage_refresh.active(p['id']))
+            p['usage'] = (self.claude_usage.value(p) if p.get('auth_mode') == 'claude_code'
+                          else presentation(self.usage_refresh.value(p), refreshing=self.usage_refresh.active(p['id'])))
         state['hosts']=self.remote.list_hosts()
         state['view_instances']=[p for p in state['profiles'] if p.get('view_only')]
         state['profiles']=[p for p in state['profiles'] if not p.get('view_only')]
@@ -278,7 +302,7 @@ class ControlCenter:
         if (state['view_instances'] and built.get('native_record_catalog')) or shared_running:
             catalog_refresh.refresh(state['sources'],include_paginated=built.get('paginated_record_catalog',False))
         state['catalog_refresh']=catalog_refresh.status()
-        state['capabilities']=dict(remote_profile_lifecycle=True,original_gui_hosting=True,exact_navigation='request_then_verify',
+        state['capabilities']=dict(shutdown_restart_barrier=True,remote_profile_lifecycle=True,original_gui_hosting=True,exact_navigation='request_then_verify',
                                    native_catalog=built.get('native_record_catalog',False),
                                    shared_native_catalog=built.get('shared_record_catalog',False),
                                    paginated_catalog=built.get('paginated_record_catalog',False),
@@ -314,7 +338,8 @@ class ControlCenter:
                 provider=providers.get(model.get('provider_id')) if model else None
                 if provider:
                     families[p['id']]=(ProviderRegistry._runtime_provider_id(provider),model.get('wire_model_id'))
-            return warmth.summary(profiles,families,self._cache_warmth_pinned(profiles))
+            measured_profiles = [p for p in profiles if p.get('auth_mode') != 'claude_code']
+            return warmth.summary(measured_profiles,families,self._cache_warmth_pinned(measured_profiles))
         except (OSError,ValueError,TypeError,KeyError,AttributeError):
             return {'version':1,'threads':{}}
 
@@ -347,6 +372,9 @@ class ControlCenter:
             refresh(self.root, self.store.read(), thread_id=args['task']['thread_id'])
             return dict(refreshed=True)
         if command=='state':return self.state()
+        if command.startswith('presets.'):
+            from manager_core.execution_preset_service import dispatch as preset_dispatch
+            return preset_dispatch(self, command, args)
         if command=='skills.personal.list':return self.skill_bridge.decorate(self.personal_skills.list())
         if command=='skills.bridge.set':return self.skill_bridge.set(args['id'],args['enabled'])
         if command in ('skills.personal.set','skills.personal.delete','skills.personal.restore'):
@@ -369,10 +397,12 @@ class ControlCenter:
             return result
         if command=='manager.stop_warmup':
             self.instances.stop_launches()
+            self.restarts.pause_local()
             self.profile_warmup.shutdown()
             return self.profile_warmup.status()
         if command=='manager.resume_launches':
             self.instances.resume_launches()
+            self.restarts.resume_local()
             self.profile_warmup.resume()
             return self.instances.launch_status()
         if command=='profile.cleanup':
@@ -393,9 +423,18 @@ class ControlCenter:
                 result['message']=f"Windows 로그인 계정 {native['accounts']}개 중 {native['refreshed']}개의 최신 사용량을 확인했습니다."
             self._sync_at=time.monotonic();return result
         if command=='accounts.list':return dict(accounts=self.accounts.list())
+        if command=='profile.email':
+            from manager_core.profile_email import read
+            return read(self.store, args['profile_id'], reveal=args.get('reveal') is True)
         if command=='profile.add':
             kind=args.get('kind','codex')
-            if kind not in ('codex','external'):raise ValueError('프로필 종류를 선택하세요.')
+            if kind not in ('codex','external','claude_code'):raise ValueError('프로필 종류를 선택하세요.')
+            if kind == 'claude_code':
+                from manager_core.claude_auth import discover_cli
+                from manager_core.claude_profiles import settings as claude_settings
+                discover_cli()
+                return self.store.add_profile(account_alias(args['alias'], self.store.read()['profiles']),
+                                              claude_settings=claude_settings(args.get('settings')))
             if kind=='external':
                 model_id=args['model_id']
                 # Validate adapter, model and decryptable key before creating a profile.
@@ -406,6 +445,27 @@ class ControlCenter:
                 return self.store.add_profile(account_alias(args['alias'],self.store.read()['profiles']), external_model_id=model_id, external_settings=settings)
             profile=self.store.add_profile(account_alias(args['alias'],self.store.read()['profiles']))
             return self.native_login.prepare(profile['id'])
+        if command in ('claude.login', 'claude.status', 'claude.settings', 'claude.usage', 'claude.setup'):
+            from manager_core.claude_profiles import ClaudeProfiles
+            claude = ClaudeProfiles(self.store)
+            if command == 'claude.setup':
+                from manager_core.claude_auth import launch_setup
+                claude.profile(args['profile_id'])
+                return launch_setup(args['profile_id'])
+            if command == 'claude.usage':
+                return self.claude_usage.refresh(args['profile_id'], force=True)
+            if command == 'claude.login':
+                return claude.login(args['profile_id'])
+            if command == 'claude.status':
+                return claude.refresh(args['profile_id'])
+            values = {k: args[k] for k in ('model', 'reasoning_effort', 'effort', 'context_window', 'auto_compact_percent') if k in args}
+            saved = claude.configure(args['profile_id'], values)
+            profile = saved['profile']
+            prepared = self.instances.prepare(profile)
+            if self.instances.observe(profile)['status'] == 'running':
+                saved['restart'] = self.restarts.schedule(profile['id'])
+                saved['message'] = 'Claude 설정을 저장했습니다. 진행 중인 작업이 끝나면 이 프로필을 다시 열어 적용합니다.'
+            return {**prepared, **saved}
         if command=='profile.register_current':
             from manager_core.current_account import register
             return register(self.store, args['alias'], Path.home()/'.codex')
@@ -423,6 +483,9 @@ class ControlCenter:
                                 expected_generation=args['expected_generation'],
                                 interrupt_running_work=args.get('interrupt_running_work') is True)
         if command=='profile.login':
+            if self.store.profile(args['profile_id']).get('auth_mode')=='claude_code':
+                from manager_core.claude_profiles import ClaudeProfiles
+                return ClaudeProfiles(self.store).login(args['profile_id'])
             if self.store.profile(args['profile_id']).get('auth_mode')=='external':raise ValueError('외부 API 프로필은 공급자 설정에서 API 키를 관리합니다.')
             try:
                 with self.update_hooks.launch_admission(args['profile_id']):return self.native_login.open(args['profile_id'])
@@ -433,6 +496,9 @@ class ControlCenter:
                 self.profile_warmup.promote(args['profile_id'])
         if command=='profile.login_status':
             auth_mode=self.store.profile(args['profile_id']).get('auth_mode')
+            if auth_mode == 'claude_code':
+                from manager_core.claude_profiles import ClaudeProfiles
+                return ClaudeProfiles(self.store).refresh(args['profile_id'])
             if auth_mode=='external':return dict(state='api_key',message='외부 API 프로필 · 공급자 설정에서 API 키를 관리합니다.')
             if auth_mode == 'source':
                 from manager_core.current_account import status
@@ -575,7 +641,8 @@ class ControlCenter:
                     'catalog':{k:v for k,v in catalog.items() if k not in ('mapping','path')}}
         if command in ('conversation.open','conversation.continue'):
             from manager_core.conversation_open import open_shortcut
-            return open_shortcut(self,args['shortcut_id'],runtime_build(self.root).get('capabilities',{}))
+            return open_shortcut(self,args['shortcut_id'],runtime_build(self.root).get('capabilities',{}),
+                                 expected_profile_id=args.get('expected_profile_id'))
         if command=='conversation.navigate':
             return self.navigations.resume(args['navigation_id'])
         if command=='profile.model_settings':
@@ -599,6 +666,8 @@ class ControlCenter:
                 result['restart']=self.restarts.schedule(p['id'])
             return {**result,'settings':settings,'message':'모델 설정을 저장했습니다. 진행 중인 작업이 끝나면 적용하고, 닫힌 프로필은 다음 실행부터 사용합니다.'}
         if command=='policy.set':
+            if self.store.profile(args['profile_id']).get('auth_mode') == 'claude_code':
+                raise ValueError('Claude 프로필의 하위 작업은 Claude Code가 처리합니다. Claude 설정을 사용하세요.')
             enabled=args['enabled'];models=args.get('model_ids',[])
             if not isinstance(enabled,bool) or not isinstance(models,list):raise ValueError('모델 선택 값이 올바르지 않습니다.')
             selected=list(dict.fromkeys(identifier(m) for m in models))
@@ -713,7 +782,10 @@ class ControlCenter:
                 # Same-profile mutations stay ordered. Slow work for another
                 # profile must not hold a global UI/notes/connection lock.
                 profile_id=request.get('args',{}).get('profile_id')
-                key=('profile:'+str(profile_id)) if profile_id else request['command']
+                # Email is a read-only, identity-checked display query. A slow
+                # Claude CLI status must not block opening or editing a profile.
+                key=(request['command']+':'+str(profile_id)) if request['command']=='profile.email' else (
+                    ('profile:'+str(profile_id)) if profile_id else request['command'])
                 with self._request_gate_lock:
                     gate=self._request_gates.setdefault(key,threading.RLock())
             else:gate=self._mutex

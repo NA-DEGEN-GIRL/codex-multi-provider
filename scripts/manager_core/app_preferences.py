@@ -63,7 +63,8 @@ def merge_desktop(text, values):
     return updated
 
 
-def prepare(home, source, *, account_id=None, ssh_ready_aliases=None, canonical=False, signals=None):
+def prepare(home, source, *, account_id=None, ssh_ready_aliases=None, canonical=False, signals=None,
+            allow_remote_connections=True):
     home, source = Path(home).resolve(), Path(source).resolve()
     if home == source:
         raise ValueError('원본 앱의 설정은 덮어쓰지 않습니다.')
@@ -94,11 +95,13 @@ def prepare(home, source, *, account_id=None, ssh_ready_aliases=None, canonical=
     donor_state = source / '.codex-global-state.json'
     original = json.loads(donor_state.read_text(encoding='utf-8-sig')) if donor_state.is_file() else {}
     current = json.loads(state.read_text(encoding='utf-8-sig')) if state.exists() else {}
+    membership_baseline = deepcopy(current)
     from .ssh_connection_recovery import apply_pending, finish as finish_ssh_recovery
-    ssh_recovery = apply_pending(home, current)
+    ssh_recovery = apply_pending(home, current) if allow_remote_connections else None
     from .app_workspace import merge_workspace, remove_imported_projects
     project_aliases, result['workspace'] = merge_workspace(current, original, owned, source,
-        ssh_ready_aliases=ssh_ready_aliases, signals=signals)
+        ssh_ready_aliases=ssh_ready_aliases, signals=signals,
+        allow_remote_connections=allow_remote_connections)
     if canonical:
         # Project IDs now belong to the shared store. Never run each profile's
         # legacy importer against it or resurrect removed project declarations.
@@ -117,7 +120,26 @@ def prepare(home, source, *, account_id=None, ssh_ready_aliases=None, canonical=
         remote_assignments = {key: value for key, value in current.get('thread-project-assignments', {}).items()
                               if value.get('projectKind') != 'local'}
         current['thread-project-assignments'] = {**remote_assignments, **deepcopy(source_assignments)}
-        current['projectless-thread-ids'] = deepcopy(workspace.get('projectless-thread-ids', []))
+        # Canonical membership describes local records. Remote membership belongs
+        # to this profile, even after a one-shot move request has been consumed.
+        # A host marker also identifies a remote task moved out of its project;
+        # an explicit local assignment wins over an older remote host marker.
+        baseline_assignments = membership_baseline.get('thread-project-assignments', {})
+        remote_threads = {key for key, value in baseline_assignments.items()
+                          if isinstance(value, dict) and value.get('projectKind') == 'remote'}
+        remote_threads.update(key for key, value in membership_baseline.get('thread-project-membership-host-ids', {}).items()
+                              if isinstance(value, str) and value.startswith('remote-ssh-')
+                              and key not in baseline_assignments)
+        for key in remote_threads:
+            if key in baseline_assignments:
+                current['thread-project-assignments'][key] = deepcopy(baseline_assignments[key])
+            else:
+                current['thread-project-assignments'].pop(key, None)
+        # Preserve the exact remote projectless choice, including a stale
+        # assignment retained alongside an explicit projectless move.
+        current['projectless-thread-ids'] = (
+            [key for key in workspace.get('projectless-thread-ids', []) if key not in remote_threads]
+            + [key for key in membership_baseline.get('projectless-thread-ids', []) if key in remote_threads])
         migration = deepcopy(workspace.get('app-server-projects-migration-by-host', {}).get(donor_host, {}))
         migration['projectsMigrated'] = True
         migration.setdefault('threadAssignmentsMigrated', False)
@@ -139,7 +161,13 @@ def prepare(home, source, *, account_id=None, ssh_ready_aliases=None, canonical=
         if account_id:
             target.setdefault('electron:onboarding-conversational-completed-by-account-id', {})[account_id] = True
         result['onboarding'] = 'common_setup_completed'
+    from .remote_project_membership import apply_pending as apply_membership, finish as finish_membership
+    membership_result = apply_membership(home, current, membership_baseline, signals=signals)
+    if membership_result is not None:
+        result['remote_membership'] = membership_result
     atomic_json(state, current)
     atomic_json(metadata, owned)
-    finish_ssh_recovery(home, ssh_recovery)
+    finish_membership(home, membership_result)
+    if allow_remote_connections:
+        finish_ssh_recovery(home, ssh_recovery)
     return result

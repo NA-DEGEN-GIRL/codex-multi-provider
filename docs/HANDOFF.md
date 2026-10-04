@@ -1,4 +1,184 @@
-# HANDOFF - Codex workspace manager (revision 89 prepared)
+# HANDOFF - Codex workspace manager
+
+Update 2026-10-02: revision 106 adds one-shot navigation recovery in the WPF shell.
+See [observations, implementation and application boundary](design/shortcut-navigation-recovery-106.md).
+Candidate `20261001-171017-309` passed all ten staged UI groups and the separate
+29-check shortcut fixture. A direct route to an existing live desktop repaired
+the reported failure without restarting it; the user confirmed recovery. The new
+automatic watcher has fixture validation; its live use awaits opening the new shell.
+Only the manager release pointer was advanced after verifying 217 frozen-file hashes;
+the previous pointer is preserved in `work/manager-current-before-106.json`.
+Existing revision 99 processes remain running. Native Windows and default Linux
+artifacts remain unchanged; revision 102–105 backend activation is still deferred.
+Closing only the manager window and reopening loads the new shell against the
+existing service while profiles are running. Do not full-exit or restart accounts
+to apply this UI-only recovery. No commit or push is requested.
+
+Update 2026-10-02: revision 105 removes leftover unconditional Claude-local-only
+routing from ControlCenter, while requiring supported artifacts and the current
+tracked SSH generation. See [cause, evidence and activation steps](design/claude-ssh-enrollment-105.md).
+Manager candidate `20261001-162653-598` passed ten UI groups and all 217 frozen-file
+hashes; focused Python tests passed 71 cases. Three enabled Linux hosts have the
+selected Claude profile's definitions prepared and verified by actual binary
+version execution and settings fingerprints. Two managed Claude CLI installations
+were signature-verified; the third already existed. No paid model turn was sent.
+The live manager/service is still revision 99; release pointers and live profile
+SSH bindings are unchanged. The new nested Linux candidate is intentionally not
+the default artifact. Service replacement awaits the user's other-work timing;
+do not report the live Claude desktop as SSH-enabled yet. Preserve the preceding
+revision 98–104 changes. No commit or push was made for this revision.
+
+Update 2026-10-01: revision 104 adds default-hidden profile emails with an explicit
+show/hide button. See [privacy boundaries and validation](design/profile-email-visibility-104.md).
+Candidate `20261001-113150-043` is staged, not activated; all 217 frozen bundle
+files match their hashes. The earlier revision 104 candidate passed all ten staged
+UI groups; the final candidate additionally passed the email/Claude UI fixture after
+the read-only command gate and old-service error handling were finalized. Python
+email/dispatch (9), Claude profiles (16), and CLI adapter (42) tests passed. All seven
+current Codex profiles had readable local email metadata; no address was printed,
+persisted or included here. Live Claude status was not queried. The new service
+must support `profile.email`; an old running service cannot provide this new UI
+operation. Keep revision 103's separate native activation requirements. No running
+profile, service, account login or release pointer was changed for revision 104.
+
+Update 2026-10-01: revision 103 extends saved execution presets to SSH and adds
+connection-bound account borrowing for remote Codex/Claude delegation. See
+[source contracts, setup and verification status](design/ssh-execution-presets-103.md).
+This entry supersedes revision 102's SSH limitation; it does not imply that a
+production runtime or running profile was updated. Exact build/activation evidence
+is recorded in the revision 103 document. Preserve unrelated revision 98–102 changes.
+Revision 103's Windows native build, cross-harness tests, storage gates, generated
+schemas and Bazel lock check supersede the older native-build blockers described
+in the historical revision 102 entry below. The final manager candidate
+`20261001-080642-677` passes all ten staged UI self-tests, including real service
+and deep-path notes storage, plus the separate 13-check preset editor test. The
+initial executable policy block does not describe this final candidate's service
+execution. Separate manager-service unit tests remain blocked before execution by
+Windows Application Control rejecting a dependency build script (OS 4551).
+Activation remains unperformed; do not weaken policy or report the candidate as
+installed. A discovered baseline long-path atomic-save defect was corrected in
+`manager/service/src/windows.rs`; the layout fixture now supplies real current-task
+selection state without weakening retention assertions. The cumulative patch restores to tree
+`1b201dcd91d9cedf8515ac8427f7064292d04823`.
+New source entry points include `execution_preset_render.py`,
+`execution_preset_remote_service.py`, `execution_preset_reconnect.py`,
+`execution_preset_replay.py`, `execution_preset_auth.py`,
+`remote_helpers/execution_presets.py`, and
+`remote_helpers/claude_remote.py`. The Linux CLI installer verifies an official
+signed manifest and installs only a versioned manager tool, without logging in.
+
+Update 2026-10-01: revision 102 implements Windows task execution presets and
+Codex/Claude cross-harness subagent delegation, but is **not activated**. See
+[design, validation and remaining work](design/execution-presets-cross-agents-102.md).
+Manager candidate `20260930-172530-234` builds successfully and passes the hidden
+preset editor fixture. Scoped Rust Clippy checking of core, protocol and app-server
+protocol (including test code) passed, as did the separate protocol build. The
+production native build remains blocked: Windows Application Control rejects an
+`rmcp_macros` build DLL with OS error 4551. Bazel's Windows JNI DLL is independently
+blocked (exit 37). Native behavioral tests and schema regeneration remain unverified.
+Do not disable policy or substitute old binaries as feature validation. Use an
+approved build environment, complete the native/schema/Bazel checks and offline
+cross-harness tests, then the existing same-binary shared/canonical storage gates.
+The current manager/native release pointers remain on their earlier validated
+releases; production profiles and tasks were not restarted. Existing uncommitted
+revision 98–101 work remains intact; no commit or push was made for revision 102.
+New source entry points: `execution_presets.py`, `execution_preset_service.py`,
+`claude_delegation.py`, `claude_delegation_mcp.py`, Shell `ExecutionPresets.cs`,
+native core `config/execution_presets.rs`, `thread_manager/preset_auth.rs`, and
+`tasks/claude_code/delegation.rs`. Source and registry tests explicitly cover
+immutable version history and account authentication separation. SSH presets are
+unsupported and fail closed; host-specific authentication/registry work is separate.
+The cumulative source patch restores to tree
+`90ffc4c5082cec81d1e5a2e4eaf045a000dfd844`; a new detached verification worktree
+matched the manifest without changing the working runtime index. Regenerate both
+stable and experimental API fixture sets before treating the patch as release-ready.
+
+Update 2026-10-01: revision 101 fixes Claude per-task model selection and retains
+the same CLI session across model/effort changes within the same identity boundary.
+See [implementation and validation](design/claude-model-switching-101.md).
+The [persistent worktree domain assessment](design/persistent-worktree-domains.md)
+is a proposal grounded in current code; domain dispatch, execution admission and
+automatic integration are not implemented. Preserve existing project grouping.
+No existing worktree, live task, CLI installation or production process is changed
+by the assessment. Earlier revision 98–100 uncommitted changes remain present.
+Manager `20260930-154746-301` is published for the next launch, with 203 frozen
+bundle files hash-checked. Validation passed 182 Python checks, 10 offline native
+integration tests and 29 WPF checks. Native runtime is unchanged. No live model
+calls or profile/service restarts were performed. Reopen the Claude profile after
+applying the manager update to receive the new multi-model catalog and proxy.
+
+Update 2026-09-29: revision 100 adds explicit local Responses-provider registration,
+optional authentication, Windows-only/default versus explicit SSH execution scope,
+and sourced presets for three Flash checkpoints. Full preset context is retained;
+Qwen logical max maps to its actual xhigh enum. See
+[revision 100](design/local-model-profiles-100.md) and its linked specification record.
+Actual endpoint/model IDs, engine/version and Responses/thinking support are still
+awaiting the local model operator. Do not claim live model integration is verified
+or treat a Chat Completions endpoint as Responses. Desktop fallback notices are now
+shown once in settings; the newer installed desktop remains unsupported, as below.
+Release `20260929-043810-921` is published for the next manager launch. Its 203
+bundle files were hash-checked; 95 Python checks, 29 WPF checks and 2 offline native
+Responses integration tests passed. The native executable is unchanged from
+revision 99. Running profiles and services were not restarted.
+
+Update 2026-09-29: revision 99 adds native Claude context/auto-compaction defaults,
+the genuine UltraCode CLI option, account-scoped five-hour/weekly usage display,
+and an explicit remote project membership repair queue. Implementation/validation:
+[revision 99](design/claude-defaults-usage-99.md). Existing revision 98 dirty work is
+preserved. Pending membership files apply only during safe profile preparation;
+their presence does not mean an already-running desktop has adopted the move.
+Shortcut navigation now attaches before unrelated state refresh, avoids transient
+viewport resizing and discarded legacy manifests, and validates the captured target
+profile before opening it. CLI OAuth login alone may leave first-run onboarding
+incomplete; the explicit setup action opens the official CLI, while quota probing
+reports unknown rather than inventing a percentage.
+Revision 99 Release `20260928-181339-023` and native `20260928-181038-780945`
+passed the scoped validation recorded in the revision document. Real subscription
+percentages remain unverified until CLI onboarding. Installed desktop 26.924 has
+archive integrity enabled and remains unsupported by the customization path;
+do not disable that protection. An audited immutable upgrade of the existing
+26.917 managed cache provides the picker fixes and passes the current fallback
+identity checks. See `desktop_managed_upgrade.py` and `work/desktop-upgrade-99.json`.
+
+Update 2026-09-28: revision 98 is implemented from baseline `f554498`.
+The change adds local Claude Code OAuth profiles, shared task history and skills,
+isolated account-return sessions, and portable compaction checkpoints. Source
+changes are not committed. Existing private migration notes and design drafts
+must not be staged accidentally or overwritten. The older snapshots below are
+historical; inspect the live process and release pointers before deployment.
+
+Start with [the revision 98 implementation and validation record](design/claude-code-agent-profiles-98.md).
+Python/C# manager integration passes. All five native executables build; the final
+Claude bridge suite passes 8 tests, and shared-editing/canonical-storage proofs
+pass 15/16 checks. Schema generation and 64 focused Rust checks are complete.
+The scoped final `just fix` completed with exit code 0. Strict Clippy previously
+failed at two unchanged revision-97 production sites; the final fix run retains
+those diagnostics and an existing test's `needless_collect` diagnostic as warnings.
+This is not a clean strict-Clippy pass. Only test expressions were auto-corrected.
+No real Claude login/model request or active-profile restart has been performed.
+The installed official CLI owns credentials outside the repository; never read
+or copy its OAuth token into an HTTP provider. SSH Claude execution and translating
+Codex-specific tools into Claude tools are outside the implemented local scope.
+
+Local proof reports: `work/claude-98-native-e2e.json`,
+`work/claude-98-python-regression.json`, and the same-binary headless reports
+under `artifacts/results`. These ignored local reports are supporting evidence,
+not credentials or a requirement for understanding the design. The final cumulative
+patch was restored in a fresh worktree and matched tree
+`edbbae73532603534316520fbc5702d528d5dd48`; the original runtime index was preserved.
+`build-manager.ps1 -StageOnly` creates an immutable candidate without replacing
+the active manager. A real user login and a small real-model smoke test remain separate.
+
+Selected for next launch on 2026-09-28: manager `20260928-115405-935` (revision 98)
+and native runtime `20260928-123915-e04fc1`. Both release pointers were published
+after same-binary validation; no running profile or service was restarted. Finish
+active work, use **Full exit**, and reopen before creating a Claude profile.
+Closing only the manager window can leave the older service and runtime alive.
+Next validation: official OAuth login, a small Claude → GPT → Claude exchange,
+optional A → B → A with two accounts, and natural compaction during ordinary use.
+See the implementation record for extra summary usage and unsupported tools/SSH.
+
+## Earlier operational snapshots
 
 Update 2026-09-23: revision 89 adds an explicit per-profile remote configuration
 apply/drain command and remote stop verification to full exit on the new backend.

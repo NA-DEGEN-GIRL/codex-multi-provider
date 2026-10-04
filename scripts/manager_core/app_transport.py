@@ -371,6 +371,7 @@ class RuntimeObserver:
         self.account: dict = {'state': 'unknown'}
         self.last_thread_read: str | None = None
         self.opened_task: dict = {}
+        self.execution_presets: dict = {}
         self.messages = 0
         self.diagnostics: list[dict] = []
         self.diagnostic_sequence = 0
@@ -487,6 +488,17 @@ class RuntimeObserver:
                 self._thread_status(thread_id, params.get('status'))
             elif method == 'thread/started':
                 self._thread(params.get('thread'))
+            elif method == 'thread/settings/updated' and thread_id:
+                settings = params.get('threadSettings', {})
+                if isinstance(settings, dict) and 'executionPreset' in settings:
+                    preset = settings['executionPreset']
+                    if preset is None:
+                        self.execution_presets[thread_id] = None
+                    elif (isinstance(preset, dict) and identifier(preset.get('id'))
+                          and type(preset.get('revision')) is int and preset['revision'] > 0):
+                        self.execution_presets[thread_id] = {'id': preset['id'], 'revision': preset['revision']}
+                    while len(self.execution_presets) > 256:
+                        self.execution_presets.pop(next(iter(self.execution_presets)))
             elif method == 'thread/queue/changed' and thread_id:
                 self.queue_unknown.add(thread_id)
             elif method in ('item/started', 'item/completed'):
@@ -659,6 +671,7 @@ class RuntimeObserver:
                     'observed_message_count': self.messages,
                     'account': dict(self.account), 'last_thread_read': self.last_thread_read,
                     'opened_task': dict(self.opened_task),
+                    'execution_presets': dict(self.execution_presets),
                     'selection_verified': False, 'safe_to_restart': False,
                     'limitations': ['selection_not_observable_from_runtime_rpc',
                                     'detached_tools_and_remote_transports_not_fully_observed']}

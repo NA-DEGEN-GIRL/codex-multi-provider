@@ -33,6 +33,46 @@ SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,95}\Z")
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 ARCHES = {"x86_64": "x86_64", "amd64": "x86_64", "aarch64": "aarch64", "arm64": "aarch64"}
 MARKER = "CODEX_MANAGER_INSPECT_V1"
+REMOTE_CAPABILITY_MARKERS = {
+    # This is read by Config::initialize_execution_presets in production.
+    # Rust symbol names such as managed_execution_presets vanish when stripped.
+    'execution_presets_present': b'CODEX_MANAGER_EXECUTION_PRESETS',
+    'execution_preset_auth_present': b'account/executionPresetAuthTokens/read',
+    'claude_account_auth_present': b'CODEX_MANAGER_CLAUDE_AUTH',
+}
+_CAPABILITY_CACHE = {}
+
+
+def supports_remote_claude(root):
+    """Only verified local Linux artifacts can opt a profile into SSH Claude."""
+    root = Path(root).resolve()
+    for manifest_path in (root / 'artifacts/remote').glob('*/manifest.json'):
+        try:
+            raw = manifest_path.read_bytes()
+            value = json.loads(raw)
+            if not all(value.get(flag) is True for flag in REMOTE_CAPABILITY_MARKERS):
+                continue
+            directory = manifest_path.parent
+            if any(path.is_symlink() for path in (directory, *directory.parents)):
+                continue
+            identities = []
+            for entry in value['files']:
+                path = directory.joinpath(*_safe_relative(entry['path']).parts)
+                stat = path.stat()
+                identities.append((str(path), stat.st_size, stat.st_mtime_ns, stat.st_ino, path.is_symlink()))
+            key = (str(manifest_path), hashlib.sha256(raw).hexdigest(), tuple(identities))
+            if key not in _CAPABILITY_CACHE:
+                artifact = RemoteManager(root)._artifact(value['platform'], value['architecture'], directory=directory)
+                if len(_CAPABILITY_CACHE) >= 128:
+                    _CAPABILITY_CACHE.clear()
+                _CAPABILITY_CACHE[key] = artifact.get('claude_account_auth_present') is True
+            if _CAPABILITY_CACHE[key]:
+                return True
+        except (OSError, ValueError, KeyError, TypeError, RemoteError):
+            continue
+    return False
+
+
 INSPECT_SCRIPT = r'''set -u
 emit() { printf 'CODEX_MANAGER_INSPECT_V1\t%s\t%s\n' "$1" "$2"; }
 emit os "$(uname -s 2>/dev/null || printf unknown)"
@@ -62,6 +102,13 @@ if [ -n "$python" ]; then
   emit python_version "$("$python" --version 2>/dev/null)"
   emit host_identity "$("$python" -c 'import hashlib,os,pathlib; p=pathlib.Path("/etc/machine-id"); identity=p.read_text().strip(); print(hashlib.sha256((identity+"\\0"+str(os.getuid())+"\\0"+str(pathlib.Path.home())).encode()).hexdigest())' 2>/dev/null || true)"
 fi
+claude="$HOME/.local/share/codex-control-center/tools/claude/claude"
+if [ ! -x "$claude" ]; then claude=$(command -v claude 2>/dev/null || true); fi
+if [ -n "$claude" ] && [ -n "$python" ]; then
+  claude=$("$python" -c 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).resolve(strict=True))' "$claude" 2>/dev/null || true)
+fi
+emit claude_path "$claude"
+if [ -n "$claude" ]; then emit claude_version "$("$claude" --version 2>/dev/null | head -n 1)"; fi
 '''
 
 
@@ -210,7 +257,7 @@ class RemoteManager:
         for line in response.stdout.decode("utf-8", "replace").splitlines():
             parts = line.split("\t", 2)
             if len(parts) == 3 and parts[0] == MARKER and parts[1] in {
-                "os", "arch", "home", "uid", "machine", "cli", "cli_version", "stock_login", "python", "python_version", "host_identity"
+                "os", "arch", "home", "uid", "machine", "cli", "cli_version", "stock_login", "python", "python_version", "host_identity", "claude_path", "claude_version"
             }:
                 if parts[1] in observed or len(parts[2]) > 4096 or "\x00" in parts[2]:
                     raise RemoteError("invalid_remote_response", "원격 검사 응답을 안전하게 해석할 수 없습니다.")
@@ -228,6 +275,10 @@ class RemoteManager:
                       host_identity=observed.get("host_identity"),
                       python_path=observed["python"], python_version=observed.get("python_version"),
                       message="읽기 전용 검사 완료. 관리 프로필의 인증과 앱 연결은 별도로 확인합니다.")
+        if observed.get('claude_path') and observed.get('claude_version'):
+            match = re.fullmatch(r'(\d+\.\d+\.\d+)(?: \(Claude Code\))?', observed['claude_version'])
+            if match:
+                result['claude_cli'] = dict(path=observed['claude_path'], version=match.group(1))
         if platform != "linux" or not arch:
             result["blockers"].append("platform_not_supported")
         if not observed["python"] or not observed["python"].startswith("/"):
@@ -290,6 +341,10 @@ class RemoteManager:
                 raise ValueError()
             for executable in ("codex", "codex-code-mode-host", "bwrap"):
                 _verify_elf(directory / executable, arch)
+            from remote_helpers.package_runtime import contains_marker
+            for flag, marker in REMOTE_CAPABILITY_MARKERS.items():
+                if manifest.get(flag) is True and not contains_marker(directory / 'codex', marker):
+                    raise ValueError()
             bwrap_digest = next(item["sha256"] for item in files if item["path"] == "bwrap")
             if manifest.get("bwrap_sha256") != bwrap_digest:
                 raise ValueError()
@@ -306,7 +361,7 @@ class RemoteManager:
             self._registry = ProviderRegistry(self.root)
         return self._registry
 
-    def _definition_revision(self, files, bundle, host_identity, *, legacy):
+    def _definition_revision(self, files, bundle, host_identity, *, legacy, helper_files=None):
         """Only remote execution inputs belong in the SSH definition identity."""
         values = {"files": files, "runtime": bundle, "host_identity": host_identity}
         for key, name in (('installer', 'install'), ('launcher', 'launch'),
@@ -315,7 +370,97 @@ class RemoteManager:
             values[key] = _hash(script_path(self.root, 'scripts/remote_helpers/' + name + '.py'))
         values['catalog_legacy'] = (_hash(script_path(self.root, 'scripts/remote_helpers/catalog_legacy.py'))
                                     if legacy else None)
+        if 'manager-execution-authority.json' in files:
+            values['execution_presets'] = _hash(script_path(self.root, 'scripts/remote_helpers/execution_presets.py'))
+        if helper_files:
+            values['provider_helpers'] = {name: hashlib.sha256(value.encode() if isinstance(value, str) else value).hexdigest()
+                                         for name, value in helper_files.items()}
         return hashlib.sha256(json.dumps(values, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+    @staticmethod
+    def _execution_presets_supported(artifact):
+        from remote_helpers.package_runtime import contains_marker
+        binary = artifact['directory'] / 'codex'
+        return all(contains_marker(binary, marker) for marker in REMOTE_CAPABILITY_MARKERS.values())
+
+    def _render_presets(self, profile, rendered, *, alias, config_home, remote_python, host_identity, remote_cli=None):
+        from .execution_presets import ExecutionPresets
+        from .store import Store
+        result = ExecutionPresets(Store(self.root), self._registry_instance()).render_for_host(
+            profile['id'], rendered['files']['config.toml'], host_id='ssh:' + alias,
+            config_home=config_home, remote_python=remote_python, host_identity=host_identity, remote_cli=remote_cli)
+        rendered['files'].update(result['files'])
+        rendered.setdefault('helper_files', {}).update(result.get('helper_files', {}))
+        if rendered.get('main_auth') is not None:
+            from .providers import _json
+            result['authority']['main_auth'] = rendered['main_auth']
+            result['manifest']['main_auth'] = rendered['main_auth']
+            rendered['files']['manager-execution-authority.json'] = _json(result['authority'])
+            ExecutionPresets._validate_runtime_limits(result['manifest'])
+        rendered['execution_presets'] = result
+        return rendered
+
+    def _authority_path(self, profile_id, alias, revision):
+        from .store import identifier
+        profile_id = identifier(profile_id)
+        if not ALIAS.fullmatch(alias or '') or not SHA256.fullmatch(revision or ''):
+            raise RemoteError('invalid_preset_binding', 'SSH 실행 프리셋 연결 정보를 확인하세요.')
+        path = self.root / 'work/control-center/remote-execution-presets' / profile_id / hashlib.sha256(alias.encode()).hexdigest()[:24] / (revision + '.json')
+        if any(item.is_symlink() for item in (path, *path.parents)) or not path.resolve().is_relative_to(self.root):
+            raise RemoteError('invalid_preset_binding', 'SSH 실행 프리셋 경로를 확인하세요.')
+        return path
+
+    def execution_preset_authority(self, profile, binding):
+        """Manager-owned authority for the exact prepared host/account runtime."""
+        from .execution_presets import ExecutionPresets, MAX_RUNTIME_BYTES
+        from .ssh_shim import validate_binding
+        valid = validate_binding(binding, profile['id'])
+        if (binding.get('prepared') is not True or binding.get('execution_presets_version') != 1
+                or not SHA256.fullmatch(binding.get('host_identity', ''))):
+            raise RemoteError('runtime_prepare_required', '실행 프리셋을 지원하는 SSH 런타임 준비가 필요합니다.')
+        path = self._authority_path(profile['id'], valid['alias'], valid['revision'])
+        try:
+            if path.stat().st_size > MAX_RUNTIME_BYTES + 65536:
+                raise ValueError()
+            value = json.loads(path.read_text(encoding='utf-8'))
+            if (value.get('schema_version') != 1 or value.get('profile_id') != profile['id']
+                    or value.get('host_id') != 'ssh:' + valid['alias'] or value.get('revision') != valid['revision']
+                    or value.get('host_identity') != binding['host_identity'] or not isinstance(value.get('roles'), dict)):
+                raise ValueError()
+            native = {key: value[key] for key in
+                      ('schema_version', 'profile_id', 'host_id', 'roles', 'environment_model_ids', 'main_auth') if key in value}
+            ExecutionPresets._validate_runtime_limits(dict(native, presets=[], default_preset=None, task_bindings={}))
+            return value
+        except (OSError, ValueError, KeyError, TypeError):
+            raise RemoteError('runtime_prepare_required', '준비된 SSH 프리셋 권한 정보를 확인하세요.') from None
+
+    def publish_execution_presets(self, profile, binding):
+        from .execution_presets import ExecutionPresets
+        from .ssh_shim import validate_binding
+        from .store import Store
+        valid = validate_binding(binding, profile['id'])
+        try:
+            authority = self.execution_preset_authority(profile, binding)
+        except RemoteError as error:
+            if error.code == 'runtime_prepare_required':
+                return dict(runtime_prepare_required=True, execution_presets_version=0)
+            raise
+        result = ExecutionPresets(Store(self.root), self._registry_instance()).manifest_for_prepared_host(
+            profile['id'], authority, config_home=str(PurePosixPath(valid['remote_launcher']).parent / 'codex'),
+            remote_python=valid['remote_python'], host_identity=binding['host_identity'], remote_cli=binding.get('claude_cli'))
+        selection = {key: result['manifest'][key] for key in ('presets', 'default_preset', 'task_bindings')}
+        request = dict(schema_version=1, profile_id=profile['id'], host_id='ssh:' + valid['alias'],
+                       host_identity=binding['host_identity'], revision=valid['revision'],
+                       source_revision=result['source_revision'], selection=selection)
+        command = (shlex.quote(valid['remote_python']) + ' ' + shlex.quote(valid['remote_launcher'])
+                   + ' ' + valid['revision'] + ' --publish-execution-presets')
+        response = self._json_result(self._run(self._alias(valid['alias']), command,
+            input=json.dumps(request, ensure_ascii=False, allow_nan=False).encode('utf-8')), 'remote_presets_failed')
+        if (response.get('status') != 'published' or response.get('profile_id') != profile['id']
+                or response.get('host_id') != request['host_id'] or response.get('revision') != valid['revision']
+                or response.get('source_revision') != result['source_revision']):
+            raise RemoteError('remote_presets_failed', 'SSH 실행 프리셋 적용 응답을 확인하지 못했습니다.')
+        return {key: value for key, value in result.items() if key != 'manifest'} | dict(execution_presets_version=1, published=True)
 
     def binding_matches_settings(self, profile, binding):
         """Local comparison only; never stop SSH because the shell bundle changed.
@@ -360,8 +505,17 @@ class RemoteManager:
         valid = validate_binding(binding, profile['id'])
         models = profile['policy']['model_ids'] if profile['policy']['enabled'] else []
         home = str(PurePosixPath(valid['remote_launcher']).parent / 'codex')
-        rendered = self._registry_instance().render_for_host(home, bool(models), models,
-            existing_config='[features]\ncode_mode_host = true\n', **render_options(profile))
+        if profile.get('auth_mode') == 'claude_code':
+            from .claude_profiles import render_for_host
+            rendered = render_for_host(self._registry_instance(), PurePosixPath(home), profile,
+                '[features]\ncode_mode_host = true\n', host_id='ssh:' + valid['alias'],
+                remote_python=valid['remote_python'], host_identity=binding['host_identity'], remote_cli=binding.get('claude_cli'))
+        else:
+            rendered = self._registry_instance().render_for_host(home, bool(models), models,
+                existing_config='[features]\ncode_mode_host = true\n', **render_options(profile))
+        if binding.get('execution_presets_version') == 1:
+            rendered = self._render_presets(profile, rendered, alias=valid['alias'], config_home=home,
+                remote_python=valid['remote_python'], host_identity=binding['host_identity'], remote_cli=binding.get('claude_cli'))
         return {name: hashlib.sha256(content.encode('utf-8')).hexdigest()
                 for name, content in rendered['files'].items()}
 
@@ -375,14 +529,30 @@ class RemoteManager:
     def settings_fingerprint(self, profile, binding):
         return self._settings_fingerprint(binding, self.settings_files(profile, binding))
 
+    def _validate_claude_profile(self, profile_id, snapshot):
+        from .claude_profiles import settings
+        from .store import Store
+        try:
+            profile = Store(self.root).profile(profile_id)
+            if (not isinstance(snapshot, dict) or set(snapshot) != {'id', 'settings'}
+                    or snapshot['id'] != profile_id or profile.get('auth_mode') != 'claude_code'
+                    or settings(snapshot['settings']) != settings(profile.get('claude_settings'))):
+                raise ValueError()
+        except (OSError, ValueError, KeyError, TypeError):
+            raise RemoteError('profile_settings_changed',
+                'Claude 계정 설정이 변경되었습니다. 최신 설정으로 SSH 연결을 다시 준비하세요.') from None
+
     def prepare(self, alias: str, profile_id: str, profile_home: Path | str,
-                model_ids: list[str], *, primary_model_id=None, primary_settings=None, selection_mode='automatic', reuse_host_runtime=False) -> dict:
+                model_ids: list[str], *, primary_model_id=None, primary_settings=None, selection_mode='automatic', reuse_host_runtime=False,
+                claude_profile=None) -> dict:
         alias = self._alias(alias)
         try:
             if str(uuid.UUID(profile_id)) != profile_id:
                 raise ValueError()
         except (ValueError, TypeError, AttributeError):
             raise RemoteError("invalid_profile", "관리 프로필 ID가 올바르지 않습니다.") from None
+        if claude_profile is not None:
+            self._validate_claude_profile(profile_id, claude_profile)
         # The argument is intentionally not a source of files, auth, or secrets.
         # A remote profile is generated from the registry, never copied wholesale.
         observed = self.inspect(alias)
@@ -409,7 +579,7 @@ class RemoteManager:
         try:
             return self._install(alias, profile_id, model_ids, observed, artifact, reused,
                                  primary_model_id=primary_model_id, primary_settings=primary_settings,
-                                 selection_mode=selection_mode)
+                                 selection_mode=selection_mode, claude_profile=claude_profile)
         finally:
             if upload_lock is not None:
                 self._release_runtime_upload(upload_lock)
@@ -442,7 +612,9 @@ class RemoteManager:
         return max(low, min(high, 120 + size // UPLOAD_MIN_RATE))
 
     def _install(self, alias, profile_id, model_ids, observed, artifact, reused, *,
-                 primary_model_id, primary_settings, selection_mode):
+                 primary_model_id, primary_settings, selection_mode, claude_profile=None):
+        if claude_profile is not None:
+            self._validate_claude_profile(profile_id, claude_profile)
         if selection_mode == 'external_only':
             from remote_helpers.package_runtime import contains_marker
             if not contains_marker(artifact['directory'] / 'codex', b'External-only subagents:'):
@@ -450,9 +622,23 @@ class RemoteManager:
         base = PurePosixPath(observed["remote_home"]) / ".local/share/codex-control-center"
         remote_profile = base / "profiles" / profile_id
         registry = self._registry_instance()
-        rendered = registry.render_for_host(str(remote_profile / "codex"), bool(model_ids), model_ids,
-                                            existing_config="[features]\ncode_mode_host = true\n",
-                                            primary_model_id=primary_model_id, primary_settings=primary_settings, selection_mode=selection_mode)
+        from .store import Store
+        profile = next((value for value in Store(self.root).read()['profiles'] if value['id'] == profile_id), None)
+        preset_support = self._execution_presets_supported(artifact)
+        if profile and profile.get('auth_mode') == 'claude_code':
+            if not preset_support:
+                raise RemoteError('runtime_update_required', 'Claude 계정을 지원하는 SSH 런타임 업데이트가 필요합니다.')
+            from .claude_profiles import render_for_host
+            rendered = render_for_host(registry, remote_profile / 'codex', profile,
+                '[features]\ncode_mode_host = true\n', host_id='ssh:' + alias,
+                remote_python=observed['python_path'], host_identity=observed['host_identity'], remote_cli=observed.get('claude_cli'))
+        else:
+            rendered = registry.render_for_host(str(remote_profile / "codex"), bool(model_ids), model_ids,
+                                                existing_config="[features]\ncode_mode_host = true\n",
+                                                primary_model_id=primary_model_id, primary_settings=primary_settings, selection_mode=selection_mode)
+        if preset_support and profile:
+            rendered = self._render_presets(profile, rendered, alias=alias, config_home=str(remote_profile / 'codex'),
+                remote_python=observed['python_path'], host_identity=observed['host_identity'], remote_cli=observed.get('claude_cli'))
         helper = script_path(self.root, "scripts/remote_helpers/install.py")
         launcher = script_path(self.root, "scripts/remote_helpers/launch.py")
         controller = script_path(self.root, "scripts/remote_helpers/native_controller.py")
@@ -473,7 +659,7 @@ class RemoteManager:
                 raise RemoteError('remote_helper_missing', '기존 SSH 기록을 찾는 도우미 파일이 없습니다.')
             legacy_bytes = legacy_helper.read_bytes()
         revision = self._definition_revision(rendered['files'], artifact['bundle_id'],
-            observed['host_identity'], legacy=legacy_bytes is not None)
+            observed['host_identity'], legacy=legacy_bytes is not None, helper_files=rendered.get('helper_files'))
         entries = {}
         runtime_hashes = {}
         for item in artifact["files"]:
@@ -489,6 +675,13 @@ class RemoteManager:
         entries["helpers/ws_client.py"] = (websocket_bytes, 0o700)
         entries["helpers/common.py"] = (common_bytes, 0o700)
         entries["helpers/managed_sources.py"] = (managed_bytes, 0o700)
+        if 'execution_presets' in rendered:
+            entries['helpers/execution_presets.py'] = (script_path(self.root, 'scripts/remote_helpers/execution_presets.py').read_bytes(), 0o700)
+        for name, content in rendered.get('helper_files', {}).items():
+            relative = _safe_relative(name)
+            if relative.suffix != '.py' or 'helpers/' + str(relative) in entries:
+                raise RemoteError('invalid_remote_config', 'SSH 제공자 도우미 경로를 확인하세요.')
+            entries['helpers/' + str(relative)] = (content.encode() if isinstance(content, str) else content, 0o700)
         if legacy_bytes is not None:
             entries['helpers/catalog_legacy.py'] = (legacy_bytes, 0o700)
         metadata = {"schema": 1, "bundle_id": artifact["bundle_id"], "profile_id": profile_id,
@@ -519,7 +712,8 @@ class RemoteManager:
         if payload.get("status") != "prepared" or payload.get("revision") != revision:
             raise RemoteError("remote_install_failed", "원격 설치 완료를 확인하지 못했습니다. 기존 CLI는 유지됩니다.")
         # Deliver only selected provider credentials over SSH stdin after installation.
-        credential_models = list(dict.fromkeys(model_ids + ([primary_model_id] if primary_model_id else [])))
+        credential_models = list(dict.fromkeys(model_ids + ([primary_model_id] if primary_model_id else [])
+            + rendered.get('execution_presets', {}).get('environment_model_ids', [])))
         env = registry.environment(credential_models) if credential_models else {}
         command = (shlex.quote(observed["python_path"]) + " " +
                    shlex.quote(str(remote_profile / "launch.py")) + " " + revision + " --configure")
@@ -547,6 +741,22 @@ class RemoteManager:
                 "message": "원격 파일 준비 완료. 원본 앱 연결과 선택한 GPT 계정 확인 전에는 사용 가능으로 표시하지 않습니다."}
         result['settings_fingerprint'] = self._settings_fingerprint(result,
             {name: hashlib.sha256(content.encode('utf-8')).hexdigest() for name, content in rendered['files'].items()})
+        if profile and profile.get('auth_mode') == 'claude_code':
+            from .model_settings import render_options
+            result['model_options'] = render_options(profile)
+        if observed.get('claude_cli'):
+            result['claude_cli'] = observed['claude_cli']
+        if 'execution_presets' in rendered:
+            from .store import atomic_json
+            authority = dict(rendered['execution_presets']['authority'], revision=revision,
+                             host_identity=observed['host_identity'])
+            cache = self._authority_path(profile_id, alias, revision)
+            if cache.exists() and json.loads(cache.read_text(encoding='utf-8')) != authority:
+                raise RemoteError('invalid_preset_binding', '기존 SSH 프리셋 권한 정보와 충돌합니다.')
+            atomic_json(cache, authority)
+            result['execution_presets_version'] = 1
+            publication = self.publish_execution_presets(profile, result)
+            result['execution_presets'] = publication
         return result
 
     def _select_runtime(self, alias, observed, artifact, reuse_host_runtime):
@@ -565,7 +775,8 @@ class RemoteManager:
                     bundle=info['version']+'-'+hashlib.sha256(json.dumps(info,sort_keys=True).encode()).hexdigest()[:16]
                     if bundle not in known:continue
                     if any(artifact.get(k) is True and info.get(k) is not True for k in
-                           ('external_bridge_present','managed_sources_present','source_catalog_present','mixed_source_catalog_present')):continue
+                           ('external_bridge_present','managed_sources_present','source_catalog_present','mixed_source_catalog_present',
+                            *REMOTE_CAPABILITY_MARKERS)):continue
                     candidates.append(self._artifact(observed['platform'],observed['architecture'],directory=path.parent))
                 except (OSError,ValueError,KeyError,RemoteError):continue
                 if len(candidates)>=16:break

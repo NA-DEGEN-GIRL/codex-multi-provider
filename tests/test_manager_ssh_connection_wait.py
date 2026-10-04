@@ -62,6 +62,21 @@ class ConnectionWaitTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, 'ssh_settings_pending')
         self.assertAlmostEqual(self.elapsed, .3)
 
+    def test_known_remote_drain_reports_real_reason_without_connection_timeout(self):
+        self.data['ssh_maintenance']['profile'].update(
+            graceful_drain=True, waiting_hosts=['dev-host'], stop_only=True)
+        with self.assertRaises(ShimError) as caught:
+            self.wait()
+        self.assertEqual(caught.exception.code, 'ssh_remote_drain_pending')
+        self.assertEqual(self.sleeps, 0)
+        self.assertEqual(self.data['ssh_maintenance']['profile']['state'], 'held')
+
+    def test_parallel_startup_wait_does_not_hot_poll_shared_state(self):
+        with self.assertRaises(ShimError):
+            self.wait(timeout=10)
+        self.assertLess(self.store.read.call_count, 20)
+        self.assertAlmostEqual(self.elapsed, 10)
+
     def test_healthy_profiles_and_configuration_queries_have_no_wait(self):
         self.data['ssh_maintenance'].clear()
         self.wait()

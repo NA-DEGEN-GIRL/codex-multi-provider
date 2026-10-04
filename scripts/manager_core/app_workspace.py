@@ -146,9 +146,18 @@ def current_workspace(source, original, *, signals=None):
         return result
 
 
-def merge_workspace(current, original, owned, source, *, ssh_ready_aliases=None, signals=None):
+def merge_workspace(current, original, owned, source, *, ssh_ready_aliases=None, signals=None,
+                    allow_remote_connections=True):
     source = Path(source).resolve()
     original = current_workspace(source, original, signals=signals)
+    if not allow_remote_connections:
+        # Local-only agents must not inherit Electron's automatic SSH startup.
+        # These dictionaries belong to this isolated profile; never change the donor.
+        original = deepcopy(original)
+        for key, empty in (('codex-managed-remote-connections', []),
+                           ('remote-connection-auto-connect-by-host-id', {})):
+            original[key] = deepcopy(empty)
+            current[key] = deepcopy(empty)
     projects = {}
     for key, value in original.get('local-projects', {}).items():
         if (isinstance(value, dict) and value.get('id') == key

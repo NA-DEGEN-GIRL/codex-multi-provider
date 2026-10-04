@@ -67,6 +67,7 @@ internal static class LayoutSelfTest
         var controls = Descendants(layout).ToArray();
         AssertActionsReachable(layout);
         AssertProfileCards(layout);
+        AssertUpdateDetails(window, layout, fixture.RootElement);
         // Exercise real bindings after a count-only refresh; all these values are
         // unknown, while the baseline fixture proves that integer zero is known.
         foreach (var count in new double?[] { null, 1.5, -1 })
@@ -174,6 +175,7 @@ internal static class LayoutSelfTest
             long_alias_ellipsis = true, quota_and_reset_values_single_line = true, selection_retained = true,
             notes_open_close_checked = true, notes_per_profile_checked = true, compact_notes_and_log_checked = true, wide_notes_resize_checked = true, many_note_tabs_accessible = true,
             compatibility_states_and_refresh_reachable = true, compatibility_inspection_checks = compatibilityChecks,
+            update_blockers_expand_scroll_and_identify_profiles = true,
             sidebar_drag_checked = true, independent_list_scrolling = true, sidebar_selection_preserved = true,
             sidebar_extremes_and_compact_settings_checked = true, sidebar_ratio_reloaded = true, sidebar_scroll_preserved_on_refresh = true,
             source = "synthetic WPF controls only; no live profile or Codex process", png, sidebar_png = sidebarPng, notes_png = notesPng, notes_detail_png = notesDetailPng, compact_png = narrowPng }, new JsonSerializerOptions { WriteIndented = true }));
@@ -183,6 +185,42 @@ internal static class LayoutSelfTest
     // Notes open/closed belongs to each profile: switching restores that
     // profile's own choice, a same-profile refresh keeps it, a new window
     // reloads it, and a profile without a saved choice starts closed.
+    private static void AssertUpdateDetails(MainWindow window, FrameworkElement layout, JsonElement baseline)
+    {
+        var state = JsonNode.Parse(baseline.GetRawText())!;
+        state["updates"] = JsonSerializer.SerializeToNode(new
+        {
+            status = "blocked", message = "업데이트 조건을 다시 확인해야 합니다.",
+            blockers = Enumerable.Range(1, 12).Select(i => new
+            {
+                code = "jobs_not_quiescent", profile_alias = $"fixture-{i:00}",
+                message = "SSH 작업이 끝났는지 확인하지 못했습니다. 연결 상태를 확인한 뒤 다시 시도해 주세요."
+            }).ToArray()
+        });
+        window.UseFixture(JsonSerializer.SerializeToElement(state));
+        var settings = Descendants(layout).OfType<Expander>().Single(e => Equals(e.Header, "설정 및 관리"));
+        var wasExpanded = settings.IsExpanded;
+        Expander? details = null;
+        try
+        {
+            settings.IsExpanded = true; window.UpdateLayout();
+            details = Descendants(layout).OfType<Expander>().Single(e => e.Name == "CodexUpdateDetails");
+            details.IsExpanded = true; window.UpdateLayout();
+            var scroll = (ScrollViewer)details.Content;
+            var text = (TextBlock)scroll.Content;
+            if (details.Visibility != Visibility.Visible || scroll.ScrollableHeight <= 0 ||
+                !double.IsPositiveInfinity(text.MaxHeight) || !text.Text.Contains("[fixture-01]") ||
+                !text.Text.Contains("[fixture-12]"))
+                throw new InvalidOperationException("Update reasons must identify each profile and remain scrollable without clipped text.");
+        }
+        finally
+        {
+            settings.IsExpanded = wasExpanded;
+            if (details is not null) details.IsExpanded = false;
+            window.UseFixture(baseline); window.UpdateLayout();
+        }
+    }
+
     private static async Task AssertNotesPerProfileAsync(MainWindow window, string fixtureRoot, JsonElement state,
         Func<string, object?, Task<JsonElement>> fixtureRequest)
     {
@@ -281,14 +319,21 @@ internal static class LayoutSelfTest
         var shortcutRows = (JsonArray)crowded["shortcuts"]!;
         for (int index = 4; index <= 36; index++)
             shortcutRows.Add(new JsonObject { ["id"] = $"task-{index:00}", ["alias"] = $"검토 작업 {index}", ["profile_id"] = "fixture-01", ["host_id"] = "local" });
+        // Rendering derives shortcut selection from the profile's current task.
+        // A ListBox-only selection is intentionally cleared on the next refresh.
+        const string selectedThread = "layout-sidebar-selected-task";
+        profileRows[0]!["current_task"] = new JsonObject { ["thread_id"] = selectedThread };
+        shortcutRows[1]!["thread_id"] = selectedThread;
         var state = JsonSerializer.SerializeToElement(crowded);
         window.UseFixture(state);
         await Settle(window);
         var profiles = List(layout, "fixture-01");
         var shortcuts = List(layout, "task-01");
-        shortcuts.SelectedIndex = 1;
-        var selectedProfile = ((Choice)profiles.SelectedItem).Id;
-        var selectedShortcut = ((Choice)shortcuts.SelectedItem).Id;
+        if (profiles.SelectedItem is not Choice profileChoice || profileChoice.Id != "fixture-01" ||
+            shortcuts.SelectedItem is not Choice shortcutChoice || shortcutChoice.Id != "task-02")
+            throw new InvalidOperationException("The sidebar fixture did not select the current profile and its task shortcut.");
+        var selectedProfile = profileChoice.Id;
+        var selectedShortcut = shortcutChoice.Id;
         int profileSelectionChanges = 0, shortcutSelectionChanges = 0;
         profiles.SelectionChanged += (_, _) => profileSelectionChanges++;
         shortcuts.SelectionChanged += (_, _) => shortcutSelectionChanges++;

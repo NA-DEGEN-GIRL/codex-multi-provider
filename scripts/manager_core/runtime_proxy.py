@@ -64,6 +64,8 @@ def runtime_environment(source: dict) -> dict:
             env[name] = source[name]
     if source.get('CODEX_MANAGER_PROJECT_ALIASES'):
         env['CODEX_MANAGER_PROJECT_ALIASES'] = source['CODEX_MANAGER_PROJECT_ALIASES']
+    if source.get('CODEX_MANAGER_EXECUTION_PRESETS'):
+        env['CODEX_MANAGER_EXECUTION_PRESETS'] = source['CODEX_MANAGER_EXECUTION_PRESETS']
     # The Windows sandbox grants its writable temp root (TEMP/TMP) on first
     # setup, and Windows propagates that ACE to every file already below it.
     # A small per-profile temp keeps that setup fast whatever the user's TEMP
@@ -260,6 +262,7 @@ def proxy(runtime: Path, arguments: list[str], observer_path: Path, profile_id: 
             value['canonical_storage'] = {'enabled': bool(source_environment.get('CODEX_RECORD_HOME'))}
             value['record_edits_version'] = 1
             value['runtime_observer_version'] = 2
+            value['execution_presets_version'] = (1 if source_environment.get('CODEX_MANAGER_EXECUTION_PRESETS_VERSION') == '1' else 0)
             value['transport'] = {'to_runtime': runtime_output.snapshot(),
                                   'to_app': frontend_output.snapshot()}
             value['shared_execution_version'] = 1 if source_environment.get('CODEX_MANAGER_SHARED_EXECUTION') == '1' else 0
@@ -320,6 +323,13 @@ def proxy(runtime: Path, arguments: list[str], observer_path: Path, profile_id: 
                     target.write(frame)
                     continue
                 if direction == 'frontend':
+                    if (message.get('method') in ('thread/start', 'thread/resume', 'thread/fork')
+                            and source_environment.get('CODEX_MANAGER_ROOT')):
+                        try:
+                            from manager_core.project_trust import sync as sync_project_trust
+                            sync_project_trust(source_environment['CODEX_MANAGER_ROOT'], profile_id)
+                        except (OSError, ValueError):
+                            pass  # The runtime still enforces its own trust check.
                     # Restoring a returning provider's settings reads other
                     # profiles' files. Only this reader waits for it; the
                     # runtime-to-app stream needs protocol_lock and never does.

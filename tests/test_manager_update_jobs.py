@@ -220,6 +220,25 @@ class UpdateWorkerTests(unittest.TestCase):
         self.join()
         self.assertEqual(self.jobs.status()['status'], 'complete')
 
+    def test_recreated_controller_prefers_recovered_same_transaction(self):
+        for phase in ('complete', 'registration_pending'):
+            with self.subTest(phase=phase):
+                transaction_id = str(uuid4())
+                self.jobs._write(dict(phase='finished', result=dict(transaction_id=transaction_id,
+                    status='recovery_required', message='Old failure')))
+                job = self.jobs._read()
+                job['updated_at'] = '2000-01-01T00:00:00Z'
+                from manager_core.store import atomic_json
+                atomic_json(self.jobs.path, job)
+                self.manager._journal(dict(transaction_id=transaction_id), phase,
+                    'Recovered state', recovery_required=phase == 'registration_pending')
+                recreated = UpdateJobs(self.manager)
+                self.assertEqual(recreated.status()['status'], phase)
+                if phase == 'complete':
+                    with patch.object(self.manager, 'check', return_value=dict(status='up_to_date')) as check:
+                        self.assertEqual(recreated.check()['status'], 'up_to_date')
+                    check.assert_called_once()
+
 
 if __name__ == '__main__':
     unittest.main()

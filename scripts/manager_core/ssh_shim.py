@@ -399,7 +399,11 @@ def prepare_environment(root: Path | str, profile_id: str, host_bindings: list[d
     manifest['selected_model_ids'] = sorted(selected or [])
     manifest['model_options'] = model_options
     if environment.get('CODEX_MANAGER_PRIMARY_MODEL'):
-        manifest['primary_model_id'] = json.loads(environment['CODEX_MANAGER_PRIMARY_MODEL'])['model_id']
+        primary = json.loads(environment['CODEX_MANAGER_PRIMARY_MODEL'])
+        # Claude's primary binding identifies an agent harness. Its profile is
+        # already captured in model_options, not an external API model UUID.
+        if primary.get('agent_kind') != 'claude_code':
+            manifest['primary_model_id'] = str(UUID(primary['model_id']))
     if environment.get('CODEX_MANAGER_GENERATION'):
         from manager_core.ssh_inventory import SshInventory
         generation = str(UUID(environment['CODEX_MANAGER_GENERATION']))
@@ -617,6 +621,12 @@ def _proxy_with_auth(executable: Path, arguments: list[str], environment: dict,
     from manager_core.external_profile import ExternalProfile
     external = ExternalProfile(source_environment)
     external.bind_auth(auth)
+    from manager_core.execution_preset_reconnect import publish_before_connect
+    publish_before_connect(source_environment, event, ssh_executable=str(executable))
+    from manager_core.execution_preset_auth import wrap_ssh_auth
+    auth = wrap_ssh_auth(auth, source_environment, event)
+    from manager_core.execution_preset_replay import selection_source
+    preset_source = selection_source(source_environment, event, auth)
     if not auth.bound and not external.binding:
         raise ShimError('ssh_account_binding_required', 'The selected SSH account binding is unavailable.')
     gate = MarkerGate(marker)
@@ -674,7 +684,8 @@ def _proxy_with_auth(executable: Path, arguments: list[str], environment: dict,
             event['profile_id'],generation,event['alias'],event['revision'])
         control = SshRuntimeControl(auth, event['profile_id'], generation, child.pid,
                                    runtime_writer.put, lock=protocol_lock,
-                                   host_alias=event['alias'], revision=event['revision'], record_delete=record_delete)
+                                   host_alias=event['alias'], revision=event['revision'], record_delete=record_delete,
+                                   preset_source=preset_source)
         try:
             admin_server = AdminServer(source_environment['CODEX_MANAGER_ROOT'],
                 endpoint_id(event['profile_id'], event['alias']), generation, child.pid, control.dispatch).start()
@@ -744,10 +755,20 @@ def _proxy_with_auth(executable: Path, arguments: list[str], environment: dict,
         fail_transport('runtime', error)
     finally:
         stop.set()
+        if hasattr(auth, 'close'):
+            auth.close()
         if activity is not None:
             activity.close()
         if control is not None:
-            control.close()
+            closed = control.close()
+            if closed is not None:
+                from manager_core.websocket_auth import encode_frame
+                for message in closed.frontend:
+                    try:
+                        frontend_writer.put(encode_frame(json.dumps(message).encode('utf-8'), masked=False))
+                    except (OSError, ValueError, ShimError):
+                        # The peer may already have disposed this connection.
+                        break
         if admin_server is not None:
             admin_server.close()
         signal.signal(signal.SIGINT, previous_handler)

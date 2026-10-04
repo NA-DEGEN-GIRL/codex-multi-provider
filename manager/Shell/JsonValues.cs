@@ -25,7 +25,8 @@ internal sealed record Choice(string Id, string Label, JsonElement Data = defaul
     public string ProfileNotice { get; init; } = "";
     public string ProfileCache { get; init; } = "";
     public string ProfileCacheTone { get; init; } = "";
-    public ProfileCardData Card => ProfileCardData.Create(Data, Label, ProfileNotice, ProfileCache, ProfileCacheTone);
+    public string ProfileEmail { get; init; } = "";
+    public ProfileCardData Card => ProfileCardData.Create(Data, Label, ProfileNotice, ProfileCache, ProfileCacheTone) with { Email = ProfileEmail };
     public ShortcutCardData? Shortcut { get; init; }
     public string AgentBadge => ProfileAgentPresentation.Badge(Data);
     public string AgentHint => ProfileAgentPresentation.Hint(Data);
@@ -35,6 +36,7 @@ internal sealed record Choice(string Id, string Label, JsonElement Data = defaul
         get
         {
             if (Shortcut is { } shortcut) return shortcut.Detail;
+            if (ClaudeProfilePresentation.IsClaude(Data)) return Card.DetailHint + "\n" + ClaudeProfilePresentation.Status(Data).Message("");
             if (Data.S("thread_id") != "") return "작업 이름을 누르면 표시된 계정에서 열립니다.\n계정 이동·별칭 변경·링크 삭제는 ⋯ 버튼을 사용하세요.";
             var usage = Data.Get("usage");
             var observed = usage.S("observed_at");

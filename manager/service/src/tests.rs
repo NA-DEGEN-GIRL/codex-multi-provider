@@ -246,6 +246,21 @@ fn explicit_shutdown_only_drains_remote_queue_after_profiles_and_launches_exit()
     assert!(can_drain(&response));
     response["result"]["profile_restarts"] = json!({"p":{"phase":"opening"}});
     assert!(!can_drain(&response));
+    response["result"]["remote_updates"]["worker_active"] = json!(false);
+    response["result"]["profile_restarts"] = json!({"p":{
+        "phase":"waiting", "remote_background":true, "transaction_id":"pending-remote-stop"
+    }});
+    assert!(!can_stop(&response)); // Closing only the UI must preserve SSH retry ownership.
+    assert!(can_drain(&response)); // Explicit exit preserves the journal, not the retry process.
+    for job in [
+        json!({"phase":"waiting", "remote_background":false}),
+        json!({"phase":"waiting", "remote_background":"true"}),
+        json!({"phase":"opening", "remote_background":true}),
+        json!({"phase":"", "remote_background":true}),
+    ] {
+        response["result"]["profile_restarts"] = json!({"p":job});
+        assert!(!can_drain(&response));
+    }
 }
 
 #[tokio::test]
@@ -254,6 +269,10 @@ async fn full_exit_drains_real_adapter_once_and_keeps_retry_journal() {
     std::fs::create_dir(root.path().join("scripts")).unwrap();
     let state = json!({"profiles":[],"view_instances":[],
         "local_launches":{"active":0,"stopping":true},
+        "profile_restarts":{"profile":{"phase":"waiting", "remote_background":true,
+            "transaction_id":"pending-remote-stop", "stop_only":true}},
+        "ssh_maintenance":{"profile":{"state":"held", "stop_only":true,
+            "transaction_id":"pending-remote-stop", "waiting_hosts":["fixture-host"]}},
         "remote_updates":{"worker_active":true,"items":[{"job":{"state":"waiting"}}]}});
     let journal = root.path().join("fixture-state.json");
     std::fs::write(&journal, state.to_string()).unwrap();

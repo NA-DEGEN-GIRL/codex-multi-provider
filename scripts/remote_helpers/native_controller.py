@@ -305,6 +305,14 @@ DRAIN_MARKERS = (
 #   version 0.153.4-managed-98ad6b88cd3ca441, build_source_sha256 98ad6b88...
 #     (unstripped 40f5b129..., and the same build stripped b8f98675...)
 #   (revisions 94-96: app-server/src/lib.rs still maps SIGHUP to GracefulOnly)
+#   version 0.153.4-managed-858db000295f38fe (Claude/preset runtime):
+#   revision 112 isolated Linux audit held a fixture model response, sent two
+#   SIGHUPs, observed the same live turn, then completed it and observed exit 0.
+#   Evidence: work/validation/release-112/drain-audit.json. No live profile was signalled.
+#   versions 0.153.4-managed-d305e51ac94deedd (codex 26715eda...) and
+#   0.153.4-managed-62c39321e32ce3be (codex 1148581b..., revision 113): each passed
+#   the same isolated two-SIGHUP audit with its own binary before being listed.
+#   Evidence: work/validation/release-113/drain-audit.json.
 # The manager may pass the digest from its own verified manifest; that digest
 # must still be in this allowlist, so an unknown bundle always refuses.
 DRAIN_AUDITED_SHA256 = frozenset({
@@ -313,6 +321,9 @@ DRAIN_AUDITED_SHA256 = frozenset({
     "e85e7046798622783e66ee9ea97b2e36c8c53bea05b04252f80a8396261b727a",
     "40f5b129ca8e01983854e38ed6d629e5ba10f11da8b66e8134b12a2d34c9ecc2",
     "b8f98675d7a90b0c0eae6c1d627431c3c71637a07691c5c856b0cc3dfa4f5921",
+    "d765eb778ea7a609e574f18709cc1cd464943914e715d9d0c7958dec0ebe1b17",
+    "26715edad0e99f54d3c3c87cade7e2f0e5148aff01fcdacc5c4a5e89c1207aad",
+    "1148581b96c5c772193b14dad0ba390bca89922fc118b0b899d23dc9d196a33d",
 })
 # Unstripped revision 94-96 builds are ~1.3 GB; a smaller bound refused them.
 DRAIN_HASH_BYTES = 2 * 1024 * 1024 * 1024

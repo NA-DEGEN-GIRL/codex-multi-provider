@@ -283,6 +283,33 @@ class MarkerGateTests(unittest.TestCase):
 
 
 class ManifestTests(unittest.TestCase):
+    def test_claude_primary_binding_keeps_profile_without_external_model_id(self):
+        from manager_core.model_settings import render_options
+        from manager_core.providers import ProviderRegistry
+        from manager_core.store import Store
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            proxy, real = root / 'ssh.exe', root / 'original.exe'
+            proxy.touch(); real.touch()
+            profile = Store(root).add_profile('Claude SSH fixture', claude_settings={})
+            options = render_options(profile)
+            primary = ProviderRegistry(root).render_for_host(profile['home'], False, [], '', **options)['primary']
+            self.assertEqual(primary['agent_kind'], 'claude_code')
+            self.assertNotIn('model_id', primary)
+            environment = {'CODEX_MANAGER_PRIMARY_MODEL': json.dumps(primary),
+                           'CODEX_MANAGER_MODEL_OPTIONS': json.dumps(options)}
+            scoped = prepare_environment(root, profile['id'], [], environment,
+                app_version='26.903.9818.0', ssh_proxy=proxy, real_ssh=real)
+            saved = json.loads(Path(scoped['CODEX_MANAGER_SSH_BINDINGS']).read_text())
+            self.assertNotIn('primary_model_id', saved)
+            self.assertEqual(saved['model_options'], options)
+            environment['CODEX_MANAGER_PRIMARY_MODEL'] = json.dumps({'model_id': OTHER})
+            scoped = prepare_environment(root, PROFILE, [], environment,
+                app_version='26.903.9818.0', ssh_proxy=proxy, real_ssh=real)
+            saved = json.loads(Path(scoped['CODEX_MANAGER_SSH_BINDINGS']).read_text())
+            self.assertEqual(saved['primary_model_id'], OTHER)
+
     def test_remote_paths_cannot_escape_profile_or_inject_line(self):
         for path in ('/home/test/launch.py',
                      binding()['remote_launcher'].replace(PROFILE, OTHER),

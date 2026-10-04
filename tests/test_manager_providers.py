@@ -236,6 +236,165 @@ class ProviderRegistryTests(unittest.TestCase):
             self.assertEqual(self.registry.environment([]), {})
         decrypt.assert_not_called()
 
+    def local_definition(self, *, auth_type='none', execution_scope=None):
+        provider, model = self.definition('Local fixture', 'served/model-id')
+        provider.update(deployment='local', auth_type=auth_type, base_url='http://local-engine.example:8080/v1')
+        if execution_scope is not None:
+            provider['execution_scope'] = execution_scope
+        return provider, model
+
+    def test_local_no_auth_renders_main_and_subagents_without_credentials(self):
+        provider, model = self.local_definition()
+        with patch.object(providers, '_unprotect_secret', side_effect=AssertionError('No credentials may be decrypted')):
+            saved = self.registry.save(provider, model)
+            self.assertEqual(self.registry.environment([saved['model']['id']]), {})
+            visible = self.registry.list()['providers'][0]
+            self.assertEqual((visible['key_saved'], visible['credentials_ready'], visible['execution_scope']),
+                             (False, True, 'local'))
+            rendered = self.registry.render_for_host(r'C:\managed\codex', True, [saved['model']['id']],
+                                                    primary_model_id=saved['model']['id'])
+        config = tomllib.loads(rendered['files']['config.toml'])
+        connection = config['model_providers'][config['model_provider']]
+        self.assertEqual(connection['base_url'], provider['base_url'])
+        self.assertNotIn('env_key', connection)
+        self.assertFalse(connection['requires_openai_auth'])
+        self.assertEqual(config['model'], 'served/model-id')
+        self.assertEqual(config['subagent_model_provider_allowlist'], [config['model_provider']])
+        role = tomllib.loads(next(v for k, v in rendered['files'].items() if k.startswith('agents/')))
+        self.assertEqual((role['model'], role['model_provider']), (config['model'], config['model_provider']))
+        self.assertEqual((config['model_context_window'], role['model_context_window']), (32768, 32768))
+        self.assertEqual((config['model_reasoning_effort'], role['model_reasoning_effort']), ('low', 'low'))
+        with self.assertRaisesRegex(providers.ProviderError, 'does not use an API key'):
+            self.registry.save_key(saved['provider']['id'], 'unused-synthetic-key')
+
+    def test_local_endpoint_preserves_user_host_and_cloud_still_requires_https_and_auth(self):
+        for endpoint in ('http://localhost:8080/v1', 'http://127.0.0.1:8080/v1',
+                         'http://[::1]:8080/v1', 'http://inference.lan:8080/v1', 'https://inference.lan/v1'):
+            with self.subTest(endpoint=endpoint):
+                provider, model = self.local_definition()
+                provider['base_url'] = endpoint
+                self.assertEqual(self.registry.save(provider, model)['provider']['base_url'], endpoint)
+        for changes in ({'base_url': 'http://localhost:8080/v1'}, {'auth_type': 'none'}):
+            with self.subTest(changes=changes):
+                provider, model = self.definition()
+                provider.update(changes)
+                before = self.snapshot()
+                with self.assertRaises(providers.ProviderError):
+                    self.registry.save(provider, model)
+                self.assertEqual(self.snapshot(), before)
+        for endpoint in ('file:///tmp/model', 'http://user:secret@localhost/v1', 'http://@localhost/v1',
+                         'http://localhost/v1?key=secret', 'http://localhost/v1#fragment',
+                         'http://localhost/a/%2e%2e/v1', 'http://localhost:0/v1'):
+            with self.subTest(endpoint=endpoint):
+                provider, model = self.local_definition()
+                provider['base_url'] = endpoint
+                with self.assertRaises(providers.ProviderError):
+                    self.registry.save(provider, model)
+
+    def test_local_scope_blocks_remote_main_and_subagents_until_explicit_all_hosts(self):
+        provider, model = self.local_definition()
+        saved = self.registry.save(provider, model)
+        for enabled, selected, primary in ((True, [saved['model']['id']], None),
+                                           (False, [], saved['model']['id'])):
+            with self.subTest(primary=primary), self.assertRaisesRegex(providers.ProviderError, 'remote host'):
+                self.registry.render_for_host('/home/fixture/.codex', enabled, selected, primary_model_id=primary)
+        shared_provider, shared_model = self.local_definition(execution_scope='all_hosts')
+        shared = self.registry.save(shared_provider, shared_model)
+        rendered = self.registry.render_for_host('/home/fixture/.codex', True, [shared['model']['id']],
+                                                primary_model_id=shared['model']['id'])
+        config = tomllib.loads(rendered['files']['config.toml'])
+        self.assertEqual(config['model_providers'][config['model_provider']]['base_url'], shared_provider['base_url'])
+
+    def test_auth_deployment_and_scope_changes_invalidate_connection_verification(self):
+        for field, value in (('auth_type', 'api_key'), ('deployment', 'cloud'), ('execution_scope', 'all_hosts')):
+            with self.subTest(field=field):
+                provider, model = self.local_definition(auth_type='api_key' if field == 'deployment' else 'none')
+                provider['base_url'] = 'https://inference.example/v1'
+                saved = self.registry.save(provider, model)
+                sibling = self.registry.save(saved['provider'], {**model, 'wire_model_id': 'sibling-model'})
+                old = self.registry._runtime_provider_id(saved['provider'])
+                changed = self.registry.save({**saved['provider'], field: value}, saved['model'])
+                self.assertEqual(changed['provider']['revision'], saved['provider']['revision'] + 1)
+                self.assertNotEqual(self.registry._runtime_provider_id(changed['provider']), old)
+                self.assertFalse(changed['model']['verified'])
+                other = next(m for m in self.registry.list()['models'] if m['id'] == sibling['model']['id'])
+                self.assertFalse(other['verified'])
+
+    def test_local_api_key_still_requires_and_uses_saved_credentials(self):
+        provider, model = self.local_definition(auth_type='api_key')
+        saved = self.registry.save(provider, model)
+        visible = self.registry.list()['providers'][0]
+        self.assertEqual((visible['key_saved'], visible['credentials_ready']), (False, False))
+        with self.assertRaisesRegex(providers.ProviderError, 'API key'):
+            self.registry.environment([saved['model']['id']])
+        self.prepare_probe_key(saved['provider']['id'])
+        with patch.object(providers, '_unprotect_secret', return_value=b'synthetic-probe-key') as decrypt:
+            environment = self.registry.environment([saved['model']['id']])
+        self.assertEqual(list(environment.values()), ['synthetic-probe-key'])
+        decrypt.assert_called_once()
+        self.assertTrue(self.registry.list()['providers'][0]['credentials_ready'])
+        rendered = self.registry.render_for_host(r'C:\managed\codex', False, [], primary_model_id=saved['model']['id'])
+        config = tomllib.loads(rendered['files']['config.toml'])
+        self.assertIn('env_key', config['model_providers'][config['model_provider']])
+
+    def test_old_cloud_records_gain_defaults_without_rewriting_or_changing_runtime_identity(self):
+        saved = self.add_model()
+        state = json.loads(self.registry.path.read_text(encoding='utf-8'))
+        old_provider = state['providers'][0]
+        for key in ('deployment', 'execution_scope'):
+            old_provider.pop(key)
+        self.registry.path.write_text(json.dumps(state), encoding='utf-8')
+        before = self.snapshot()
+        identity = self.registry._runtime_provider_id(old_provider)
+        visible = self.registry.list()['providers'][0]
+        self.assertEqual((visible['deployment'], visible['auth_type'], visible['execution_scope']),
+                         ('cloud', 'api_key', 'all_hosts'))
+        self.assertFalse(visible['credentials_ready'])
+        self.assertEqual(self.registry._runtime_provider_id(visible), identity)
+        self.assertEqual(self.snapshot(), before)
+        unchanged = self.registry.save(old_provider, saved['model'])
+        self.assertEqual(unchanged['revision'], saved['revision'])
+        self.assertEqual(self.snapshot(), before)
+
+    def test_local_verification_uses_two_responses_requests_without_authorization(self):
+        provider, model = self.local_definition()
+        model['capabilities']['verified'] = False
+        saved = self.registry.save(provider, model)
+        with self.assertRaisesRegex(providers.ProviderError, 'verification'):
+            self.registry.render_for_host(r'C:\managed\codex', False, [], primary_model_id=saved['model']['id'])
+        requests = []
+
+        def respond(request, timeout):
+            requests.append(request)
+            self.assertEqual(request.full_url, provider['base_url'] + '/responses')
+            self.assertIsNone(request.get_header('Authorization'))
+            payload = json.loads(request.data)
+            nonce = re.search(r'value "([0-9a-f]{32})"', payload['input'][0]['content']).group(1)
+            if len(payload['input']) == 1:
+                self.assertEqual(payload['tool_choice'], 'auto')
+                output = [{'type': 'function_call', 'name': 'manager_probe', 'call_id': 'local-call',
+                           'arguments': json.dumps({'value': nonce})}]
+            else:
+                self.assertEqual(payload['tool_choice'], 'none')
+                self.assertEqual(payload['input'][-1], {'type': 'function_call_output', 'call_id': 'local-call', 'output': nonce})
+                output = [{'type': 'message', 'content': [{'type': 'output_text', 'text': 'verified:' + nonce}]}]
+            body = io.BytesIO(('data: ' + json.dumps({'type': 'response.completed',
+                'response': {'status': 'completed', 'output': output}}) + '\n\n').encode())
+            response = MagicMock()
+            response.headers = {'Content-Type': 'text/event-stream'}
+            response.__enter__.return_value = response
+            response.readline.side_effect = body.readline
+            return response
+
+        opener = MagicMock()
+        opener.open.side_effect = respond
+        with patch.object(providers, 'build_opener', return_value=opener), \
+                patch.object(providers, '_unprotect_secret', side_effect=AssertionError('No key expected')):
+            result = self.registry.verify(saved['model']['id'])
+        self.assertTrue(result['verified'])
+        self.assertEqual(len(requests), 2)
+        self.assertIn('configured-reasoning-accepted', result['checks'])
+
     def test_generated_configuration_does_not_include_plaintext_secrets(self):
         saved = self.add_model()
         secret = 'synthetic-secret-never-in-config'

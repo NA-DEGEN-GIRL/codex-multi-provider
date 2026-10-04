@@ -54,6 +54,10 @@ from .remote_readiness import RemoteReadiness, pending_message
 from .runtime_build import resolve as resolve_runtime
 
 
+class _RemoteStopConverted(Exception):
+    """Retry a startup reconcile using its newly authorized drain journal."""
+
+
 _REQUIRED_CHECKS = (
     "initialize", "managed_idle_status", "managed_close_idle",
     "proxy_maintenance", "auth_binding",
@@ -279,6 +283,10 @@ class UpdateHooks:
         """Freeze SSH enrollment atomically; an update never opens/closes local work."""
         requested_transaction_id = identifier(transaction_id) if transaction_id else None
         profile_id = identifier(profile_id)
+        if self._profile(profile_id).get('auth_mode') == 'claude_code':
+            from .remote import supports_remote_claude
+            if not supports_remote_claude(self.root):
+                raise UpdateError('claude_remote_runtime_required', 'Claude SSH 실행을 지원하는 원격 런타임 준비가 필요합니다.')
         from .launch_metrics import LaunchMetrics
         with LaunchMetrics(self.store.directory).phase(profile_id, 'ssh_launch_admission_wait'):
             lock = self._acquire_launch_admission_lock(profile_id)
@@ -447,6 +455,8 @@ class UpdateHooks:
     def reconcile_opened_remotes(self, profile_id, transaction_id, *, target_guard=None):
         try:
             return self._reconcile_opened_remotes(profile_id, transaction_id, target_guard=target_guard)
+        except _RemoteStopConverted:
+            return False
         except UpdateError as error:
             from .ssh_deferred_settings import DEFERRED_MESSAGE, UNSUPPORTED_IDLE, resume_previous
             if error.code not in UNSUPPORTED_IDLE or self.remote_maintenance is None:
@@ -488,6 +498,14 @@ class UpdateHooks:
             self.guard_launch(profile_id)
             if target_guard is not None:
                 target_guard()
+            if (gate.get('stop_only') and not gate.get('reopen_committed')
+                    and not lease.get('graceful_drain')):
+                # Only an explicit stop sets this gate. Keep all process and
+                # in-flight operation identities; retry rather than continuing
+                # a reuse/idle branch entered before the stop arrived.
+                lease.update(graceful_drain=True, stop_only=True)
+                self._save_lease(lease)
+                raise _RemoteStopConverted()
             return profile
         profile = current()
         if self.remote_maintenance is None:
@@ -521,6 +539,7 @@ class UpdateHooks:
         # aside instead of blocking the other hosts. An explicit runtime update
         # still reports it.
         isolate = not lease.get('force_runtime_update')
+        draining = []
         for record in ([] if reused else records):
             current()
             if record.get('state') == 'unobserved' or record.get('reinspect'):
@@ -566,7 +585,13 @@ class UpdateHooks:
                     'drain', expected_process=record['process'])
                 current()
                 if proof['exited'] is not True or proof['idle'] is not True:
-                    return False
+                    # One busy listener must not starve the remaining hosts.
+                    # Keep every exact-process journal and the profile fence;
+                    # no start/publication is allowed until the entire cohort
+                    # has verified exit. The remote helper sends its signal only
+                    # once and subsequent calls only observe that same process.
+                    draining.append(record['alias'])
+                    continue
                 record.update(state='closed', exit_proof=proof)
                 self._save_lease(lease)
             elif record.get('state') == 'observed':
@@ -581,16 +606,30 @@ class UpdateHooks:
                 if record['state'] in ('stop_requested', 'start_requested'):
                     return False
         current()
+        if draining:
+            def waiting(data):
+                gate = data['ssh_maintenance'][profile_id]
+                profile = self.store.profile(profile_id, data)
+                if (gate.get('transaction_id') != transaction_id or gate.get('state') != 'held'
+                        or gate.get('generation') != entry['generation']
+                        or profile.get('generation') != entry['generation']
+                        or profile['policy']['desired_revision'] != lease['target_revision']):
+                    raise UpdateError('ssh_generation_changed', 'SSH 종료 대기 중 프로필 설정이 변경되었습니다.')
+                gate.update(waiting_hosts=sorted(draining), graceful_drain=True,
+                            stop_only=bool(gate.get('stop_only') or lease.get('stop_only')), updated_at=now())
+            self.store.mutate(waiting)
+            return False
         if not reused:
             # A resumed start has already crossed the exit boundary. Never
             # replay stop or discard its write-ahead start journal.
             pending_close = {**entry, 'remotes': [r for r in records if r.get('state') in ('observed', 'closed')]}
             self._close_remotes(lease, pending_close, lifecycle_guard=current)
             profile = current()
-            if (lease.get('graceful_drain') and not lease.get('stop_only')
+            if (not lease.get('stop_only')
                     and self._commit_remote_reopen(profile_id, transaction_id)):
                 # A full exit converted this explicit drain before any start.
                 lease['stop_only'] = True
+                lease['graceful_drain'] = True
                 self._save_lease(lease)
             if not lease.get('stop_only'):
                 # An explicit runtime update must report its failed host; a
@@ -608,7 +647,12 @@ class UpdateHooks:
                     or profile.get('generation') != entry['generation']
                     or profile['policy']['desired_revision'] != lease['target_revision']):
                 raise UpdateError('ssh_generation_changed', 'SSH 준비 중 프로필 설정이 변경되었습니다.')
+            if gate.get('stop_only') and not lease.get('stop_only') and not gate.get('reopen_committed'):
+                # A stop raced the last reuse observation. Do not publish
+                # completion until the next pass drains that same cohort.
+                return Unchanged(False)
             gate.update(state='released', updated_at=now())
+            gate.pop('waiting_hosts', None)
             if failed:
                 from .ssh_deferred_settings import HOST_PREPARE_FAILED, host_failure_message
                 if lease.get('stop_only'):
@@ -620,7 +664,9 @@ class UpdateHooks:
                     gate.update(settings_deferred=True, deferred_reason=HOST_PREPARE_FAILED,
                                 code='ssh_settings_deferred', deferred_policy_hosts=failed,
                                 message=host_failure_message(records))
-        self.store.mutate(release)
+            return True
+        if not self.store.mutate(release):
+            return False
         if reused:
             lease['reused_unchanged'] = True
             if adopted:
@@ -638,10 +684,10 @@ class UpdateHooks:
         self.store.mutate(attention)
 
     def downgrade_remote_reconcile_to_stop(self, profile_id, transaction_id):
-        """Turn a held explicit drain-and-reopen into drain-then-stop.
+        """Turn a held SSH reconcile into drain-then-stop.
 
         One-way only: nothing upgrades a stop-only reconcile to a reopen, and
-        only a graceful-drain journal honours the flag. False means the start
+        the reconcile adopts the flag at its next guarded boundary. False means the start
         was already committed or this transaction no longer holds the gate;
         the caller must then stop after the reconcile finishes.
         """
@@ -839,6 +885,8 @@ class UpdateHooks:
         for profile in self.store.read()["profiles"]:
             if selected is not None and profile["id"] not in selected:
                 continue
+            live = None
+            proof_stage = "runtime"
             try:
                 live = self._live(profile)
                 if live is None:
@@ -849,6 +897,7 @@ class UpdateHooks:
                         item['remote_maintenance_required'] = True
                         item['remote_only'] = True
                         if self.remote_maintenance is not None:
+                            proof_stage = "remote"
                             remotes = self.remote_maintenance.snapshot(profile, coverage)
                             item.update(remote_states=remotes, idle_verified=all(r['idle'] for r in remotes),
                                         job_state='idle' if all(r['idle'] for r in remotes) else 'active')
@@ -872,6 +921,7 @@ class UpdateHooks:
                                         idle_evidence="runtime_managed_idle_advisory",
                                         writer_release_verified=False, loaded_thread_ids=scope["thread_ids"])
                             if self.remote_maintenance is not None:
+                                proof_stage = "remote"
                                 remotes = self.remote_maintenance.snapshot(profile, self.host_inventory(profile))
                                 live['remote_states'] = remotes
                                 if any(not remote['idle'] for remote in remotes):
@@ -880,11 +930,17 @@ class UpdateHooks:
                             live.update(job_state="active", update_blocker="runtime_not_idle")
                 result.append(live)
             except (RuntimeError, ValueError, KeyError, OSError):
-                result.append({**profile, "profile_id": profile["id"],
-                               "job_state": "unknown", "idle_verified": False,
-                               "remote_maintenance_required": True,
-                               "remote_only": not profile.get('process_id'),
-                               "update_blocker": "runtime_proof_unavailable"})
+                # An idle/SSH proof failure does not invalidate an already
+                # verified desktop identity. Losing it here made managed
+                # Electron trees appear to be unrelated apps in preflight.
+                # Still discard all idle claims: this is not closure authority.
+                result.append({**(live if live is not None else profile), "profile_id": profile["id"],
+                                "job_state": "unknown", "idle_verified": False,
+                                "writer_release_verified": False,
+                                "remote_maintenance_required": True,
+                                "remote_only": not profile.get('process_id'),
+                                "update_blocker": ("remote_runtime_proof_unavailable" if proof_stage == "remote"
+                                                   else "runtime_proof_unavailable")})
         return result
 
     def compatibility_fingerprint(self):
@@ -928,7 +984,7 @@ class UpdateHooks:
                         "evidence_path": str(evidence), "message": "검증된 앱과 관리 런타임 조합입니다."}
         except (RuntimeError, ValueError, OSError, KeyError, TypeError):
             pass
-        return {"compatible": False, "message": "이 앱 버전과 현재 패치 런타임의 검증된 조합 기록이 필요합니다."}
+        return {"compatible": False, "message": "새 Codex 버전은 아직 작업 공간 앱과 호환 검증되지 않았습니다. 창을 닫아도 설치할 수 없으며, 호환 지원이 먼저 필요합니다."}
 
     def _lease_path(self, transaction_id):
         return self.directory / (identifier(transaction_id) + ".json")

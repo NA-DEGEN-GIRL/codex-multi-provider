@@ -56,6 +56,9 @@ class UpdateJobs:
             result = self.last_check
         else:
             result = job.get('result') or transaction
+            if (transaction.get('transaction_id') and
+                    transaction.get('updated_at', '') >= job.get('updated_at', '')):
+                result = transaction
         # Older versions persisted "nothing to install" as plan_not_ready.
         # Keep real blockers visible, but do not replay that false alarm forever.
         blockers = result.get('blockers', [])
@@ -66,6 +69,9 @@ class UpdateJobs:
 
     def check(self):
         status = self.status()
+        if status.get('status') == 'registration_pending' and not status.get('worker_active'):
+            self.last_check = self.manager.recover()
+            return deepcopy(self.last_check)
         if status.get('worker_active') or _needs_recovery(self.manager.status()) or status.get('status') == 'recovery_required':
             return status
         self.last_check = self.manager.check()
@@ -85,7 +91,8 @@ class UpdateJobs:
                 identity = process_identity(os.getpid()) or {}
                 job = dict(id=str(uuid4()), phase='queued', worker_pid=os.getpid(),
                            worker_created=identity.get('process_created'), previous_transaction_id=previous.get('transaction_id'),
-                           action='recover' if _needs_recovery(previous) else 'apply')
+                           action='finalize' if previous.get('status') == 'registration_pending' else
+                                  'recover' if _needs_recovery(previous) else 'apply')
                 self.last_check = None
                 self._write(job)
                 try:
@@ -99,16 +106,20 @@ class UpdateJobs:
                 raise
             return dict(status='queued', worker_active=True, worker_phase='queued', job_id=job['id'],
                         message='업데이트 상태 확인을 백그라운드에서 계속합니다.' if job['action'] == 'recover' else
-                                '모든 관리 프로필에 적용할 Codex 앱 업데이트를 준비합니다.')
+                                '실행 중인 작업의 유지 가능 여부와 공식 Codex 앱 업데이트를 확인합니다.')
 
     def _run(self, job, claim):
         try:
             self._write(job, phase='running')
-            if job['action'] == 'recover':
+            if job['action'] == 'finalize':
+                from .managed_package_update import finalize
+                result = finalize(self.manager)
+            elif job['action'] == 'recover':
                 result = self.manager.recover()
             else:
-                instances = self.manager.snapshot_instances() if self.manager.snapshot_instances else []
-                result = self.manager.apply(self.manager.plan(instances))
+                # Isolated Windows package installation needs no remote/idle
+                # RPCs. The legacy combined plan obtains those only if needed.
+                result = self.manager.apply(self.manager.plan())
             while result.get('status') == 'connecting':
                 self._write(job, phase='connecting', result=result)
                 if self.stopping.wait(self.interval):

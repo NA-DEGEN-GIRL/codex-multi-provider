@@ -2,6 +2,8 @@
 
 Run on a Linux build machine with this checkout and its Rust prerequisites:
     python3 scripts/remote_helpers/package_runtime.py --build
+Pass --build-cache /path/to/remote-build to reuse its linux-<arch> and v8
+directories while staging this checkout's package separately.
 This is not a downloader and never installs over the host's stock Codex CLI.
 """
 from __future__ import annotations
@@ -23,7 +25,7 @@ import urllib.request
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
-from manager_core.remote import ARCHES, _verify_elf
+from manager_core.remote import ARCHES, REMOTE_CAPABILITY_MARKERS, _verify_elf
 
 
 def digest(path):
@@ -42,7 +44,7 @@ def contains_marker(path, marker):
     return False
 
 
-def prepare_v8(root, arch):
+def prepare_v8(root, arch, *, build_cache=None):
     """Follow the upstream .github/actions/setup-rusty-v8/action.yml contract."""
     lock = tomllib.loads((root / "runtime/codex-rs/Cargo.lock").read_text())
     versions = {package["version"] for package in lock["package"] if package["name"] == "v8"}
@@ -56,7 +58,8 @@ def prepare_v8(root, arch):
     binding = "src_binding_ptrcomp_sandbox_release_" + target + ".rs"
     checksums = "rusty_v8_ptrcomp_sandbox_release_" + target + ".sha256"
     url = "https://github.com/openai/codex/releases/download/rusty-v8-v" + version + "/"
-    directory = root / "work/remote-build/v8" / target / version
+    cache = Path(build_cache).expanduser().resolve() if build_cache is not None else root / "work/remote-build"
+    directory = cache / "v8" / target / version
     directory.mkdir(parents=True, exist_ok=True)
     with urllib.request.urlopen(url + checksums, timeout=60) as response:
         lines = response.read(8192).decode().splitlines()
@@ -82,7 +85,7 @@ def prepare_v8(root, arch):
     return {"RUSTY_V8_ARCHIVE": str(directory / archive), "RUSTY_V8_SRC_BINDING_PATH": str(directory / binding)}
 
 
-def build(root=ROOT):
+def build(root=ROOT, *, build_cache=None):
     root = Path(root).resolve()
     arch = ARCHES.get(platform.machine().lower())
     if platform.system() != "Linux" or arch not in ("x86_64", "aarch64"):
@@ -92,9 +95,10 @@ def build(root=ROOT):
     if not cargo:
         raise RuntimeError("The repository's Rust toolchain and Linux build prerequisites are required.")
     destination = root / "artifacts/remote" / ("linux-" + arch)
-    target = root / "work/remote-build" / ("linux-" + arch)
+    cache = Path(build_cache).expanduser().resolve() if build_cache is not None else root / "work/remote-build"
+    target = cache / ("linux-" + arch)
     environment = dict(os.environ)
-    environment.update(prepare_v8(root, arch))
+    environment.update(prepare_v8(root, arch, build_cache=cache))
     # Match the upstream release build: finalize bubblewrap first, then pin its
     # exact digest in Codex. Never publish a Linux runtime without its sandbox.
     subprocess.run([cargo, "build", "--locked", "--release", "--target-dir", str(target),
@@ -114,9 +118,16 @@ def build(root=ROOT):
     # archive symbols first. Shipping them made every SSH upload ~1.4 GB, so
     # strip copies here and keep the .debug sidecars beside them on the build
     # host; cargo's own outputs stay intact for the next incremental build.
-    staged = target / "package"
-    shutil.rmtree(staged, ignore_errors=True)
-    staged.mkdir(parents=True)
+    if build_cache is None:
+        staged = target / "package"
+        shutil.rmtree(staged, ignore_errors=True)
+        staged.mkdir(parents=True)
+    else:
+        # The explicitly reused cache may hold another build's debug symbols.
+        # Keep every candidate under this checkout and never clean cache/package.
+        staging_root = root / "work/remote-build"
+        staging_root.mkdir(parents=True, exist_ok=True)
+        staged = Path(tempfile.mkdtemp(prefix="package-linux-" + arch + "-", dir=staging_root))
     for name in ("codex", "codex-code-mode-host"):
         built, copy = target / "release" / name, staged / name
         shutil.copy2(built, copy)
@@ -148,6 +159,7 @@ def build(root=ROOT):
                 "bwrap_sha256": environment["CODEX_BWRAP_SHA256"],
                 "verification": "Built from the patched runtime checkout; ELF architecture and external_agents marker checked.",
                 "native_gui_ssh_verified": False, "files": []}
+    manifest.update({name: contains_marker(binary, marker) for name, marker in REMOTE_CAPABILITY_MARKERS.items()})
     destination.mkdir(parents=True, exist_ok=True)
     for source_file in (binary, companion, bwrap):
         if (destination / source_file.name).is_symlink():
@@ -167,16 +179,17 @@ def build(root=ROOT):
         temporary = Path(stream.name)
         json.dump(manifest, stream, ensure_ascii=False, indent=2)
     os.replace(temporary, destination / "manifest.json")
-    return {"status": "built", "bundle_directory": str(destination), "version": manifest["version"],
+    return {"status": "built", "bundle_directory": str(destination), "staging_directory": str(staged), "version": manifest["version"],
             "native_gui_ssh_verified": False}
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build", action="store_true", required=True)
-    parser.parse_args()
+    parser.add_argument("--build-cache", type=Path, help="Explicit cache containing linux-<arch> and v8 directories.")
+    args = parser.parse_args()
     try:
-        print(json.dumps(build()))
+        print(json.dumps(build(build_cache=args.build_cache)))
     except Exception as error:
         print(str(error), file=sys.stderr)
         sys.exit(1)

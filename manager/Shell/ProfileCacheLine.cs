@@ -26,6 +26,7 @@ internal static class ProfileCacheLine
 
     internal static Choice Apply(Choice choice, JsonElement state, SelectedTask? task)
     {
+        if (ClaudeProfilePresentation.IsClaude(choice.Data)) return choice with { ProfileCache = "", ProfileCacheTone = "" };
         var entry = Entry(state, task, choice.Id);
         return choice with { ProfileCache = entry.S("line"), ProfileCacheTone = entry.S("tone") };
     }
@@ -35,6 +36,7 @@ internal static class ProfileCacheLine
     internal static string? Notice(JsonElement state, SelectedTask? task, string? profileId,
         Dictionary<string, DateTime> shown, DateTime now)
     {
+        if (ClaudeProfilePresentation.IsClaude(state.Arr("profiles").FirstOrDefault(profile => profile.S("id") == profileId))) return null;
         var entry = Entry(state, task, profileId);
         var notice = entry.S("notice");
         if (notice.Length == 0 || task is null) return null;

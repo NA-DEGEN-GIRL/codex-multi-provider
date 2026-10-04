@@ -1,8 +1,8 @@
 """Remote-user common settings for an isolated managed Codex home.
 
 Run this helper on the SSH host, under that host's OS user. It never reads a
-Windows config or any auth/credentials file. Only ``mcp_servers`` from the
-remote user's config is imported. MCP environment values can contain secrets;
+Windows config or any auth/credentials file. ``mcp_servers`` and explicit
+project trust from the remote user's configs are imported. MCP environment values can contain secrets;
 the returned plan stays on the remote host and must not be logged or uploaded.
 
 ``prepare`` is side-effect free. After all destinations validate, the launcher
@@ -17,6 +17,7 @@ import hashlib
 import json
 import math
 import os
+import posixpath
 from pathlib import Path
 import tempfile
 import tomllib
@@ -30,6 +31,33 @@ _MISSING = object()
 
 class CommonSettingsError(ValueError):
     """A value-free error; never include configuration content in diagnostics."""
+
+
+def merge_project_trust(current, sources):
+    """Same-host explicit approvals only; never override a target decision."""
+    projects = current.get('projects', {})
+    if not isinstance(projects, dict):
+        return
+    existing = {posixpath.normpath(path) for path in projects if isinstance(path, str)}
+    approved, denied = {}, set()
+    for source in sources:
+        declarations = source.get('projects', {})
+        if not isinstance(declarations, dict):
+            continue
+        for path, declaration in declarations.items():
+            if (not isinstance(path, str) or not path.startswith('/') or '\\' in path
+                    or any(ord(c) < 32 for c in path) or not isinstance(declaration, dict)):
+                continue
+            key = posixpath.normpath(path)
+            if declaration.get('trust_level') == 'trusted':
+                approved[key] = path
+            elif declaration.get('trust_level') == 'untrusted':
+                denied.add(key)
+    for key, path in approved.items():
+        if key not in existing and key not in denied:
+            projects[path] = {'trust_level': 'trusted'}
+    if projects:
+        current['projects'] = projects
 
 
 class Plan:
@@ -308,7 +336,18 @@ def prepare(profile_home, generated_config, *, source_home=None, previous_genera
             _set(current, path, value)
             next_owned[key] = _digest(value)
 
-    common = _parse(_read_text(source / "config.toml")).get("mcp_servers", {})
+    source_config = _parse(_read_text(source / "config.toml"))
+    trust_sources = [source_config]
+    profiles = Path.home() / '.local/share/codex-control-center/profiles'
+    if profile.parent.parent == profiles:
+        for sibling in profiles.glob('*/codex/config.toml'):
+            if sibling.parent != profile:
+                try:
+                    trust_sources.append(_parse(_read_text(sibling)))
+                except (OSError, ValueError):
+                    continue
+    merge_project_trust(current, trust_sources)
+    common = source_config.get("mcp_servers", {})
     existing = current.get("mcp_servers", {})
     if (not isinstance(common, dict) or not isinstance(existing, dict)
             or not all(isinstance(value, dict) for value in common.values())

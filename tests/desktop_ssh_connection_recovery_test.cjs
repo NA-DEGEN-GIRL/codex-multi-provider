@@ -117,6 +117,17 @@ async function drain(){for(let i=0;i<8;i++){await new Promise(resolve=>setTimeou
   await drain();
   assert.equal(refreshes,beforeHandler[2]+1,'late handler must fulfill existing refresh intent');
   assert.deepEqual([writes,messages.length],beforeHandler.slice(0,2));
+  // Claude's local-only prepare clears imported SSH ownership along with its
+  // connection state. Live healing must not re-import donor auto-connects.
+  metadata.workspace[sshKey]={};
+  fs.writeFileSync(path.join(home,'.manager-app-preferences.json'),JSON.stringify(metadata));
+  store.set(sshKey,[]);store.set(autoKey,{});
+  const localOnly=[writes,messages.length,refreshes];
+  await drain();
+  assert.equal(state.get(sshKey).length,0,'local-only profiles must remain disconnected');
+  assert.equal(Object.keys(state.get(autoKey)).length,0,'live sync must not restore auto-connect');
+  assert.deepEqual([writes,messages.length,refreshes],localOnly,'local-only sync must not refresh SSH');
+  assert(state.get('project-order').includes(project.id),'shared project declarations remain visible');
   assert.equal(fs.existsSync(path.join(home,'.codex-global-state.json')),false,'only the native store may persist live settings');
   console.log('PASS: SSH declaration recovery, native refresh retry/cooldown/no overlap/late handler, nonblocking project sync, explicit OFF, donor removal, no event loop');
 })().catch(error=>{console.error(error);process.exitCode=1}).finally(()=>{

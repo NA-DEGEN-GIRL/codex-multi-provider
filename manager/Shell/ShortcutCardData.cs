@@ -83,7 +83,8 @@ internal sealed record ShortcutCardData(string Title, string Account, string Acc
         IReadOnlyDictionary<string, (string State, string Alias)> activity, JsonElement[] models)
     {
         var alias = owner.ValueKind == JsonValueKind.Object ? owner.S("alias") : "";
-        var external = owner.S("auth_mode") == "external";
+        var claude = ClaudeProfilePresentation.IsClaude(owner);
+        var external = claude || owner.S("auth_mode") == "external";
         var host = shortcut.S("host_id", "local");
         host = host == "local" ? "Windows" : host.StartsWith("ssh:", StringComparison.Ordinal) ? host[4..] : host;
         var observed = activity.TryGetValue(shortcut.S("thread_id"), out var live);
@@ -94,8 +95,15 @@ internal sealed record ShortcutCardData(string Title, string Account, string Acc
             "idle" => "대기", "closed" => "계정 닫힘", _ => "계정 지정 필요"
         };
         var (outer, outerLabel, inner, innerLabel) = Quota(owner, external);
+        var claudeUsage = claude ? ClaudeUsagePresentation.Read(owner) : null;
+        if (claudeUsage is not null)
+        {
+            outer = claudeUsage.Weekly.HasValue && !claudeUsage.Weekly.Stale ? claudeUsage.Weekly.Remaining : double.NaN;
+            inner = claudeUsage.FiveHour.HasValue && !claudeUsage.FiveHour.Stale ? claudeUsage.FiveHour.Remaining : double.NaN;
+            outerLabel = "주간"; innerLabel = "5시간";
+        }
         var runner = observed && live.Alias.Length > 0 && live.Alias != alias ? $" · {live.Alias}" : "";
-        var usage = external ? "외부 API · 사용량 한도 없음"
+        var usage = claudeUsage is not null ? claudeUsage.Summary : LocalModelPresentation.IsLocalProfile(owner) ? "로컬 서버 · 구독 사용량 해당 없음" : external ? "외부 API · 사용량 한도 없음"
             : double.IsFinite(outer) ? $"{outerLabel} {outer:0}% 남음" + (double.IsFinite(inner) ? $" · {innerLabel} {inner:0}% 남음" : "")
             : "사용량 확인 안 됨";
         var where = runner.Length > 0 ? $" ({live.Alias} 계정에서 실행 중)" : "";
@@ -103,17 +111,19 @@ internal sealed record ShortcutCardData(string Title, string Account, string Acc
         var detail = $"{shortcut.S("alias", "이름 없는 작업")}\n{(alias == "" ? "계정 지정 필요" : alias + " 계정")} · {host}\n" +
                      $"{stateText}{where}\n{usage}\n{agentDetail}\n누르면 이 계정에서 열립니다. ⋯ 버튼으로 계정 이동·별칭 변경·링크 삭제.";
         return new(shortcut.S("alias", "이름 없는 작업"), alias == "" ? "계정 지정 필요" : alias,
-            Short(alias), host, state, stateText + runner, outer, inner, outerLabel, innerLabel, external, agent, detail);
+            Short(alias), host, state, stateText + runner, outer, inner, outerLabel, innerLabel, external && !claude, agent, detail);
     }
 
     // Compact chip: the external model an API profile runs, or the saved
     // subagent models of a Codex account ("↳ deepseek-flash +1", "… 전용").
     private static (string Chip, string Detail) Agents(JsonElement owner, bool external, JsonElement[] models)
     {
+        if (ClaudeProfilePresentation.IsClaude(owner)) return ("Claude · " + ClaudeProfilePresentation.Model(owner), ClaudeProfilePresentation.Detail(owner));
         if (external)
         {
             var model = owner.S("external_model_name", "외부 API");
-            return ("API · " + Clip(model), "외부 API 프로필 · " + model);
+            var local = LocalModelPresentation.IsLocalProfile(owner);
+            return ((local ? "로컬 · " : "API · ") + Clip(model), (local ? "로컬 모델 프로필 · " : "외부 API 프로필 · ") + model);
         }
         var policy = owner.Get("policy");
         if (!policy.B("enabled")) return ("", "하위 에이전트 사용 안 함");

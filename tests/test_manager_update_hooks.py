@@ -6,13 +6,13 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from uuid import uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from manager_core.store import Store, atomic_json
 from manager_core.update_hooks import UpdateHooks, _cim_birth
-from manager_core.updates import UpdateError
+from manager_core.updates import UpdateError, UpdateManager
 from manager_core.runtime_admin import AdminClient, AdminError
 
 
@@ -356,6 +356,47 @@ class HookFixtures(unittest.TestCase):
         self.admin.scope_missing = True
         self.assertFalse(self.hooks.snapshot_instances()[0]["idle_verified"])
 
+    def assert_managed_but_not_idle(self, snapshot):
+        current = self.instances.running[self.profile['id']]
+        live = [{"process_id": current['process_id'], "created_at": _cim_birth(current['process_created']),
+                 "executable": current['executable_path']},
+                {"process_id": current['process_id'] + 20, "parent_process_id": current['process_id']}]
+        updater = UpdateManager(self.root, processes=lambda _: live, **self.hooks.callbacks())
+        blockers = updater._blockers([snapshot], {})
+        self.assertEqual({b['code'] for b in blockers}, {'jobs_not_quiescent'})
+        self.assertFalse(snapshot['idle_verified'])
+        self.assertFalse(snapshot['writer_release_verified'])
+        self.assertFalse(self.closes)
+
+    def test_idle_rpc_error_keeps_verified_desktop_identity(self):
+        with patch.object(self.hooks, '_idle_scope', side_effect=AdminError('runtime_error')):
+            snapshot = self.hooks.snapshot_instances()[0]
+        self.assertEqual(snapshot['update_blocker'], 'runtime_proof_unavailable')
+        self.assert_managed_but_not_idle(snapshot)
+
+    def test_remote_error_discards_local_idle_claim_but_keeps_desktop_identity(self):
+        self.hooks.remote_maintenance = Mock()
+        self.hooks.remote_maintenance.snapshot.side_effect = UpdateError('remote_maintenance_unverified', 'fixture')
+        snapshot = self.hooks.snapshot_instances()[0]
+        self.assertEqual(snapshot['update_blocker'], 'remote_runtime_proof_unavailable')
+        self.assert_managed_but_not_idle(snapshot)
+
+    def test_failed_second_identity_does_not_reuse_first_profile_identity(self):
+        peer = self.store.add_profile('peer')
+        self.instances.show_calls.append(peer['id'])
+        peer = self.instances.start(peer['id'])
+        observe = self.hooks._live
+        def fail_peer(profile):
+            if profile['id'] == peer['id']:
+                raise UpdateError('process_identity_changed', 'fixture')
+            return observe(profile)
+        with patch.object(self.hooks, '_live', side_effect=fail_peer):
+            snapshots = self.hooks.snapshot_instances()
+        snapshot = next(item for item in snapshots if item['id'] == peer['id'])
+        self.assertNotIn('executable', snapshot)
+        self.assertEqual(snapshot['process_id'], peer['process_id'])
+        self.assertFalse(snapshot['idle_verified'])
+
     def test_maintenance_prevents_ordinary_launches(self):
         lease, _ = self.acquire()
         with self.assertRaises(UpdateError):
@@ -547,6 +588,12 @@ class HookFixtures(unittest.TestCase):
             {"transaction_id": str(uuid4()), "maintenance_state": "requested"}, {"version": "26.999.1.0"}))
 
     def build_compatibility_fixture(self):
+        # This fixture deliberately changes its private adapter files. Pin
+        # that lookup even when the tested hooks come from an immutable build;
+        # never edit the actual installed bundle to simulate changed code.
+        paths = patch('manager_core.update_hooks.script_path', side_effect=lambda root, relative: Path(root) / relative)
+        paths.start()
+        self.addCleanup(paths.stop)
         runtime = self.root / "artifacts/manager-runtime/releases/test/codex.exe"
         proxy = self.root / "artifacts/manager/releases/test/RuntimeProxy.exe"
         for path in (runtime, proxy, self.root / "scripts/manager_core/runtime_admin.py",

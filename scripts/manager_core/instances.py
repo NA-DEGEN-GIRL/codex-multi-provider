@@ -255,6 +255,8 @@ class Instances:
         home,ui=self.paths(profile)
         home.mkdir(parents=True,exist_ok=True);ui.mkdir(parents=True,exist_ok=True)
         from .runtime_build import resolve
+        if profile.get('auth_mode') == 'claude_code' and not resolve(self.root).get('capabilities', {}).get('claude_code_agent'):
+            raise RuntimeError('Claude 실행을 지원하는 작업 공간 런타임이 필요합니다. 새 버전 적용 후 프로필을 열어 주세요.')
         canonical = (not profile.get('view_only') and profile.get('runtime_channel') != 'packaged'
                      and resolve(self.root).get('capabilities', {}).get('canonical_record_storage', False))
         if canonical:
@@ -263,6 +265,9 @@ class Instances:
         # Source settings are declarations only. Existing manager config is preserved.
         from .common import prepare_common
         common=prepare_common(home,Path.home()/'.codex') if not profile.get('view_only') else {'mcp':'viewer_disabled'}
+        if not profile.get('view_only'):
+            from .project_trust import sync as sync_project_trust
+            common['project_trust_added'] = sync_project_trust(self.root, profile['id'])
         if not profile.get('view_only') and (self.store.directory/'personal-skills.json').is_file():
             with self.metrics.phase(profile['id'], 'shared_skills'):
                 common['personal_skills'] = self.personal_skills.reconcile()
@@ -283,8 +288,11 @@ class Instances:
                 pass
             ready_aliases = None if profile.get('runtime_channel') == 'packaged' else {
                 binding['alias'] for binding in profile.get('remote_bindings', []) if binding.get('prepared') is True}
+            from .remote import supports_remote_claude
             common['app'] = prepare_app(home, Path.home()/'.codex', account_id=account_id,
                                         ssh_ready_aliases=ready_aliases, canonical=canonical,
+                                        allow_remote_connections=(profile.get('auth_mode') != 'claude_code'
+                                                                  or supports_remote_claude(self.root)),
                                         signals=self.store.directory / 'record-signals')
             if canonical:
                 from .workspace_seed import ensure as seed_ssh_projects
@@ -297,6 +305,11 @@ class Instances:
         generated=(dict(runtime='packaged',external_models=False) if profile.get('runtime_channel')=='packaged'
                    else self.providers.generate(home,policy['enabled'],policy['model_ids'],
                         **render_options(profile)))
+        if profile.get('runtime_channel') != 'packaged' and not profile.get('view_only'):
+            from .execution_presets import ExecutionPresets
+            generated['execution_presets'] = (ExecutionPresets(self.store, self.providers).prepare_runtime(profile['id'])
+                if resolve(self.root).get('capabilities', {}).get('managed_execution_presets') else
+                {'runtime_prepare_required': True})
         return dict(state='prepared',generated=generated,common=common)
 
     def environment(self, profile):
@@ -317,8 +330,20 @@ class Instances:
             pass  # Chrome registration is optional; it never blocks a launch.
         if self.embed_windows:
             env['CODEX_MANAGER_PRELOAD_HIDDEN'] = '1'
-        if profile.get('auth_mode') in ('native', 'source', 'external'):
+        if profile.get('auth_mode') in ('native', 'source', 'external', 'claude_code'):
             env={name:value for name,value in env.items() if not name.upper().startswith(('OPENAI_','AZURE_OPENAI_','CHATGPT_'))}
+        if profile.get('auth_mode') == 'claude_code':
+            env = {name: value for name, value in env.items()
+                   if name.upper() == 'CLAUDE_CODE_GIT_BASH_PATH' or (
+                       not name.upper().startswith(('ANTHROPIC_', 'CLAUDE_', 'DEEPSEEK_', 'CODEX_EXTERNAL_'))
+                       and name.upper() != 'CLAUDECODE')}
+            # A manager launched from a managed task can inherit its SSH proxy
+            # directory. Local Claude must see the host's ordinary SSH binary.
+            for name in list(env):
+                if name.upper() == 'PATH':
+                    env[name] = os.pathsep.join(part for part in env[name].split(os.pathsep)
+                        if not (Path(part.strip('"')).name.casefold() == 'ssh'
+                            and Path(part.strip('"')).resolve().is_relative_to(self.root/'artifacts/manager')))
         if profile.get('runtime_channel')=='packaged':
             from .login_probe import verification_runtime
             # An unpackaged desktop cannot reliably execute an MSIX CLI in
@@ -364,9 +389,17 @@ class Instances:
             if profile.get('auth_mode')=='native' and profile.get('native_login_pending'):
                 env['CODEX_MANAGER_NATIVE_LOGIN']='1'
         selected_models = list(profile['policy']['model_ids']) if profile['policy']['enabled'] else []
+        from .execution_presets import ExecutionPresets
+        if runtime_info.get('capabilities', {}).get('managed_execution_presets'):
+            selected_models.extend(ExecutionPresets(self.store, self.providers).environment_model_ids(profile['id']))
         env['CODEX_MANAGER_MODEL_OPTIONS'] = json.dumps(render_options(profile))
-        if profile.get('auth_mode') == 'external':
-            selected_models.append(profile['external_model_id'])
+        if runtime_info.get('capabilities', {}).get('managed_execution_presets') and (home / 'manager-execution-presets.json').is_file():
+            env['CODEX_MANAGER_EXECUTION_PRESETS'] = str(home / 'manager-execution-presets.json')
+            if runtime_info.get('capabilities', {}).get('managed_execution_presets'):
+                env['CODEX_MANAGER_EXECUTION_PRESETS_VERSION'] = '1'
+        if profile.get('auth_mode') in ('external', 'claude_code'):
+            if profile.get('auth_mode') == 'external':
+                selected_models.append(profile['external_model_id'])
             binding = json.loads((home/'manager-provider-binding.json').read_text(encoding='utf-8'))['primary']
             env['CODEX_MANAGER_PRIMARY_MODEL'] = json.dumps(binding)
         if selected_models:
@@ -382,12 +415,16 @@ class Instances:
             if not runtime_info.get('capabilities',{}).get('native_record_catalog'):
                 raise RuntimeError('전체 기록 조회 런타임이 아직 검증·배포되지 않았습니다.')
             env['CODEX_MANAGER_RECORD_CATALOG']=profile['record_catalog_path']
-        elif runtime_info.get('capabilities',{}).get('managed_store_binding'):
-            from .managed_sources import manifest as source_manifest
-            env['CODEX_MANAGER_MANAGED_SOURCES']=str(source_manifest(self.store,profile))
         from .shared_catalog import environment as shared_environment
         env.update(shared_environment(self.store,profile,runtime_info.get('capabilities',{}),
                                       self.catalog_refresh,self.source_catalog_refresh))
+        if (not profile.get('record_catalog_path') and not env.get('CODEX_RECORD_HOME')
+                and runtime_info.get('capabilities',{}).get('managed_store_binding')):
+            # Canonical navigation needs no per-profile authority manifest.
+            # Building one enumerates every peer's records and writes a file
+            # that the canonical branch below would immediately discard.
+            from .managed_sources import manifest as source_manifest
+            env['CODEX_MANAGER_MANAGED_SOURCES']=str(source_manifest(self.store,profile))
         if env.get('CODEX_RECORD_HOME'):
             env.pop('CODEX_MANAGER_MANAGED_SOURCES', None)
             env.pop('CODEX_MANAGER_PROJECT_ALIASES', None)
@@ -401,7 +438,9 @@ class Instances:
                 sources = self.store.read()['sources']
                 if any(s.get('host_id') == 'local' and Path(s['home']) == original for s in sources):
                     env['CODEX_MANAGER_NEW_THREAD_HOME'] = str(original)
-        if manifest.is_file() and json.loads(manifest.read_text(encoding='utf-8-sig')).get('ssh_proxy'):
+        from .remote import supports_remote_claude
+        if ((profile.get('auth_mode') != 'claude_code' or supports_remote_claude(self.root)) and manifest.is_file()
+                and json.loads(manifest.read_text(encoding='utf-8-sig')).get('ssh_proxy')):
             if profile.get('auth_mode')=='native':
                 env['CODEX_MANAGER_SSH_AUTH_SOURCE']=str(home)
             if not manifest.is_file():

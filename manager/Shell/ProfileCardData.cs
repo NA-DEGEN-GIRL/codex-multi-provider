@@ -9,25 +9,40 @@ namespace Codex.ControlCenter.Shell;
 internal sealed record ProfileCardData(string Name, string Status, string StatusTone,
     string QuotaLabel, string QuotaText, double Remaining, bool HasQuota,
     string ResetText, string RedeemText, string Model, bool External,
-    string Freshness, string Notice, string Cache = "", string CacheTone = "")
+    string Freshness, string Notice, string Cache = "", string CacheTone = "",
+    string ProviderBadge = "API", string Account = "", string UsageHint = "",
+    ClaudeUsageWindow? ClaudeFiveHour = null, ClaudeUsageWindow? ClaudeWeekly = null, string Email = "")
 {
     public Visibility QuotaVisibility => HasQuota ? Visibility.Visible : Visibility.Collapsed;
     public Visibility NativeVisibility => External || QuotaLabel.Length == 0 ? Visibility.Collapsed : Visibility.Visible;
     public Visibility ExternalVisibility => External ? Visibility.Visible : Visibility.Collapsed;
     public Visibility FreshnessVisibility => Freshness.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
     public Visibility NoticeVisibility => Notice.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
+    public Visibility AccountVisibility => Account.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
+    public Visibility EmailVisibility => Email.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
+    public Visibility UsageHintVisibility => UsageHint.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
+    public Visibility ClaudeUsageVisibility => ClaudeFiveHour is null ? Visibility.Collapsed : Visibility.Visible;
     // Prompt-cache line for the selected task (ProfileCacheLine, cache_warmth.py).
     public Visibility CacheVisibility => Cache.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
     public Brush CacheBrush => CacheTone switch { "ready" => ReadyBrush, "warning" => WarningBrush, _ => CacheMutedBrush };
     public Brush StatusBrush => StatusTone switch { "ready" => ReadyBrush, "warning" => WarningBrush, _ => MutedBrush };
     public Brush QuotaBrush => Remaining <= 10 ? WarningBrush : AccentBrush;
-    public string DetailHint => string.Join("\n", new[] { Name, Status, QuotaLabel + " " + QuotaText, ResetText, RedeemText, Freshness, Notice, Cache }.Where(v => !string.IsNullOrWhiteSpace(v)));
+    public string DetailHint => string.Join("\n", new[] { Name, Status, Account, ClaudeFiveHour?.Detail, ClaudeWeekly?.Detail, UsageHint, QuotaLabel + " " + QuotaText, ResetText, RedeemText, Freshness, Notice, Cache }.Where(v => !string.IsNullOrWhiteSpace(v)));
     private static readonly Brush ReadyBrush = Brush("#77C6A0"), WarningBrush = Brush("#E5B773"),
         MutedBrush = Brush("#9BA6B8"), AccentBrush = Brush("#94A9F8"), CacheMutedBrush = Brush("#8E9BB2");
     private static Brush Brush(string color) { var brush = (SolidColorBrush)new BrushConverter().ConvertFromString(color)!; brush.Freeze(); return brush; }
 
     internal static ProfileCardData Create(JsonElement profile, string fallback, string notice = "", string cache = "", string cacheTone = "")
     {
+        if (ClaudeProfilePresentation.IsClaude(profile))
+        {
+            var claude = ClaudeProfilePresentation.Status(profile);
+            var claudeUsage = ClaudeUsagePresentation.Read(profile);
+            return new(profile.S("alias", fallback.Split('\n')[0]), ClaudeProfilePresentation.Label(claude), ClaudeProfilePresentation.Tone(claude),
+                "", "", 0, false, "", "", ClaudeProfilePresentation.Model(profile), true, "", notice.Trim(),
+                ProviderBadge: "Claude", Account: ClaudeProfilePresentation.Account(claude), UsageHint: claudeUsage.Hint,
+                ClaudeFiveHour: claudeUsage.FiveHour, ClaudeWeekly: claudeUsage.Weekly);
+        }
         var external = profile.S("auth_mode") == "external";
         var status = profile.S("status") switch
         {
@@ -70,6 +85,7 @@ internal sealed record ProfileCardData(string Name, string Status, string Status
             hasQuota ? Math.Clamp(number, 0, 100) : 0, hasQuota,
             external ? "" : resetText, external ? "" : redeem,
             external ? profile.S("external_model_name", "외부 API 모델") : "", external,
-            external ? "" : freshness, notice.Trim(), cache.Trim(), cacheTone);
+            external ? "" : freshness, notice.Trim(), cache.Trim(), cacheTone,
+            ProviderBadge: LocalModelPresentation.IsLocalProfile(profile) ? "로컬" : "API");
     }
 }

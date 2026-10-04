@@ -11,7 +11,7 @@ using Codex.ControlCenter.Shared;
 
 namespace Codex.ControlCenter.Shell;
 
-public sealed class MainWindow : Window
+public sealed partial class MainWindow : Window
 {
     private readonly string _root;
     private readonly bool _fixture;
@@ -65,7 +65,10 @@ public sealed class MainWindow : Window
     private readonly TextBlock _profileUpdateStatus = new() { TextWrapping = TextWrapping.Wrap, Foreground = Muted, FontSize = 12, Margin = new Thickness(0, 4, 0, 8) };
     private string? _lastUpdateNotice;
     private readonly TextBlock _updateStatus = new() { TextWrapping = TextWrapping.Wrap, FontSize = 12, Foreground = Muted,
-        MaxHeight = 56, Margin = new Thickness(0, 0, 0, 6), Visibility = Visibility.Collapsed };
+        Margin = new Thickness(0, 4, 6, 6) };
+    private readonly Expander _updateDetails = new() { Name = "CodexUpdateDetails", Header = "Codex 업데이트 상태", Visibility = Visibility.Collapsed };
+    private readonly TextBlock _desktopCompatibility = new() { Name = "DesktopCompatibilityNotice", TextWrapping = TextWrapping.Wrap,
+        FontSize = 11, Foreground = Muted, Margin = new Thickness(0, 0, 0, 8), Visibility = Visibility.Collapsed };
     private readonly DispatcherTimer _timer = new() { Interval = TimeSpan.FromSeconds(4) };
     private readonly DispatcherTimer _activityTimer = new() { Interval = TimeSpan.FromSeconds(1) };
     private readonly Dictionary<Guid, (string Label, DateTime Started)> _pendingActions = [];
@@ -194,13 +197,15 @@ public sealed class MainWindow : Window
         var heading = new StackPanel { Margin = new Thickness(18, 22, 18, 8) };
         heading.Children.Add(new TextBlock { Text = "Codex 작업 공간", FontSize = 20, FontWeight = FontWeights.SemiBold });
         heading.Children.Add(new TextBlock { Text = "계정과 작업을 한곳에서", Foreground = Muted, FontSize = 11, Margin = new Thickness(0, 5, 0, 20) });
-        var profileMenu = MenuButton("프로필 관리", ("외부 모델 기본 설정", EditExternalModelAsync), ("하위 에이전트 설정", ProfileProvidersAsync), ("로그인 · API 키 관리", LoginProfileAsync),
+        var profileMenu = MenuButton("프로필 관리", ("모델 기본 설정 · 로컬 / API / Claude", EditExternalModelAsync), ("실행 프리셋", () => ManagePresetsAsync(_contextProfile ?? RequireProfile())), ("하위 에이전트 설정", ProfileProvidersAsync), ("로그인 · API 키 관리", LoginProfileAsync),
             ("현재 앱의 로그인 계정 연결", RegisterCurrentAsync), ("로그인 상태 새로 확인", RefreshLoginStatusAsync),
             ("이 프로필 다시 열기", RecoverProfileAsync), ("작업 종료 후 설정 적용 예약", RestartProfileAsync), ("SSH 작업 종료 후 설정 적용", RestartRemoteProfileAsync),
             ("원래 창으로 분리", DetachAsync), ("별칭 변경", RenameProfileAsync),
             ("계정을 목록에서 제거", RemoveProfileAsync), ("제거한 계정 복원", RestoreProfileAsync), ("프로필 준비", PrepareProfileAsync));
+        profileMenu.ContextMenu.Opened += (_, _) => SetClaudeProfileMenu(profileMenu.ContextMenu, Profile());
         heading.Children.Add(SidebarSection("프로필", _profileCount,
-            SidebarIcon(Action("＋", AddProfileAsync), "AddProfile", "＋", "Codex 계정 또는 외부 API 프로필 추가"),
+            ProfileEmailButton(),
+            SidebarIcon(Action("＋", AddProfileAsync), "AddProfile", "＋", "ChatGPT · Claude · 로컬 모델 · 외부 API 프로필 추가"),
             SidebarIcon(Action("↻", RefreshAccountsAsync), "RefreshProfiles", "↻", "계정·사용량·리딤 횟수 새로고침"),
             SidebarIcon(profileMenu, "ProfileActions", "⋯", "선택한 프로필 관리")));
         sidebar.Children.Add(heading);
@@ -221,7 +226,7 @@ public sealed class MainWindow : Window
             if (choice is not null) Log($"프로필 클릭 수신 · {choice.Data.S("alias")} · {choice.Id}");
         };
         _profiles.MouseLeftButtonUp += async (_, e) => { if (_profileAlreadySelected && ClickedChoice(e.OriginalSource) is { } choice) await Safe(() => ShowProfileAsync(choice.Id)); };
-        _profiles.ContextMenu = ProfileMenu(("위로 이동", id => _profileOrdering.MoveByAsync(id, -1)), ("아래로 이동", id => _profileOrdering.MoveByAsync(id, 1)), ("외부 모델 기본 설정", EditExternalModelAsync), ("하위 에이전트 설정", id => ShowProvidersAsync(id)), ("로그인 · API 키 관리", LoginProfileAsync), ("로그인 상태 새로 확인", RefreshLoginStatusAsync), ("이 프로필 다시 열기", RecoverProfileAsync), ("작업 종료 후 설정 적용 예약", RestartProfileAsync), ("SSH 작업 종료 후 설정 적용", RestartRemoteProfileAsync), ("별칭 변경", RenameProfileAsync), ("계정을 목록에서 제거", RemoveProfileAsync), ("제거한 계정 복원", _ => RestoreProfileAsync()), ("프로필 준비", PrepareProfileAsync));
+        _profiles.ContextMenu = ProfileMenu(("위로 이동", id => _profileOrdering.MoveByAsync(id, -1)), ("아래로 이동", id => _profileOrdering.MoveByAsync(id, 1)), ("모델 기본 설정 · 로컬 / API / Claude", EditExternalModelAsync), ("실행 프리셋", id => ManagePresetsAsync(id)), ("하위 에이전트 설정", id => ShowProvidersAsync(id)), ("로그인 · API 키 관리", LoginProfileAsync), ("로그인 상태 새로 확인", RefreshLoginStatusAsync), ("이 프로필 다시 열기", RecoverProfileAsync), ("작업 종료 후 설정 적용 예약", RestartProfileAsync), ("SSH 작업 종료 후 설정 적용", RestartRemoteProfileAsync), ("별칭 변경", RenameProfileAsync), ("계정을 목록에서 제거", RemoveProfileAsync), ("제거한 계정 복원", _ => RestoreProfileAsync()), ("프로필 준비", PrepareProfileAsync));
         _profiles.ContextMenu.Opened += (_, _) =>
         {
             // WPF closes the popup before dispatching MenuItem.Click. Keep the
@@ -231,6 +236,7 @@ public sealed class MainWindow : Window
             var index = Array.IndexOf(ids, _contextProfile ?? _selectedProfile);
             ((MenuItem)_profiles.ContextMenu.Items[0]).IsEnabled = index > 0 && !_profileOrdering.IsInteracting;
             ((MenuItem)_profiles.ContextMenu.Items[1]).IsEnabled = index >= 0 && index < ids.Length - 1 && !_profileOrdering.IsInteracting;
+            SetClaudeProfileMenu(_profiles.ContextMenu, _state.Arr("profiles").FirstOrDefault(p => p.S("id") == (_contextProfile ?? _selectedProfile)));
         };
         _profiles.PreviewMouseRightButtonDown += (_, e) =>
         {
@@ -292,13 +298,17 @@ public sealed class MainWindow : Window
         footer.Children.Add(allRecords);
         var settings = new StackPanel();
         settings.Children.Add(Action("공통 개인 스킬", PersonalSkillsAsync));
-        settings.Children.Add(Action("하위 에이전트 · API 공급자", ProvidersAsync));
+        settings.Children.Add(Action("실행 프리셋", () => ManagePresetsAsync()));
+        settings.Children.Add(Action("하위 에이전트 · 모델 연결", ProvidersAsync));
         settings.Children.Add(Action("SSH 업데이트 · 연결 준비", RemoteAsync));
         settings.Children.Add(Action("전체 프로필 업데이트", ProfileUpdatesAsync));
         settings.Children.Add(_profileUpdateStatus);
         _updateButton = Action("Codex 앱 버전 확인", UpdatesAsync);
         settings.Children.Add(_updateButton);
-        settings.Children.Add(_updateStatus);
+        _updateDetails.Content = new ScrollViewer { Content = _updateStatus, MaxHeight = 200,
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled };
+        settings.Children.Add(_updateDetails);
+        settings.Children.Add(_desktopCompatibility);
         settings.Children.Add(Action("관리 서비스 다시 연결", ReconnectAsync));
         settings.Children.Add(Action("Windows 실행 권한…", ExecutionModeAsync));
         settings.Children.Add(Action("완전 종료 후 관리자 실행…", RestartAdministratorAsync));
@@ -386,6 +396,8 @@ public sealed class MainWindow : Window
         var controls = new WrapPanel { Name = "WorkspaceTools", VerticalAlignment = VerticalAlignment.Center };
         notesToggle = WorkspaceAppearance.Tool(Action("작업 메모", () => { ChooseNotesVisible(_notes.Visibility != Visibility.Visible); return Task.CompletedTask; }, "이 작업의 메모와 체크리스트 열기 / 접기"), "ToggleTaskNotes");
         controls.Children.Add(notesToggle);
+        _presetButton = WorkspaceAppearance.Tool(Action("실행 프리셋", ChooseTaskPresetAsync), "ExecutionPreset");
+        controls.Children.Add(_presetButton);
         controls.Children.Add(WorkspaceAppearance.Tool(Action("관리창 안에 표시", AttachSelectedAsync), "RestoreWorkspaceView"));
         controls.Children.Add(WorkspaceAppearance.Tool(MenuButton("창 및 연결", ("원래 창으로 보기", DetachAsync), ("연결 확인", VerifyConversationAsync),
             ("입력 상태 확인", CheckInputAsync), ("로그인 상태 새로 확인", RefreshLoginStatusAsync)), "WorkspaceConnections", quiet: true));
@@ -452,6 +464,7 @@ public sealed class MainWindow : Window
             _taskIdentity.ToolTip = task is null ? null : task.Title + "\n" + task.Task.Key;
             if (_selectedProfile is { } profile && !_viewingCatalog) _workspaceNotifications?.Remember(profile, task);
             _ = _notes.SelectTaskAsync(task);
+            _ = RefreshTaskPresetAsync();
             RefreshCacheLines();
         });
         if (!fixture) Loaded += async (_, _) => await Safe(async () => {
@@ -773,12 +786,14 @@ public sealed class MainWindow : Window
     {
         if (_serviceShutdown.DrainStarted)
             throw new InvalidOperationException("관리 서비스가 종료 중입니다. 완전 종료를 다시 눌러 마무리해 주세요.");
-        if (_fixtureRequest is not null) return await _fixtureRequest(command, args);
-        if (_client is null) throw new InvalidOperationException("관리 서비스 연결을 기다려 주세요.");
+        if (_client is null && _fixtureRequest is null) throw new InvalidOperationException("관리 서비스 연결을 기다려 주세요.");
         var tracked = command is not ("state" or "conversation.navigate" or "remote.updates.status");
+        // Shortcut progress stays in the status line. Expanding this header
+        // would resize the native viewport twice for every task navigation.
+        var showActivity = tracked && command is not ("conversation.open" or "profile.email");
         using var timing = _responsiveness?.Time("rpc." + command, tracked ? 0 : 500);
         var actionId = Guid.NewGuid();
-        if (tracked) { _pendingActions[actionId] = (CommandLabel(command), DateTime.UtcNow); RenderActivity(); _activityTimer.Start(); }
+        if (showActivity) { _pendingActions[actionId] = (CommandLabel(command), DateTime.UtcNow); RenderActivity(); _activityTimer.Start(); }
         if (tracked) Log($"요청 시작 · {CommandLabel(command)} · {command}");
         try
         {
@@ -789,14 +804,14 @@ public sealed class MainWindow : Window
                 _ => 180
             }));
             JsonElement result;
-            try { result = await _client.RequestAsync(command, args, deadline.Token); }
+            try { result = _fixtureRequest is not null ? await _fixtureRequest(command, args) : await _client!.RequestAsync(command, args, deadline.Token); }
             catch (OperationCanceledException) when (deadline.IsCancellationRequested)
             { throw new InvalidOperationException("요청 응답을 제한 시간 안에 받지 못했습니다. 이미 시작한 처리는 계속될 수 있습니다. 상태 갱신은 계속됩니다."); }
             if (tracked) Log($"요청 응답 · {CommandLabel(command)} · {result.S("state", "수신 완료")}");
             return result;
         }
         catch (Exception ex) { if (tracked) Log($"요청 실패 · {command} · {ex.Message}"); throw; }
-        finally { if (tracked) { _pendingActions.Remove(actionId); RenderActivity(); } }
+        finally { if (showActivity) { _pendingActions.Remove(actionId); RenderActivity(); } }
     }
     private static string CommandLabel(string command) => command switch
     {
@@ -804,6 +819,7 @@ public sealed class MainWindow : Window
         "manager.recover_legacy" => "확인한 구버전 프로필 일괄 정리",
         "profile.show" => "Codex 프로필 열기", "profile.prepare" => "프로필 준비", "accounts.refresh" => "계정·사용량 확인",
         "profile.login" => "프로필 로그인 화면 열기", "profile.login_status" => "로그인 계정 상태 확인",
+        "profile.email" => "계정 이메일 확인",
         "profile.restart" => "설정 적용 · 정상 종료 후 다시 열기",
         "profile.remote_restart" => "프로필 SSH 설정 적용", "profile.remote_stop" => "프로필 SSH 종료",
         "profile.recover" => "선택한 관리용 Codex 종료",
@@ -873,6 +889,15 @@ public sealed class MainWindow : Window
         {
             var startup = _state.Get("startup_updates");
             _profileUpdateStatus.Text = startup.Message("전체 프로필 업데이트 확인 중");
+            // Profiles share the managed desktop. Keep its version fallback in
+            // settings once; account and runtime failures still use attention.
+            var desktopNotices = _state.Arr("profiles").Concat(_state.Arr("view_instances"))
+                .Select(profile => profile.S("desktop_compatibility_notice").Trim())
+                .Where(notice => notice.Length > 0).Distinct().ToArray();
+            _desktopCompatibility.Text = desktopNotices.Length == 0 ? ""
+                : "관리용 Codex 버전 안내\n" + string.Join("\n", desktopNotices);
+            _desktopCompatibility.ToolTip = _desktopCompatibility.Text;
+            _desktopCompatibility.Visibility = desktopNotices.Length == 0 ? Visibility.Collapsed : Visibility.Visible;
             var warmup = _state.Get("profile_warmup");
             _profileCount.Text = _state.Arr("profiles").Count().ToString();
             using (_responsiveness?.Stage("shell.profile_list", 25))
@@ -888,9 +913,13 @@ public sealed class MainWindow : Window
                     if (prepared.S("state") is "checking" or "opening") suffix = "\n백그라운드에서 여는 중";
                     else if (prepared.S("state") == "queued") suffix = "\n미리 열기 대기";
                 }
-                var label = p.S("auth_mode") == "external" ? "[API] " + p.S("alias") : p.S("alias", "이름 없는 프로필");
-                var usage = p.S("auth_mode") == "external" ? p.S("external_model_name", "외부 API") : Usage(p.Get("usage"));
-                return ProfileCacheLine.Apply(new Choice(p.S("id"), $"{label}\n{usage} · {Status(p.S("status"))}" + suffix, p) { ProfileNotice = suffix }, _state, _selectedTask);
+                var label = ClaudeProfilePresentation.IsClaude(p) ? "[Claude] " + p.S("alias")
+                    : LocalModelPresentation.IsLocalProfile(p) ? "[로컬] " + p.S("alias")
+                    : p.S("auth_mode") == "external" ? "[API] " + p.S("alias") : p.S("alias", "이름 없는 프로필");
+                var usage = ClaudeProfilePresentation.IsClaude(p) ? ClaudeProfilePresentation.Detail(p)
+                    : p.S("auth_mode") == "external" ? p.S("external_model_name", "외부 API") : Usage(p.Get("usage"));
+                return ProfileCacheLine.Apply(new Choice(p.S("id"), $"{label}\n{usage} · {Status(p.S("status"))}" + suffix, p)
+                    { ProfileNotice = suffix, ProfileEmail = ProfileEmailText(p) }, _state, _selectedTask);
             }), _selectedProfile);
             var shortcuts = _state.Arr("shortcuts");
             var shortcutOwners = _state.Arr("profiles").ToArray();
@@ -912,7 +941,7 @@ public sealed class MainWindow : Window
                 p = _viewerProfile;
             }
             ApplyProfileNotes();
-            _identity.Text = _selectedProfile is null ? "사용할 프로필을 선택하세요" : (p.S("auth_mode") == "external" ? "외부 API 프로필 " : "Codex 프로필 ") + p.S("alias", "연결된 프로필 없음");
+            _identity.Text = _selectedProfile is null ? "사용할 프로필을 선택하세요" : (ClaudeProfilePresentation.IsClaude(p) ? "Claude 프로필 " : LocalModelPresentation.IsLocalProfile(p) ? "로컬 모델 프로필 " : p.S("auth_mode") == "external" ? "외부 API 프로필 " : "Codex 프로필 ") + p.S("alias", "연결된 프로필 없음");
             _identity.ToolTip = _identity.Text;
             var openedTask = p.Get("runtime_state").Get("opened_task");
             _taskIdentity.Text = openedTask.S("thread_id") == "" ? "작업 · 아직 열지 않음" : "최근 연 작업 · " + openedTask.S("title", openedTask.S("thread_id"));
@@ -922,7 +951,8 @@ public sealed class MainWindow : Window
             if (_selectedTask is { } selectedTask) { _taskIdentity.Text = "작업 · " + selectedTask.Title; _taskIdentity.ToolTip = selectedTask.Title + "\n" + selectedTask.Task.Key; }
             ShowCacheNotice();
             var policy = p.Get("policy");
-            var mode = p.S("auth_mode") == "external" ? p.S("external_model_name", "외부 API 모델") : "GPT 사용";
+            var mode = ClaudeProfilePresentation.IsClaude(p) ? "Claude " + ClaudeProfilePresentation.Model(p)
+                : p.S("auth_mode") == "external" ? p.S("external_model_name", "외부 API 모델") : "GPT 사용";
             var agentBadge = ProfileAgentPresentation.Badge(p);
             if (agentBadge.Length > 0) mode += " · " + agentBadge;
             _mode.ToolTip = ProfileAgentPresentation.Hint(p);
@@ -953,7 +983,6 @@ public sealed class MainWindow : Window
                 _runtimeVersion.Text += " · 이전 목록 정리 대기: 새로 시작해야 적용됩니다";
             _runtimeVersion.Foreground = selection.B("restart_required") || p.B("sidebar_cache_pending") ? Brushes.Orange : Muted;
             var warnings = new List<string>();
-            if (p.S("desktop_compatibility_notice") != "") warnings.Add(p.S("desktop_compatibility_notice"));
             if (ProfileLoginPresentation.NeedsLogin(p)) warnings.Add("로그인 확인 필요 · 이 프로필에 로그인해 주세요.");
             if (automatic.S("phase") == "attention") warnings.Add(automatic.S("message"));
             else if (selection.B("restart_required") || p.B("sidebar_cache_pending")) warnings.Add(_runtimeVersion.Text);
@@ -967,7 +996,8 @@ public sealed class MainWindow : Window
             _updateButton.ToolTip = update.Message("Codex 업데이트 상태");
             _updateStatus.Text = UpdatePresentation.Summary(update);
             _updateStatus.ToolTip = _updateStatus.Text;
-            _updateStatus.Visibility = update.B("worker_active") || update.S("status") is "complete" or "recovery_required" or "failed_restore" or "failed_install" or "blocked" or "installed_newer" or "up_to_date"
+            _updateDetails.Header = update.S("status") == "blocked" ? "업데이트 보류 · 상세 이유" : "Codex 업데이트 상태";
+            _updateDetails.Visibility = update.B("worker_active") || update.S("status") is "complete" or "recovery_required" or "failed_restore" or "failed_install" or "blocked" or "installed_newer" or "up_to_date"
                 ? Visibility.Visible : Visibility.Collapsed;
             var updateNotice = update.S("status") + ":" + _updateStatus.Text;
             if (update.S("status") != "" && _lastUpdateNotice != updateNotice)
@@ -978,7 +1008,7 @@ public sealed class MainWindow : Window
             using (_responsiveness?.Stage("shell.diagnostics", 25))
             foreach (var observed in _state.Arr("profiles").Concat(_state.Arr("view_instances")))
             {
-                var loginProblem = observed.Get("login_health");
+                var loginProblem = ClaudeProfilePresentation.IsClaude(observed) ? default : observed.Get("login_health");
                 var loginReason = loginProblem.S("reason");
                 if (_loginNotices.GetValueOrDefault(observed.S("id"), "") != loginReason)
                 {
@@ -1277,6 +1307,22 @@ public sealed class MainWindow : Window
     private void RenderLoginState()
     {
         var saved = Profile();
+        _loginRepair.Content = "이 프로필에 로그인";
+        System.Windows.Automation.AutomationProperties.SetName(_loginRepair, "이 프로필에 로그인");
+        if (ClaudeProfilePresentation.IsClaude(saved))
+        {
+            var claude = ClaudeProfilePresentation.Status(saved);
+            _loginRepair.Content = "Claude 로그인 · 설정";
+            System.Windows.Automation.AutomationProperties.SetName(_loginRepair, "Claude 로그인 · 설정");
+            _loginRepair.Visibility = !_viewingCatalog && _selectedProfile is not null ? Visibility.Visible : Visibility.Collapsed;
+            _loginRepair.IsEnabled = true;
+            _loginRepair.ToolTip = "Claude Code의 공식 로그인 콘솔을 열거나 이 프로필의 기본 모델과 컨텍스트를 설정합니다.";
+            _accountState.Visibility = _selectedProfile is null || _viewingCatalog ? Visibility.Collapsed : Visibility.Visible;
+            _accountState.Foreground = ClaudeProfilePresentation.Tone(claude) == "warning" ? Brushes.Orange : Muted;
+            _accountState.Text = ClaudeProfilePresentation.Detail(saved);
+            _accountState.ToolTip = claude.Message(_accountState.Text);
+            return;
+        }
         if (saved.S("auth_mode") == "external")
         {
             _loginRepair.Visibility = Visibility.Collapsed;
@@ -1310,7 +1356,9 @@ public sealed class MainWindow : Window
     private Task LoginProfileAsync() => LoginProfileAsync(RequireProfile());
     private async Task LoginProfileAsync(string id)
     {
-        if (_state.Arr("profiles").First(p => p.S("id") == id).S("auth_mode") == "external")
+        var saved = _state.Arr("profiles").First(p => p.S("id") == id);
+        if (ClaudeProfilePresentation.IsClaude(saved)) { await EditClaudeProfileAsync(id); return; }
+        if (saved.S("auth_mode") == "external")
         {
             await ShowProvidersAsync(id);
             return;
@@ -1331,6 +1379,17 @@ public sealed class MainWindow : Window
     private Task RefreshLoginStatusAsync() => RefreshLoginStatusAsync(RequireProfile());
     private async Task RefreshLoginStatusAsync(string id)
     {
+        if (ClaudeProfilePresentation.IsClaude(_state.Arr("profiles").First(p => p.S("id") == id)))
+        {
+            var claude = await Request("claude.status", new { profile_id = id });
+            if (_closing) return;
+            await Request("claude.usage", new { profile_id = id });
+            if (_closing) return;
+            await RefreshAsync();
+            SetStatus("Claude · " + ClaudeProfilePresentation.Label(claude) + " · " + claude.Message("상태를 확인했습니다."),
+                ClaudeProfilePresentation.Tone(claude) == "warning");
+            return;
+        }
         var result = await Request("profile.login_status", new { profile_id = id, verify_server = true });
         if (_closing) return;
         _loginStatuses[id] = (result, DateTime.Now);
@@ -1371,14 +1430,31 @@ public sealed class MainWindow : Window
             return; // The confirmation dialog explicitly describes this legacy scope.
         }
         var jobs = new Dictionary<string, string>();
+        var refused = new List<string>();
         var maxHosts = 0;
         foreach (var profile in _state.Arr("profiles"))
         {
             if (profile.S("generation") == "" || !profile.Arr("remote_bindings").Any(b => b.B("prepared"))) continue;
             maxHosts = Math.Max(maxHosts, profile.Arr("remote_bindings").Count(b => b.B("prepared")));
             using var requestDeadline = new CancellationTokenSource(TimeSpan.FromSeconds(20));
-            var job = await _client.RequestAsync("profile.remote_stop",
-                new { profile_id = profile.S("id"), generation = profile.S("generation") }, requestDeadline.Token);
+            JsonElement job;
+            try
+            {
+                job = await _client.RequestAsync("profile.remote_stop",
+                    new { profile_id = profile.S("id"), generation = profile.S("generation") }, requestDeadline.Token);
+            }
+            catch (Exception error)
+            {
+                // Older services reject stop while ordinary SSH preparation
+                // is pending. Still attempt the other profiles and offer the
+                // existing explicit choice to leave unconfirmed remotes alone.
+                var detail = error is OperationCanceledException
+                    ? "SSH 종료 요청의 결과를 확인하지 못했습니다."
+                    : error.Message;
+                refused.Add($"{profile.S("alias", profile.S("id"))} · {detail}");
+                Log($"프로필 원격 종료 요청 확인 필요 · {profile.S("alias", profile.S("id"))} · {detail}");
+                continue;
+            }
             jobs[profile.S("id")] = job.S("id");
             // The service turned a pending "SSH 작업 종료 후 설정 적용" into this stop.
             if (job.B("stop_converted"))
@@ -1392,7 +1468,6 @@ public sealed class MainWindow : Window
         // A refused remote stop (an unaudited runtime, no shutdown proof) does
         // not resolve by waiting. Collect them and let the user leave those
         // listeners on the server, exactly like closing only the window.
-        var refused = new List<string>();
         var aliases = _state.Arr("profiles").ToDictionary(p => p.S("id"), p => p.S("alias", p.S("id")));
         try
         {
@@ -1811,7 +1886,7 @@ public sealed class MainWindow : Window
     }
     private Task RequestWorkspaceExitAsync(bool restartAdministrator)
     {
-        if (_shutdownInProgress || (_closing && !_serviceShutdown.DrainStarted)) return Task.CompletedTask;
+        if (_shutdownInProgress || (_closing && !_serviceShutdown.DrainStarted && !_serviceShutdown.BackendResetting)) return Task.CompletedTask;
         var message = restartAdministrator
             ? "관리 중인 모든 Codex 프로필과 작업을 종료한 뒤 관리자 권한으로 다시 실행합니다.\n진행 중인 작업은 중단됩니다. 작업을 모두 마쳤을 때만 계속하세요.\n\n종료가 확인되면 Windows 권한 허용 창이 나타납니다."
             : "관리 중인 모든 Codex 프로필과 작업을 종료합니다.\n진행 중인 작업은 중단됩니다.\n\n창만 닫고 작업을 계속하려면 취소한 뒤 제목줄의 X를 누르세요.";
@@ -1885,6 +1960,13 @@ public sealed class MainWindow : Window
         await Task.Yield();
         try
         {
+            if (_serviceShutdown.BackendResetting)
+            {
+                using var settle = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+                await _serviceShutdown.SettleLegacyRestartsAsync(
+                    (command, token) => _client!.RequestAsync(command, cancellationToken: token),
+                    message => SetStatus(message), settle.Token);
+            }
             if (!_serviceShutdown.DrainStarted)
             {
                 if (_client is not null && !_client.IsConnected)
@@ -1906,7 +1988,11 @@ public sealed class MainWindow : Window
                         // No show lands after _closing, so this snapshot is newer than any kept launch.
                         _state = await _client.RequestAsync("state", cancellationToken: stopWarmup.Token); _shownProfiles.Clear();
                         if (!_state.Get("profile_warmup").B("worker_active") &&
-                            _state.Get("local_launches").N("active") == 0) break;
+                            _state.Get("local_launches").N("active") == 0 &&
+                            (!_state.Get("capabilities").B("shutdown_restart_barrier") ||
+                             (_state.Get("local_restarts").B("paused") &&
+                              _state.Get("local_restarts").N("pending") == 0 &&
+                              _state.Get("local_restarts").N("active") == 0))) break;
                         await Task.Delay(100, stopWarmup.Token);
                     } while (true);
                     // State reads profile identities before the launch counter. A
@@ -1983,6 +2069,10 @@ public sealed class MainWindow : Window
                             "남은 Codex 정리 확인", MessageBoxButton.OKCancel, MessageBoxImage.Warning, MessageBoxResult.Cancel) != MessageBoxResult.OK)
                         throw new InvalidOperationException("남은 Codex 프로세스 정리를 확인하지 못해 관리창을 유지합니다: " +
                             string.Join(", ", cleanupWarnings));
+                    using var settle = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+                    await _serviceShutdown.SettleLegacyRestartsAsync(
+                        (command, token) => _client.RequestAsync(command, cancellationToken: token),
+                        message => SetStatus(message), settle.Token);
                     await StopRemoteProfilesAsync();
                 }
             }
@@ -2012,12 +2102,14 @@ public sealed class MainWindow : Window
                     throw new InvalidOperationException("관리 서비스 종료를 확인하지 못해 관리자 실행을 보류했습니다.");
                 ((App)Application.Current).RestartAdministratorAfterExit(_root);
             }
+            if (_serviceShutdown.DrainStarted && !_restartAsAdministrator)
+                PackageUpdateAfterExit.Queue(_root, Log);
             _shutdownComplete = true;
             Close();
         }
         catch (Exception error)
         {
-            if (!_serviceShutdown.DrainStarted && _client?.IsConnected == true)
+            if (!_serviceShutdown.DrainStarted && !_serviceShutdown.BackendResetting && _client?.IsConnected == true)
             {
                 try
                 {
@@ -2026,9 +2118,10 @@ public sealed class MainWindow : Window
                 }
                 catch (Exception resumeError) { Log("프로필 실행 재개 확인 · " + resumeError.Message); }
             }
-            _closing = _serviceShutdown.DrainStarted; _shutdownInProgress = false; _exitAllRequested = _serviceShutdown.DrainStarted;
+            _closing = _serviceShutdown.DrainStarted || _serviceShutdown.BackendResetting;
+            _shutdownInProgress = false; _exitAllRequested = _closing;
             IsEnabled = true;
-            if (!_serviceShutdown.DrainStarted) { _timer.Start(); _activityTimer.Start(); }
+            if (!_closing) { _timer.Start(); _activityTimer.Start(); }
             SetStatus(error.Message, true);
         }
     }
@@ -2077,39 +2170,74 @@ public sealed class MainWindow : Window
     private async Task AddProfileAsync()
     {
         var kind = Dialogs.Select(this, "프로필 추가", "작업을 실행할 모델의 연결 방식을 선택하세요.",
-            [new Choice("codex", "Codex 계정 · ChatGPT 로그인"), new Choice("external", "외부 API 모델 · Codex에서 직접 작업")]);
+            [new Choice("codex", "Codex 계정 · ChatGPT 로그인"), new Choice("claude_code", "Claude · 이 PC의 Claude Code CLI로 실행"),
+                new Choice("local", "로컬 모델 · 직접 준비한 서버에서 실행"), new Choice("external", "외부 API 모델 · 클라우드 API에서 실행")]);
         if (kind is null) return;
         string? modelId = null;
         Dictionary<string, object>? modelSettings = null;
-        if (kind.Id == "external")
+        if (kind.Id is "external" or "local")
         {
             var registry = await Request("providers.list");
-            var available = registry.Arr("models").Where(m => m.B("verified") || m.Get("capabilities").B("verified"))
-                .Where(m => registry.Arr("providers").Any(p => p.S("id") == m.S("provider_id") && p.B("key_saved") && p.B("adapter_available")))
+            var local = kind.Id == "local";
+            var available = LocalModelPresentation.AvailableModels(registry, local)
                 .Select(m => new Choice(m.S("id"), m.S("display_name", m.S("name")) + " · " + m.S("reasoning_effort"), m)).ToArray();
-            if (available.Length == 0) { SetStatus("하위 에이전트 · API 공급자에서 모델 등록, 키 저장, 연결 시험을 먼저 완료하세요.", true); return; }
-            var model = Dialogs.Select(this, "외부 API 프로필", "선택한 모델이 직접 답변하고 도구를 실행합니다. 기존 작업 기록을 이어서 사용하며, 전송한 기록은 해당 API로 전달됩니다.", available);
+            if (available.Length == 0) { SetStatus(local ? "하위 에이전트 · 모델 연결에서 로컬 모델을 등록하고 연결 시험을 완료하세요." : "하위 에이전트 · 모델 연결에서 클라우드 모델 등록, 키 저장, 연결 시험을 먼저 완료하세요.", true); return; }
+            var model = Dialogs.Select(this, local ? "로컬 모델 프로필" : "외부 API 프로필", local
+                ? "선택한 로컬 서버의 모델이 직접 답변하고 도구를 실행합니다. 작업 기록은 지정한 서버에 전달됩니다."
+                : "선택한 모델이 직접 답변하고 도구를 실행합니다. 기존 작업 기록을 이어서 사용하며, 전송한 기록은 해당 클라우드 API로 전달됩니다.", available);
             if (model is null) return;
             modelId = model.Id;
-            modelSettings = Dialogs.ExternalModelSettings(this, model.Data);
+            modelSettings = Dialogs.ExternalModelSettings(this, LocalModelPresentation.ForSettings(registry, model.Data));
+            if (modelSettings is null) return;
+        }
+        if (kind.Id == "claude_code")
+        {
+            modelSettings = Dialogs.ClaudeProfileSettings(this);
             if (modelSettings is null) return;
         }
         var alias = Dialogs.Prompt(this, "프로필 이름", "목록에 표시할 이름을 입력하세요."); if (alias is null) return;
-        var result = await Request("profile.add", new { alias, kind = kind.Id, model_id = modelId, settings = modelSettings }); await RefreshAsync();
-        await ShowProfileAsync(result.S("id"), kind.Id == "external" ? "profile.show" : "profile.login");
+        var result = await Request("profile.add", new { alias, kind = kind.Id == "local" ? "external" : kind.Id, model_id = modelId, settings = modelSettings }); await RefreshAsync();
+        if (kind.Id == "claude_code")
+        {
+            var login = await Request("claude.login", new { profile_id = result.S("id") });
+            await RefreshAsync();
+            await ShowProfileAsync(result.S("id"));
+            SetStatus(login.Message("Claude Code가 연 콘솔과 브라우저에서 로그인을 완료한 뒤 상태를 새로 확인하세요."));
+        }
+        else await ShowProfileAsync(result.S("id"), kind.Id is "external" or "local" ? "profile.show" : "profile.login");
     }
     private string RequireContextProfile() => _profiles.ContextMenu.Tag as string ?? RequireProfile();
+    private static void SetClaudeProfileMenu(ContextMenu menu, JsonElement profile)
+    {
+        foreach (var item in menu.Items.OfType<MenuItem>().Where(item => Equals(item.Header, "하위 에이전트 설정")))
+            item.Visibility = ClaudeProfilePresentation.IsClaude(profile) ? Visibility.Collapsed : Visibility.Visible;
+    }
     private Task EditExternalModelAsync() => EditExternalModelAsync(_contextProfile ?? RequireProfile());
     private async Task EditExternalModelAsync(string id)
     {
         var profile = _state.Arr("profiles").First(p => p.S("id") == id);
-        if (profile.S("auth_mode") != "external") { SetStatus("외부 API 프로필을 선택하세요. GPT 하위 에이전트 설정은 ‘하위 에이전트 · API 공급자’에서 변경합니다."); return; }
+        if (ClaudeProfilePresentation.IsClaude(profile)) { await EditClaudeProfileAsync(id); return; }
+        if (profile.S("auth_mode") != "external") { SetStatus("로컬 모델 또는 외부 API 프로필을 선택하세요. GPT 하위 에이전트 설정은 ‘하위 에이전트 · 모델 연결’에서 변경합니다."); return; }
         var registry = await Request("providers.list");
         var model = registry.Arr("models").First(m => m.S("id") == profile.S("external_model_id"));
-        var settings = Dialogs.ExternalModelSettings(this, model, profile.Get("external_settings"), profile.S("alias"));
+        var settings = Dialogs.ExternalModelSettings(this, LocalModelPresentation.ForSettings(registry, model), profile.Get("external_settings"), profile.S("alias"));
         if (settings is null) return;
         var result = await Request("profile.model_settings", new { profile_id = id, settings });
         await RefreshAsync(); SetStatus(result.Message());
+    }
+    private async Task EditClaudeProfileAsync(string id)
+    {
+        var profile = _state.Arr("profiles").First(p => p.S("id") == id);
+        var settings = Dialogs.ClaudeProfileSettings(this, profile, async command =>
+        {
+            var result = await Request(command, new { profile_id = id });
+            await RefreshAsync();
+            return result;
+        });
+        if (settings is null) return;
+        settings["profile_id"] = id;
+        var saved = await Request("claude.settings", settings);
+        await RefreshAsync(); SetStatus(saved.Message("Claude 기본 설정을 저장했습니다."));
     }
     private Task RenameProfileAsync() => RenameProfileAsync(RequireProfile());
     private async Task RenameProfileAsync(string id)
@@ -2254,6 +2382,7 @@ public sealed class MainWindow : Window
     }
     private async Task OpenShortcutAsync(string id)
     {
+        using var timing = _responsiveness?.Time("shortcut.open." + id);
         var item = _state.Arr("shortcuts").FirstOrDefault(s => s.S("id") == id);
         var profileId = item.S("profile_id"); if (profileId == "") throw new InvalidOperationException("이 바로가기에 연결된 프로필이 없습니다.");
         using var action = _profileActions.Enter(profileId, "대화 열기");
@@ -2261,18 +2390,21 @@ public sealed class MainWindow : Window
             .Get("current_task").S("thread_id"));
         _shortcuts.SelectedItem = _shortcuts.Items.OfType<Choice>().FirstOrDefault(c => c.Id == id);
         var ticket = ++_navigation; if (_selectedProfile != profileId || _viewingCatalog) ParkCurrent(); _viewingCatalog = false; _selectedProfile = profileId;
+        _expectedConversation = null; _expectedCanonicalThread = null;
         _hostDeck.Select(profileId); BeginAttach(); _profileRequestTicket = ticket;
-        if (_host.IsAttached) _host.Visibility = Visibility.Visible;
         Render();
+        // A retained target is usable while its exact task navigation is sent.
+        // Synchronize it now, as profile selection does, without waiting for state.
+        var retained = Latest(profileId, Profile());
+        if (_host.HasLiveAttachment) TryAttach(retained);
+        SetStatus("선택한 계정에서 작업으로 이동하고 있습니다…");
         JsonElement result;
-        try { result = await Request("conversation.open", new { shortcut_id = id }); }
+        try { result = await Request("conversation.open", new { shortcut_id = id, expected_profile_id = profileId }); }
         finally { if (_profileRequestTicket == ticket) _profileRequestTicket = null; }
         if (ticket != _navigation || _closing) return;
         if (result.S("state") == "waiting_for_reader")
         {
-            ApplyConversationResult(result, item, profileId);
-            await RefreshAsync();
-            if (ticket != _navigation || _closing) return;
+            PresentShortcutResult(result, item, profileId);
             SetStatus(result.Message("Codex가 준비되면 선택한 대화로 자동 이동합니다."));
             var completed = await ConversationReadyWait.CompleteAsync(result,
                 () => ticket == _navigation && _selectedProfile == profileId && !_closing,
@@ -2282,10 +2414,27 @@ public sealed class MainWindow : Window
             result = completed.Value;
             Log($"{Profile().S("alias")} · 준비 후 대화 이동 · {result.S("state")}");
         }
-        ApplyConversationResult(result, item, profileId);
-        await RefreshAsync();
-        if (ticket != _navigation || _selectedProfile != profileId || _closing) return;
+        PresentShortcutResult(result, item, profileId);
+        // A background state poll updates the sidebar. Its latency must not
+        // delay the attached task or keep this account's action gate occupied.
+        action.Dispose();
         SetStatus(result.Message("대화 열기 요청을 보냈습니다."), result.S("state") == "blocked");
+        _ = VerifyShortcutNavigationAsync(ticket, result, item);
+    }
+    private void PresentShortcutResult(JsonElement result, JsonElement item, string profileId)
+    {
+        var returned = result.Get("profile");
+        if (returned.ValueKind == JsonValueKind.Object && (returned.S("id") == ""
+            || (!result.B("readonly_viewer") && returned.S("id") != profileId)
+            || (result.S("profile_id") != "" && result.S("profile_id") != returned.S("id"))))
+            throw new InvalidOperationException("요청한 프로필과 반환된 창 정보가 일치하지 않습니다.");
+        ApplyConversationResult(result, item, profileId);
+        if (returned.ValueKind != JsonValueKind.Object) return;
+        _shownProfiles[returned.S("id")] = returned;
+        ++_stateRevision;
+        _expectedWindowLaunch = WindowLaunchIdentity.From(returned);
+        _attachDeadline = DateTime.UtcNow.AddSeconds(25);
+        TryAttach(returned);
     }
     private void ApplyConversationResult(JsonElement result, JsonElement item, string profileId)
     {
@@ -2324,14 +2473,19 @@ public sealed class MainWindow : Window
         await Request("shortcut.rename", new { shortcut_id = id, alias }); await RefreshAsync(); SetStatus("바로가기 별칭을 변경했습니다.");
     }
     private async Task UndoShortcutAsync() { var result = await Request("shortcut.undo"); await RefreshAsync(); SetStatus(result.Message("바로가기 삭제를 취소했습니다.")); }
-    private Task ProvidersAsync() => ShowProvidersAsync(_selectedProfile);
+    private Task ProvidersAsync() => ShowProvidersAsync(ClaudeProfilePresentation.IsClaude(Profile()) ? null : _selectedProfile);
     private Task ProfileProvidersAsync() => ShowProvidersAsync(_contextProfile ?? RequireProfile());
     private async Task ShowProvidersAsync(string? profileId)
     {
         // Capture the menu target before the RPC yields and the context menu
         // clears itself. Editing another profile must not select or launch it.
-        var registry = await Request("providers.list");
         var profile = _state.Arr("profiles").FirstOrDefault(p => p.S("id") == profileId);
+        if (ClaudeProfilePresentation.IsClaude(profile))
+        {
+            SetStatus("Claude 프로필의 하위 에이전트는 Claude Code CLI가 관리합니다.");
+            return;
+        }
+        var registry = await Request("providers.list");
         if (profileId is not null && profile.ValueKind == JsonValueKind.Undefined)
             throw new InvalidOperationException("설정할 프로필이 목록에서 제거되었습니다.");
         await Dialogs.ProvidersAsync(this, profile, registry, Request);

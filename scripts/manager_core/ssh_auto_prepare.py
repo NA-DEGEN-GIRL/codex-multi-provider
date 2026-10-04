@@ -43,6 +43,10 @@ def ensure_binding(arguments, manifest, path, *, remote=None):
 
     def check_profile():
         profile = store.profile(profile_id)
+        if profile.get('auth_mode') == 'claude_code':
+            from .remote import supports_remote_claude
+            if not supports_remote_claude(root):
+                raise ShimError('claude_remote_runtime_required', 'Claude SSH 실행을 지원하는 원격 런타임 준비가 필요합니다.')
         current_models = profile['policy']['model_ids'] if profile['policy']['enabled'] else []
         if (profile.get('generation') != generation or sorted(current_models) != models or profile.get('external_model_id') != primary
                 or ('model_options' in manifest and render_options(profile) != manifest['model_options'])):
@@ -51,6 +55,7 @@ def ensure_binding(arguments, manifest, path, *, remote=None):
 
     # One provisioner per profile/host. Inventory enrollment also prevents an
     # automatic profile restart from interrupting an in-progress installation.
+    check_profile()
     with SshInventory(root).execution(profile_id, generation, dict(operation='native-prepare', alias=alias)):
         lock = wait_lock(expected.parent / ('ssh-prepare-' + alias + '.lock'), 600)
         try:

@@ -36,6 +36,30 @@ public partial class App : Application
     protected override async void OnStartup(StartupEventArgs e)
     {
         base.OnStartup(e);
+        if (e.Args.Contains("--shortcut-navigation-self-test"))
+        {
+            ShutdownMode = ShutdownMode.OnExplicitShutdown;
+            var report = Argument(e.Args, "--report") ?? throw new ArgumentException("--report is required.");
+            try { await ShortcutNavigationSelfTest.RunAsync(report); Shutdown(0); }
+            catch (Exception error) { File.WriteAllText(report, System.Text.Json.JsonSerializer.Serialize(new { passed = false, error = error.ToString() })); Shutdown(1); }
+            return;
+        }
+        if (e.Args.Contains("--claude-profile-self-test"))
+        {
+            ShutdownMode = ShutdownMode.OnExplicitShutdown;
+            var report = Argument(e.Args, "--report") ?? throw new ArgumentException("--report is required.");
+            try { await ClaudeProfileSelfTest.RunAsync(report); Shutdown(0); }
+            catch (Exception error) { File.WriteAllText(report, System.Text.Json.JsonSerializer.Serialize(new { passed = false, error = error.ToString() })); Shutdown(1); }
+            return;
+        }
+        if (e.Args.Contains("--execution-presets-self-test"))
+        {
+            ShutdownMode = ShutdownMode.OnExplicitShutdown;
+            var report = Argument(e.Args, "--report") ?? throw new ArgumentException("--report is required.");
+            try { await ExecutionPresetsSelfTest.RunAsync(report); Shutdown(0); }
+            catch (Exception error) { File.WriteAllText(report, System.Text.Json.JsonSerializer.Serialize(new { passed = false, error = error.ToString() })); Shutdown(1); }
+            return;
+        }
         if (e.Args.Contains("--write-shell-compatibility"))
         {
             // Build-time metadata comes from the actual compiled shell. No
@@ -142,7 +166,7 @@ public partial class App : Application
             catch (Exception ex)
             {
                 var report = Argument(e.Args, "--report");
-                if (report is not null) File.WriteAllText(report, System.Text.Json.JsonSerializer.Serialize(new { ok = false, error = ex.Message }));
+                if (report is not null) File.WriteAllText(report, System.Text.Json.JsonSerializer.Serialize(new { ok = false, error = ex.ToString() }));
                 Shutdown(1);
             }
             return;
@@ -231,6 +255,11 @@ public partial class App : Application
                 Shutdown(0);
                 return;
             }
+            // Starting profile processes while the after-exit worker registers
+            // the MSIX makes Windows reject that same update as package-in-use.
+            ShutdownMode = ShutdownMode.OnExplicitShutdown;
+            await PackageUpdateAfterExit.BeforeStartAsync(root);
+            ShutdownMode = ShutdownMode.OnLastWindowClose;
             var workspace = new MainWindow(root, administratorPending: administratorPending);
             MainWindow = workspace;
             MainWindow.Show();

@@ -14,6 +14,7 @@ from uuid import uuid4
 SCRIPTS = Path(__file__).resolve().parents[1] / 'scripts'
 sys.path.insert(0, str(SCRIPTS))
 from manager_core import install_worker
+from manager_core import updates
 from manager_core.package_install import PackageInstaller, digest, read_record
 from manager_core.process_state import process_liveness
 from manager_core.store import Store, atomic_json
@@ -44,6 +45,9 @@ def execute(root, request, dispatching):
         wait_release()
     if mode == 'fail':
         raise ValueError('Fixture failure after dispatch')
+    if mode == 'busy':
+        from manager_core.updates import UpdateError
+        raise UpdateError('package_in_use', 'Fixture known package busy rejection')
 result = run_job(path, execute=execute)
 if mode == 'hold_after':
     wait_release()
@@ -160,6 +164,16 @@ class PackageInstallTests(unittest.TestCase):
         self.assertEqual(proof['installer_process_state'], 'exited')
         self.assertEqual(proof['installer_phase'], 'failed')
         self.assertFalse(proof['installer_settled'])
+
+    def test_unrelated_matching_windows_event_never_certifies_failed_receipt(self):
+        unrelated = [dict(record_id=123, activity_id=str(uuid4()), error_code='0x80073d02',
+            package_full_name='OpenAI.Codex_26.904.1.0_x64__2p2nqsd0c76g0')]
+        with patch.object(updates, '_powershell', return_value=json.dumps(unrelated)) as event_query:
+            with self.assertRaises(UpdateError):
+                self.run_installer(mode='fail')
+            proof = PackageInstaller(self.root).inspect(self.transaction)
+        self.assertFalse(proof['installer_settled'])
+        event_query.assert_not_called()
 
     def test_mismatched_or_corrupt_records_never_certify_another_request(self):
         installer = self.run_installer()
@@ -304,6 +318,24 @@ os._exit(0)
         self.assertEqual(kwargs, {'timeout': None})
         for flag in ('Force', 'AllowUnsigned', 'Defer', 'AllowDowngrade'):
             self.assertNotIn(flag, command)
+
+    def test_deferred_installer_preserves_apps_and_records_known_busy_result(self):
+        request = dict(package_path=str(self.package), package_sha256=digest(self.package),
+            installed_before=self.transaction['installed_before'], target=self.transaction['target'], defer_registration=True)
+        with patch.object(install_worker.UpdateManager, '_validate_download'), \
+             patch.object(install_worker, '_powershell', return_value='{"status":"package_in_use"}') as shell:
+            with self.assertRaises(UpdateError) as error:
+                install_worker.perform_install(self.root, request, lambda: None)
+        self.assertEqual(error.exception.code, 'package_in_use')
+        command = shell.call_args.args[0]
+        self.assertIn('-DeferRegistrationWhenPackagesAreInUse', command)
+        self.assertNotIn('-Force', command)
+        with self.assertRaises(UpdateError) as result:
+            self.run_installer(mode='busy')
+        self.assertEqual(result.exception.code, 'package_in_use')
+        proof = PackageInstaller(self.root).inspect(self.transaction)
+        self.assertTrue(proof['installer_settled'])
+        self.assertEqual(proof['installer_result_code'], 'package_in_use')
 
 
 if __name__ == '__main__':

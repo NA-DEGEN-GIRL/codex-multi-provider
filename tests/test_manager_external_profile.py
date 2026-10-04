@@ -69,6 +69,93 @@ class ExternalProfileTests(unittest.TestCase):
         self.control.dispatch('profile.rename',dict(profile_id=profile['id'],alias='Changed'))
         self.control.remote_accounts.sync.assert_not_called()
 
+    def test_claude_automatic_context_clears_foreign_overrides_and_keeps_ultracode(self):
+        binding = dict(model='cc-opus', model_provider='claude_code', agent_kind='claude_code',
+                       reasoning_effort='ultracode', supported_reasoning_efforts=['high', 'ultracode'],
+                       context_window=None, auto_compact_percent=None)
+        adapter = ExternalProfile({'CODEX_MANAGER_PRIMARY_MODEL': json.dumps(binding)})
+        original = {'method': 'thread/resume', 'params': {'model': 'gpt-6-astra', 'config': {
+            'model_context_window': 200000, 'model_auto_compact_token_limit': 170000, 'approval_policy': 'never'}}}
+        result = adapter.request(original)
+        self.assertEqual(result['params']['config'], {
+            'model_provider': 'claude_code', 'model_reasoning_effort': 'ultracode', 'approval_policy': 'never'})
+        self.assertEqual(original['params']['config']['model_auto_compact_token_limit'], 170000)
+        binding.update(context_window=200000, auto_compact_percent=85)
+        adapter = ExternalProfile({'CODEX_MANAGER_PRIMARY_MODEL': json.dumps(binding)})
+        explicit = adapter.request(original)['params']['config']
+        self.assertEqual(explicit['model_context_window'], 200000)
+        self.assertEqual(explicit['model_auto_compact_token_limit'], 170000)
+
+    def test_claude_custom_percentage_with_auto_context_uses_model_metadata(self):
+        binding = dict(model='cc-sonnet', model_provider='claude_code', agent_kind='claude_code',
+                       reasoning_effort='high', context_window=None, auto_compact_percent=90)
+        adapter = ExternalProfile({'CODEX_MANAGER_PRIMARY_MODEL': json.dumps(binding)})
+        config = adapter.request({'method': 'thread/start'})['params']['config']
+        self.assertNotIn('model_context_window', config)
+        self.assertEqual(config['model_auto_compact_token_limit'], 900000)
+
+    def test_claude_task_model_and_effort_selection_survive_all_request_routes(self):
+        binding = dict(model='cc-opus', model_provider='claude_code', agent_kind='claude_code',
+                       reasoning_effort='high', context_window=None, auto_compact_percent=None)
+        adapter = ExternalProfile({'CODEX_MANAGER_PRIMARY_MODEL': json.dumps(binding)})
+        for method in ('thread/start', 'thread/resume', 'thread/fork', 'turn/start', 'thread/settings/update'):
+            for model in ('cc-sonnet', 'cc-fable', 'cc-claude-opus-5-5'):
+                with self.subTest(method=method, model=model):
+                    original = {'method': method, 'params': {'threadId': 'same-task',
+                        'model': model, 'effort': 'ultracode'}}
+                    result = adapter.request(original)['params']
+                    self.assertEqual(result['model'], model)
+                    self.assertEqual(result['threadId'], 'same-task')
+                    if method.startswith('thread/') and method != 'thread/settings/update':
+                        self.assertEqual(result['config']['model_reasoning_effort'], 'ultracode')
+                        self.assertEqual(result['modelProvider'], 'claude_code')
+                    else:
+                        self.assertEqual(result['effort'], 'ultracode')
+                    self.assertEqual(original['params'], {'threadId': 'same-task', 'model': model, 'effort': 'ultracode'})
+
+    def test_claude_sparse_updates_do_not_reset_task_or_other_tasks(self):
+        binding = dict(model='cc-opus', model_provider='claude_code', agent_kind='claude_code', reasoning_effort='high')
+        adapter = ExternalProfile({'CODEX_MANAGER_PRIMARY_MODEL': json.dumps(binding)})
+        adapter.request({'method': 'thread/settings/update', 'params': {'threadId': 'one', 'model': 'cc-sonnet', 'effort': 'low'}})
+        for method in ('turn/start', 'thread/settings/update'):
+            for task in ('one', 'two'):
+                original = {'method': method, 'params': {'threadId': task, 'approvalPolicy': 'never'}}
+                self.assertEqual(adapter.request(original), original)
+            result = adapter.request({'method': method, 'params': {'threadId': 'one', 'effort': 'ultracode'}})
+            self.assertEqual(result['params'], {'threadId': 'one', 'effort': 'ultracode'})
+
+    def test_claude_collaboration_and_config_models_use_native_precedence(self):
+        binding = dict(model='cc-opus', model_provider='claude_code', agent_kind='claude_code', reasoning_effort='high')
+        adapter = ExternalProfile({'CODEX_MANAGER_PRIMARY_MODEL': json.dumps(binding)})
+        original = {'method': 'turn/start', 'params': {'model': 'cc-opus', 'effort': 'low', 'collaborationMode': {
+            'mode': 'plan', 'settings': {'model': 'cc-sonnet', 'reasoning_effort': 'ultracode',
+                                       'developer_instructions': 'Keep the plan.'}}}}
+        result = adapter.request(original)['params']
+        self.assertEqual(result['model'], 'cc-sonnet')
+        self.assertEqual(result['effort'], 'ultracode')
+        self.assertEqual(result['collaborationMode'], original['params']['collaborationMode'])
+        self.assertEqual(original['params']['model'], 'cc-opus')
+        result = adapter.request({'method': 'thread/resume', 'params': {
+            'config': {'model': 'cc-claude-opus-5-5', 'model_reasoning_effort': 'low'}}})['params']
+        self.assertEqual(result['model'], 'cc-claude-opus-5-5')
+        self.assertEqual(result['config']['model_reasoning_effort'], 'low')
+
+    def test_claude_unapproved_model_does_not_escape_profile(self):
+        binding = dict(model='cc-opus', model_provider='claude_code', agent_kind='claude_code', reasoning_effort='high')
+        adapter = ExternalProfile({'CODEX_MANAGER_PRIMARY_MODEL': json.dumps(binding)})
+        for model in ('gpt-6-astra', 'cc-claude-sonnet-5-5', 'cc-arbitrary', ['cc-sonnet'], {'model': 'cc-sonnet'}):
+            result = adapter.request({'method': 'turn/start', 'params': {'model': model, 'effort': 'low'}})['params']
+            self.assertEqual(result, {'model': 'cc-opus', 'effort': 'high'})
+
+    def test_claude_choices_respect_the_generated_catalog_subset(self):
+        binding = dict(model='cc-opus', model_provider='claude_code', agent_kind='claude_code',
+                       reasoning_effort='high', supported_models={'cc-opus': ['high'], 'cc-sonnet': ['low', 'high']})
+        adapter = ExternalProfile({'CODEX_MANAGER_PRIMARY_MODEL': json.dumps(binding)})
+        result = adapter.request({'method': 'turn/start', 'params': {'model': 'cc-fable', 'effort': 'low'}})
+        self.assertEqual(result['params'], {'model': 'cc-opus', 'effort': 'high'})
+        result = adapter.request({'method': 'turn/start', 'params': {'model': 'cc-sonnet', 'effort': 'ultracode'}})
+        self.assertEqual(result['params'], {'model': 'cc-sonnet', 'effort': 'high'})
+
     def test_remote_api_bridge_routes_without_chatgpt_or_llm_usage(self):
         from manager_core.proxy_auth import AuthProxy
         binding={'model':'external-test','model_provider':'provider-test','reasoning_effort':'high'}

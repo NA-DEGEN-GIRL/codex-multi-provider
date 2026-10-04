@@ -15,7 +15,7 @@ from manager_core import desktop_bundle as bundle
 from manager_core.original_sync_bundle import PATCHES, RENDERER_PATCHES
 
 
-def archive(path, source=None, notification=None):
+def archive(path, source=None, notification=None, composer=None):
     body = b'function s9(){' + (source if source is not None else bundle._ORIGINAL) + b'return "posix";}'
     notice = notification if notification is not None else (bundle._NOTIFICATION_CLICK + b'originalCallback();})' +
         bundle._NOTIFICATION_SHOW + bundle._WINDOW_MESSAGE)
@@ -25,6 +25,8 @@ def archive(path, source=None, notification=None):
               ('.vite/build/context.js', b'' +
                (b'' if source is not None and all(pattern in source for pattern in PATCHES) else b';'.join(PATCHES))),
               ('webview/assets/app-initial-fixture.js', bundle._CONTEXT_RENDERER + b';' + b';'.join(RENDERER_PATCHES))]
+    if composer is not None:
+        chunks.append(('webview/assets/app-primary-fixture.js', composer))
     tree = {'files': {}}
     offset = 0
     for name, data in chunks:
@@ -96,6 +98,19 @@ class DesktopBundleTests(unittest.TestCase):
         self.assertEqual(integrity['blocks'], [hashlib.sha256(changed[i:i+32]).hexdigest() for i in range(0, len(changed), 32)])
         notice_integrity = entries['.vite/build/notifications.js']['integrity']
         self.assertEqual(notice_integrity['hash'], hashlib.sha256(data['.vite/build/notifications.js']).hexdigest())
+
+    def test_composer_effort_patch_is_published_with_verified_archive_offsets(self):
+        from test_manager_desktop_reasoning import DesktopReasoningTests
+        composer = DesktopReasoningTests().composer()
+        archive(self.path, composer=composer)
+        original = self.path.read_bytes()
+        target = self.root / 'patched.asar'
+        bundle.patch_archive(self.path, target)
+        patched = entry(target, 'webview/assets/app-primary-fixture.js')
+        self.assertIn(b'defaultMessage:`Ultracode`', patched)
+        self.assertIn(b'(fne(e)||e===`ultracode`)&&t.some', patched)
+        self.assertEqual(self.path.read_bytes(), original)
+        self.assertEqual(entry(target, '.vite/build/after.bin'), b'AFTER')
 
     def test_unknown_renderer_does_not_publish_half_working_sync(self):
         self.path.write_bytes(self.path.read_bytes().replace(
@@ -289,6 +304,28 @@ const results = {};
             self.assertEqual(bundle._matching_variant(keys[1], variants), keys[1])
             with self.assertRaises(ValueError): bundle._matching_variant(b';'.join(keys), variants)
             with self.assertRaises(ValueError): bundle._matching_variant(keys[1]*2, variants)
+
+    @unittest.skipUnless(shutil.which('node'), 'Node.js required for pipe isolation behavior')
+    def test_new_path_import_binding_preserves_strict_profile_pipe_namespace(self):
+        original = bundle._ORIGINAL.replace(b'return i.join', b'return o.join')
+        self.assertEqual(original, bundle._matching_variant(original, bundle._PIPE_VARIANTS))
+        archive(self.path, source=original)
+        target = self.root / 'renamed-path-import.asar'
+        bundle.patch_archive(self.path, target)
+        replacement = bundle._PIPE_VARIANTS[original]
+        self.assertIn(replacement, entry(target, '.vite/build/main.js'))
+        program = '''const build=new Function('process','o',SOURCE), path=require('node:path').win32;
+const p='codex-manager-00000000-0000-4000-8000-000000000000';
+const result=build({platform:'win32',env:{CODEX_MANAGER_DESKTOP_PIPE:p}},path);
+let refused=0;for(const value of ['', 'codex-ipc', '../other', undefined]) {
+ try {build({platform:'win32',env:{CODEX_MANAGER_DESKTOP_PIPE:value}},path)}catch {refused++}
+}
+console.log(JSON.stringify({result,refused}));'''.replace('SOURCE', json.dumps(replacement.decode()))
+        result = subprocess.run([shutil.which('node'), '-e', program], capture_output=True,
+                                text=True, check=True, timeout=10)
+        parsed = json.loads(result.stdout)
+        self.assertEqual('\\\\.\\pipe\\codex-manager-00000000-0000-4000-8000-000000000000', parsed['result'])
+        self.assertEqual(4, parsed['refused'])
 
     def test_new_package_compatibility_failure_uses_verified_isolated_copy(self):
         first = bundle.prepare(self.root, self.app)

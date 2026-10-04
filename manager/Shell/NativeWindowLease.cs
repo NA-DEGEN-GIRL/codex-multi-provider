@@ -70,23 +70,41 @@ internal sealed class NativeWindowLease : IDisposable
     {
         if (released) throw new InvalidOperationException("Codex 창 연결이 해제되었습니다.");
         string id = Guid.NewGuid().ToString("N"), command = path + ".navigate.json";
+        string temporary = command + "." + id + ".tmp";
         var payload = JsonSerializer.Serialize(new { id, token, appPid, hwnd, shellPid = Environment.ProcessId,
             createdAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), threadId = task.ThreadId, hostId = task.HostId });
-        await File.WriteAllTextAsync(command + ".tmp", payload, cancellation);
-        File.Move(command + ".tmp", command, true);
-        for (int attempt = 0; attempt < 60; attempt++)
+        try
         {
+            await File.WriteAllTextAsync(temporary, payload, cancellation);
             cancellation.ThrowIfCancellationRequested();
             if (released) throw new InvalidOperationException("Codex 창 연결이 해제되었습니다.");
+            File.Move(temporary, command, true);
+            for (int attempt = 0; attempt < 60; attempt++)
+            {
+                cancellation.ThrowIfCancellationRequested();
+                if (released) throw new InvalidOperationException("Codex 창 연결이 해제되었습니다.");
+                try
+                {
+                    using var ack = JsonDocument.Parse(await File.ReadAllTextAsync(command + ".ack", cancellation));
+                    if (ack.RootElement.GetProperty("id").GetString() == id && ack.RootElement.GetProperty("token").GetString() == token) return;
+                }
+                catch (Exception error) when (error is IOException or JsonException) { }
+                await Task.Delay(250, cancellation);
+            }
+            throw new TimeoutException("Codex의 작업 화면 이동 응답이 늦습니다. 작업은 중단하지 않았습니다.");
+        }
+        finally
+        {
             try
             {
-                using var ack = JsonDocument.Parse(await File.ReadAllTextAsync(command + ".ack", cancellation));
-                if (ack.RootElement.GetProperty("id").GetString() == id && ack.RootElement.GetProperty("token").GetString() == token) return;
+                if (File.Exists(temporary)) File.Delete(temporary);
+                // A cancelled, unread command must not navigate a different
+                // selection later. Never remove a newer command from this lease.
+                using var pending = JsonDocument.Parse(File.ReadAllText(command));
+                if (pending.RootElement.S("id") == id && pending.RootElement.S("token") == token) File.Delete(command);
             }
-            catch (Exception error) when (error is IOException or JsonException) { }
-            await Task.Delay(250, cancellation);
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException or JsonException) { }
         }
-        throw new TimeoutException("Codex의 알림 작업 이동 응답이 늦습니다. 작업은 중단하지 않았습니다.");
     }
 
     private void Write()

@@ -2,9 +2,11 @@ param(
     [ValidateSet('Debug','Release')][string]$Configuration = 'Release',
     [switch]$SelfTest,
     [switch]$Launch,
-    [switch]$SkipBuild
+    [switch]$SkipBuild,
+    [switch]$StageOnly
 )
 $ErrorActionPreference = 'Stop'
+if ($StageOnly -and ($Launch -or $SkipBuild)) { throw 'StageOnly cannot launch or reuse the active release.' }
 trap {
     if ($Launch) {
         Add-Type -AssemblyName PresentationFramework
@@ -77,6 +79,11 @@ $currentBuild = [ordered]@{
     ssh_proxy = if (Test-Path -LiteralPath (Join-Path $outputPath 'ssh\ssh.exe')) { Join-Path $outputPath 'ssh\ssh.exe' } else { $null }
 }
 if ($SelfTest) {
+    $claudeReport = Join-Path $repoRoot 'work\control-center-claude-profile-test.json'
+    $claudeTest = Start-Process -FilePath (Join-Path $outputPath 'Codex.ControlCenter.exe') -ArgumentList ('--claude-profile-self-test --report "' + $claudeReport + '"') -WindowStyle Hidden -PassThru
+    if (-not $claudeTest.WaitForExit(30000)) { throw 'Claude profile self-test timed out. Current release is unchanged.' }
+    if ($claudeTest.ExitCode -ne 0) { throw "Claude profile self-test failed. Review $claudeReport" }
+    Get-Content -LiteralPath $claudeReport
     $reportPath = Join-Path $repoRoot 'work\control-center-native-host-test.json'
     $arguments = '--native-host-self-test --report "' + $reportPath + '"'
     $test = Start-Process -FilePath (Join-Path $outputPath 'Codex.ControlCenter.exe') -ArgumentList $arguments -WindowStyle Hidden -PassThru
@@ -124,6 +131,12 @@ if ($SelfTest) {
     if (-not $remoteUpdatesTest.WaitForExit(15000)) { throw 'Remote updates self-test timed out. Current release is unchanged.' }
     if ($remoteUpdatesTest.ExitCode -ne 0) { throw "Remote updates self-test failed. Review $remoteUpdatesReport" }
     Get-Content -LiteralPath $remoteUpdatesReport
+}
+if ($StageOnly) {
+    $candidatePath = Join-Path $outputPath 'candidate.json'
+    [System.IO.File]::WriteAllText($candidatePath, ($currentBuild | ConvertTo-Json), (New-Object System.Text.UTF8Encoding($false)))
+    Write-Output "Candidate prepared; active manager unchanged: $candidatePath"
+    return
 }
 $temporaryPointer = Join-Path $managerPath ('current.' + [guid]::NewGuid().ToString('N') + '.tmp')
 [System.IO.File]::WriteAllText($temporaryPointer, ($currentBuild | ConvertTo-Json), (New-Object System.Text.UTF8Encoding($false)))

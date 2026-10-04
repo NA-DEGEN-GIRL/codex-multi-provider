@@ -197,6 +197,17 @@ class UpdateFixtures(unittest.TestCase):
         result = self.manager.plan(self.instances)
         self.assertIn("unmanaged_instance", [b["code"] for b in result["blockers"]])
 
+    def test_update_blockers_identify_profiles_and_distinguish_failed_proofs(self):
+        self.instances[0].update(alias='fixture-profile', job_state='unknown', idle_verified=False,
+                                 update_blocker='remote_runtime_proof_unavailable')
+        result = self.manager.plan(self.instances)
+        blocker, = result['blockers']
+        self.assertEqual(blocker['code'], 'jobs_not_quiescent')
+        self.assertEqual(blocker['profile_alias'], 'fixture-profile')
+        self.assertEqual(blocker['reason'], 'remote_runtime_proof_unavailable')
+        self.assertIn('SSH', blocker['message'])
+        self.assertFalse(self.closed or self.installs)
+
     def test_closed_windows_do_not_skip_active_ssh_or_its_restore_manifest(self):
         self.live = []
         self.instances = [dict(profile_id='remote-fixture', process_id=None,

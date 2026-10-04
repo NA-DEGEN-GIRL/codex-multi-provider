@@ -83,6 +83,7 @@ impl Service {
             status["records"] = self.records.status();
             status["preserves_background_profiles"] = json!(true);
             status["graceful_shutdown"] = json!(true);
+            status["shutdown_remote_journals"] = json!(true);
             status["shutdown_draining"] = json!(self.draining.load(Ordering::SeqCst));
             status["operations"] = json!(
                 self.operations
@@ -128,7 +129,11 @@ impl Service {
                     return error(
                         id,
                         "backend_busy",
-                        "실행 중인 프로필과 관리 작업을 유지합니다. 완전 종료 후 관리 서비스를 바꿀 수 있습니다.",
+                        if explicit {
+                            "아직 종료되지 않은 로컬 프로필 또는 진행 중인 관리 작업을 확인하고 있습니다."
+                        } else {
+                            "실행 중인 프로필과 관리 작업을 유지합니다. 완전 종료 후 관리 서비스를 바꿀 수 있습니다."
+                        },
                     );
                 }
             }
@@ -345,6 +350,12 @@ fn allowed(command: &str) -> bool {
         "profile.prepare",
         "profile.login",
         "profile.login_status",
+        "profile.email",
+        "claude.login",
+        "claude.status",
+        "claude.usage",
+        "claude.setup",
+        "claude.settings",
         "shortcut.add",
         "shortcut.move",
         "shortcut.rename",
@@ -358,6 +369,12 @@ fn allowed(command: &str) -> bool {
         "catalog.show",
         "catalog.resolve",
         "policy.set",
+        "presets.list",
+        "presets.save",
+        "presets.delete",
+        "presets.default",
+        "presets.select",
+        "presets.status",
         "profile.model_settings",
         "profile.restart",
         "profile.remote_restart",
@@ -412,6 +429,15 @@ fn can_stop_management(response: &Value, drain_remote_queue: bool) -> bool {
                 jobs.values().all(|j| {
                     ["complete", "attention", "superseded"]
                         .contains(&j["phase"].as_str().unwrap_or(""))
+                        // A remote reconcile journal can remain waiting for a
+                        // server indefinitely. Explicit local shutdown closes
+                        // adapter stdin; its shutdown hook stops that retry loop
+                        // without clearing the remote transaction or claiming
+                        // the remote process exited. Passive retirement must
+                        // still preserve the adapter that owns those retries.
+                        || (drain_remote_queue
+                            && j["remote_background"] == true
+                            && j["phase"] == "waiting")
                 })
             })
         })

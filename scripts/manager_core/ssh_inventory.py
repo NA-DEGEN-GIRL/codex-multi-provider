@@ -129,6 +129,17 @@ class SshInventory:
             worker.join(timeout)
 
     def coverage(self, profile):
+        inventory = self.store.read().get('ssh_inventory', {}).get(identifier(profile['id']), {})
+        if profile.get('auth_mode') == 'claude_code' and not (
+                inventory.get('adapter') == 'tracked-ssh-v1' and inventory.get('generation') == profile.get('generation')):
+            # Older Claude generations never launched SSH. Preserve their local
+            # maintenance path without treating an upgraded SSH generation as local.
+            # Preserve unexpected older evidence rather than claiming it stopped.
+            complete = bool(profile.get('generation')) and not any(
+                inventory.get(key) for key in ('hosts', 'operations', 'unclassified'))
+            return dict(complete=complete, maintenance_complete=complete,
+                        generation=profile.get('generation'), hosts=['local', *inventory.get('hosts', [])],
+                        operations=list(inventory.get('operations', {}).values()))
         inventory = self._reconcile(identifier(profile['id']))
         complete = (profile.get('runtime_channel') != 'packaged'
                     and inventory.get('generation') == profile.get('generation')
@@ -154,6 +165,10 @@ class SshInventory:
         if observed.get('process_id') != pid or type(created) is not int or created <= 0:
             created = None
         def enroll(data):
+            if self.store.profile(profile_id, data).get('auth_mode') == 'claude_code':
+                inventory = data.get('ssh_inventory', {}).get(profile_id, {})
+                if inventory.get('adapter') != 'tracked-ssh-v1' or inventory.get('generation') != generation:
+                    raise UpdateError('claude_remote_runtime_required', '이 Claude 프로필을 새 SSH 실행기로 다시 열어 주세요.')
             ssh_gate = data.get('ssh_maintenance', {}).get(profile_id)
             if ssh_gate and ssh_gate.get('state') != 'released':
                 raise UpdateError('ssh_settings_pending', 'SSH settings are being prepared; local work remains available.')

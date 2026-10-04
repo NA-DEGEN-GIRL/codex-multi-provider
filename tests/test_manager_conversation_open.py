@@ -139,6 +139,25 @@ class ConversationOpenTests(unittest.TestCase):
         self.assertEqual(len(self.launches), 1)
         self.assertFalse(any(a.calls for a in self.admins.values()))
 
+    def test_moved_shortcut_rejects_captured_profile_before_any_open_or_handoff(self):
+        expected = self.link['profile_id']
+        self.store.shortcut_move(self.link['id'], self.a['id'])
+        response = self.center.request(dict(id='open-captured', command='conversation.open',
+            args={'shortcut_id': self.link['id'], 'expected_profile_id': expected}))
+        self.assertTrue(response['ok'], response)
+        self.assertEqual('shortcut_profile_changed', response['result']['reason'])
+        self.assertEqual(expected, response['result']['profile_id'])
+        self.assertFalse(self.shown)
+        self.assertFalse(self.launches)
+        self.assertFalse(any(a.calls for a in self.admins.values()))
+
+    def test_captured_profile_allows_matching_shortcut(self):
+        response = self.center.request(dict(id='open-captured', command='conversation.open',
+            args={'shortcut_id': self.link['id'], 'expected_profile_id': self.b['id']}))
+        self.assertTrue(response['ok'], response)
+        self.assertEqual('request_sent', response['result']['state'])
+        self.assertEqual([self.b['id']], self.shown)
+
     def test_shared_editing_opens_canonical_task_without_closing_other_account(self):
         self.capabilities['shared_record_execution'] = True
         self.source.busy = True

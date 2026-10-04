@@ -13,11 +13,15 @@ CONNECT_CAPABILITIES = (
 )
 
 
-def open_shortcut(center, shortcut_id, capabilities):
+def open_shortcut(center, shortcut_id, capabilities, *, expected_profile_id=None):
     link = next((item for item in center.store.read()['shortcuts']
                  if item['id'] == identifier(shortcut_id)), None)
     if link is None:
         raise ValueError('바로가기를 찾을 수 없습니다.')
+    if expected_profile_id is not None and identifier(expected_profile_id) != link['profile_id']:
+        return dict(state='blocked', access_mode='unavailable', reason='shortcut_profile_changed',
+                    profile_id=identifier(expected_profile_id),
+                    message='바로가기의 연결 프로필이 변경되었습니다. 목록을 확인한 뒤 다시 열어 주세요.')
     profile = center.store.profile(link['profile_id'])
     # An SSH task opens through the desktop's own thread link with its host id
     # (AppTransport.open_conversation); only shared execution supports it.

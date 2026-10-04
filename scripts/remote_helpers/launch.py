@@ -16,7 +16,7 @@ import sys
 import tempfile
 
 
-ROLE_NAME = re.compile(r"agents/cc_(?:gpt_(?:astra|luna|sol|terra)|external_[0-9a-f]{32}_r[0-9]+_[0-9a-f]{12})\.toml")
+ROLE_NAME = re.compile(r"agents/cc_(?:gpt_(?:astra|luna|sol|terra)|preset_[0-9a-f]{24}|external_[0-9a-f]{32}_r[0-9]+_[0-9a-f]{12})\.toml")
 
 
 class ConfigurationConflict(ValueError):
@@ -398,6 +398,10 @@ def run(profile, revision, argv, *, managed_socket=None):
         env = {key: value for key, value in os.environ.items() if not key.startswith("CODEX_") and key not in inherited_auth}
         env.update(_read(profile / "credentials" / (revision + ".json")))
         env["CODEX_HOME"] = str(codex_home)
+        env['CODEX_MANAGER_DEFINITION_REVISION'] = revision
+        if (definition / 'manager-execution-authority.json').is_file():
+            from execution_presets import runtime_path
+            env['CODEX_MANAGER_EXECUTION_PRESETS'] = str(runtime_path(profile, revision))
         if descriptor.get('managed_sources') is True:
             from managed_sources import generate
             shared_catalog = descriptor.get('source_catalog') is True
@@ -435,7 +439,13 @@ def run(profile, revision, argv, *, managed_socket=None):
 if __name__ == "__main__":
     profile = Path(os.environ.get("CODEX_MANAGER_PROFILE_DIR", str(Path(__file__).resolve().parent))).resolve()
     try:
-        if sys.argv[-1:] == ["--configure"]:
+        if sys.argv[-1:] == ['--publish-execution-presets']:
+            from execution_presets import MAX_REQUEST_BYTES, publish
+            incoming = sys.stdin.buffer.read(MAX_REQUEST_BYTES + 1)
+            if len(incoming) > MAX_REQUEST_BYTES or len(sys.argv) != 3:
+                raise ValueError('execution preset publication request')
+            print(json.dumps(publish(profile, sys.argv[1], json.loads(incoming))))
+        elif sys.argv[-1:] == ["--configure"]:
             incoming = sys.stdin.buffer.read(4 * 1024 * 1024 + 1)
             if len(incoming) > 4 * 1024 * 1024:
                 raise ValueError("payload too large")

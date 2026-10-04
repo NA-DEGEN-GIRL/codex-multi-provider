@@ -125,11 +125,14 @@ class ProfileOpeningTests(unittest.TestCase):
 
     def test_manager_close_cancels_pending_preloads(self):
         self.center.dispatch('manager.stop_warmup',{})
+        self.center.instances.stop_launches.assert_called_once_with()
+        self.center.restarts.pause_local.assert_called_once_with()
         self.center.profile_warmup.shutdown.assert_called_once_with()
 
     def test_failed_full_exit_resumes_launches_and_warmup_admission(self):
         self.center.dispatch('manager.resume_launches',{})
         self.center.instances.resume_launches.assert_called_once_with()
+        self.center.restarts.resume_local.assert_called_once_with()
         self.center.profile_warmup.resume.assert_called_once_with()
 
     def test_cleanup_is_scoped_to_the_requested_current_generation(self):

@@ -617,6 +617,10 @@ class RemoteMaintenance:
         publish_started keeps that host on its previous binding. Lifecycle and
         start failures stay fatal for the whole cohort.
         """
+        if profile.get('auth_mode') == 'claude_code' and entries:
+            from .remote import supports_remote_claude
+            if not supports_remote_claude(self.root):
+                raise UpdateError('claude_remote_runtime_required', 'Claude SSH 실행을 지원하는 원격 런타임 준비가 필요합니다.')
         check_current = lifecycle_guard or (lambda: None)
         check_current()
         allowed = ('closed', 'prepared', 'start_requested', 'started') + (

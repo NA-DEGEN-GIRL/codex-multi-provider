@@ -61,7 +61,7 @@ def _retire_unselected_roles(home, files):
         if isinstance(role, dict) and isinstance(role.get('config_file'), str):
             selected.add((home / role['config_file']).resolve())
     for path in directory.glob('cc_*.toml'):
-        if path in selected or not re.fullmatch(r'cc_(?:gpt_(?:astra|sol|terra|luna)|external_[0-9a-f]{32}_r\d+_[0-9a-f]{12})', path.stem):
+        if path in selected or not re.fullmatch(r'cc_(?:gpt_(?:astra|sol|terra|luna)|external_[0-9a-f]{32}_r\d+_[0-9a-f]{12}|preset_[0-9a-f]{24})', path.stem):
             continue
         if path.is_symlink() or path.is_junction() or not path.is_file():
             continue
@@ -98,18 +98,33 @@ def _text(value, label, max_length=160):
     return value.strip()
 
 
-def _endpoint(value):
+def _connection_settings(provider):
+    deployment = provider.get('deployment', 'cloud')
+    auth = provider.get('auth_type', 'api_key')
+    scope = provider.get('execution_scope', 'local' if deployment == 'local' else 'all_hosts')
+    if deployment not in ('cloud', 'local'):
+        raise ProviderError('Provider deployment must be cloud or local.')
+    if auth not in ('api_key', 'none') or (auth == 'none' and deployment != 'local'):
+        raise ProviderError('Authentication may be disabled only for an explicit local provider.')
+    if scope not in ('local', 'all_hosts'):
+        raise ProviderError('Provider execution scope must be local or all_hosts.')
+    return dict(deployment=deployment, auth_type=auth, execution_scope=scope)
+
+
+def _endpoint(value, *, deployment='cloud'):
     value = _text(value, 'Provider URL', 2048)
     try:
         url = urlsplit(value)
-        if (url.scheme != 'https' or not url.hostname or url.username or url.password
+        schemes = ('http', 'https') if deployment == 'local' else ('https',)
+        if (url.scheme not in schemes or not url.hostname or url.username is not None or url.password is not None
                 or url.query or url.fragment or url.port == 0 or '\\' in value
                 or any(c.isspace() for c in value)
                 or any(p in ('.', '..') for p in unquote(url.path).split('/'))):
             raise ValueError()
         url.hostname.encode('idna')
     except (ValueError, UnicodeError):
-        raise ProviderError('Use an HTTPS API URL without credentials, query, fragment, or path traversal.') from None
+        scheme = 'HTTP or HTTPS' if deployment == 'local' else 'HTTPS'
+        raise ProviderError(f'Use an {scheme} API URL without credentials, query, fragment, or path traversal.') from None
     return value.rstrip('/')
 
 
@@ -243,8 +258,8 @@ def _strip_provider_block(text):
             dropping = False
             if inside:
                 for section, pattern in (
-                    ('agents', r'cc_gpt_(?:astra|sol|terra|luna)|cc_external_[0-9a-f]{32}_r[0-9]+_[0-9a-f]{12}'),
-                    ('model_providers', r'cc_[0-9a-f]{32}_r[0-9]+_[0-9a-f]{12}'),
+                    ('agents', r'cc_gpt_(?:astra|sol|terra|luna)|cc_external_[0-9a-f]{32}_r[0-9]+_[0-9a-f]{12}|cc_preset_[0-9a-f]{24}'),
+                    ('model_providers', r'cc_[0-9a-f]{32}_r[0-9]+_[0-9a-f]{12}|claude_code|cc_claude_[0-9a-f]{32}'),
                 ):
                     for name in parsed.get(section, {}):
                         if re.fullmatch(pattern, name):
@@ -348,12 +363,17 @@ class ProviderRegistry:
                 raise ValueError()
             for provider in state['providers']:
                 _uuid(provider['id'], 'Provider ID')
-                _endpoint(provider['base_url'])
+                provider.update(_connection_settings(provider))
+                _endpoint(provider['base_url'], deployment=provider['deployment'])
                 self._secret_path(provider)
             for model in state['models']:
                 _uuid(model['id'], 'Model binding ID')
                 _uuid(model['provider_id'], 'Provider ID')
                 _wire_model(model['wire_model_id'])
+                if model.get('local_preset_id') or model.get('capabilities', {}).get('local_model'):
+                    provider = next((p for p in state['providers'] if p['id'] == model['provider_id']), None)
+                    if provider is None or not model.get('local_preset_id') or self._model(model, provider, model) != model:
+                        raise ValueError('Saved local model capabilities do not match their explicit preset.')
                 # Older manager releases pinned Flash to max. Keep that default,
                 # but expose the provider's supported choices without a key change.
                 if model_settings.is_deepseek(model):
@@ -388,15 +408,19 @@ class ProviderRegistry:
         if not re.fullmatch(r'[A-Za-z0-9._-]+', version):
             raise ProviderError('Adapter version is invalid.')
         pid = _uuid(combined.get('id') or str(uuid.uuid4()), 'Provider ID')
+        connection = _connection_settings(combined)
         return {'id': pid, 'name': _text(combined.get('name'), 'Provider name'),
-                'base_url': _endpoint(combined.get('base_url')), 'protocol': protocol, 'wire_api': protocol,
-                'adapter_id': adapter, 'adapter_version': version, 'auth_type': 'api_key',
+                'base_url': _endpoint(combined.get('base_url'), deployment=connection['deployment']),
+                'protocol': protocol, 'wire_api': protocol,
+                'adapter_id': adapter, 'adapter_version': version, **connection,
                 'credential_ref': (previous or {}).get('credential_ref', 'dpapi:' + pid),
                 'revision': (previous or {}).get('revision', 1)}
 
     def _model(self, data, provider, previous):
         if not isinstance(data, dict):
             raise ProviderError('Model settings must be an object.')
+        from .local_models import apply_preset
+        data = apply_preset(data, provider, previous)
         combined = {**(previous or {}), **data}
         if combined.get('provider_id', provider['id']) != provider['id']:
             raise ProviderError('A model binding cannot be moved to another provider; create a new binding.')
@@ -417,7 +441,10 @@ class ProviderRegistry:
                   'name': name, 'display_name': name, 'reasoning_effort': reasoning, 'reasoning': reasoning,
                   'forced_reasoning_effort': forced, 'capabilities': caps, 'verified': caps['verified'],
                   'revision': (previous or {}).get('revision', 1)}
-        if previous and 'catalog' in previous and previous['wire_model_id'] == wire:
+        if combined.get('local_preset_id'):
+            result['local_preset_id'] = combined['local_preset_id']
+        if (previous and 'catalog' in previous and previous['wire_model_id'] == wire
+                and previous.get('local_preset_id') == result.get('local_preset_id')):
             result['catalog'] = copy.deepcopy(previous['catalog'])
         if model_settings.is_deepseek(result):
             caps.setdefault('context_window', 1048576)
@@ -437,10 +464,13 @@ class ProviderRegistry:
         raise ProviderError('The provider credential reference is not recognized.')
 
     def list(self):
+        from .local_model_presets import list_presets
+        from .local_models import supported_efforts as local_supported_efforts
         state = self._read()
         providers = copy.deepcopy(state['providers'])
         for provider in providers:
             provider['key_saved'] = self._secret_path(provider).is_file()
+            provider['credentials_ready'] = provider['auth_type'] == 'none' or provider['key_saved']
             provider['adapter_available'] = self._supported(provider)
         models = copy.deepcopy(state['models'])
         for model in models:
@@ -448,7 +478,10 @@ class ProviderRegistry:
             model['settings_defaults'] = model_settings.resolve(model)
         for model in models:
             model.pop('catalog', None)
+        presets = [{**preset, 'supported_reasoning_efforts': local_supported_efforts(preset['id'])}
+                   for preset in list_presets()]
         return {'providers': providers, 'models': models, 'revision': state['revision'],
+                'local_presets': presets,
                 'notices': state.get('notices', [])}
 
     def save(self, provider, model):
@@ -468,10 +501,16 @@ class ProviderRegistry:
             prior_model = next((m for m in state['models'] if m['id'] == mid), None)
             saved_provider = self._provider(provider, prior_provider)
             saved_model = self._model(model, saved_provider, prior_model)
+            # A provider is shared by every bound model. Validate the whole set
+            # before changing deployment/auth, not only the edited model.
+            for other in state['models']:
+                if other['provider_id'] == saved_provider['id'] and other['id'] != saved_model['id']:
+                    self._model({}, saved_provider, other)
             provider_changed = prior_provider is not None and saved_provider != prior_provider
             connection_changed = prior_provider is not None and any(
                 saved_provider[k] != prior_provider[k]
-                for k in ('base_url', 'protocol', 'adapter_id', 'adapter_version', 'auth_type'))
+                for k in ('base_url', 'protocol', 'adapter_id', 'adapter_version', 'auth_type',
+                          'deployment', 'execution_scope'))
             if provider_changed:
                 saved_provider['revision'] += 1
             if prior_model and (saved_model != prior_model or provider_changed):
@@ -507,6 +546,8 @@ class ProviderRegistry:
             provider = next((p for p in state['providers'] if p['id'] == provider_id), None)
             if provider is None:
                 raise ProviderError('Provider is not registered.')
+            if provider['auth_type'] == 'none':
+                raise ProviderError('This local provider does not use an API key; select API key authentication before saving one.')
             encrypted = _protect_secret(key.strip().encode('utf-8'))
             # Saving a new manager key never overwrites the legacy lab key.
             provider['credential_ref'] = 'dpapi:' + provider_id
@@ -531,6 +572,9 @@ class ProviderRegistry:
     def _runtime_provider_id(provider):
         # Content hash also pins virtual legacy imports before their first save.
         connection = {k: provider[k] for k in ('base_url', 'protocol', 'adapter_id', 'adapter_version')}
+        settings = _connection_settings(provider)
+        if settings != dict(deployment='cloud', auth_type='api_key', execution_scope='all_hosts'):
+            connection.update(settings)
         digest = hashlib.sha256(_json(connection).encode('utf-8')).hexdigest()[:12]
         return f'cc_{provider["id"].replace("-", "")}_r{provider["revision"]}_{digest}'
 
@@ -555,6 +599,8 @@ class ProviderRegistry:
         environment = {}
         try:
             for provider, _ in selected:
+                if provider['auth_type'] == 'none':
+                    continue
                 name = self._env_name(provider)
                 if name in environment:
                     continue
@@ -596,11 +642,42 @@ class ProviderRegistry:
                                                 for value in model_settings.supported_efforts(model)])
         settings = model_settings.resolve(model)
         info.update(context_window=settings['context_window'], max_context_window=settings['context_window'],
-                    effective_context_window_percent=95,
+                    effective_context_window_percent=100 if model.get('capabilities', {}).get('local_model') else 95,
                     auto_compact_token_limit=settings['context_window'] * settings['auto_compact_percent'] // 100)
         return {'models': [info]}
 
-    def render_for_host(self, config_home, enabled, model_ids, existing_config='', *, primary_model_id=None, primary_settings=None, selection_mode='automatic'):
+    def execution_preset_external(self, role):
+        """Resolve a saved registered model revision, without reading its key."""
+        state = self._read()
+        # Keys are refreshed from the current registered provider at launch.
+        # Never pair that credential with a historical endpoint/auth binding.
+        current = next((item for item in state['providers'] if item['id'] == role['provider_id']), None)
+        if current is None or current['revision'] != role['provider_revision']:
+            raise ProviderError('The saved execution preset provider changed. Save a new preset revision before using its current credential.')
+        for snapshot in (state, *reversed(state.get('history', []))):
+            model = next((item for item in snapshot['models'] if item['id'] == role['model_id']
+                          and item['revision'] == role['model_revision']), None)
+            provider = next((item for item in snapshot['providers'] if item['id'] == role['provider_id']
+                             and item['revision'] == role['provider_revision']), None)
+            if model is not None and provider is not None and model['provider_id'] == provider['id']:
+                if not self._supported(provider) or not model.get('capabilities', {}).get('verified'):
+                    break
+                return copy.deepcopy(provider), copy.deepcopy(model)
+        raise ProviderError('The saved execution preset model revision is unavailable. Save a new preset revision.')
+
+    def execution_preset_http_provider(self, provider):
+        """A trusted provider table for a saved preset role, containing no key."""
+        definition = dict(name=provider['name'], base_url=provider['base_url'], wire_api='responses',
+                          requires_openai_auth=False, supports_websockets=False,
+                          request_max_retries=0, stream_max_retries=0, stream_idle_timeout_ms=60000)
+        if provider['auth_type'] == 'api_key':
+            definition['env_key'] = self._env_name(provider)
+        return self._runtime_provider_id(provider), definition
+
+    def render_for_host(self, config_home, enabled, model_ids, existing_config='', *, primary_model_id=None, primary_settings=None, selection_mode='automatic', claude_profile=None):
+        if claude_profile is not None:
+            from .claude_profiles import render
+            return render(self, config_home, claude_profile, existing_config)
         if type(enabled) is not bool:
             raise ProviderError('External model policy must be true or false.')
         if selection_mode not in ('automatic', 'external_only'):
@@ -620,6 +697,9 @@ class ProviderRegistry:
             raise ProviderError('Profile config path cannot contain parent traversal.')
         state = self._read()
         selected = self._selected(state, list(dict.fromkeys((model_ids if enabled else []) + ([primary_model_id] if primary_model_id else []))))
+        if isinstance(config_path, PurePosixPath) and any(
+                p['deployment'] == 'local' and p['execution_scope'] == 'local' for p, _ in selected):
+            raise ProviderError('A local-scoped provider cannot run on a remote host. Configure that host explicitly or choose all_hosts execution scope.')
         text = _strip_provider_block(existing_config.replace('\r\n', '\n'))
         try:
             parsed = tomllib.loads(text)
@@ -669,7 +749,8 @@ class ProviderRegistry:
             if pid not in written:
                 block += [f'[model_providers.{pid}]', f'name = {_toml(provider["name"])}',
                           f'base_url = {_toml(provider["base_url"])}', 'wire_api = "responses"',
-                          f'env_key = {_toml(self._env_name(provider))}', 'requires_openai_auth = false',
+                          *([f'env_key = {_toml(self._env_name(provider))}'] if provider['auth_type'] == 'api_key' else []),
+                          'requires_openai_auth = false',
                           'supports_websockets = false', 'request_max_retries = 0',
                           'stream_max_retries = 0', 'stream_idle_timeout_ms = 60000', '']
                 written.add(pid)
@@ -691,16 +772,20 @@ class ProviderRegistry:
                              'model_id': model['id'], 'model_revision': model['revision'],
                              'runtime_provider_id': pid, 'role_id': rid, 'wire_model_id': model['wire_model_id'],
                              'reasoning_effort': model['reasoning_effort'], 'base_url': provider['base_url'],
+                             'deployment': provider['deployment'], 'auth_type': provider['auth_type'],
+                             'execution_scope': provider['execution_scope'],
                              'adapter_id': provider['adapter_id'], 'adapter_version': provider['adapter_version']})
         primary = None
         if primary_model_id:
+            from .local_models import effort_aliases as local_effort_aliases
             provider, model = next((p, m) for p, m in selected if m['id'] == primary_model_id)
             model = model_settings.configured(model, primary_settings)
             pid = self._runtime_provider_id(provider)
             primary = dict(model_id=model['id'], model=model['wire_model_id'], model_provider=pid,
                            **model_settings.resolve(model), provider_name=provider['name'],
                            supported_reasoning_efforts=model_settings.supported_efforts(model),
-                           effort_aliases=model_settings.DEEPSEEK_ALIASES if model_settings.is_deepseek(model) else {})
+                           effort_aliases=(local_effort_aliases(model) if model.get('capabilities', {}).get('local_model')
+                                           else model_settings.DEEPSEEK_ALIASES if model_settings.is_deepseek(model) else {}))
             catalog_name = 'catalogs/primary-' + hashlib.sha256(_json(primary).encode()).hexdigest()[:16] + '.json'
             catalog = self._catalog(model)
             if 'catalog' not in model:
@@ -732,7 +817,7 @@ class ProviderRegistry:
                 'enabled': enabled, 'models': [m['id'] for _, m in selected],
                 'providers': list(dict.fromkeys(p['id'] for p, _ in selected)), 'bindings': bindings, 'primary': primary}
 
-    def generate(self, profile_home, enabled, model_ids, *, primary_model_id=None, primary_settings=None, selection_mode='automatic'):
+    def generate(self, profile_home, enabled, model_ids, *, primary_model_id=None, primary_settings=None, selection_mode='automatic', claude_profile=None):
         home = Path(profile_home).resolve()
         parent = (self.directory / 'profiles').resolve()
         if home.name != 'codex' or home.parent.parent != parent:
@@ -744,7 +829,7 @@ class ProviderRegistry:
         with config_lock(home):
             existing = config.read_text(encoding='utf-8-sig') if config.is_file() else ''
             result = self.render_for_host(home, enabled, model_ids, existing, primary_model_id=primary_model_id,
-                                          primary_settings=primary_settings, selection_mode=selection_mode)
+                                          primary_settings=primary_settings, selection_mode=selection_mode, claude_profile=claude_profile)
             for relative in result['files']:
                 path = (home / relative).resolve()
                 if not path.is_relative_to(home):
@@ -769,10 +854,13 @@ class ProviderRegistry:
         """Explicit, billable two-request synthetic tool/stream probe; no workspace data."""
         state = self._read()
         provider, model = self._selected(state, [model_id], require_verified=False)[0]
-        try:
-            key = _unprotect_secret(self._secret_path(provider).read_bytes()).decode('utf-8')
-        except (OSError, ValueError, UnicodeError):
-            raise ProviderError('Save an API key for this provider before testing its connection.') from None
+        key = None
+        if provider['auth_type'] == 'api_key':
+            try:
+                key = _unprotect_secret(self._secret_path(provider).read_bytes()).decode('utf-8')
+            except (OSError, ValueError, UnicodeError):
+                raise ProviderError('Save an API key for this provider before testing its connection.') from None
+        probe_options = {'deployment': 'local'} if provider['deployment'] == 'local' else {}
         nonce = uuid.uuid4().hex
         tool = {'type': 'function', 'name': 'manager_probe', 'description': 'Synthetic connection test; no file or network access.',
                 'parameters': {'type': 'object', 'properties': {'value': {'type': 'string'}},
@@ -784,11 +872,12 @@ class ProviderRegistry:
         # function selection with HTTP 400. Keep the configured reasoning level
         # and require the same actual tool/nonce/follow-up results below; changing
         # tool_choice must not turn this into a text-only connectivity check.
-        first_choice = ('auto' if model_settings.is_deepseek(model) and model['reasoning_effort'] != 'none'
+        first_choice = ('auto' if provider['deployment'] == 'local'
+                        or (model_settings.is_deepseek(model) and model['reasoning_effort'] != 'none')
                         else {'type': 'function', 'name': 'manager_probe'})
         try:
             first = _responses_probe(provider['base_url'], key, {**common, 'input': [prompt],
-                                      'tool_choice': first_choice})
+                                      'tool_choice': first_choice}, **probe_options)
             if not isinstance(first, dict) or not isinstance(first.get('output'), list) or not all(isinstance(i, dict) for i in first['output']):
                 raise ProviderError('Provider returned a malformed synthetic tool response.')
             calls = [item for item in first.get('output', []) if item.get('type') == 'function_call']
@@ -801,7 +890,7 @@ class ProviderRegistry:
             if args != {'value': nonce}:
                 raise ProviderError('The model did not preserve the synthetic tool argument.')
             follow = [prompt, *first['output'], {'type': 'function_call_output', 'call_id': calls[0]['call_id'], 'output': nonce}]
-            second = _responses_probe(provider['base_url'], key, {**common, 'input': follow, 'tool_choice': 'none'})
+            second = _responses_probe(provider['base_url'], key, {**common, 'input': follow, 'tool_choice': 'none'}, **probe_options)
             if not isinstance(second, dict) or not isinstance(second.get('output'), list) or not all(isinstance(i, dict) for i in second['output']):
                 raise ProviderError('Provider returned a malformed synthetic follow-up response.')
             for item in second['output']:
@@ -837,15 +926,17 @@ class ProviderRegistry:
 
 class _NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        raise ProviderError('Provider redirected the verification request; use its final HTTPS API URL.')
+        raise ProviderError('Provider redirected the verification request; use its final configured API URL.')
 
 
-def _responses_probe(base_url, key, payload):
-    url = _endpoint(base_url)
+def _responses_probe(base_url, key, payload, *, deployment='cloud'):
+    url = _endpoint(base_url, deployment=deployment)
     if not url.endswith('/responses'):
         url += '/responses'
-    request = Request(url, data=json.dumps(payload).encode('utf-8'), method='POST',
-                      headers={'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json', 'Accept': 'text/event-stream'})
+    headers = {'Content-Type': 'application/json', 'Accept': 'text/event-stream'}
+    if key is not None:
+        headers['Authorization'] = 'Bearer ' + key
+    request = Request(url, data=json.dumps(payload).encode('utf-8'), method='POST', headers=headers)
     deadline = time.monotonic() + 55
     total, data_lines = 0, []
     try:

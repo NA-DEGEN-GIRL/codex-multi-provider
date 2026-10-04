@@ -66,6 +66,24 @@ class ProfileRestarts:
         self.spawn = spawn or self._spawn
         self.owner_alive = owner_alive
         self.stopping = threading.Event()
+        self.local_paused = False
+        self.local_steps = set()
+
+    def pause_local(self):
+        # Stop admitting local restart steps before the shell closes windows.
+        # Admitted steps finish normally; SSH-only drains remain available.
+        with self.lock:
+            self.local_paused = True
+
+    def resume_local(self):
+        with self.lock:
+            self.local_paused = False
+
+    def shutdown_status(self, state=None):
+        with self.lock:
+            jobs = (self.store.read() if state is None else state).get('profile_restarts', {})
+            pending = sum(not jobs.get(pid, {}).get('remote_background') for pid in self.workers)
+            return dict(paused=self.local_paused, active=len(self.local_steps), pending=pending)
 
     def shutdown(self):
         self.stopping.set()
@@ -88,7 +106,7 @@ class ProfileRestarts:
         # Both entry points take the OS profile claim before self.lock. A
         # waiter must not block the current opener from publishing its worker.
         with _claim(self.store.directory / 'restarts' / (profile_id + '.lock'), self.stopping), self.lock:
-            if self.stopping.is_set():
+            if self.stopping.is_set() or self.local_paused:
                 raise UpdateError('service_stopped', '관리 앱이 종료 중입니다. 다시 연 뒤 적용하세요.')
             profile = self.store.profile(profile_id)
             self.instances.paths(profile)
@@ -146,6 +164,14 @@ class ProfileRestarts:
                 raise ValueError('사용할 계정 프로필을 선택하세요.')
             old = self.store.read().get('profile_restarts', {}).get(profile_id)
             if profile_id in self.workers or (old and old['phase'] not in TERMINAL and self.owner_alive(old)):
+                if (stop_only and old and old.get('remote_background')
+                        and old['phase'] not in TERMINAL):
+                    # An ordinary startup reconcile may be waiting for SSH
+                    # work indefinitely. Explicit full exit must take over
+                    # that same journal, not reject it as a competing update.
+                    if old.get('stop_only') or old.get('stop_requested'):
+                        return deepcopy(old)
+                    return self._convert_to_stop(profile_id, old['id'])
                 if old and old.get('graceful_drain'):
                     stopping = bool(old.get('stop_only') or old.get('stop_requested'))
                     if stopping == stop_only:
@@ -186,7 +212,8 @@ class ProfileRestarts:
                 raise UpdateError('profile_prepare_busy',
                                   '이 프로필의 SSH 설정 적용이 방금 끝났습니다. 다시 종료하면 원격 실행을 종료합니다.')
             before_start = self.hooks.downgrade_remote_reconcile_to_stop(profile_id, job['transaction_id'])
-            return self._write(profile_id, job_id, stop_only=before_start, stop_requested=True, stop_converted=True,
+            return self._write(profile_id, job_id, graceful_drain=True,
+                               stop_only=before_start, stop_requested=True, stop_converted=True,
                                message=('SSH 설정 적용 대신, 이 프로필의 SSH 작업이 끝나면 원격 실행을 종료합니다.'
                                         if before_start else
                                         '이 프로필의 SSH 설정 적용을 마무리하는 중입니다. 끝나는 대로 원격 실행을 종료합니다.'))
@@ -312,6 +339,27 @@ class ProfileRestarts:
                 self.workers.discard(profile_id)
 
     def step(self, profile_id, job_id):
+        with self.lock:
+            job = self.store.read()['profile_restarts'][profile_id]
+            if job['id'] != job_id or job['phase'] in TERMINAL:
+                return True
+            local = not job.get('remote_background')
+            if (local and self.local_paused and job['phase'] == 'waiting'
+                    and not any(job.get(key) for key in (
+                        'transaction_id', 'recovery_transaction_id', 'connection_transaction_id'))):
+                self._write(profile_id, job_id, phase='attention', code='service_stopped',
+                            message='완전 종료를 위해 설정 적용 예약을 멈췄습니다. 다음 실행 시 적용합니다.')
+                return True
+            if local:
+                self.local_steps.add((profile_id, job_id))
+        try:
+            return self._step(profile_id, job_id)
+        finally:
+            if local:
+                with self.lock:
+                    self.local_steps.discard((profile_id, job_id))
+
+    def _step(self, profile_id, job_id):
         """Advance once; False means wait without holding any admission lease."""
         lease = None
         phase = 'observing'
@@ -325,8 +373,15 @@ class ProfileRestarts:
             if job.get('remote_background'):
                 try:
                     if not self.hooks.reconcile_opened_remotes(profile_id, job['transaction_id']):
+                        gate = self.store.read().get('ssh_maintenance', {}).get(profile_id, {})
+                        hosts = gate.get('waiting_hosts', [])
+                        draining = (gate.get('transaction_id') == job['transaction_id']
+                                    and gate.get('graceful_drain') and hosts)
                         self._write(profile_id, job_id, phase='waiting',
-                                    message='로컬 창은 사용할 수 있습니다. 진행 중인 SSH 작업이 끝나기를 기다립니다.')
+                                    message=('원격 Codex 종료 대기 · ' + ', '.join(hosts)
+                                             + '. 이 프로필의 SSH 재연결은 종료 확인 뒤 가능합니다. 로컬 작업은 계속 사용할 수 있습니다.'
+                                             if draining else
+                                             '로컬 창은 사용할 수 있습니다. 진행 중인 SSH 작업이 끝나기를 기다립니다.'))
                         return False
                     finished = self._finish_remote(profile_id, job_id)
                 except (RuntimeError, ValueError, OSError, KeyError) as error:

@@ -148,8 +148,13 @@ class Store:
             atomic_json(self.path, data)
             return deepcopy(result)
 
-    def add_profile(self, alias, usage_account_id=None, source_home=None, *, external_model_id=None, external_settings=None):
+    def add_profile(self, alias, usage_account_id=None, source_home=None, *, external_model_id=None, external_settings=None, claude_settings=None):
         alias = label(alias)
+        if claude_settings is not None:
+            if usage_account_id or source_home or external_model_id:
+                raise ValueError('Claude 로그인은 다른 계정 인증과 함께 등록할 수 없습니다.')
+            from .claude_profiles import settings as validate_claude_settings
+            claude_settings = validate_claude_settings(claude_settings)
         if usage_account_id:
             usage_account_id = identifier(usage_account_id)
         def add(data):
@@ -166,6 +171,10 @@ class Store:
             if external_model_id:
                 profile.update(auth_mode='external', profile_kind='external', runtime_channel='managed',
                                external_model_id=identifier(external_model_id), external_settings=deepcopy(external_settings or {}), alias_authority='manager')
+            if claude_settings is not None:
+                profile.update(auth_mode='claude_code', profile_kind='claude_code', runtime_channel='managed',
+                               claude_settings=deepcopy(claude_settings), alias_authority='manager',
+                               claude_status=dict(logged_in=False, state='login_needed'))
             data['profiles'].append(profile)
             if not data['representative_profile_id']:
                 data['representative_profile_id'] = pid

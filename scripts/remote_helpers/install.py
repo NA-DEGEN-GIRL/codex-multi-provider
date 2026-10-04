@@ -22,7 +22,8 @@ DISPATCHER = '''from pathlib import Path
 import json,os,re,runpy,sys
 sys.dont_write_bytecode=True
 profile=Path(__file__).resolve().parent
-revision=sys.argv[1] if len(sys.argv)>1 else ""
+runner=len(sys.argv)>1 and sys.argv[1]=="claude-runner"
+revision=os.environ.get("CODEX_MANAGER_DEFINITION_REVISION", "") if runner else (sys.argv[1] if len(sys.argv)>1 else "")
 if not re.fullmatch(r"[0-9a-f]{64}",revision): raise SystemExit("Invalid manager revision")
 descriptor=profile/"definitions"/(revision+".json")
 if descriptor.is_symlink(): raise SystemExit("Invalid manager descriptor")
@@ -31,7 +32,7 @@ helpers=Path(data["helpers"])
 if helpers.is_symlink() or helpers.parent.resolve()!=(profile/"helpers").resolve(): raise SystemExit("Invalid manager helpers")
 os.environ["CODEX_MANAGER_PROFILE_DIR"]=str(profile)
 sys.path.insert(0,str(helpers))
-runpy.run_path(str(helpers/"launch.py"),run_name="__main__")
+runpy.run_path(str(helpers/("claude_remote.py" if runner else "launch.py")),run_name="__main__")
 '''
 
 
@@ -152,7 +153,7 @@ def install(stream, base=None):
                 if not re.fullmatch(r"[0-9a-f]{64}", item["sha256"]) or item["mode"] not in (0o600, 0o700):
                     raise ValueError("manifest item invalid")
                 expected[name] = item
-            if not 4 <= len(expected) <= 256:
+            if not 4 <= len(expected) <= 1024:
                 raise ValueError("manifest count invalid")
             if not {"runtime/codex", "runtime/codex-code-mode-host", "runtime/bwrap", "definition/config.toml", "helpers/launch.py", "helpers/common.py", "helpers/native_controller.py"} <= expected.keys():
                 raise ValueError("required member missing")

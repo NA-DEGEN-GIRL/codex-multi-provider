@@ -1,8 +1,20 @@
 # Rust 런타임 복원
 
-`codex-0.153.4-cross-provider.patch`는 공식 OpenAI Codex 기반 커밋부터 현재 작업 공간용 수정까지 포함하는 **누적 패치**입니다. `runtime-source.json`에 기반 커밋, 패치 SHA256, 적용 후 Git 트리 ID를 기록합니다. 외부 에이전트, 공통 기록, 프로젝트 메타데이터, 관리 실행 수명과 프로토콜 스키마 변경을 포함합니다.
+`codex-0.153.4-cross-provider.patch`는 공식 OpenAI Codex 기반 커밋부터 현재 작업 공간용 수정까지 포함하는 **누적 패치**입니다. `runtime-source.json`에 기반 커밋, 패치 SHA256, 적용 후 Git 트리 ID를 기록합니다. 외부 에이전트, 공통 기록, 프로젝트 메타데이터, 관리 실행 수명과 프로토콜 스키마 변경을 포함합니다. 수정 98의 Claude Code 실행기 연결, 계정별 재개 검증, 공통 압축 요약 및 첨부 전달도 포함하며, 관리 앱의 Python 실행기는 루트 `scripts/manager_core/claude_*.py`에 있습니다.
 
 공식 소스를 `upstream/`에 준비한 뒤 실행합니다. 복원 대상은 존재하지 않는 경로여야 합니다.
+
+수정 99는 Claude 실행기의 컨텍스트·압축 값을 선택 사항으로 만들어 공식 CLI 기본값을
+그대로 사용할 수 있도록 하며, 모델 제공자 스키마와 검증 시험도 함께 갱신합니다.
+
+수정 102–103의 작업별 실행 프리셋·교차 하위 에이전트와 SSH 인증 연결도 포함합니다.
+안정/실험 API 스키마는 Linux에서 재생성했으며 Bazel 잠금 갱신 검사를 통과했습니다.
+현재 활성 런타임을 이 패치의 바이너리라고 간주하지 마세요. Windows 실행 정책의 차단,
+네이티브 검사와 후보 빌드·적용 상태는 [수정 103 검증 기록](../docs/design/ssh-execution-presets-103.md)에 구분합니다.
+
+수정 109는 닫힌 watch 채널의 반복 처리와 OTel exporter 종료 대기를 보강합니다.
+Windows/Linux에서 패치의 동일 트리 복원을 확인했지만 새 런타임 바이너리를 배포한 것은
+아닙니다. [수정 109의 검사 범위](../docs/design/shutdown-ssh-package-update-109.md)를 확인하세요.
 
 ```powershell
 python scripts/restore_runtime.py --source upstream --destination runtime

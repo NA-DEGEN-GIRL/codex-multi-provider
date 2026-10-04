@@ -74,6 +74,20 @@ def _needs_maintenance(instance):
     return bool(instance.get('process_id') or instance.get('remote_maintenance_required'))
 
 
+def _activity_blocker(instance):
+    reason = instance.get("update_blocker")
+    message = {
+        "runtime_not_idle": "진행 중인 대화·도구·하위 작업이 있습니다. 작업을 마친 뒤 다시 확인해 주세요.",
+        "remote_runtime_coverage_unverified": "이 프로필의 SSH 실행 상태를 확인하지 못했습니다. SSH 연결 상태를 확인해 주세요.",
+        "remote_runtime_proof_unavailable": "SSH 작업이 끝났는지 확인하지 못했습니다. SSH 연결 상태를 확인한 뒤 다시 시도해 주세요.",
+        "runtime_identity_not_ready": "이 프로필의 실행 상태 보고가 아직 준비되지 않았습니다. 잠시 후 다시 확인해 주세요.",
+        "runtime_admin_not_ready": "이 프로필의 작업 상태를 확인하지 못했습니다. 잠시 후 다시 확인해 주세요.",
+        "runtime_proof_unavailable": "이 프로필의 대화·도구 작업이 끝났는지 확인하는 중 오류가 났습니다. 진행 기록을 확인해 주세요.",
+    }.get(reason, "진행 중인 작업 또는 확인되지 않은 자식·도구 작업이 있습니다.")
+    return {"code": "jobs_not_quiescent", "profile_id": instance.get("profile_id", instance.get("id")),
+            "reason": reason, "message": message}
+
+
 def version_tuple(value: str) -> tuple[int, int, int, int]:
     if not isinstance(value, str) or not re.fullmatch(r"\d+\.\d+\.\d+\.\d+", value):
         raise UpdateError("invalid_version", "패키지 버전 형식을 확인할 수 없습니다.")
@@ -208,10 +222,18 @@ def _powershell(script: str, timeout=30) -> str:
     shell = shutil.which("powershell.exe") or shutil.which("pwsh.exe")
     if not shell:
         raise UpdateError("unsupported_platform", "Windows PowerShell을 찾을 수 없습니다.")
+    # A manager launched by PowerShell 7 inherits its module search path. Passing
+    # that path to Windows PowerShell 5 can load the incompatible PS7 Security
+    # module, making signature verification fail before installation. Let the
+    # selected shell construct its own default module path. All commands used by
+    # this helper are Windows/PowerShell built-ins; no caller modules are needed.
+    environment = {key: value for key, value in os.environ.items()
+                   if key.casefold() != 'psmodulepath'}
     result = subprocess.run(
         [shell, "-NoProfile", "-NonInteractive", "-Command",
          "$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new(); " + script],
         capture_output=True, encoding="utf-8", errors="replace", timeout=timeout,
+        env=environment,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     if result.returncode:
@@ -234,6 +256,31 @@ def installed_package() -> dict:
     return result
 
 
+def _image_path(pid):
+    """Full image path through PROCESS_QUERY_LIMITED_INFORMATION, or None."""
+    if os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.QueryFullProcessImageNameW.argtypes = (wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+                                                   ctypes.POINTER(wintypes.DWORD))
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    handle = kernel32.OpenProcess(0x1000, False, pid)
+    if not handle:
+        return None
+    try:
+        size = wintypes.DWORD(32768)
+        buffer = ctypes.create_unicode_buffer(size.value)
+        if not kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+            return None
+        return buffer.value or None
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def package_processes(installed: dict, managed_root=None) -> list[dict]:
     """Inventory only process identity, never command lines or credentials."""
     raw = _powershell(
@@ -249,6 +296,11 @@ def package_processes(installed: dict, managed_root=None) -> list[dict]:
         "ConvertTo-Json -Compress")
     values = json.loads(raw) if raw else []
     values = values if isinstance(values, list) else [values]
+    for value in values:
+        # WMI leaves ExecutablePath empty for an elevated process of this
+        # user; the limited query still names its image.
+        if not value.get("executable") and type(value.get("process_id")) is int:
+            value["executable"] = _image_path(value["process_id"])
     prefix = installed["install_location"].replace("/", "\\").rstrip("\\").casefold() + "\\"
     # Unknown executable paths are intentionally not assumed safe.
     def managed(executable):
@@ -258,8 +310,13 @@ def package_processes(installed: dict, managed_root=None) -> list[dict]:
         return (path.is_relative_to(Path(managed_root).resolve())
                 and path.name.casefold() == 'chatgpt.exe'
                 and (path.parent / 'manager-desktop.json').is_file())
+    def official(executable):
+        # Older package processes can remain after a Store update and still
+        # share the package identity that the installer is about to replace.
+        path = executable.replace("/", "\\").casefold()
+        return path.startswith(prefix) or "\\windowsapps\\openai.codex_" in path
     return [p for p in values if not p.get("executable") or
-            p["executable"].replace("/", "\\").casefold().startswith(prefix) or managed(p["executable"])]
+            official(p["executable"]) or managed(p["executable"])]
 
 
 def _sha256(path: Path) -> str:
@@ -293,7 +350,7 @@ def _needs_recovery(transaction: dict) -> bool:
                 or any(i.get("state") == "requested" for i in transaction.get("close_intents", []))
                 or transaction.get("status") in {
                     "recovery_required", "preparing", "closing_instances", "installing",
-                    "restoring_instances", "recovering"})
+                    "restoring_instances", "recovering", "registration_pending"})
 
 
 def _lock_file(path: Path):
@@ -456,7 +513,8 @@ class UpdateManager:
             raise UpdateError("downgrade_rejected", "같거나 이전 버전의 패키지를 설치하지 않습니다.")
         signature = json.loads(_powershell(
             "$s=Get-AuthenticodeSignature -LiteralPath " + _ps_quote(str(path)) + "; "
-            "@{status=$s.Status.ToString(); signer=$s.SignerCertificate.Subject} | ConvertTo-Json -Compress"))
+            "@{status=$s.Status.ToString(); signer=$s.SignerCertificate.Subject} | ConvertTo-Json -Compress",
+            timeout=120))
         if signature.get("status") != "Valid" or not signature.get("signer"):
             raise UpdateError("untrusted_signature", "다운로드한 패키지의 Windows 서명이 유효하지 않습니다.")
         return {"identity": identity, "signature": signature, "sha256": digest}
@@ -498,14 +556,18 @@ class UpdateManager:
                 blockers.append({"code": "process_identity_unverified", "profile_id": profile_id,
                                  "message": "프로필의 실제 프로세스 식별자를 확인하지 못했습니다."})
             if instance.get("job_state") != "idle" or instance.get("idle_verified") is not True:
-                blockers.append({"code": "jobs_not_quiescent", "profile_id": profile_id,
-                                 "message": "진행 중인 작업 또는 확인되지 않은 자식·도구 작업이 있습니다."})
+                blockers.append(_activity_blocker(instance))
             if not self.close_instance or not self.restore_instance or not self.snapshot_instances:
                 blockers.append({"code": "restart_hooks_unavailable", "profile_id": profile_id,
                                  "message": "프로필 종료·재개 연결이 아직 준비되지 않았습니다."})
             if not self.acquire_maintenance or not self.release_maintenance:
                 blockers.append({"code": "maintenance_barrier_unavailable", "profile_id": profile_id,
                                  "message": "업데이트 동안 새 작업 시작을 막는 연결이 필요합니다."})
+        aliases = {i.get("profile_id", i.get("id")): i.get("alias") for i in instances}
+        for blocker in blockers:
+            alias = aliases.get(blocker.get("profile_id"))
+            if alias:
+                blocker["profile_alias"] = alias
         return blockers
 
     def _compatibility(self, latest: dict) -> dict:
@@ -519,7 +581,7 @@ class UpdateManager:
         except Exception:
             return {"compatible": False, "message": "패치 런타임 호환 상태를 확인하지 못했습니다."}
 
-    def plan(self, instances) -> dict:
+    def plan(self, instances=None) -> dict:
         """Persist a server-owned plan. UI may later submit only its plan_id."""
         check = self._latest_check()
         plan = {
@@ -536,6 +598,21 @@ class UpdateManager:
             else:
                 plan["blockers"].append({"code": check["status"], "message": check["message"]})
         else:
+            from .managed_package_update import inspect as inspect_isolation, MODE
+            isolation = inspect_isolation(self, plan['installed'])
+            if isolation is not None:
+                plan.update(mode=MODE, isolation=isolation, instances=[],
+                    blockers=isolation['blockers'], managed_versions=isolation['managed_versions'],
+                    phases=['verify_isolated_desktop', 'prepare', 'official_install',
+                            'verify_installed', 'verify_preserved_desktop'])
+                if plan['blockers']:
+                    plan['message'] = plan['blockers'][0]['message']
+                else:
+                    plan.update(status='ready', message='공식 Codex 업데이트를 준비합니다. Windows가 사용 중인 앱의 교체는 다음 실행까지 기다리며, 작업 공간은 검증된 관리용 버전을 계속 사용합니다.')
+                _atomic_json(self.directory / 'plans' / (plan['plan_id'] + '.json'), plan)
+                return plan
+            if instances is None:
+                instances = self.snapshot_instances() if self.snapshot_instances else []
             snapshots = copy.deepcopy(list(instances))
             plan["instances"] = snapshots
             plan["blockers"] = self._blockers(snapshots, plan["installed"])
@@ -592,6 +669,9 @@ class UpdateManager:
         if trusted["status"] != "ready" or trusted["expires_at"] < time.time():
             return {"status": "blocked", "code": "plan_not_ready",
                     "message": "업데이트 조건을 다시 확인해야 합니다.", "blockers": trusted.get("blockers", [])}
+        if trusted.get('mode') == 'official_package_only':
+            from .managed_package_update import apply as apply_package_only
+            return apply_package_only(self, trusted, path)
         self.directory.mkdir(parents=True, exist_ok=True)
         lock = self.directory / "apply.lock"
         try:
@@ -844,6 +924,9 @@ class UpdateManager:
             transaction = self.status()
             if not _needs_recovery(transaction):
                 return transaction
+            if transaction.get('mode') == 'official_package_only':
+                from .managed_package_update import recover as recover_package_only
+                return recover_package_only(self, transaction)
             actual = self.inventory()
             validate_identity(actual)
             proof = self.verify_recovery(copy.deepcopy(transaction), copy.deepcopy(actual)) if self.verify_recovery else {}

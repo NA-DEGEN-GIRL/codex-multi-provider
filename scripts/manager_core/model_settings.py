@@ -7,6 +7,8 @@ DEEPSEEK_ALIASES = {'minimal': 'low', 'medium': 'high', 'xhigh': 'high', 'ultra'
 
 
 def is_deepseek(model):
+    if model.get('capabilities', {}).get('local_model'):
+        return False  # Local checkpoint capabilities take precedence over cloud aliases.
     return model.get('wire_model_id', model.get('model', '')).lower().startswith(('deepseek-flash', 'deepseek-v4-'))
 
 
@@ -23,6 +25,9 @@ def supported_efforts(model):
 
 
 def normalize_effort(model, effort):
+    if model.get('capabilities', {}).get('local_model'):
+        from .local_models import effort_aliases
+        effort = effort_aliases(model).get(effort, effort)
     if is_deepseek(model):
         effort = DEEPSEEK_ALIASES.get(effort, effort)
     if effort not in supported_efforts(model):
@@ -31,6 +36,11 @@ def normalize_effort(model, effort):
 
 
 def context_limit(model):
+    if model.get('capabilities', {}).get('local_model'):
+        maximum = model['capabilities'].get('published_max_context')
+        if type(maximum) is not int or maximum < 4096:
+            raise ValueError('로컬 모델의 최대 컨텍스트 사양을 먼저 확인하세요.')
+        return maximum
     return model.get('capabilities', {}).get('context_window',
         model.get('catalog', {}).get('context_window', 1048576 if is_deepseek(model) else 32768))
 
@@ -45,6 +55,8 @@ def resolve(model, settings=None):
     percent = settings.get('auto_compact_percent', model.get('auto_compact_percent', 90))
     if type(context) is not int or not 4096 <= context <= maximum:
         raise ValueError(f'컨텍스트는 4,096~{maximum:,} 토큰 범위로 입력하세요.')
+    if model.get('capabilities', {}).get('local_model') and context != maximum:
+        raise ValueError(f'로컬 모델은 최대 컨텍스트 {maximum:,} 토큰을 유지합니다. 서버의 최대 길이를 확인하세요.')
     # The native runtime caps auto-compaction at 90% of the raw context window.
     if type(percent) is not int or not 10 <= percent <= 90:
         raise ValueError('자동 압축 기준은 컨텍스트의 10~90%로 설정하세요.')
@@ -63,6 +75,8 @@ def configured(model, settings=None):
 
 def render_options(profile):
     options = {}
+    if profile.get('auth_mode') == 'claude_code':
+        return {'claude_profile': {'id': profile['id'], 'settings': profile.get('claude_settings', {})}}
     if profile.get('auth_mode') == 'external':
         options.update(primary_model_id=profile['external_model_id'], primary_settings=profile.get('external_settings'))
     if profile.get('policy', {}).get('selection_mode') == 'external_only':

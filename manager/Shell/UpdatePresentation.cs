@@ -5,7 +5,7 @@ namespace Codex.ControlCenter.Shell;
 internal static class UpdatePresentation
 {
     public static bool CanInstall(JsonElement result) => !result.B("worker_active") &&
-        result.S("status") is "available" or "update_available" or "recovery_required" or "failed_restore";
+        result.S("status") is "available" or "update_available" or "registration_pending" or "recovery_required" or "failed_restore";
 
     public static string Summary(JsonElement result)
     {
@@ -14,6 +14,8 @@ internal static class UpdatePresentation
             foreach (var entry in result.Arr(field))
             {
                 var message = entry.ValueKind == JsonValueKind.String ? entry.GetString()! : entry.Message();
+                if (entry.ValueKind == JsonValueKind.Object && entry.S("profile_alias") is { Length: > 0 } alias)
+                    message = $"[{alias}] {message}";
                 if (!lines.Contains(message)) lines.Add(message);
             }
         return string.Join("\n", lines);

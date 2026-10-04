@@ -230,7 +230,18 @@ mod execution_authority_tests {
 
 pub fn atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write;
-    std::fs::create_dir_all(path.parent().ok_or(io::ErrorKind::InvalidInput)?)?;
+    use std::os::windows::ffi::OsStrExt;
+
+    let file_name = path.file_name().ok_or(io::ErrorKind::InvalidInput)?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    // Rust canonicalization returns an absolute extended-length Windows path,
+    // including the correct UNC form. Normalize the existing parent because
+    // the destination may not exist yet, and use it for both rename operands.
+    let path = std::fs::canonicalize(parent)?.join(file_name);
     let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
     let result = (|| {
         let mut file = std::fs::OpenOptions::new()
@@ -240,13 +251,15 @@ pub fn atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
+        let source: Vec<u16> = temporary.as_os_str().encode_wide().chain(Some(0)).collect();
+        let destination: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
         unsafe {
             use windows_sys::Win32::Storage::FileSystem::{
                 MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
             };
             if MoveFileExW(
-                wide(&temporary.to_string_lossy()).as_ptr(),
-                wide(&path.to_string_lossy()).as_ptr(),
+                source.as_ptr(),
+                destination.as_ptr(),
                 MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
             ) == 0
             {
@@ -259,4 +272,34 @@ pub fn atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
         let _ = std::fs::remove_file(temporary);
     }
     result
+}
+
+#[cfg(test)]
+mod atomic_tests {
+    use super::atomic;
+    use std::os::windows::ffi::OsStrExt;
+
+    #[test]
+    fn creates_and_replaces_long_unicode_paths_without_temporary_files() {
+        let root = tempfile::tempdir().unwrap();
+        let mut directory = root.path().join("작업 메모 📝");
+        while directory.as_os_str().encode_wide().count() < 300 {
+            directory = directory.join("깊은 폴더-0123456789");
+        }
+        let path = directory.join("저장할 메모 📝.json");
+        assert!(path.as_os_str().encode_wide().count() > 260);
+
+        let original = "{\"메모\":\"처음 저장\"}".as_bytes();
+        atomic(&path, original).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+
+        let replacement = "{\"메모\":\"변경된 내용 📝\"}".as_bytes();
+        atomic(&path, replacement).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), replacement);
+        let entries: Vec<_> = std::fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![path.file_name().unwrap().to_os_string()]);
+    }
 }

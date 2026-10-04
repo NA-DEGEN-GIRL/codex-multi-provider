@@ -2,6 +2,7 @@
 from pathlib import Path
 import os
 import sys
+import json
 
 if __package__ in (None, ''):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -9,7 +10,7 @@ if __package__ in (None, ''):
 from manager_core.instances import process_identity
 from manager_core.package_install import digest, read_request
 from manager_core.store import atomic_json
-from manager_core.updates import UpdateManager, _lock_file, _unlock_file, _powershell, _ps_quote
+from manager_core.updates import UpdateError, UpdateManager, _lock_file, _unlock_file, _powershell, _ps_quote
 
 
 def perform_install(root, request, dispatching):
@@ -17,11 +18,17 @@ def perform_install(root, request, dispatching):
     UpdateManager(root)._validate_download(package, request['package_sha256'], request['installed_before'], request['target'])
     dispatching()
     # Keep the final byte check in the same PowerShell process that invokes the
-    # official cmdlet. No force-close, downgrade, unsigned or deferred options.
-    _powershell('$p=' + _ps_quote(str(package)) + '; '
+    # official cmdlet. Deferred registration preserves active applications.
+    defer = ' -DeferRegistrationWhenPackagesAreInUse' if request.get('defer_registration') is True else ''
+    output = _powershell('$p=' + _ps_quote(str(package)) + '; '
         'if((Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToLower() -ne '
         + _ps_quote(request['package_sha256']) + "){throw 'Package changed'}; "
-        'Add-AppxPackage -Path $p -ErrorAction Stop', timeout=None)
+        'try {Add-AppxPackage -Path $p' + defer + ' -ErrorAction Stop; '
+        "@{status='command_completed'} | ConvertTo-Json -Compress} catch {"
+        "if($_.Exception.Message -match '0x80073D02' -or $_.ErrorDetails.Message -match '0x80073D02'){"
+        "@{status='package_in_use'} | ConvertTo-Json -Compress}else{throw}}", timeout=None)
+    if output and json.loads(output).get('status') == 'package_in_use':
+        raise UpdateError('package_in_use', 'Windows가 실행 중인 Codex의 교체를 보류했습니다.')
 
 
 def run_job(path, *, execute=perform_install):
@@ -53,9 +60,11 @@ def run_job(path, *, execute=perform_install):
             receipt['phase'] = 'succeeded'
             atomic_json(receipt_path, receipt)
             return 0
-        except Exception:
+        except Exception as error:
             # Cmdlet errors after dispatch do not prove deployment service exit.
             receipt['phase'] = 'failed' if dispatched else 'rejected_before_install'
+            if dispatched and isinstance(error, UpdateError) and error.code == 'package_in_use':
+                receipt.update(phase='rejected_package_in_use', result_code='package_in_use')
             atomic_json(receipt_path, receipt)
             return 1
     finally:

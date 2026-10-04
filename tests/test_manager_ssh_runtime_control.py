@@ -69,6 +69,23 @@ class ControlTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             endpoint_id(self.profile_id, '../remote-dev')
 
+    def test_preset_status_requires_current_stream_and_actual_capability(self):
+        self.control.binding = {'profileId': self.profile_id, 'hostAlias': 'dev', 'revision': 'a' * 64}
+        params = {'threadId': self.thread_id}
+        unknown = self.control.dispatch('manager/executionPresets/status', params, 1, None)
+        self.assertEqual({'known': False, 'executionPreset': None, 'version': 0,
+                          'sshBinding': self.control.binding}, unknown)
+        self.control.auth.execution_presets_version = 1
+        preset = {'id': str(uuid4()), 'revision': 2}
+        self.control.process('runtime', {'method': 'thread/settings/updated', 'params': {
+            'threadId': self.thread_id, 'threadSettings': {'executionPreset': preset}}})
+        applied = self.control.dispatch('manager/executionPresets/status', params, 1, None)
+        self.assertEqual({'known': True, 'executionPreset': preset, 'version': 1,
+                          'sshBinding': self.control.binding}, applied)
+        self.control.observer.gap()
+        with self.assertRaises(AdminError):
+            self.control.dispatch('manager/executionPresets/status', params, 1, None)
+
 
 class NotificationTests(unittest.TestCase):
     def test_native_opt_out_events_still_update_observer_without_reaching_frontend(self):

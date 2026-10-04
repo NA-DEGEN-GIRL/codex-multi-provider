@@ -43,9 +43,9 @@ _MAX_TIMEOUT = 120.0
 _PREFIX = 'codex-manager-admin:'
 _PIPE_PREFIX = r'\\.\pipe\Codex.ControlCenter.Admin.'
 _LOCAL_METHODS = frozenset({'manager/maintenance/acquire', 'manager/maintenance/status', 'manager/maintenance/release'})
-_METHODS = frozenset({'thread/managedCloseIdle', 'thread/managedReloadBinding', 'thread/managedIdleStatus',
-                      'thread/loaded/list', 'thread/read'}) | _LOCAL_METHODS
-_MUTATIONS = frozenset({'thread/managedCloseIdle', 'thread/managedReloadBinding',
+_METHODS = frozenset({'thread/managedCloseIdle', 'thread/managedReloadBinding', 'thread/managedIdleStatus', 'thread/settings/update',
+                      'thread/loaded/list', 'thread/read', 'manager/executionPresets/status'}) | _LOCAL_METHODS
+_MUTATIONS = frozenset({'thread/managedCloseIdle', 'thread/managedReloadBinding', 'thread/settings/update',
                         'manager/maintenance/acquire', 'manager/maintenance/release'})
 _ERRORS = frozenset({'invalid_request', 'unavailable', 'stale_runtime', 'not_ready',
                      'busy', 'timeout', 'runtime_error', 'invalid_response', 'closed'})
@@ -112,6 +112,22 @@ def validate_request(method, params):
     """Reject extra arguments; admin is not a general-purpose RPC tunnel."""
     if not isinstance(method, str) or method not in _METHODS or not isinstance(params, dict):
         raise AdminError('invalid_request')
+    if method == 'manager/executionPresets/status':
+        if set(params) != {'threadId'}:
+            raise AdminError('invalid_request')
+        return {'threadId': _uuid(params['threadId'])}
+    if method == 'thread/settings/update':
+        # The manager can select an approved preset only. This is deliberately
+        # not a general settings/permissions RPC tunnel.
+        if set(params) != {'threadId', 'executionPreset'}:
+            raise AdminError('invalid_request')
+        preset = params['executionPreset']
+        if preset is not None:
+            if (not isinstance(preset, dict) or set(preset) != {'id', 'revision'}
+                    or type(preset.get('revision')) is not int or not 0 < preset['revision'] <= 2**53 - 1):
+                raise AdminError('invalid_request')
+            preset = {'id': _uuid(preset['id']), 'revision': preset['revision']}
+        return {'threadId': _uuid(params['threadId']), 'executionPreset': preset}
     if method in _LOCAL_METHODS:
         if method == 'manager/maintenance/status' and not params:
             return {}
@@ -167,6 +183,25 @@ def sanitize_result(method, params, value):
     try:
         if not isinstance(value, dict):
             raise ValueError()
+        if method == 'manager/executionPresets/status':
+            if type(value.get('known')) is not bool or type(value.get('version')) is not int or value['version'] not in (0, 1):
+                raise ValueError()
+            preset = validate_request('thread/settings/update', {
+                'threadId': params['threadId'], 'executionPreset': value['executionPreset']})['executionPreset']
+            if not value['known'] and preset is not None:
+                raise ValueError()
+            binding = value['sshBinding']
+            if (not isinstance(binding, dict)
+                    or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', binding.get('hostAlias', ''))
+                    or not re.fullmatch(r'[0-9a-f]{64}', binding.get('revision', ''))):
+                raise ValueError()
+            return {'known': value['known'], 'version': value['version'], 'executionPreset': preset,
+                    'sshBinding': {'profileId': _uuid(binding['profileId']),
+                                   'hostAlias': binding['hostAlias'], 'revision': binding['revision']}}
+        if method == 'thread/settings/update':
+            if value:
+                raise ValueError()
+            return {}  # Queue acknowledgement, not proof that the next turn used it.
         if method in _LOCAL_METHODS:
             booleans = ('held', 'frontendMutationBlocked', 'initialized', 'streamComplete', 'accountReady', 'connected')
             if any(type(value.get(key)) is not bool for key in booleans):

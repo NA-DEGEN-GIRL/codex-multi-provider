@@ -44,6 +44,8 @@ def read_request(path, *, verify_worker=False):
             or any(not isinstance(value.get(key), str) or not HASH.fullmatch(value[key])
                    for key in ('nonce', 'package_sha256', 'worker_sha256'))):
         raise ValueError('Invalid installer request identity')
+    if 'defer_registration' in value and type(value['defer_registration']) is not bool:
+        raise ValueError('Invalid deferred registration option')
     validate_identity(value['installed_before'])
     validate_identity(value['target'], value['installed_before'])
     package = Path(value['package_path'])
@@ -78,6 +80,8 @@ class PackageInstaller:
             worker_sha256=digest(Path(__file__).with_name('install_worker.py')),
             installed_before={k: transaction['installed_before'][k] for k in IDENTITY_FIELDS if k in transaction['installed_before']},
             target={k: transaction['target'][k] for k in IDENTITY_FIELDS if k in transaction['target']})
+        if transaction.get('defer_registration') is True:
+            request['defer_registration'] = True
         atomic_json(path, request)
         read_request(path, verify_worker=True)
         reference = dict(version=1, job_id=job_id, request_sha256=digest(path), package_sha256=package_sha256)
@@ -93,6 +97,8 @@ class PackageInstaller:
             return
         if proof.get('installer_settled') and proof.get('installer_phase') == 'rejected_before_install':
             raise UpdateError('installer_preflight_failed', '설치 전 패키지 확인에 실패했습니다. 설치 명령은 실행되지 않았습니다.')
+        if proof.get('installer_settled') and proof.get('installer_result_code') == 'package_in_use':
+            raise UpdateError('package_in_use', 'Windows가 사용 중인 Codex의 교체를 보류했습니다. 작업을 유지하는 다음 실행 시 적용 방식으로 준비할 수 있습니다.')
         raise UpdateError('installer_result_unknown', 'Windows 설치 결과를 확인해야 합니다. 설치를 반복하지 않았습니다.')
 
     def inspect(self, transaction):
@@ -108,6 +114,7 @@ class PackageInstaller:
             root, request = read_request(path)
             if (root != self.root or digest(path) != reference.get('request_sha256')
                     or request['package_sha256'] != reference.get('package_sha256')
+                    or request.get('defer_registration', False) != transaction.get('defer_registration', False)
                     or any(request[field] != {k: transaction[field][k] for k in IDENTITY_FIELDS if k in transaction[field]}
                            for field in ('installed_before', 'target'))):
                 return result
@@ -121,11 +128,13 @@ class PackageInstaller:
                 return result
             state = self.liveness({'pid': receipt['pid'], 'created': receipt['process_created']})
             phase = receipt.get('phase')
-            if phase not in ('validating', 'dispatching', 'succeeded', 'rejected_before_install', 'failed'):
+            if phase not in ('validating', 'dispatching', 'succeeded', 'rejected_before_install', 'rejected_package_in_use', 'failed'):
                 return result
             result.update(installer_phase=phase, installer_process_state=state)
             if state in ('exited', 'reused') and phase in ('succeeded', 'rejected_before_install'):
                 result['installer_settled'] = True
+            if state in ('exited', 'reused') and phase == 'rejected_package_in_use' and receipt.get('result_code') == 'package_in_use':
+                result.update(installer_settled=True, installer_result_code='package_in_use')
         except (ValueError, RuntimeError, OSError, KeyError, TypeError, IndexError):
             pass
         return result

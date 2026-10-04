@@ -341,6 +341,70 @@ class RemoteDrainConversionTests(unittest.TestCase):
     def names(self):
         return [name for name, _ in self.hooks.calls]
 
+    def test_full_exit_retires_local_wait_without_reopening_then_accepts_remote_stop(self):
+        self.hooks.idle = False
+        job = self.restarts.schedule(self.profile['id'], automatic_key='new-manager',
+                                     expected_generation='gen-1')
+        self.assertFalse(self.step(job))
+        desired = self.store.profile(self.profile['id'])['policy']['desired_revision']
+        self.restarts.pause_local()
+        self.assertEqual(self.restarts.shutdown_status()['pending'], 1)
+        with self.assertRaises(UpdateError):
+            self.restarts.schedule(self.profile['id'])
+        self.pending.pop(0)()
+        self.assertEqual(self.restarts.shutdown_status(), dict(paused=True, active=0, pending=0))
+        self.assertEqual(self.job()['code'], 'service_stopped')
+        self.assertEqual(self.store.profile(self.profile['id'])['policy']['desired_revision'], desired)
+        stopped = self.remote(stop_only=True)
+        self.pending.pop(0)()
+        self.assertEqual(self.job()['id'], stopped['id'])
+        self.assertEqual(self.job()['phase'], 'complete')
+        self.assertNotIn('restore', self.names())
+        self.assertNotIn('close', self.names())
+        self.assertNotIn('remote_start', self.names())
+
+    def test_shutdown_waits_for_admitted_local_observation_before_reporting_quiescence(self):
+        entered, release = threading.Event(), threading.Event()
+        self.hooks.idle = False
+        snapshot = self.hooks.snapshot_instances
+        def observing(**args):
+            entered.set()
+            if not release.wait(5):
+                raise RuntimeError('fixture release timed out')
+            return snapshot(**args)
+        self.hooks.snapshot_instances = observing
+        self.restarts.interval = .001
+        self.restarts.schedule(self.profile['id'])
+        worker = threading.Thread(target=self.pending.pop())
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(5))
+            self.restarts.pause_local()
+            self.assertEqual(self.restarts.shutdown_status(), dict(paused=True, active=1, pending=1))
+        finally:
+            release.set()
+            worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(self.restarts.shutdown_status()['pending'], 0)
+        self.assertEqual(self.job()['code'], 'service_stopped')
+        self.assertNotIn('restore', self.names())
+
+    def test_pause_does_not_discard_an_acquired_restart_transaction(self):
+        job = self.restarts.schedule(self.profile['id'])
+        self.restarts._write(self.profile['id'], job['id'], transaction_id='already-acquired')
+        self.restarts.pause_local()
+        with patch.object(self.restarts, '_step', return_value=False) as advance:
+            self.assertFalse(self.step(job))
+        advance.assert_called_once_with(self.profile['id'], job['id'])
+        self.assertEqual(self.job()['transaction_id'], 'already-acquired')
+        self.assertNotIn('code', self.job())
+
+    def test_cancelled_full_exit_allows_future_local_schedule(self):
+        self.restarts.pause_local()
+        self.restarts.resume_local()
+        job = self.restarts.schedule(self.profile['id'])
+        self.assertEqual(job['phase'], 'waiting')
+
     def test_full_exit_converts_waiting_reopen_drain_into_the_same_stop_job(self):
         self.hooks.remote_busy = True
         job = self.remote()
@@ -453,12 +517,18 @@ class RemoteDrainConversionTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, 'profile_prepare_busy')
         self.assertEqual(self.job()['id'], job['id'])
         self.assertNotIn('stop_requested', self.job())
-        # A local-first open's SSH job is not an explicit drain either.
-        self.store.mutate(lambda d: d['profile_restarts'][self.profile['id']].update(
-            remote_background=True, transaction_id=str(uuid4())))
-        with self.assertRaises(UpdateError):
-            self.remote(stop_only=True)
         self.assertEqual(self.hooks.calls, [])
+
+    def test_ordinary_remote_preparation_can_convert_without_a_local_restart(self):
+        job = self.remote()
+        # Startup preparation did not originally request an explicit drain.
+        self.restarts._write(self.profile['id'], job['id'], graceful_drain=False)
+        stopped = self.remote(stop_only=True)
+        self.assertEqual(stopped['id'], job['id'])
+        self.assertTrue(stopped['stop_only'])
+        self.pending.pop()()
+        self.assertEqual(self.job()['phase'], 'complete')
+        self.assertNotIn('remote_start', self.names())
 
     def test_pending_stop_is_never_upgraded_to_reopen(self):
         self.hooks.remote_busy = True

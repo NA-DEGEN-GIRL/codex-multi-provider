@@ -61,7 +61,9 @@ _NOTIFICATION_SHOW_VARIANTS = {_NOTIFICATION_SHOW: _NOTIFICATION_SHOW_REPLACEMEN
         b'globalThis.__codexManagerNotificationShow(e,t,()=>{if(this.notifications.get(e.id)?.notification===d){'
         b'if(t.isDestroyed()){this.removeNotification(e.id);return}m()}}):m()}')}
 _PIPE_VARIANTS = {_ORIGINAL: _REPLACEMENT,
-    _ORIGINAL.replace(b'return i.join', b'return s.join'): _REPLACEMENT.replace(b'return i.join', b'return s.join')}
+    **{_ORIGINAL.replace(b'return i.join', b'return '+binding+b'.join'):
+       _REPLACEMENT.replace(b'return i.join', b'return '+binding+b'.join')
+       for binding in (b's', b'o')}}  # 26.924 renames the path import to o.
 _RENDERER_VARIANTS = {_CONTEXT_RENDERER: _CONTEXT_RENDERER_REPLACEMENT,
     **{_CONTEXT_RENDERER.replace(b't7.', binding): _CONTEXT_RENDERER_REPLACEMENT.replace(b't7.', binding)
        for binding in (b'F9.', b'R9.', b'L9.')}}
@@ -135,9 +137,17 @@ def patch_archive(source, destination):
         renderers = []
         sync_modules = []
         sync_renderers = []
+        composer_renderers = []
         browser_runtimes = []
         chrome_host = ChromeHostPlan()
         for name, item in entries:
+            if name.startswith('webview/assets/app-primary') and name.endswith('.js') and item['size'] <= 32 * 1024 * 1024:
+                from .desktop_reasoning_ui import patch_composer
+                src.seek(base + int(item['offset']))
+                original = src.read(item['size'])
+                updated = patch_composer(original)
+                if updated != original:
+                    composer_renderers.append((name, item, updated))
             if (name.startswith('.vite/build/') or name.startswith('webview/assets/app-initial')) and name.endswith('.js') and item['size'] <= 32 * 1024 * 1024:
                 src.seek(base + int(item['offset']))
                 data = src.read(item['size'])
@@ -180,6 +190,10 @@ def patch_archive(source, destination):
             ('desktop_network_policy.cjs', 'desktop_window_host.cjs', 'desktop_window_health.cjs'))
         notification_adapter = Path(__file__).with_name('desktop_notification_activation.cjs').read_bytes()
         changed = {name: (target, adapter + b'\n' + data.replace(pipe_pattern, _PIPE_VARIANTS[pipe_pattern]))}
+        if len(composer_renderers) > 1:
+            raise ValueError('Desktop composer effort bundle is ambiguous.')
+        for composer_name, composer_target, composer_data in composer_renderers:
+            changed[composer_name] = (composer_target, composer_data)
         browser_name, browser_target, browser_data = browser_runtimes[0]
         browser_data = changed.get(browser_name, (None, browser_data))[1]
         changed[browser_name] = (browser_target, browser_data.replace(_BROWSER_RUNTIME, _BROWSER_RUNTIME_REPLACEMENT))
@@ -269,6 +283,17 @@ def patch_archive(source, destination):
         chrome_native_host=chrome_native_host)
 
 
+def adapter_identity():
+    """The complete code identity shared by normal publication and upgrades."""
+    adapters = ['desktop_network_policy.cjs', 'desktop_window_host.cjs', 'desktop_window_health.cjs', 'desktop_notification_activation.cjs', 'desktop_task_context.cjs',
+        'desktop_signal_files.cjs', 'desktop_record_sync.cjs', 'desktop_renderer_record_sync.cjs', 'desktop_plugin_renderer_sync.cjs', 'desktop_profile_resume.cjs',
+        'desktop_workspace_sync.cjs', 'desktop_project_membership.cjs', 'desktop_local_workspace_sync.cjs', 'desktop_plugin_sync.cjs', 'desktop_reasoning_ui.py', 'original_sync_bundle.py',
+        'desktop_publication.py', 'desktop_chrome_host.py', 'desktop_managed_upgrade.py']
+    return dict(revision=REVISION,
+        patch=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        adapters={name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest() for name in adapters})
+
+
 def prepare(root, app):
     """Copy program assets once per package version; never copy account data."""
     source = Path(app['executable']).resolve().parent
@@ -277,13 +302,8 @@ def prepare(root, app):
     if not re.fullmatch(r'[0-9.]{1,40}', version):
         raise ValueError('Invalid desktop version.')
     stat = archive.stat()
-    adapters = ['desktop_network_policy.cjs', 'desktop_window_host.cjs', 'desktop_window_health.cjs', 'desktop_notification_activation.cjs', 'desktop_task_context.cjs',
-        'desktop_signal_files.cjs', 'desktop_record_sync.cjs', 'desktop_renderer_record_sync.cjs', 'desktop_plugin_renderer_sync.cjs', 'desktop_profile_resume.cjs',
-        'desktop_workspace_sync.cjs', 'desktop_project_membership.cjs', 'desktop_local_workspace_sync.cjs', 'desktop_plugin_sync.cjs', 'desktop_reasoning_ui.py', 'original_sync_bundle.py',
-        'desktop_publication.py', 'desktop_chrome_host.py']
-    identity = dict(version=version, source=str(source), size=stat.st_size, modified=stat.st_mtime_ns, revision=REVISION,
-        patch=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-        adapters={name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest() for name in adapters})
+    identity = dict(version=version, source=str(source), size=stat.st_size, modified=stat.st_mtime_ns,
+        **adapter_identity())
     key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:16]
     directory = Path(root).resolve() / 'artifacts/managed-desktop' / (version + '-' + key)
     from .desktop_publication import publish

@@ -34,6 +34,37 @@ internal static class ProfileCards
     private const string CardMarkup = """
         <DataTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
                       xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+          <DataTemplate.Resources>
+            <DataTemplate x:Key="ClaudeUsageWindow">
+              <StackPanel Margin="0,5,0,0" ToolTip="{Binding Detail}">
+                <Grid>
+                  <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                  </Grid.ColumnDefinitions>
+                  <TextBlock Text="{Binding Label}" FontSize="12" Foreground="#9FA7B7" TextWrapping="NoWrap"/>
+                  <TextBlock Grid.Column="1" Text="{Binding Text}" FontSize="12" FontWeight="SemiBold"
+                             Foreground="{Binding ValueBrush}" TextWrapping="NoWrap" Margin="6,0,0,0"/>
+                  <ProgressBar Grid.Column="2" Height="3" MinWidth="24" Margin="10,0,0,0" VerticalAlignment="Center"
+                               IsHitTestVisible="False" Background="#2A2E37" Foreground="{Binding ValueBrush}"
+                               BorderThickness="0" Minimum="0" Maximum="100" Value="{Binding Remaining}"
+                               Visibility="{Binding MeterVisibility}">
+                    <ProgressBar.Template>
+                      <ControlTemplate TargetType="ProgressBar">
+                        <Grid UseLayoutRounding="True">
+                          <Border x:Name="PART_Track" Background="{TemplateBinding Background}" CornerRadius="1.5"/>
+                          <Border x:Name="PART_Indicator" Background="{TemplateBinding Foreground}"
+                                  CornerRadius="1.5" HorizontalAlignment="Left"/>
+                        </Grid>
+                      </ControlTemplate>
+                    </ProgressBar.Template>
+                  </ProgressBar>
+                </Grid>
+                <TextBlock Text="{Binding ResetText}" FontSize="11" Foreground="#8E9BB2" TextWrapping="NoWrap" Margin="0,3,0,0"/>
+              </StackPanel>
+            </DataTemplate>
+          </DataTemplate.Resources>
           <Grid x:Name="ProfileCard">
             <Grid.ColumnDefinitions>
               <ColumnDefinition Width="16"/>
@@ -74,6 +105,9 @@ internal static class ProfileCards
                              VerticalAlignment="Center"/>
                 </StackPanel>
               </Grid>
+              <TextBlock Text="{Binding Card.Email}" FontSize="11" Foreground="#9FA7B7" Margin="0,4,0,0"
+                         TextWrapping="NoWrap" TextTrimming="CharacterEllipsis" ToolTip="{Binding Card.Email}"
+                         Visibility="{Binding Card.EmailVisibility}"/>
               <Grid Margin="0,5,0,0" Visibility="{Binding Card.NativeVisibility}">
                 <Grid.ColumnDefinitions>
                   <ColumnDefinition Width="Auto"/>
@@ -122,13 +156,21 @@ internal static class ProfileCards
                 </Grid.ColumnDefinitions>
                 <Border Background="#33291F" CornerRadius="3" Padding="5,1,5,1" Margin="0,0,7,0"
                         VerticalAlignment="Center">
-                  <TextBlock Text="API" FontSize="10" FontWeight="SemiBold" Foreground="#E5B773"
+                  <TextBlock Text="{Binding Card.ProviderBadge}" FontSize="10" FontWeight="SemiBold" Foreground="#E5B773"
                              TextWrapping="NoWrap"/>
                 </Border>
                 <TextBlock Grid.Column="1" Text="{Binding Card.Model}" FontSize="12" Foreground="#9FA7B7"
                            TextWrapping="NoWrap" TextTrimming="CharacterEllipsis" VerticalAlignment="Center"
                            ToolTip="{Binding Card.Model}"/>
               </Grid>
+              <TextBlock Text="{Binding Card.Account}" FontSize="11" Foreground="#9FA7B7" TextWrapping="Wrap"
+                         Margin="0,4,0,0" Visibility="{Binding Card.AccountVisibility}"/>
+              <StackPanel Visibility="{Binding Card.ClaudeUsageVisibility}">
+                <ContentControl Content="{Binding Card.ClaudeFiveHour}" ContentTemplate="{StaticResource ClaudeUsageWindow}"/>
+                <ContentControl Content="{Binding Card.ClaudeWeekly}" ContentTemplate="{StaticResource ClaudeUsageWindow}"/>
+              </StackPanel>
+              <TextBlock Text="{Binding Card.UsageHint}" FontSize="11" Foreground="#8E9BB2" TextWrapping="Wrap"
+                         Margin="0,4,0,0" Visibility="{Binding Card.UsageHintVisibility}"/>
               <!-- Selected task's prompt cache on this profile: warm or cold, minutes left and the
                    first request's rough cost. Wraps rather than trims so the cost stays whole. -->
               <TextBlock Text="{Binding Card.Cache}" FontSize="11" Foreground="{Binding Card.CacheBrush}"

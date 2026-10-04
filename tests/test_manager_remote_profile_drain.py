@@ -53,7 +53,7 @@ class RemoteProfileDrainTests(unittest.TestCase):
         before = deepcopy(peer)
         job = self.schedule()
         self.assertFalse(self.step(job))
-        self.assertEqual(len(self.drains), 1)
+        self.assertEqual([binding['alias'] for binding, _ in self.drains], ['fixture-a', 'fixture-b'])
         self.assertFalse(any(c[0] in ('prepare', 'start', 'stop') for c in self.fleet.calls))
         self.ready = True
         self.assertTrue(self.step(job))
@@ -84,6 +84,66 @@ class RemoteProfileDrainTests(unittest.TestCase):
         self.assertIsNone(self.fleet.running['fixture-a'])
         self.assertIsNotNone(self.fleet.running['fixture-b'])
         self.assertFalse(any(c[0] in ('prepare', 'start') for c in self.fleet.calls))
+
+    def test_first_busy_host_does_not_starve_idle_host_or_release_fence(self):
+        job = self.schedule(stop_only=True)
+        original = self.fleet.request
+        def busy_first(binding, operation, **params):
+            if operation == 'drain':
+                self.ready = binding['alias'] == 'fixture-b'
+            return original(binding, operation, **params)
+        self.fleet.request = busy_first
+        self.assertFalse(self.step(job))
+        self.assertEqual([binding['alias'] for binding, _ in self.drains], ['fixture-a', 'fixture-b'])
+        self.assertIsNotNone(self.fleet.running['fixture-a'])
+        self.assertIsNone(self.fleet.running['fixture-b'])
+        self.assertEqual(self.fx.gate()['state'], 'held')
+        self.assertEqual(self.fx.gate()['waiting_hosts'], ['fixture-a'])
+        self.assertTrue(self.fx.gate()['stop_only'])
+        self.assertIn('fixture-a', self.fx.job()['message'])
+        self.assertFalse(any(c[0] in ('prepare', 'start', 'stop') for c in self.fleet.calls))
+        # A later poll observes the outstanding process only. Completed hosts
+        # are never signalled or started again while their peer is busy.
+        self.assertFalse(self.step(job))
+        self.assertEqual([binding['alias'] for binding, _ in self.drains],
+                         ['fixture-a', 'fixture-b', 'fixture-a'])
+        self.fleet.request = original
+        self.ready = True
+        self.assertTrue(self.step(job))
+        self.assertEqual(self.fx.gate()['state'], 'released')
+        self.assertNotIn('waiting_hosts', self.fx.gate())
+
+    def test_new_policy_during_drain_prevents_signalling_next_host(self):
+        job = self.schedule()
+        original = self.fleet.request
+        def change(binding, operation, **params):
+            result = original(binding, operation, **params)
+            if operation == 'drain':
+                self.store.mutate(lambda d: self.store.profile(self.profile['id'], d)['policy'].update(desired_revision=99))
+            return result
+        self.fleet.request = change
+        self.assertTrue(self.step(job))
+        self.assertEqual(len(self.drains), 1)
+        self.assertEqual(self.fx.job()['phase'], 'attention')
+        self.assertNotIn('waiting_hosts', self.fx.gate())
+
+    def test_progress_does_not_erase_stop_requested_while_remote_reply_is_pending(self):
+        job = self.schedule()
+        original = self.fleet.request
+        converted = []
+        def full_exit(binding, operation, **params):
+            result = original(binding, operation, **params)
+            if operation == 'drain' and not converted:
+                converted.append(self.schedule(stop_only=True))
+            return result
+        self.fleet.request = full_exit
+        self.assertFalse(self.step(job))
+        self.assertTrue(self.fx.job()['stop_only'])
+        self.assertTrue(self.fx.gate()['stop_only'])
+        self.assertEqual(self.fx.gate()['waiting_hosts'], ['fixture-a', 'fixture-b'])
+        self.ready = True
+        self.assertTrue(self.step(job))
+        self.assertFalse(any(c[0] in ('prepare', 'start', 'stop') for c in self.fleet.calls))
 
     def test_new_generation_prevents_signal(self):
         job = self.schedule()
@@ -186,6 +246,81 @@ class RemoteProfileDrainTests(unittest.TestCase):
         shown = self.fx.open()
         self.step(shown['restart'])
         self.assertEqual(self.drains, [])
+
+    def test_full_exit_converts_ordinary_startup_wait_without_losing_journal(self):
+        self.fleet.idle_evidence = True
+        request = self.fleet.request
+        def busy(binding, operation, **params):
+            result = request(binding, operation, **params)
+            if operation == 'inspect' and result.get('process') is not None:
+                result['idle'] = False
+            return result
+        self.fleet.request = busy
+        job = self.fx.open()['restart']
+        self.assertFalse(self.step(job))
+        before = self.lease(job['transaction_id'])
+        stopped = self.schedule(stop_only=True)
+        self.assertEqual(stopped['id'], job['id'])
+        self.assertTrue(stopped['stop_only'])
+        self.assertFalse(self.step(job))  # adopts the explicit stop at a boundary
+        after = self.lease(job['transaction_id'])
+        self.assertEqual(before['profiles'], after['profiles'])
+        self.assertTrue(after['graceful_drain'])
+        self.assertTrue(after['stop_only'])
+        self.assertFalse(self.step(job))
+        self.assertEqual(len(self.drains), 2)
+        self.ready = True
+        self.assertTrue(self.step(job))
+        self.assertEqual(self.fx.job()['phase'], 'complete')
+        self.assertFalse(any(c[0] in ('prepare', 'start', 'stop') for c in self.fleet.calls))
+
+    def test_stop_during_ordinary_reuse_does_not_complete_with_running_listeners(self):
+        job = self.fx.open()['restart']
+        def reuse(profile, records):
+            self.schedule(stop_only=True)
+            return True
+        self.hooks.remote_maintenance.reuse_unchanged = reuse
+        self.assertFalse(self.step(job))
+        self.assertNotEqual(self.fx.job()['phase'], 'complete')
+        self.ready = True
+        self.assertTrue(self.step(job))
+        self.assertTrue(all(p is None for p in self.fleet.running.values()))
+        self.assertFalse(any(c[0] in ('prepare', 'start') for c in self.fleet.calls))
+
+    def test_stop_after_ordinary_start_commit_drains_new_listeners(self):
+        self.fleet.idle_evidence = True
+        job = self.fx.open()['restart']
+        prepare = self.fleet.prepare
+        converted = []
+        def preparing(alias, *args, **kwargs):
+            if not converted:
+                converted.append(self.schedule(stop_only=True))
+            return prepare(alias, *args, **kwargs)
+        self.fleet.prepare = preparing
+        self.assertFalse(self.step(job))
+        self.assertFalse(converted[0]['stop_only'])
+        self.assertNotEqual(self.fx.job()['transaction_id'], job['transaction_id'])
+        self.ready = True
+        self.assertTrue(self.step(job))
+        self.assertTrue(all(p is None for p in self.fleet.running.values()))
+
+    def test_stop_racing_ordinary_reuse_release_keeps_gate_held(self):
+        job = self.fx.open()['restart']
+        self.hooks.remote_maintenance.reuse_unchanged = lambda *_: True
+        mutate = self.store.mutate
+        converted = []
+        def before_release(callback):
+            if callback.__name__ == 'release' and not converted:
+                converted.append(True)
+                self.schedule(stop_only=True)
+            return mutate(callback)
+        with patch.object(self.store, 'mutate', side_effect=before_release):
+            self.assertFalse(self.step(job))
+        self.assertEqual(self.fx.gate()['state'], 'held')
+        self.assertFalse(self.step(job))
+        self.ready = True
+        self.assertTrue(self.step(job))
+        self.assertTrue(all(p is None for p in self.fleet.running.values()))
 
     def test_wrong_generation_and_live_competing_job_are_rejected(self):
         with self.assertRaises(UpdateError):

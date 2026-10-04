@@ -35,6 +35,123 @@
 
 ## 최근 수정
 
+### 수정 113 — GPT 긴 작업의 Claude 전환, Claude 이미지, 공식 앱 업데이트 보류
+
+- 긴 GPT 작업을 Claude로 이어 갈 때 "이식용 요약 + 최근 기록"까지 거부하던 Claude 전달 조건을 고쳤다. 크기 확인 기준을 재구성과
+  맞추고, Claude 검증 요약이 GPT 요약 체크포인트를 지워 요약이 없어지던 경로와, 오래전 중단된 턴 하나가 그 뒤의 모든 요약을
+  버리던 경로를 막았다. 첫 전달 상한은 240,000토큰.
+- 관리용 Windows 런타임을 디버그 빌드 대신 release 빌드로 배포한다. 1.6 GB 기록에서 Claude 턴 시작 전 대기가 60초에서 9초 수준으로 줄었다.
+- Claude 모델 목록이 텍스트 전용으로 알려 이미지 첨부가 막히던 문제를 고쳤다(런타임은 PNG/JPEG를 파일로 전달).
+- 위치를 읽지 못한 다른 계정의 프로세스 때문에 공식 앱만 갱신하는 업데이트가 보류되던 문제를 고쳤다.
+- [원인·변경·검증](design/claude-long-handoff-images-update-113.md).
+
+### 수정 112 — Claude 사용량·긴 대화 전환, 업데이트 재실행 대기
+
+- 로그인되어도 CLI 첫 실행 화면 때문에 비어 있던 Claude 사용량을 별도로 조회한다.
+- 종료 후 패키지 설치 중 다시 실행하면 설치 결과를 확인한 뒤 프로필을 연다.
+- 검증된 Linux 런타임의 안전 종료 허용 목록과 SSH 대기 조회 간격을 보완한다.
+- 긴 대화의 중복 순회·해시·첨부 준비를 줄인다. [원인·변경·검증 경계](design/claude-usage-startup-update-112.md).
+
+### 수정 111 — Claude SSH·프로젝트 신뢰와 앱 내 업데이트 적용
+
+- 준비된 Claude SSH 런타임을 기본 배포에 반영하고, 프리셋 동기화가 SSH 중계기를 재호출하던 경로를 수정합니다.
+- 같은 컴퓨터에서 이미 승인한 프로젝트의 신뢰 설정을 프로필 전환 시 연결합니다. 기존 거부 설정은 유지합니다.
+- 보류된 공식 앱 업데이트를 작업 공간에서 적용하며, 파일 사용 중이면 완전 종료 직후 한 번 적용합니다.
+- [원인·구현·실제 검증과 제한](design/claude-ssh-trust-update-111.md).
+
+### 수정 110 — 설정 예약과 완전 종료 충돌 수정
+
+- 로컬 자동 재시작 예약이 SSH 종료 요청과 관리 서비스 종료를 막던 경로를 수정합니다.
+- 새 서비스는 대기 예약을 정리하고, 이전 서비스는 로컬 창 종료 확인 후 어댑터를 정상 종료·재연결해 SSH 종료를 이어갑니다.
+- 실제 이전 서비스 바이너리로 오류 재현과 격리된 서비스 종료를 확인했습니다. 실제 서버 종료와 공식 패키지 등록 완료를 뜻하지는 않습니다.
+- [원인·종료 순서·검증 범위](design/full-exit-local-restart-110.md).
+
+### 수정 109 — SSH 종료 대기 복구·완전 종료·공식 앱 업데이트 분리
+
+- 원격 종료 예약만 남아도 로컬 완전 종료를 막던 서비스와 이전 서비스 연결 경로를 수정합니다.
+- 검증된 독립 관리용 앱을 유지하면서 공식 Windows 패키지만 업데이트하는 경로를 추가합니다.
+- 멈춘 기존 원격 실행 6개는 백업과 프로세스 신원 확인 후 정리했고 잠금 해제를 확인했습니다.
+- 최종 관리창 `20261004-053808-002` 적용, 고정 Python 검사 89개·파일 해시 218개 검증.
+  공식 앱 `26.930.3930.0`은 Windows 지연 등록 준비 완료이며 조사 시 등록 버전은
+  `26.930.2377.0`입니다. 준비와 실제 적용을 구분해 표시합니다.
+- [원인·설계·검증 및 남은 경계](design/shutdown-ssh-package-update-109.md).
+
+### 수정 108 — 새 플랜 화면 전환·완전 종료·업데이트 안내 수정
+
+- 새 개인 플랜을 인식하지 못해 ChatGPT에서 Codex로 돌아가지 못하는 관리용 화면을 보정했습니다. 일반 SSH 준비 중 완전 종료 요청을 거절하던 경로와, 이전 서비스의 거절 뒤 관리창만 남는 경로도 수정했습니다.
+- 최종 빌드는 `20261004-045528-854`입니다. 고정 빌드 Python 검사 179개, WPF 레이아웃, 실제 ASAR의 플랜 판단 함수 및 고정 파일 217개 해시 검사를 통과했습니다. 다음 실행용으로 게시하며 실행 중인 서비스·프로필은 바꾸지 않습니다. [원인·검증·적용 순서](design/plan-switch-and-full-exit-108.md).
+- 첫 SSH 서버가 종료 대기 중이어도 나머지 서버의 종료를 진행합니다. 모든 종료가 확인되기 전에는 재시작하거나 연결 잠금을 해제하지 않습니다.
+- 관리창에는 대기 서버를 표시하고, 알려진 원격 종료 대기는 일반 연결 시간 초과와 구분합니다.
+- 관련 Python 검사 71개 통과. 실행 중 서비스와 원격 프로세스는 변경하지 않았습니다.
+- 마지막 경쟁 조건 수정 후 drain 검사 18개, 고정 후보 핵심 검사 3개 통과. 후보 `20261004-042100-114` 빌드·패키징 완료, 활성화하지 않았습니다.
+- [확인한 원인·검증 범위·Claude 및 플랜 표시의 남은 문제](design/ssh-drain-progress-108.md).
+- 업데이트 사전 검사의 작업 상태 조회 실패가 관리 중인 Codex를 미관리 실행으로 오인하던 문제를 수정합니다. 프로필별 이유를 펼쳐 볼 수 있게 하며, 작업 진행·호환성 미검증에 따른 차단은 유지합니다. [추가 수정과 검증](design/update-preflight-diagnostics-108.md).
+- 중간 후보 `20261004-044251-802`는 업데이트 Python 검사 86개, WPF 레이아웃, 고정 후보 회귀 4개와 파일 해시 검증을 통과했고, 위 최종 빌드로 대체했습니다.
+
+### 수정 106 — 작업 화면 이동 확인·재시작 없는 자동 복구
+
+- 열기 요청 이후 실제 화면 선택을 확인하고 막힌 경우 기존 창에 직접 이동을 한 번 전달합니다.
+- 선택 변경 시 취소하며, 요청 수신만으로 성공 처리하거나 프로필을 자동 재시작하지 않습니다.
+- 관리 앱 시험 10종과 최종 후보의 작업 전환 검사 29개 통과. 기존 관리 서비스·프로필은 유지합니다.
+- [원인 관찰·검증·관리창만 적용하는 방법](design/shortcut-navigation-recovery-106.md).
+
+### 수정 105 — Claude SSH 연결·원격 실행 준비
+
+- 원격 Claude 지원 추가 후에도 남아 있던 로컬 전용 등록·열기 조건을 정리합니다.
+- 현재 실행 세대의 SSH 추적 여부를 확인하며 원격 유지보수와 기존 연결 확인을 처리합니다.
+- Python 회귀 71개와 관리 앱 자체 검사 10종 통과. 서버 3곳 준비 완료, 실행 중 서비스 교체와 실제 화면 연결은 대기 상태입니다.
+- [원인·검증·적용 순서](design/claude-ssh-enrollment-105.md).
+
+### 수정 104 — 계정 이메일 표시·기본 숨김
+
+- 프로필 제목 옆 버튼으로 Codex·Claude 계정 이메일을 한꺼번에 표시하거나 숨깁니다. 이름 아래 한 줄로 표시하고 긴 주소는 툴팁으로 확인합니다.
+- 숨김이 기본값이며 다시 실행해도 숨김으로 시작합니다. 이메일은 일반 상태·설정·진단 로그에 저장하지 않고 버튼을 누를 때만 읽습니다.
+- 조회 중 숨김과 늦게 도착한 결과, 계정 연결 변경을 처리하며 이메일 조회가 프로필 열기를 막지 않습니다.
+- [구현·검증 및 적용 상태](design/profile-email-visibility-104.md).
+
+### 수정 103 — SSH 실행 프리셋·원격 교차 하위 에이전트
+
+- 최종 Linux 릴리스의 기능 감지와 Windows 긴 경로 메모 저장을 보완했습니다. 관리 앱 10종 자체 시험과 실행 프리셋 검사, 양방향 원격 위임 검사를 통과했습니다. 관리 서비스 단위 시험은 Windows 빌드 정책 차단으로 미실행이며 후보는 아직 활성화하지 않았습니다.
+- SSH 호스트별 불변 역할 정의와 변경 가능한 작업 선택을 분리하고, 준비된 조합을 다음 응답부터 적용합니다.
+- 선택된 Codex·Claude 계정의 접근 토큰을 원격 연결에 한정해 빌리며 인증 파일과 refresh token은 복사하지 않습니다.
+- 재연결 전 선택 게시와 leaf 하위 에이전트의 부모 결과 전달을 보강합니다.
+- [설계·설치·검증 및 배포 상태](design/ssh-execution-presets-103.md).
+
+### 수정 102 — 작업별 실행 프리셋·Codex↔Claude 하위 에이전트
+- 계정별로 여러 조합을 저장하고 작업마다 설정 버전을 고정해 선택합니다. 준비된 조합 변경은 다음 응답부터 적용합니다.
+- Codex·Claude 계정을 역할별로 지정하고, Claude의 위임도 네이티브 에이전트 관리자를 통하도록 연결합니다.
+- 진행 중 응답·하위 에이전트의 설정과 기존 작업 기록은 유지합니다. SSH 원격 적용은 아직 지원하지 않습니다.
+- [구현·검증 기록](design/execution-presets-cross-agents-102.md).
+
+### 수정 101 — Claude 작업 중 모델 전환·대화 유지
+- 프로필 기본 모델을 모든 요청에 강제하던 경로를 수정하고, 같은 작업에서 Opus·Sonnet·Fable·Opus 5.5를 선택합니다.
+- 같은 계정의 모델·추론 강도 변경은 기존 Claude 세션을 이어 사용하며, UltraCode 선택과 전달을 검증합니다.
+- 워크트리별 영속 담당 대화는 기존 기능과 새로 필요한 실행·통합 제어를 구분해 적용안을 작성했습니다. 아직 자동 조율 기능을 구현한 것은 아닙니다.
+- [구현·검증 기록](design/claude-model-switching-101.md), [워크트리 적용 검토](design/persistent-worktree-domains.md).
+
+### 수정 100 — 로컬 모델 프로필·최대 컨텍스트·호환 안내
+- 로컬 Responses 서버를 주 프로필과 하위 에이전트에 등록하며 키 없는 인증과 실행 위치를 구분합니다.
+- 세 Flash 모델의 공식 최대 컨텍스트와 최대 추론 대응을 제공하고 임의 축소를 거절합니다.
+- 이전 관리용 앱을 사용하는 안내를 설정 화면에 한 번 표시하며 실제 오류 경고는 유지합니다.
+- 실제 서버 접속·최대 길이 처리는 서버 정보를 받은 뒤 검증해야 합니다. [상세 기록](design/local-model-profiles-100.md).
+
+### 수정 99 — Claude 기본 압축·UltraCode·구독 사용량
+- Claude 기본 컨텍스트와 자동 압축을 선택할 수 있고, 숫자 직접 지정도 유지합니다.
+- UltraCode를 별도 effort로 전달하고 프로필·작업 바로가기에 5시간·주간 사용량을 표시합니다.
+  값의 출처·오래됨·미확인을 구분하며 계정이 바뀌면 이전 수치를 제거합니다.
+- 사용자 지정 SSH 작업 소속을 다음 안전한 프로필 실행 때 적용하는 일회성 복구를 추가합니다.
+- 바로가기의 전체 상태 조회 대기와 화면 크기 변화를 없애고, 공통 저장소에서 버리던 기록 목록 생성을 건너뜁니다.
+- 구현과 검증 범위: [상세 기록](design/claude-defaults-usage-99.md).
+
+### 수정 98 — Claude 로그인 프로필, 공통 작업과 전환 캐시
+- 공식 Claude Code CLI를 사용하는 프로필을 추가합니다. OAuth 인증은 CLI가 소유하고 기존 GPT/API
+  인증과 분리합니다. Claude의 모델·추론·컨텍스트·압축 비율 설정과 공통 스킬 진입점을 제공합니다.
+- 공통 작업의 완료 턴을 평문으로 전달하며, 계정별 Claude 세션으로 돌아올 때는 보지 않은 턴만 전달합니다.
+  재개 장부는 공통 기록 저장이 확인된 뒤 확정하며, 수정·중단·인증 주체 변경 시 재검증합니다.
+- 자동 압축의 검증된 요약을 원본 기록과 함께 보존합니다. 현재 Windows 로컬 실행 범위이며,
+  SSH 실행·Codex 전용 도구 변환·실계정 모델 검증을 지원 완료로 간주하지 않습니다.
+- 구현 및 검증 범위: `docs/design/claude-code-agent-profiles-98.md`.
+
 ### 수정 97 — SSH 런타임 경량화, 서버별 실패 분리, 작업 바로가기 상태
 - 수정 96 배포 직후 한 프로필의 SSH가 모든 서버에서 막혔습니다. 원인은 디버그 정보가 든 1.45GB 원격
   런타임, 여러 프로필의 같은 서버 동시 업로드(디스크 부족), 한 서버 실패가 프로필 전체를 막는 구조였습니다.
@@ -111,6 +228,8 @@
 
 | 수정 | 문서 | 주제 |
 |---|---|---|
+| 112 | [claude-usage-startup-update-112](design/claude-usage-startup-update-112.md) | Claude 사용량·긴 대화 전환, 업데이트 재실행 대기와 SSH 복구 |
+| 106 | [shortcut-navigation-recovery-106](design/shortcut-navigation-recovery-106.md) | 실제 화면 이동 확인, 직접 전달 자동 복구와 취소 |
 | 30 | [desktop-input-and-ssh-30](design/desktop-input-and-ssh-30.md) | 내장 창 키보드 입력과 공통 SSH 켜짐 상태 |
 | 31 | [ime-and-project-membership-31](design/ime-and-project-membership-31.md) | 한영 전환과 본앱 프로젝트 이동 |
 | 32 | [record-refresh-32](design/record-refresh-32.md) | 열린 대화 갱신과 재부팅 후 실행 연결 |
@@ -172,3 +291,11 @@
 | 94–95 | [parallel-profile-launch-94](design/parallel-profile-launch-94.md), [full-exit-unsaved-launch-94](design/full-exit-unsaved-launch-94.md), [cross-provider-context-94](design/cross-provider-context-94.md) | 병렬·우선 시작, 완전 종료, 공급자 간 문맥 |
 | 96 | [switch-cache-optimization-96](design/switch-cache-optimization-96.md), [shared-history-stability-96](design/shared-history-stability-96.md), [ssh-worktree-project-grouping-96](design/ssh-worktree-project-grouping-96.md), [new-project-thread-visibility-96](design/new-project-thread-visibility-96.md), [chrome-native-host-96](design/chrome-native-host-96.md) | 전환 캐시 절약, 공유 기록 안정성, SSH 프로젝트 분류, 새 프로젝트 표시, Chrome·computer use 플러그인 |
 | 97 | [ssh-upload-and-task-shortcuts-97](design/ssh-upload-and-task-shortcuts-97.md) | SSH 런타임 경량화·서버별 실패 분리, 작업 바로가기 상태, 앱 아이콘 |
+| 98 | [claude-code-agent-profiles-98](design/claude-code-agent-profiles-98.md) | Claude 로그인 프로필, 공통 대화·스킬, 계정 전환과 압축 |
+| 99 | [claude-defaults-usage-99](design/claude-defaults-usage-99.md) | Claude 기본 압축·UltraCode·사용량, 작업 바로가기 전환 |
+| 100 | [local-model-profiles-100](design/local-model-profiles-100.md) | 로컬 모델 등록·최대 컨텍스트·호환 안내 |
+| 101 | [claude-model-switching-101](design/claude-model-switching-101.md), [persistent-worktree-domains](design/persistent-worktree-domains.md) | Claude 작업 중 모델 전환·대화 유지, 영속 워크트리 담당 대화 검토 |
+| 108 | [ssh-drain-progress-108](design/ssh-drain-progress-108.md), [update-preflight-diagnostics-108](design/update-preflight-diagnostics-108.md) | SSH 서버별 종료 대기·업데이트 미관리 실행 오탐과 안내 수정 |
+| 109 | [shutdown-ssh-package-update-109](design/shutdown-ssh-package-update-109.md) | 원격 종료 예약과 로컬 종료 분리, 멈춘 SSH 복구, 공식 패키지 지연 등록 |
+| 110 | [full-exit-local-restart-110](design/full-exit-local-restart-110.md) | 로컬 설정 예약의 종료 충돌, 이전 어댑터 정리와 SSH 종료 연속 처리 |
+| 113 | [claude-long-handoff-images-update-113](design/claude-long-handoff-images-update-113.md) | GPT 긴 작업의 Claude 전환, Claude 이미지, 공식 앱 업데이트 보류 |

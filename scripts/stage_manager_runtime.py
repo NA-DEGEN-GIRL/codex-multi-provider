@@ -15,9 +15,14 @@ BINARIES = ('codex', 'codex-code-mode-host', 'codex-windows-sandbox-setup',
             'codex-command-runner', 'codex-app-server')
 
 
-def stage(root=ROOT):
+def stage(root=ROOT, profile='release'):
+    # The managed runtime parses and hashes very large shared histories (hundreds
+    # of MB for a long task). An unoptimized debug build made a Claude handoff
+    # spend ~90 s reading one; ship the optimized release profile.
+    if profile not in ('release', 'debug'):
+        raise ValueError('profile must be release or debug')
     root = Path(root).resolve()
-    source = root / 'work/target-runtime/debug'
+    source = root / 'work/target-runtime' / profile
     for name in BINARIES:
         if not (source / (name + '.exe')).is_file():
             raise RuntimeError('Missing built companion: ' + name)
@@ -33,7 +38,7 @@ def stage(root=ROOT):
     binary = destination / 'codex.exe'
     version = subprocess.check_output([str(binary), '--version'], text=True, timeout=15).strip()
     base = subprocess.check_output(['git', '-C', str(root / 'runtime'), 'rev-parse', 'HEAD'], text=True).strip()
-    manifest = dict(runtime=str(binary), version=version, source_base=base,
+    manifest = dict(runtime=str(binary), version=version, source_base=base, build_profile=profile,
                     sha256=files[binary.name], files=files, validation='candidate',
                     staged_at=datetime.now(timezone.utc).isoformat(),
                     capabilities={name: True for name in (
@@ -53,6 +58,10 @@ def stage(root=ROOT):
         binary, b'shared task was replaced during history refresh')
     manifest['capabilities']['canonical_record_storage'] = contains_marker(
         binary, b'CODEX_RECORD_HOME must be an absolute storage root')
+    manifest['capabilities']['claude_code_agent'] = contains_marker(
+        binary, b'CODEX_CLAUDE_CODE_AGENT_V1')
+    manifest['capabilities']['managed_execution_presets'] = contains_marker(
+        binary, b'CODEX_MANAGER_EXECUTION_PRESETS')
     path = destination / 'candidate.json'
     atomic_json(path, manifest)
     print(json.dumps(dict(candidate_manifest=str(path), active_runtime_changed=False)))
@@ -60,4 +69,7 @@ def stage(root=ROOT):
 
 
 if __name__ == '__main__':
-    stage()
+    import argparse
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--profile', choices=('release', 'debug'), default='release')
+    stage(profile=parser.parse_args().profile)

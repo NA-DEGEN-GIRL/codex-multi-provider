@@ -36,10 +36,10 @@ internal static partial class Dialogs
     {
         var button = new Button { Content = label }; button.Click += (_, _) => action(); body.Children.Add(button); return button;
     }
-    private static Button AsyncButton(Window window, Panel body, string label, Func<Task> action)
+    private static Button AsyncButton(Window window, Panel body, string label, Func<Task> action, Func<bool>? canRun = null)
     {
         var button = new Button { Content = label };
-        button.Click += async (_, _) => { button.IsEnabled = false; button.Content = label + " · 처리 중…"; try { await action(); } catch (Exception ex) { if (window.IsVisible) MessageBox.Show(window, ex.Message, "확인 필요", MessageBoxButton.OK, MessageBoxImage.Information); } finally { button.IsEnabled = true; button.Content = label; } };
+        button.Click += async (_, _) => { button.IsEnabled = false; button.Content = label + " · 처리 중…"; try { await action(); } catch (Exception ex) { if (window.IsVisible) MessageBox.Show(window, ex.Message, "확인 필요", MessageBoxButton.OK, MessageBoxImage.Information); } finally { button.IsEnabled = canRun?.Invoke() ?? true; button.Content = label; } };
         body.Children.Add(button); return button;
     }
 
@@ -177,8 +177,8 @@ internal static partial class Dialogs
 
     public static Task ProvidersAsync(Window owner, JsonElement profile, JsonElement registry, Func<string, object?, Task<JsonElement>> request)
     {
-        var window = Create(owner, "하위 에이전트 · API 공급자", 780, 860); var body = Body(window);
-        body.Children.Add(Note("아래 선택은 하위 에이전트용입니다. 현재 프로필의 주 모델은 바뀌지 않습니다. 외부 모델이 직접 작업하게 하려면 프로필 +에서 ‘외부 API 모델’을 추가하세요."));
+        var window = Create(owner, "하위 에이전트 · 모델 연결", 780, 860); var body = Body(window);
+        body.Children.Add(Note("아래 선택은 하위 에이전트용입니다. 현재 프로필의 주 모델은 바뀌지 않습니다. 모델이 직접 작업하게 하려면 프로필 +에서 ‘로컬 모델’ 또는 ‘외부 API 모델’을 추가하세요."));
         var profileId = profile.S("id");
         body.Children.Add(new TextBlock { Text = profileId == "" ? "프로필을 선택하면 모델 조합을 저장할 수 있습니다." : "설정 대상 프로필 · " + profile.S("alias"), FontSize = 19, Margin = new Thickness(0, 0, 0, 12) });
         var enabled = new CheckBox { Content = "외부 하위 에이전트 사용", IsChecked = profile.Get("policy").B("enabled"), IsEnabled = profileId != "" }; body.Children.Add(enabled);
@@ -197,9 +197,13 @@ internal static partial class Dialogs
             foreach (var model in data.Arr("models"))
             {
                 var verified = model.B("verified") || model.Get("capabilities").B("verified");
+                var provider = data.Arr("providers").FirstOrDefault(provider => provider.S("id") == model.S("provider_id"));
+                var local = LocalModelPresentation.IsLocalProvider(provider);
+                var ready = verified && LocalModelPresentation.CredentialsReady(provider) && provider.B("adapter_available");
                 var forced = model.S("forced_reasoning_effort");
-                var text = model.S("display_name", model.S("name", model.S("wire_model_id", model.S("model")))) + (forced != "" ? " · " + forced + " 고정" : " · " + model.S("reasoning_effort", model.S("reasoning", "기본 추론"))) + (verified ? "" : " · 연결 검증 필요");
-                var box = new CheckBox { Content = text, IsChecked = selected.Contains(model.S("id")), IsEnabled = verified && profileId != "", ToolTip = model.S("wire_model_id", model.S("model")) };
+                var text = (local ? "[로컬] " : "") + model.S("display_name", model.S("name", model.S("wire_model_id", model.S("model")))) + (forced != "" ? " · " + forced + " 고정" : " · " + model.S("reasoning_effort", model.S("reasoning", "기본 추론"))) + (verified ? "" : " · 연결 검증 필요")
+                    + (local && provider.S("execution_scope", "local") == "local" ? " · Windows 전용" : "");
+                var box = new CheckBox { Content = text, IsChecked = selected.Contains(model.S("id")), IsEnabled = ready && profileId != "", ToolTip = model.S("wire_model_id", model.S("model")) };
                 models.Children.Add(box); modelChecks.Add((model.S("id"), box));
                 verifyModels.Items.Add(new Choice(model.S("id"), model.S("display_name", model.S("wire_model_id", model.S("model"))), model));
             }
@@ -214,18 +218,40 @@ internal static partial class Dialogs
             policyStatus.Text = result.Message("설정을 저장했습니다. 닫힌 프로필은 다음 실행부터 적용됩니다.");
         }).IsEnabled = profileId != "";
         body.Children.Add(new Separator { Margin = new Thickness(0, 18, 0, 18) });
-        body.Children.Add(new TextBlock { Text = "API 공급자 · 하위 에이전트와 외부 프로필 공용", FontSize = 19 });
-        var providers = Choices(body, "연결", registry.Arr("providers").Select(p => new Choice(p.S("id"), p.S("name") + (p.B("key_saved") ? " · 키 저장됨" : " · 키 필요"), p)));
+        body.Children.Add(new TextBlock { Text = "모델 연결 · 주 모델과 하위 에이전트 공용", FontSize = 19 });
+        var providers = Choices(body, "연결", registry.Arr("providers").Select(p => new Choice(p.S("id"), LocalModelPresentation.ProviderLabel(p), p)));
+        Button? keyButton = null;
+        bool NeedsKey() => providers.SelectedItem is Choice selectedProvider && selectedProvider.Data.S("auth_type", "api_key") != "none";
+        void UpdateKeyButton()
+        {
+            if (keyButton is null) return;
+            keyButton.IsEnabled = NeedsKey();
+            keyButton.ToolTip = NeedsKey() ? "선택한 연결의 API 키 저장" : "이 로컬 연결은 API 키 없이 사용합니다.";
+        }
+        void RenderProviders()
+        {
+            var selectedId = (providers.SelectedItem as Choice)?.Id;
+            providers.Items.Clear();
+            foreach (var provider in registry.Arr("providers")) providers.Items.Add(new Choice(provider.S("id"), LocalModelPresentation.ProviderLabel(provider), provider));
+            providers.SelectedItem = providers.Items.OfType<Choice>().FirstOrDefault(provider => provider.Id == selectedId) ?? providers.Items.OfType<Choice>().FirstOrDefault();
+            UpdateKeyButton();
+        }
         AsyncButton(window, body, "공급자 또는 모델 추가", async () =>
         {
-            var form = ProviderForm(window, providers.SelectedItem as Choice); if (form is null) return;
+            var form = ProviderForm(window, providers.SelectedItem as Choice, registry); if (form is null) return;
             var result = await request("providers.save", form);
             registry = await request("providers.list", null); RenderModels(registry);
-            providers.Items.Clear(); foreach (var p in registry.Arr("providers")) providers.Items.Add(new Choice(p.S("id"), p.S("name") + (p.B("key_saved") ? " · 키 저장됨" : " · 키 필요"), p));
-            if (providers.Items.Count > 0) providers.SelectedIndex = 0;
+            RenderProviders();
             policyStatus.Text = result.Message("연결을 등록했습니다. 새 모델은 연결 검증 후 자동 선택할 수 있습니다.");
         });
-        AsyncButton(window, body, "선택한 공급자의 API 키 저장", async () =>
+        AsyncButton(window, body, "로컬 모델 프리셋으로 등록", async () =>
+        {
+            var form = ProviderForm(window, null, registry, localFirst: true); if (form is null) return;
+            var result = await request("providers.save", form);
+            registry = await request("providers.list", null); RenderModels(registry); RenderProviders();
+            policyStatus.Text = result.Message("로컬 모델을 등록했습니다. 서버 준비 후 연결 시험을 실행하세요.");
+        });
+        keyButton = AsyncButton(window, body, "선택한 공급자의 API 키 저장", async () =>
         {
             if (providers.SelectedItem is not Choice provider) throw new InvalidOperationException("공급자를 선택하세요.");
             var key = Key(window, provider.Label); if (key is null) return;
@@ -233,21 +259,22 @@ internal static partial class Dialogs
             {
                 await request("providers.key", new { provider_id = provider.Id, key }); policyStatus.Text = "API 키를 Windows 사용자 보호 저장소에 저장했습니다.";
                 registry = await request("providers.list", null);
-                providers.Items.Clear(); foreach (var p in registry.Arr("providers")) providers.Items.Add(new Choice(p.S("id"), p.S("name") + (p.B("key_saved") ? " · 키 저장됨" : " · 키 필요"), p));
-                providers.SelectedItem = providers.Items.OfType<Choice>().FirstOrDefault(p => p.Id == provider.Id);
+                RenderProviders(); RenderModels(registry);
             }
             finally { key = null; }
-        });
+        }, NeedsKey);
+        providers.SelectionChanged += (_, _) => UpdateKeyButton();
+        UpdateKeyButton();
         body.Children.Add(new TextBlock { Text = "연결을 시험할 모델", Margin = new Thickness(0, 10, 0, 0) });
         body.Children.Add(verifyModels);
         AsyncButton(window, body, "선택한 모델 기본값 수정", async () =>
         {
             if (verifyModels.SelectedItem is not Choice selectedModel) return;
             var provider = registry.Arr("providers").First(p => p.S("id") == selectedModel.Data.S("provider_id"));
-            var form = ProviderForm(window, new Choice(provider.S("id"), provider.S("name"), provider), selectedModel.Data);
+            var form = ProviderForm(window, new Choice(provider.S("id"), provider.S("name"), provider), registry, selectedModel.Data);
             if (form is null) return;
             await request("providers.save", form);
-            registry = await request("providers.list", null); RenderModels(registry);
+            registry = await request("providers.list", null); RenderModels(registry); RenderProviders();
             policyStatus.Text = "모델 기본값을 저장했습니다. 프로필별 설정은 프로필 메뉴의 ‘외부 모델 설정’에서 수정하세요.";
         });
         AsyncButton(window, body, "모델 연결 시험", async () =>
@@ -258,41 +285,21 @@ internal static partial class Dialogs
             registry = await request("providers.list", null); RenderModels(registry);
             policyStatus.Text = result.Message("모델 연결 시험을 마쳤습니다.");
         });
-        body.Children.Add(Note("연결 시험은 저장한 키로 작은 API 요청을 실제 전송하므로 공급자의 사용량이 발생할 수 있습니다."));
+        body.Children.Add(Note("연결 시험은 지정한 서버에 작은 실제 요청을 전송합니다. 클라우드 API는 공급자의 사용량이 발생할 수 있습니다."));
         body.Children.Add(Note("API 키는 명령행이나 일반 설정 파일에 넣지 않습니다. 새 API 형식은 해당 어댑터의 지원이 필요하며, 등록만으로 호출 성공을 보장하지 않습니다."));
         Button(body, "닫기", window.Close); window.ShowDialog(); return Task.CompletedTask;
     }
-    private static object? ProviderForm(Window owner, Choice? existing, JsonElement modelData = default)
+    private static object? ProviderForm(Window owner, Choice? existing, JsonElement registry, JsonElement modelData = default, bool localFirst = false)
     {
-        var window = Create(owner, "공급자 · 모델 등록", 630, 790); var body = Body(window);
-        var useExisting = new CheckBox { Content = existing is null ? "기존 공급자 없음" : "기존 공급자에 모델 추가 · " + existing.Label, IsChecked = existing is not null, IsEnabled = existing is not null }; body.Children.Add(useExisting);
-        var name = Field(body, "공급자 이름", existing?.Data.S("name") ?? "");
-        var url = Field(body, "API 기본 주소 (HTTPS)", existing?.Data.S("base_url") ?? "");
-        var protocol = Choices(body, "API 형식", [new("responses", "OpenAI Responses"), new("chat_completions", "Chat Completions · 어댑터 지원 확인 필요"), new("anthropic_messages", "Anthropic Messages · 어댑터 지원 확인 필요")], existing?.Data.S("protocol", "responses"));
-        var model = Field(body, "공급자가 제공한 정확한 모델 ID", modelData.S("wire_model_id"));
-        var display = Field(body, "목록에 표시할 모델 이름", modelData.S("display_name"));
-        var reasoning = Choices(body, "기본 추론 강도", EffortNames.Select(v => new Choice(v, EffortLabel(v))), modelData.S("reasoning_effort", "high"));
-        var supported = Field(body, "지원하는 강도 · 쉼표로 구분", string.Join(",", modelData.Arr("supported_reasoning_efforts").Select(x => x.GetString())));
-        var context = Field(body, "모델 컨텍스트 한도 · 토큰", modelData.Get("settings_defaults").Get("context_window").ToString());
-        var compact = Field(body, "자동 압축 기본 비율 · 10~90%", modelData.Get("settings_defaults").Get("auto_compact_percent").ToString());
-        if (compact.Text == "") compact.Text = "90";
-        body.Children.Add(Note("DeepSeek Flash / V4는 none·low·high·max, 1,048,576 토큰을 기본으로 사용합니다. 다른 모델은 공급자의 지원값을 입력하세요. 빈 지원 목록은 선택한 강도만 사용합니다."));
+        var window = Create(owner, "공급자 · 모델 등록", 660, 860); var body = Body(window);
+        var editor = new ProviderEditor(body, existing, modelData, registry, localFirst);
         object? result = null;
         Button(body, "등록", () =>
         {
-            if (string.IsNullOrWhiteSpace(name.Text) || string.IsNullOrWhiteSpace(url.Text) || string.IsNullOrWhiteSpace(model.Text)) { MessageBox.Show(window, "공급자 이름, API 주소, 정확한 모델 ID를 입력하세요."); return; }
-            var provider = new Dictionary<string, object?> { ["name"] = name.Text.Trim(), ["base_url"] = url.Text.Trim(), ["protocol"] = (protocol.SelectedItem as Choice)?.Id ?? "responses" };
-            if (useExisting.IsChecked == true && existing is not null) provider["id"] = existing.Id;
-            var cap = new Dictionary<string, object>();
-            var isDeepSeek = model.Text.StartsWith("deepseek-flash", StringComparison.OrdinalIgnoreCase) || model.Text.StartsWith("deepseek-v4-", StringComparison.OrdinalIgnoreCase);
-            if (!int.TryParse(string.IsNullOrWhiteSpace(context.Text) ? (isDeepSeek ? "1048576" : "32768") : context.Text.Replace(",", ""), out var tokens) || tokens < 4096 || tokens > 10000000 || !int.TryParse(compact.Text, out var percent) || percent < 10 || percent > 90)
-            { MessageBox.Show(window, "컨텍스트 토큰 수와 압축 비율(10~90)을 확인하세요."); return; }
-            cap["context_window"] = tokens;
-            if (!string.IsNullOrWhiteSpace(supported.Text)) cap["reasoning_efforts"] = supported.Text.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-            var settings = new Dictionary<string, object> { ["wire_model_id"] = model.Text.Trim(), ["display_name"] = string.IsNullOrWhiteSpace(display.Text) ? model.Text.Trim() : display.Text.Trim(), ["reasoning_effort"] = (reasoning.SelectedItem as Choice)?.Id ?? "high", ["capabilities"] = cap, ["auto_compact_percent"] = percent };
-            if (modelData.S("id") != "") { settings["id"] = modelData.S("id"); provider["id"] = existing!.Id; }
-            result = new { provider, model = settings }; window.DialogResult = true;
-        }); window.ShowDialog(); return result;
+            if (!editor.TryBuild(out var value, out var error)) { MessageBox.Show(window, error); return; }
+            result = value; window.DialogResult = true;
+        });
+        Button(body, "취소", window.Close); window.ShowDialog(); return result;
     }
     private static string? Key(Window owner, string name)
     {
@@ -333,7 +340,8 @@ internal static partial class Dialogs
         foreach (var blocker in data.Arr("blockers")) body.Children.Add(Note(blocker.ValueKind == JsonValueKind.String ? blocker.GetString()! : blocker.Message()));
         bool result = false;
         if (UpdatePresentation.CanInstall(data))
-            Button(body, data.S("status") is "recovery_required" or "failed_restore" ? "이전 업데이트 확인 계속" : "모든 프로필에 앱 업데이트 적용",
+            Button(body, data.S("status") == "registration_pending" ? "준비된 업데이트 적용" :
+                data.S("status") is "recovery_required" or "failed_restore" ? "이전 업데이트 확인 계속" : "공식 Codex 업데이트 설치",
                 () => { result = true; window.DialogResult = true; });
         Button(body, "닫기", window.Close); window.ShowDialog(); return result;
     }
