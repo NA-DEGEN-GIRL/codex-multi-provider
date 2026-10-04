@@ -487,11 +487,17 @@ def build_command(cli, session, resume, settings, mode, prompts, directory, mana
             'Read(//' + (manager_root / 'work/control-center/profiles').as_posix().lstrip('/') + '/**/auth.json)']
     if managed_delegation:
         deny += ['Agent', 'Task']
+    permissions = {'deny': deny}
+    if settings['effort'] == 'ultracode' and prompts == 'none':
+        # Ultracode works through the Workflow tool, whose permission check always
+        # asks. Without an approval surface every ask is denied, so the selected
+        # mode would never run; tools inside a workflow keep the session's checks.
+        permissions['allow'] = ['Workflow']
     args = list(cli) + ['-p', '--verbose', '--input-format', 'stream-json', '--output-format', 'stream-json',
             '--include-partial-messages', '--replay-user-messages', '--resume' if resume else '--session-id',
             session, '--model', settings['model'], '--effort', settings['effort'],
             '--permission-mode', mode, '--permission-prompts', prompts,
-            '--prompt-suggestions', 'false', '--settings', json.dumps({'permissions': {'deny': deny}})]
+            '--prompt-suggestions', 'false', '--settings', json.dumps({'permissions': permissions})]
     args += ['--autocompact', str(settings['autocompact_tokens']) if settings['autocompact_tokens'] else 'auto']
     if managed_delegation:
         args += ['--disallowedTools', 'Agent,Task']
@@ -548,6 +554,12 @@ def _discard_stderr(stream):
             pass
     except OSError:
         pass
+
+
+ULTRACODE_CHECK = 'codex-ultracode-check'
+# After a background report the CLI starts its follow-up turn at once; this is
+# only the wait for a report that was already queued when a result arrived.
+BACKGROUND_SETTLE_SECONDS = 3.0
 
 
 CHECKPOINT_PROMPT = '''CODEX_PORTABLE_CHECKPOINT_V1
@@ -700,18 +712,31 @@ def execute(command, cwd, environment, incoming, emit, bridge, stopped, observed
     events = queue.Queue(maxsize=256)
     last_usage, model_started, compactions = {}, False, 0
     prior_cost = record.get('cost_total_usd', 0)
+    # Workflows and background agents report back after the turn's first
+    # result; the CLI then starts the next turn by itself. The final result
+    # is the one that arrives while none of them is still running.
+    background, background_seen, settle_deadline, results = set(), False, None, []
     try:
         tree = ProcessTree(process)
         threading.Thread(target=_reader, args=(process.stdout, 'cli', events), daemon=True).start()
         threading.Thread(target=_reader, args=(incoming, 'host', events), daemon=True).start()
         threading.Thread(target=_discard_stderr, args=(process.stderr,), daemon=True).start()
         process.stdin.write(encode_message(hello['_prompt']))
+        if record['settings'].get('effort') == 'ultracode':
+            # The CLI accepts Ultracode silently and applies it only where dynamic
+            # workflows are available; ask which settings it actually applied.
+            process.stdin.write(encode_message({'type': 'control_request', 'request_id': ULTRACODE_CHECK,
+                                                'request': {'subtype': 'get_settings'}}))
         process.stdin.flush()
         while True:
+            if settle_deadline is not None and time.monotonic() >= settle_deadline:
+                break
             try:
                 source, message = events.get(timeout=.2)
             except queue.Empty:
                 if process.poll() is not None:
+                    if result is not None:
+                        break
                     problem = ('cli_exit', 'Claude exited without a final result.')
                     break
                 continue
@@ -731,11 +756,30 @@ def execute(command, cwd, environment, incoming, emit, bridge, stopped, observed
                     break
                 continue
             if message is None:
-                problem = ('cli_exit', 'Claude exited without a final result.')
+                if result is None:
+                    problem = ('cli_exit', 'Claude exited without a final result.')
                 break
             if message.get('type') == 'control_request':
                 problem = ('permissions', 'Claude requested an unsupported permission transport; the action was stopped.')
                 break
+            if message.get('type') == 'control_response':
+                response = message.get('response') if isinstance(message.get('response'), dict) else {}
+                applied = (response.get('response') or {}).get('applied') if isinstance(response.get('response'), dict) else None
+                if (response.get('request_id') == ULTRACODE_CHECK and response.get('subtype') == 'success'
+                        and isinstance(applied, dict) and applied.get('ultracode') is False):
+                    emit(dict(type='event', kind='notice', message=(
+                        'Ultracode is not active for this Claude account (dynamic workflows are unavailable); '
+                        'this turn runs at xhigh effort without workflows.')))
+                continue
+            if message.get('type') == 'system' and message.get('subtype') == 'background_tasks_changed':
+                tasks = message.get('tasks') if isinstance(message.get('tasks'), list) else []
+                # REPLACE semantics: the message lists every live background task.
+                background = {task['task_id'] for task in tasks if isinstance(task, dict)
+                              and isinstance(task.get('task_id'), str) and not task.get('ambient')
+                              and task.get('task_type') in ('local_workflow', 'local_agent')}
+                background_seen = background_seen or bool(background)
+            if settle_deadline is not None and message.get('type') in ('assistant', 'stream_event', 'user'):
+                settle_deadline = None  # A background report started the next turn.
             if message.get('type') == 'rate_limit_event':
                 from manager_core.claude_usage import record_event
                 try:
@@ -779,8 +823,17 @@ def execute(command, cwd, environment, incoming, emit, bridge, stopped, observed
             if problem:
                 break
             if message.get('type') == 'result':
+                results.append(message)
                 result = message
-                break
+                if background:
+                    if len(results) == 1:
+                        emit(dict(type='event', kind='notice', message=(
+                            'Claude is waiting for its background workflow; the answer continues when it reports back.')))
+                    continue
+                if not background_seen:
+                    break
+                # A report may already be queued; give the CLI a moment to start that turn.
+                settle_deadline = time.monotonic() + BACKGROUND_SETTLE_SECONDS
     finally:
         stopped.set()
         try:
@@ -805,6 +858,11 @@ def execute(command, cwd, environment, incoming, emit, bridge, stopped, observed
             emit(dict(type='event', kind='compact', message='Claude supplied a portable compaction summary.',
                       summary=summary, summary_available=True))
     result = result or {}
+    if len(results) > 1:
+        # Each turn reports its own usage; the session cost stays cumulative.
+        denials = [denial for item in results for denial in item.get('permission_denials') or []
+                   if isinstance(item.get('permission_denials'), list)]
+        result = dict(result, usage=sum_usage(*(item.get('usage') for item in results)), permission_denials=denials)
     success = bool(result) and not result.get('is_error') and not problem and not interrupted and process.returncode == 0
     checkpoint, checkpoint_failed = {}, False
     if success and compactions:

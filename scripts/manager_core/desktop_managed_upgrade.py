@@ -174,7 +174,7 @@ def upgrade(root, source=None):
                 archive=dict(size=info.st_size, modified=info.st_mtime_ns),
                 files=publication._inventory(stage),
                 hashes={name: publication._hash(stage / name) for name in baseline['hashes']},
-                upgrade=dict(kind='managed-reasoning-and-plan-ui-v2', source_directory=str(source.resolve()),
+                upgrade=dict(kind='managed-reasoning-and-plan-ui-v3', source_directory=str(source.resolve()),
                     source_marker_sha256=_BASELINE_MARKER_SHA256,
                     source_archive_sha256=_BASELINE_ARCHIVE_SHA256, entries=audit))
             for name, digest in baseline['hashes'].items():

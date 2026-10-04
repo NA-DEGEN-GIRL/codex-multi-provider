@@ -14,7 +14,13 @@ class DesktopReasoningTests(unittest.TestCase):
     def fixture(self, binding):
         return (b'function picker({isCustomModelProvider:s=!1,models:c,useHiddenModels:l}){'
                 b'let e=o?r.supportedReasoningEfforts:r.supportedReasoningEfforts.filter(({reasoningEffort:e})=>e!==`ultra`);'
-                b'return e.filter(({reasoningEffort:e})=>' + binding + b'(e)&&i.has(e))}')
+                b'return e.filter(({reasoningEffort:e})=>' + binding + b'(e)&&i.has(e))}' + self.dropdown())
+
+    def dropdown(self):
+        # 26.917 npa: the composer's model/effort rows, built from the filtered model list.
+        return (b'function rows(e){return e.flatMap(({model:n,supportedReasoningEfforts:r})=>{'
+                b'let a=r.flatMap(({reasoningEffort:e})=>vw(e)&&e!==`persistent`?[e]:[]);'
+                b'return(a.length>0?a:[`medium`]).map(e=>n+`:`+e)})}')
 
     def test_verified_bindings_preserve_effort_validation_and_native_gating(self):
         for binding in (b'gj', b'WXn', b'UXn', b'vw', b'pye'):
@@ -36,7 +42,7 @@ class DesktopReasoningTests(unittest.TestCase):
                   b'r.supportedReasoningEfforts.filter(({reasoningEffort:e})=>e!==`ultra`),n=(t===`copilot`?'
                   b'[e.find(e=>e.reasoningEffort===`medium`)??{reasoningEffort:`medium`,description:`medium effort`}]:e)'
                   b'.filter(({reasoningEffort:e})=>vw(e)&&i.has(e)),a={...r,supportedReasoningEfforts:n};u.push(a)}}),'
-                  b'{models:u,defaultModel:d}}')
+                  b'{models:u,defaultModel:d}}') + self.dropdown()
         result = patch(source)
         self.assertEqual(result.count(b'let e=o||s?r.supportedReasoningEfforts:'), 1)
         self.assertEqual(result.count(b'=>(vw(e)||s&&e===`ultracode`)&&(s||i.has(e))),a={...r,'), 1)
@@ -84,16 +90,36 @@ console.log(JSON.stringify([advertised,picker({isCustomModelProvider:true}).map(
     def composer(self):
         return (b'function pj(e,t){let n=e?.find(e=>e.model===t);return n==null?[]:n.supportedReasoningEfforts.filter(e=>fne(e.reasoningEffort)&&e.reasoningEffort!==`persistent`)}'
                 b'function mj(e,t){return fne(e)&&t.some(t=>t.reasoningEffort===e)?e:`high`}'
-                b'const labels={persistent:{id:`composer.mode.local.reasoning.persistent.label`,defaultMessage:`Persistent`}};')
+                b'const labels={persistent:{id:`composer.mode.local.reasoning.persistent.label`,defaultMessage:`Persistent`}};'
+                b'const h3=`dot`,Hi=`low`,Wi=`medium`,Bi=`high`,u3=`bolt`;'
+                b'const icons={none:h3,minimal:h3,low:Hi,medium:Wi,high:Bi,xhigh:u3,max:u3,ultra:u3,persistent:u3};')
 
     @unittest.skipUnless(shutil.which('node'), 'Node is needed to execute the desktop composer fixture')
     def test_composer_retains_only_advertised_ultracode_and_has_a_visible_label(self):
         script = b'function fne(e){return [`high`,`max`,`persistent`].includes(e)};' + patch_composer(self.composer()) + b'''
 const model={model:'cc-opus',supportedReasoningEfforts:['high','max','ultracode','unknown','persistent'].map(reasoningEffort=>({reasoningEffort}))};
 const choices=pj([model],'cc-opus');
-console.log(JSON.stringify([choices.map(e=>e.reasoningEffort),mj('ultracode',choices),mj('ultracode',[{reasoningEffort:'high'}]),labels.ultracode.defaultMessage]));'''
+console.log(JSON.stringify([choices.map(e=>e.reasoningEffort),mj('ultracode',choices),mj('ultracode',[{reasoningEffort:'high'}]),labels.ultracode.defaultMessage,icons.ultracode]));'''
         result = subprocess.run([shutil.which('node'), '-e', script.decode()], capture_output=True, text=True, check=True)
-        self.assertEqual(json.loads(result.stdout), [['high', 'max', 'ultracode'], 'ultracode', 'high', 'Ultracode'])
+        self.assertEqual(json.loads(result.stdout), [['high', 'max', 'ultracode'], 'ultracode', 'high', 'Ultracode', 'bolt'])
+
+    @unittest.skipUnless(shutil.which('node'), 'Node is needed to execute the desktop dropdown fixture')
+    def test_dropdown_rows_include_only_an_advertised_ultracode(self):
+        script = '''function vw(e){return ['low','high','xhigh','max','persistent'].includes(e)};''' + patch(self.fixture(b'vw')).decode() + '''
+const claude={model:'cc-opus',supportedReasoningEfforts:['high','max','ultracode','unknown','persistent'].map(reasoningEffort=>({reasoningEffort}))};
+const gpt={model:'gpt-5.5',supportedReasoningEfforts:['low','xhigh','persistent'].map(reasoningEffort=>({reasoningEffort}))};
+console.log(JSON.stringify([rows([claude]),rows([gpt])]));'''
+        result = subprocess.run([shutil.which('node'), '-e', script], capture_output=True, text=True, check=True)
+        self.assertEqual(json.loads(result.stdout),
+                         [['cc-opus:high', 'cc-opus:max', 'cc-opus:ultracode'], ['gpt-5.5:low', 'gpt-5.5:xhigh']])
+
+    def test_missing_dropdown_or_icon_shape_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, 'dropdown'):
+            patch(self.fixture(b'vw').replace(self.dropdown(), b''))
+        with self.assertRaisesRegex(ValueError, 'dropdown'):
+            upgrade_managed(self.managed_fixture() + self.dropdown())
+        with self.assertRaisesRegex(ValueError, 'icons'):
+            patch_composer(self.composer().replace(b'ultra:u3,', b''))
 
     def test_composer_rejects_incomplete_or_duplicate_shapes(self):
         for source in (self.composer() * 2, self.composer().replace(b'return fne(e)', b'return other(e)'),

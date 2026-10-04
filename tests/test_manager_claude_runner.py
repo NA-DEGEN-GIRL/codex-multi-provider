@@ -58,8 +58,37 @@ else:
               'utilization':0.25,'resetsAt':2000000000}})
     emit({'type':'user','message':request['message']})
     print('PRIVATE_STDERR_AUTH_SECRET', file=sys.stderr, flush=True)
+    if scenario == 'ultracode_inactive':
+        check = json.loads(sys.stdin.readline())
+        assert check['request'] == {'subtype':'get_settings'}
+        emit({'type':'control_response','response':{'subtype':'success','request_id':check['request_id'],
+              'response':{'applied':{'model':'fixture','effort':'xhigh','ultracode':False}}}})
     if scenario == 'control':
         emit({'type':'control_request','request':{'private':'PRIVATE_CONTROL_AUTH_SECRET'}})
+    elif scenario in ('workflow', 'workflow_queued'):
+        settings = json.loads(args[args.index('--settings')+1])
+        assert settings['permissions']['allow'] == ['Workflow'], settings
+        task = {'task_id':'wf-1','task_type':'local_workflow','description':'review'}
+        watcher = {'task_id':'watch-1','task_type':'local_workflow','description':'watch','ambient':True}
+        emit({'type':'system','subtype':'task_started','task_id':'wf-1','task_type':'local_workflow','workflow_name':'review'})
+        emit({'type':'system','subtype':'background_tasks_changed','tasks':[task, watcher]})
+        if scenario == 'workflow_queued':
+            # The workflow reported back before the first turn ended.
+            emit({'type':'system','subtype':'background_tasks_changed','tasks':[watcher]})
+            emit({'type':'system','subtype':'task_notification','task_id':'wf-1','status':'completed','summary':'3 findings'})
+        emit({'type':'assistant','message':{'content':[{'type':'text','text':'Workflow launched.'}],
+              'usage':{'input_tokens':10,'output_tokens':4}}})
+        emit({'type':'result','subtype':'success','is_error':False,'session_id':session,'result':'Workflow launched.',
+              'usage':{'input_tokens':10,'output_tokens':4},'total_cost_usd':0.02})
+        if scenario == 'workflow':
+            emit({'type':'system','subtype':'background_tasks_changed','tasks':[watcher]})
+            emit({'type':'system','subtype':'task_notification','task_id':'wf-1','status':'completed','summary':'3 findings'})
+        emit({'type':'stream_event','event':{'type':'content_block_delta','delta':{'type':'text_delta','text':'Final'}}})
+        emit({'type':'assistant','message':{'content':[{'type':'text','text':'Final answer from the workflow.'}],
+              'usage':{'input_tokens':20,'output_tokens':6}}})
+        emit({'type':'result','subtype':'success','is_error':False,'session_id':session,
+              'result':'Final answer from the workflow.','usage':{'input_tokens':20,'output_tokens':6},
+              'total_cost_usd':0.05})
     elif scenario == 'wait':
         emit({'type':'stream_event','event':{'type':'content_block_delta','delta':{'type':'text_delta','text':'waiting'}}})
     else:
@@ -390,6 +419,37 @@ class ClaudeRunnerTests(unittest.TestCase):
         record = json.loads(ledgers[0].read_text(encoding='utf-8'))
         self.assertEqual((record['model'], record['effort'], record['dirty']), ('sonnet', 'low', False))
         self.assertEqual(record['settings']['model'], 'sonnet')
+
+    def test_ultracode_waits_for_its_background_workflow_and_reports_the_final_answer(self):
+        for scenario in ('workflow', 'workflow_queued'):
+            with self.subTest(scenario=scenario):
+                code, events = self.run_fake(scenario, profile=str(uuid4()),
+                                             mutate_hello={'model': 'cc-opus', 'effort': 'ultracode'})
+                self.assertEqual(code, 0, events)
+                done = next(event for event in events if event['type'] == 'done')
+                self.assertEqual(done['status'], 'success')
+                self.assertEqual(done['result_text'], 'Final answer from the workflow.')
+                self.assertEqual((done['usage']['input_tokens'], done['usage']['output_tokens']), (30, 10))
+                notices = [event['message'] for event in events if event.get('kind') == 'subagent']
+                self.assertEqual(notices, ['Claude started a background workflow: review',
+                                           'Claude background task completed: 3 findings'])
+                self.assertEqual(events[-1]['type'], 'committed')
+
+    def test_workflow_is_preapproved_only_for_ultracode_without_an_approval_surface(self):
+        def permissions(effort, prompts):
+            command = build_command(['claude'], str(uuid4()), False, run_settings({'reasoning_effort': effort}),
+                                    'auto', prompts, self.local, self.root, [], mcp_path=self.base / 'mcp.json')
+            return json.loads(command[command.index('--settings') + 1])['permissions']
+        self.assertEqual(permissions('ultracode', 'none').get('allow'), ['Workflow'])
+        self.assertNotIn('allow', permissions('ultracode', 'host'))
+        self.assertNotIn('allow', permissions('xhigh', 'none'))
+
+    def test_inactive_ultracode_is_reported_and_the_turn_still_completes(self):
+        code, events = self.run_fake('ultracode_inactive', profile=str(uuid4()),
+                                     mutate_hello={'model': 'cc-opus', 'effort': 'ultracode'})
+        self.assertEqual(code, 0, events)
+        self.assertTrue(any('Ultracode is not active' in event.get('message', '') for event in events), events)
+        self.assertEqual(next(event for event in events if event['type'] == 'done')['status'], 'success')
 
     def test_model_switch_retains_compaction_and_interruption_invalidates_every_model(self):
         code, first = self.run_fake('compact')

@@ -45,7 +45,9 @@ SETTINGS_WRITE_INTERVAL = 2.0
 # was last served by another provider. The proxy strips it before forwarding.
 PROVIDER_RETURN_MARKER = 'codexManagerProviderReturn'
 OPENAI_FAMILY = 'openai'
-EFFORTS = frozenset(('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'))
+# 'ultracode' is a Claude Code profile choice; a restore applies only to the
+# same provider and model that recorded it.
+EFFORTS = frozenset(('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'ultracode'))
 _TRACKED_REQUESTS = frozenset(('thread/start', 'thread/resume', 'thread/fork',
                                'thread/settings/update', 'turn/settings/update'))
 _STOP = object()

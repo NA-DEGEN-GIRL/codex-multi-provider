@@ -35,6 +35,14 @@
 
 ## 최근 수정
 
+### 수정 114 — Claude Ultracode 선택 메뉴 표시와 백그라운드 워크플로 실행
+
+- 관리용 26.917 데스크톱의 모델·추론 강도 메뉴가 별도 행 생성 함수에서 `ultracode`를 걸러 Ultracode를 고를 수 없던 문제를 고쳤다
+  (`desktop_reasoning_ui._power_choices`, 아이콘 표 보강, 업그레이드 v3 사본 `26.917.9434.0-215877556fad4160`).
+- Claude 실행기가 승인 창 없는 Ultracode에서 Workflow를 허용하고, 백그라운드 워크플로가 끝나 CLI가 이어 가는 턴의 결과까지 기다린다.
+  CLI가 Ultracode를 실제로 적용하지 않으면 알린다. 계정 전환 후 ultracode 복원도 고쳤다.
+- [원인·변경·검증](design/claude-ultracode-workflows-114.md).
+
 ### 수정 113 — GPT 긴 작업의 Claude 전환, Claude 이미지, 공식 앱 업데이트 보류
 
 - 긴 GPT 작업을 Claude로 이어 갈 때 "이식용 요약 + 최근 기록"까지 거부하던 Claude 전달 조건을 고쳤다. 크기 확인 기준을 재구성과
@@ -299,3 +307,4 @@
 | 109 | [shutdown-ssh-package-update-109](design/shutdown-ssh-package-update-109.md) | 원격 종료 예약과 로컬 종료 분리, 멈춘 SSH 복구, 공식 패키지 지연 등록 |
 | 110 | [full-exit-local-restart-110](design/full-exit-local-restart-110.md) | 로컬 설정 예약의 종료 충돌, 이전 어댑터 정리와 SSH 종료 연속 처리 |
 | 113 | [claude-long-handoff-images-update-113](design/claude-long-handoff-images-update-113.md) | GPT 긴 작업의 Claude 전환, Claude 이미지, 공식 앱 업데이트 보류 |
+| 114 | [claude-ultracode-workflows-114](design/claude-ultracode-workflows-114.md) | Claude Ultracode 선택 메뉴와 백그라운드 워크플로 |

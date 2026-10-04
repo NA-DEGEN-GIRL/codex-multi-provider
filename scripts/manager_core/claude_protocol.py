@@ -87,6 +87,13 @@ def normalize(message):
         if subtype == 'api_retry':
             return [dict(kind='retry', message='Claude is retrying a request.',
                          attempt=message.get('attempt') if isinstance(message.get('attempt'), int) else None)]
+        if subtype == 'task_started' and message.get('task_type') == 'local_workflow' and not message.get('ambient'):
+            name = bounded_text(message.get('workflow_name') or message.get('description'), 200)
+            return [dict(kind='subagent', message='Claude started a background workflow' + (f': {name}' if name else '.'))]
+        if subtype == 'task_notification' and message.get('status') in ('completed', 'failed', 'stopped'):
+            summary = bounded_text(message.get('summary'), 400)
+            return [dict(kind='subagent', message=f"Claude background task {message['status']}"
+                         + (f': {summary}' if summary else '.'))]
         return []
     if kind == 'stream_event':
         event = _object(message.get('event'))

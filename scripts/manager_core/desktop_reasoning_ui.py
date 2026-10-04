@@ -20,8 +20,24 @@ def patch(data):
     # value for a configured provider that explicitly advertises it.
     replacement = gate.replace(b'=>', b'=>(').replace(
         b'&&i.has(e)', b'||s&&e===`ultracode`)&&(s||i.has(e))')
-    return data.replace(before, before.replace(b'let e=o?', b'let e=o||s?')).replace(
-        gate, replacement)
+    return _power_choices(data.replace(before, before.replace(b'let e=o?', b'let e=o||s?')).replace(
+        gate, replacement))
+
+
+def _power_choices(data):
+    """Admit a catalog-advertised Ultracode in the composer's model/effort dropdown.
+
+    The dropdown builds its rows from the already filtered model list, not from
+    the picker gate above, so it needs the same single additional value.
+    """
+    pattern = rb'a=r\.flatMap\(\(\{reasoningEffort:e\}\)=>([A-Za-z_$][A-Za-z0-9_$]*)\(e\)&&e!==`persistent`\?\[e\]:\[\]\)'
+    matches = list(re.finditer(pattern, data))
+    if len(matches) != 1:
+        raise ValueError('Desktop effort dropdown is not verified for this version.')
+    found = matches[0].group(0)
+    validator = matches[0].group(1)
+    return data.replace(found, found.replace(b'=>' + validator + b'(e)&&',
+                                             b'=>(' + validator + b'(e)||e===`ultracode`)&&'))
 
 
 def upgrade_managed(data):
@@ -32,7 +48,7 @@ def upgrade_managed(data):
     replacement = b'.filter(({reasoningEffort:e})=>(vw(e)||s&&e===`ultracode`)&&(s||i.has(e)))'
     if any(data.count(value) != 1 for value in (marker, before, gate)) or replacement in data:
         raise ValueError('Managed reasoning picker is not the verified 26.917 baseline.')
-    return data.replace(gate, replacement)
+    return _power_choices(data.replace(gate, replacement))
 
 
 def patch_composer(data):
@@ -54,6 +70,14 @@ def patch_composer(data):
         b'&&e.reasoningEffort', b'||e.reasoningEffort===`ultracode`)&&e.reasoningEffort')
     selected = selection.replace(b'return ', b'return (').replace(
         b'&&t.some', b'||e===`ultracode`)&&t.some')
+    # The compact composer renders an icon per effort; Ultracode uses the xhigh icon.
+    icons = list(re.finditer(rb'\{none:([A-Za-z_$][A-Za-z0-9_$]*),minimal:\1,low:[A-Za-z_$][A-Za-z0-9_$]*,'
+                             rb'medium:[A-Za-z_$][A-Za-z0-9_$]*,high:[A-Za-z_$][A-Za-z0-9_$]*,'
+                             rb'xhigh:([A-Za-z_$][A-Za-z0-9_$]*),max:\2,ultra:\2,persistent:\2\}', data))
+    if len(icons) != 1:
+        raise ValueError('Desktop composer effort icons are not verified for this version.')
+    icon = icons[0]
     return data.replace(match.group(0), choices).replace(selection, selected).replace(label,
         b'ultracode:{id:`composer.mode.local.reasoning.ultracode.label`,defaultMessage:`Ultracode`,'
-        b'description:`Claude Code dynamic workflows with xhigh effort`},' + label)
+        b'description:`Claude Code dynamic workflows with xhigh effort`},' + label).replace(
+        icon.group(0), icon.group(0)[:-1] + b',ultracode:' + icon.group(2) + b'}')

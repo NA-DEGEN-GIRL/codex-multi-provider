@@ -363,6 +363,16 @@ class ProviderReturnTests(LedgerCase):
         self.assertEqual(old_entry['config']['model_reasoning_effort'], 'minimal')
         self.assertIsNone(old_entry['serviceTier'])
 
+    def test_claude_ultracode_is_restored_after_another_provider(self):
+        instances = self.root / 'instances'
+        self.seed(instances / 'claude', 'ultracode', None, 1_790_000_000.0, model='cc-opus',
+                  provider='claude_code', account='provider:claude_code')
+        self.seed(instances / 'gpt', 'high', None, 1_790_000_100.0)
+        params = ProviderReturn(instances)(self.resume(
+            model='cc-opus', modelProvider='claude_code',
+            config={'model_provider': 'claude_code', 'model': 'cc-opus', 'model_reasoning_effort': 'xhigh'}))['params']
+        self.assertEqual(params['config']['model_reasoning_effort'], 'ultracode')
+
     def test_lookup_reads_one_thread_and_only_changed_files(self):
         instances = self.root / 'instances'
         self.seed(instances / 'a', 'high', None, 1_790_000_000.0)
