@@ -26,12 +26,15 @@ internal sealed record Choice(string Id, string Label, JsonElement Data = defaul
     public string ProfileCache { get; init; } = "";
     public string ProfileCacheTone { get; init; } = "";
     public string ProfileNoticeTone { get; init; } = "";
+    public string ProfileNoticeShort { get; init; } = "";
     public string ProfileEmail { get; init; } = "";
-    public ProfileCardData Card => ProfileCardData.Create(Data, Label, ProfileNotice, ProfileCache, ProfileCacheTone, ProfileNoticeTone) with { Email = ProfileEmail };
+    public ProfileCardData Card => ProfileCardData.Create(Data, Label, ProfileNotice, ProfileCache, ProfileCacheTone, ProfileNoticeTone, ProfileNoticeShort) with { Email = ProfileEmail };
     public ShortcutCardData? Shortcut { get; init; }
     public string AgentBadge => ProfileAgentPresentation.Badge(Data);
     public string AgentHint => ProfileAgentPresentation.Hint(Data);
     public System.Windows.Visibility AgentBadgeVisibility => AgentBadge.Length > 0 ? System.Windows.Visibility.Visible : System.Windows.Visibility.Collapsed;
+    // Card chip form of the subagent policy: "↳ 혼합", "↳ 외부 전용 · 대기".
+    public string AgentChip => AgentBadge.Replace("하위 에이전트 · ", "↳ ", StringComparison.Ordinal);
     public string Hint
     {
         get

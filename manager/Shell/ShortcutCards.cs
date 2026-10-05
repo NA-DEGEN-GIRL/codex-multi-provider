@@ -7,7 +7,8 @@ namespace Codex.ControlCenter.Shell;
 
 // Task shortcut card, two lines. The title wraps to two lines; the second line
 // says whether the task is working or waiting right now, which account opens
-// it, its SSH host, the account's subagent models and when it was last used.
+// it, the account's subagent models and when it was last used. The SSH host is
+// in the card tooltip (and the search), not on every card.
 // The leading ring is the owning account's remaining usage (outer: weekly,
 // inner: a shorter window when reported) around its short label. The whole
 // card opens the task; ⋯ holds move/rename/delete. Values come from
@@ -90,9 +91,6 @@ internal static class ShortcutCards
                     <!-- The account that opens this task: number and short name. -->
                     <Border Style="{StaticResource Chip}" Background="{Binding Shortcut.BadgeBrush}" ToolTip="{Binding Shortcut.Account}">
                       <TextBlock Text="{Binding Shortcut.ProfileName}" FontSize="12" Foreground="{Binding Shortcut.BadgeTextBrush}" TextWrapping="NoWrap"/>
-                    </Border>
-                    <Border Style="{StaticResource Chip}" Background="#262B34" Visibility="{Binding Shortcut.HostVisibility}">
-                      <TextBlock Text="{Binding Shortcut.HostLabel}" FontSize="12" Foreground="#AEB6C5" TextWrapping="NoWrap"/>
                     </Border>
                     <!-- Subagent models of the account, or the model of an API profile. -->
                     <Border Style="{StaticResource Chip}" Background="#2C3044" Visibility="{Binding Shortcut.AgentVisibility}">

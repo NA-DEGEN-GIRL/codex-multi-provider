@@ -82,12 +82,16 @@ _PIPE_VARIANTS = {_ORIGINAL: _REPLACEMENT,
        for binding in (b's', b'o', b'c')}}  # 26.924 renames the path import to o, 26.930 to c.
 # 26.930 compiles the route component with the React compiler: its layout
 # effect is cached, and the pathname/search bindings are s and c.
-_CONTEXT_RENDERER_930 = b'e[15]=g):g=e[15],(0,X5.useLayoutEffect)(h,g);'
+_CONTEXT_RENDERER_930 = (b'(g=[o,s,m,t],e[11]=o,e[12]=s,e[13]=m,e[14]=t,e[15]=g):g=e[15],'
+                         b'(0,X5.useLayoutEffect)(h,g);')
 _RENDERER_VARIANTS = {_CONTEXT_RENDERER: _CONTEXT_RENDERER_REPLACEMENT,
     **{_CONTEXT_RENDERER.replace(b't7.', binding): _CONTEXT_RENDERER_REPLACEMENT.replace(b't7.', binding)
        for binding in (b'F9.', b'R9.', b'L9.')},
-    _CONTEXT_RENDERER_930: _CONTEXT_RENDERER_930 + (b'(0,X5.useEffect)(()=>{window.electronBridge?.sendMessageFromView?.('
-        b'{type:`manager-task-context-changed`,route:s+c,title:document.title})},[s,c]);')}
+    # 26.930.3930 binds React as X5, 26.930.4958 as Z5.
+    **{_CONTEXT_RENDERER_930.replace(b'X5.', binding): _CONTEXT_RENDERER_930.replace(b'X5.', binding) + (
+        b'(0,' + binding + b'useEffect)(()=>{window.electronBridge?.sendMessageFromView?.('
+        b'{type:`manager-task-context-changed`,route:s+c,title:document.title})},[s,c]);')
+       for binding in (b'X5.', b'Z5.')}}
 _CONTEXT_VARIANTS = {_CONTEXT_MAIN: _CONTEXT_MAIN_REPLACEMENT,
     _CONTEXT_MAIN.replace(b's.type', b'c.type'): _CONTEXT_MAIN_REPLACEMENT.replace(
         b's.type', b'c.type').replace(b't.sender,s.route,s.title', b'i.sender,c.route,c.title'),

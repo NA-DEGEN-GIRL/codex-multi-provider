@@ -11,7 +11,7 @@ def patch(data):
             raise ValueError('External reasoning picker is not verified for this desktop version.')
         return data
     before = b'let e=o?r.supportedReasoningEfforts:r.supportedReasoningEfforts.filter(({reasoningEffort:e})=>e!==`ultra`)'
-    gates = [b'.filter(({reasoningEffort:e})=>' + name + b'(e)&&i.has(e))' for name in (b'gj', b'WXn', b'UXn', b'vw', b'pye', b'zve')]
+    gates = [b'.filter(({reasoningEffort:e})=>' + name + b'(e)&&i.has(e))' for name in (b'gj', b'WXn', b'UXn', b'vw', b'pye', b'zve', b'kve')]
     found = [gate for gate in gates if gate in data]
     if not found:
         raise ValueError('External reasoning picker is not verified for this desktop version.')

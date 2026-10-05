@@ -50,6 +50,8 @@ public sealed partial class MainWindow : Window
     private readonly TextBlock _mode = new() { Foreground = Muted, Margin = new Thickness(0, 5, 0, 0), FontSize = 12, TextWrapping = TextWrapping.Wrap };
     private readonly TextBlock _accountState = new() { Foreground = Muted, Margin = new Thickness(0, 5, 0, 0), FontSize = 12, TextWrapping = TextWrapping.Wrap };
     private readonly TextBlock _runtimeVersion = new() { Foreground = Muted, Margin = new Thickness(0, 5, 0, 0), FontSize = 12, TextWrapping = TextWrapping.Wrap };
+    // SSH hosts of the selected profile: kept here and in the tooltip, not on cards.
+    private readonly TextBlock _sshHosts = new() { Name = "WorkspaceSshHosts", Foreground = Muted, Margin = new Thickness(0, 5, 0, 0), FontSize = 12, TextWrapping = TextWrapping.Wrap };
     private readonly TextBlock _operation = new() { Foreground = Muted, Margin = new Thickness(0, 6, 0, 0), FontSize = 12, TextWrapping = TextWrapping.Wrap, Visibility = Visibility.Collapsed };
     private readonly TextBlock _empty = new() { Text = "왼쪽에서 프로필을 선택하세요.\n선택한 계정의 Codex가 여기에 열립니다.", TextWrapping = TextWrapping.Wrap, TextAlignment = TextAlignment.Center, LineHeight = 24, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center, Foreground = Muted, FontSize = 14, Margin = new Thickness(28) };
     private readonly Grid _clientSurface = new() { Background = new SolidColorBrush(Color.FromRgb(22, 24, 29)) };
@@ -360,9 +362,6 @@ public sealed partial class MainWindow : Window
         profileTools.Children.Add(WorkspaceAppearance.Glyph(Action("↻", RefreshAccountsAsync), "RefreshProfiles", WorkspaceAppearance.GlyphRefresh, "계정·사용량·리딤 횟수 새로고침"));
         profileTools.Children.Add(WorkspaceAppearance.Glyph(profileMenu, "ProfileActions", WorkspaceAppearance.GlyphMore, "선택한 프로필 관리"));
         Grid.SetColumn(profileTools, 1); headingRow.Children.Add(profileTools);
-        // Aligned with the profile name (40-DIP avatar + 12-DIP gap).
-        _profileUsage.ContentTemplate = ProfileCards.Usage();
-        _profileUsage.Margin = new Thickness(52, 10, 0, 0);
         var controls = new WrapPanel { Name = "WorkspaceTools", VerticalAlignment = VerticalAlignment.Top };
         notesToggle = WorkspaceAppearance.Tool(Action("작업 메모", () => { ChooseNotesVisible(_notes.Visibility != Visibility.Visible); return Task.CompletedTask; }, "이 작업의 메모와 체크리스트 열기 / 접기"), "ToggleTaskNotes");
         controls.Children.Add(notesToggle);
@@ -372,7 +371,7 @@ public sealed partial class MainWindow : Window
         controls.Children.Add(WorkspaceAppearance.Tool(MenuButton("창 및 연결", ("원래 창으로 보기", DetachAsync), ("연결 확인", VerifyConversationAsync),
             ("입력 상태 확인", CheckInputAsync), ("로그인 상태 새로 확인", RefreshLoginStatusAsync)), "WorkspaceConnections", quiet: true));
         var details = new StackPanel();
-        details.Children.Add(_mode); details.Children.Add(_accountState); details.Children.Add(_runtimeVersion);
+        details.Children.Add(_mode); details.Children.Add(_accountState); details.Children.Add(_runtimeVersion); details.Children.Add(_sshHosts);
         var detailsPanel = new Border { Name = "WorkspaceDetailsPanel", Background = WorkspaceAppearance.Surface, CornerRadius = new CornerRadius(8),
             Padding = new Thickness(12, 6, 12, 12), Margin = new Thickness(0, 10, 0, 0), Child = details, Visibility = Visibility.Collapsed };
         Button? detailsToggle = null;
@@ -414,7 +413,7 @@ public sealed partial class MainWindow : Window
         headingRow.SizeChanged += (_, _) => ArrangeHeading();
         _loginRepair.IsVisibleChanged += (_, _) => ArrangeHeading();
         ArrangeHeading();
-        header.Children.Add(headingRow); header.Children.Add(_profileUsage); header.Children.Add(narrowTools);
+        header.Children.Add(headingRow); header.Children.Add(narrowTools);
         header.Children.Add(_taskIdentity);
         header.Children.Add(_attention); header.Children.Add(_operation); header.Children.Add(_updateBanner);
         header.Children.Add(detailsPanel);
@@ -883,16 +882,22 @@ public sealed partial class MainWindow : Window
             if (!_profileOrdering.IsInteracting) Fill(_profiles, _state.Arr("profiles").Select(p =>
             {
                 var update = startup.Arr("profiles").FirstOrDefault(item => item.S("profile_id") == p.S("id"));
-                var suffix = update.ValueKind == JsonValueKind.Object && update.S("state") is not ("current" or "latest_on_open" or "complete")
+                // The card shows one short word: update attention on the warning
+                // chip, progress (updating, opening in the background) on the
+                // status pill. The full sentence stays in the tooltip and Label.
+                var updateState = update.ValueKind == JsonValueKind.Object ? update.S("state") : "";
+                var suffix = updateState is not ("" or "current" or "latest_on_open" or "complete")
                     ? "\n" + UpdatePresentation.ProfileState(update) : "";
-                // Update attention and login problems mark the rail dot; progress notices stay neutral.
-                var noticeTone = suffix.Length > 0 && update.S("state") is "attention" or "superseded" ? "warning" : "";
-                if (ProfileLoginPresentation.NeedsLogin(p)) { suffix = "\n로그인 확인 필요"; noticeTone = "warning"; }
+                var (noticeTone, noticeShort) = suffix.Length == 0 ? ("", "")
+                    : updateState is "attention" or "superseded" ? ("warning", "업데이트 필요")
+                    : ("transient", updateState switch { "waiting" => "적용 대기", "login_pending" => "로그인 대기", "unknown" => "버전 확인 중", _ => "업데이트 중" });
+                // The status pill already reads 로그인 필요.
+                if (ProfileLoginPresentation.NeedsLogin(p)) { suffix = "\n로그인 확인 필요"; (noticeTone, noticeShort) = ("", ""); }
                 var prepared = warmup.Arr("profiles").FirstOrDefault(item => item.S("profile_id") == p.S("id"));
                 if (p.S("status") != "running" && !ProfileLoginPresentation.NeedsLogin(p))
                 {
-                    if (prepared.S("state") is "checking" or "opening") { suffix = "\n백그라운드에서 여는 중"; noticeTone = ""; }
-                    else if (prepared.S("state") == "queued") { suffix = "\n미리 열기 대기"; noticeTone = ""; }
+                    if (prepared.S("state") is "checking" or "opening") { suffix = "\n백그라운드에서 여는 중"; (noticeTone, noticeShort) = ("transient", "여는 중"); }
+                    else if (prepared.S("state") == "queued") { suffix = "\n미리 열기 대기"; (noticeTone, noticeShort) = ("transient", "열기 대기"); }
                 }
                 var label = ClaudeProfilePresentation.IsClaude(p) ? "[Claude] " + p.S("alias")
                     : LocalModelPresentation.IsLocalProfile(p) ? "[로컬] " + p.S("alias")
@@ -900,7 +905,7 @@ public sealed partial class MainWindow : Window
                 var usage = ClaudeProfilePresentation.IsClaude(p) ? ClaudeProfilePresentation.Detail(p)
                     : p.S("auth_mode") == "external" ? p.S("external_model_name", "외부 API") : Usage(p.Get("usage"));
                 return ProfileCacheLine.Apply(new Choice(p.S("id"), $"{label}\n{usage} · {Status(p.S("status"))}" + suffix, p)
-                    { ProfileNotice = suffix, ProfileNoticeTone = noticeTone, ProfileEmail = ProfileEmailText(p) }, _state, _selectedTask);
+                    { ProfileNotice = suffix, ProfileNoticeTone = noticeTone, ProfileNoticeShort = noticeShort, ProfileEmail = ProfileEmailText(p) }, _state, _selectedTask);
             }), _selectedProfile);
             using (_responsiveness?.Stage("shell.shortcut_list", 25)) RenderShortcuts();
             var p = Profile();
@@ -953,6 +958,10 @@ public sealed partial class MainWindow : Window
             if (p.B("sidebar_cache_pending"))
                 _runtimeVersion.Text += " · 이전 목록 정리 대기: 새로 시작해야 적용됩니다";
             _runtimeVersion.Foreground = selection.B("restart_required") || p.B("sidebar_cache_pending") ? Brushes.Orange : Muted;
+            var sshHosts = p.Arr("remote_bindings").Where(binding => binding.B("prepared")).Select(binding => binding.S("alias"))
+                .Where(alias => alias.Length > 0).Distinct().ToArray();
+            _sshHosts.Text = sshHosts.Length == 0 || _selectedProfile is null ? "" : "SSH 연결 · " + string.Join(", ", sshHosts);
+            _sshHosts.Visibility = _sshHosts.Text.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
             var warnings = new List<string>();
             if (ProfileLoginPresentation.NeedsLogin(p)) warnings.Add("로그인 확인 필요 · 이 프로필에 로그인해 주세요.");
             if (automatic.S("phase") == "attention") warnings.Add(automatic.S("message"));
@@ -1994,7 +2003,7 @@ public sealed partial class MainWindow : Window
                     }
                 }));
                 if (_parked.Count > 0)
-                    throw new InvalidOperationException("일부 Codex가 종료 요청에 응답하지 않았습니다. 관리창을 유지합니다. 구버전 프로필은 원래 창에서 앱을 종료해 주세요.");
+                    throw new InvalidOperationException("일부 Codex가 1분 안에 종료를 마치지 못했습니다. 관리창을 유지합니다. 잠시 뒤 완전 종료를 다시 눌러 주세요.");
                 if (_client?.IsConnected == true)
                 {
                     // A mode switch can hand the UI to a process that is no longer a

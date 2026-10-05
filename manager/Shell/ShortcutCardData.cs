@@ -14,9 +14,6 @@ internal sealed record ShortcutCardData(string Title, string Account, string Acc
     bool External, string Agent, string Detail, string ProfileName = "", string Provider = "gpt", string When = "")
 {
     public Visibility AgentVisibility => Agent.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
-    // Local tasks need no location chip; SSH tasks show their host alias.
-    public Visibility HostVisibility => Host is "" or "Windows" ? Visibility.Collapsed : Visibility.Visible;
-    public string HostLabel => "SSH · " + Host;
     public Visibility WhenVisibility => When.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
     public Brush BadgeBrush => WorkspaceAppearance.Tint(Provider).Fill;
     public Brush BadgeTextBrush => WorkspaceAppearance.Tint(Provider).Text;
@@ -50,7 +47,7 @@ internal sealed record ShortcutCardData(string Title, string Account, string Acc
     }
 
     private Brush QuotaBrush(double remaining, Brush plenty) => External || !double.IsFinite(remaining) ? Api
-        : remaining < 10 ? Critical : remaining < 30 ? Low : plenty;
+        : remaining < 10 ? Critical : remaining < 25 ? Low : plenty;
 
     private static Geometry Arc(double percent, double radius)
     {
@@ -114,7 +111,7 @@ internal sealed record ShortcutCardData(string Title, string Account, string Acc
             : "사용량 확인 안 됨";
         var where = runner.Length > 0 ? $" ({live.Alias} 계정에서 실행 중)" : "";
         var (agent, agentDetail) = Agents(owner, external, models);
-        var detail = $"{shortcut.S("alias", "이름 없는 작업")}\n{(alias == "" ? "계정 지정 필요" : alias + " 계정")} · {host}\n" +
+        var detail = $"{shortcut.S("alias", "이름 없는 작업")}\n{(alias == "" ? "계정 지정 필요" : alias + " 계정")} · {(host == "Windows" ? host : "SSH · " + host)}\n" +
                      $"{stateText}{where}\n{usage}\n{agentDetail}\n누르면 이 계정에서 열립니다. ⋯ 버튼으로 계정 이동·별칭 변경·링크 삭제.";
         return new(shortcut.S("alias", "이름 없는 작업"), alias == "" ? "계정 지정 필요" : alias,
             alias == "" ? "?" : ProfileBadge.Short(alias), host, state, stateText + runner, outer, inner, outerLabel, innerLabel, external && !claude, agent, detail,

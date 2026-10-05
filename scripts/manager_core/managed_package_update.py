@@ -93,27 +93,35 @@ def inspect(manager, installed, previous=None):
 
 
 def complete_message(proof):
-    versions = ', '.join(proof.get('managed_versions', []))
-    return ('Windows의 공식 Codex 앱 업데이트를 확인했습니다. 진행 중인 작업은 유지했습니다. '
-            f'작업 공간은 검증된 관리용 Codex {versions}을 계속 사용합니다. 새 화면 적용은 별도 호환 지원이 필요합니다.')
+    return ('공식 Codex 앱을 업데이트했습니다. 진행 중인 작업은 그대로입니다. '
+            '프로필을 다시 열면 새 버전과의 호환을 확인해 새 버전으로 실행합니다.')
 
 
 def _quiet(manager, installed):
-    """True when no Codex window of the package or of a managed copy runs.
+    """True when no process of the official package itself runs.
 
-    The package's own background service (CodexSandboxService, automatic start,
-    LocalSystem) then still keeps the package in use, and Windows defers every
-    registration while it runs. Only in this state may the installer stop it.
+    Managed copies run from their own folders without package identity, and
+    neither they nor the managed runtime use the package's background service
+    (CodexSandboxService, automatic start, LocalSystem). That service alone
+    then keeps the package in use, and Windows defers every registration while
+    it runs; only in this state may the installer stop it. A process whose
+    image could not be read keeps the update deferred.
     """
+    root = (manager.root / 'artifacts/managed-desktop').resolve()
     try:
-        return not manager.processes(installed)
+        for process in manager.processes(installed):
+            executable = process.get('executable')
+            if not executable or not Path(executable).resolve().is_relative_to(root):
+                return False
+        return True
     except (OSError, ValueError, UpdateError):
         return False
 
 
 def _registration_pending(manager, transaction, actual):
     return manager._journal(transaction, 'registration_pending',
-        '공식 Codex 업데이트 파일이 준비됐습니다. «준비된 업데이트 적용»을 누르면 작업 공간에서 설치를 마칩니다. 원본 앱을 열 필요는 없습니다.',
+        '새 공식 Codex 파일을 받아 두었지만 Windows가 등록을 미뤘습니다. 원래 Codex 앱 창이 열려 있으면 닫고 «준비된 업데이트 적용»을 누르세요. '
+        '작업 공간을 완전 종료할 때도 자동으로 적용합니다.',
         observed_installed=actual, recovery_required=True, install_retried=False,
         profiles_preserved=True, managed_versions=transaction['isolation']['managed_versions'])
 
@@ -191,7 +199,8 @@ def finalize(manager):
 
 def _registration_busy(manager, transaction):
     return manager._journal(transaction, 'registration_pending',
-        'Windows가 사용 중인 앱 때문에 적용을 보류했습니다. 작업 공간을 완전 종료하면 자동으로 적용합니다. 원본 앱을 열 필요는 없습니다. 작업 중에는 종료하지 않아도 됩니다.',
+        'Windows가 아직 사용 중인 Codex 때문에 적용을 미뤘습니다. 원래 Codex 앱 창이 열려 있으면 닫아 주세요. '
+        '작업 공간을 완전 종료할 때 자동으로 적용합니다.',
         install_outcome='registration_busy', recovery_required=True, profiles_preserved=True)
 
 

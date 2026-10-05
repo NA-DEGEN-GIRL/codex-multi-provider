@@ -27,10 +27,14 @@ internal static class LayoutSelfTest
         using var fixture = JsonDocument.Parse("""
         {
           "profiles":[
-            {"id":"fixture-01","alias":"01 · 개인 개발 · 아주 긴 계정 이름도 한 줄에 표시","status":"ready","runtime_state":{"opened_task":{"thread_id":"layout-task","title":"작업 공간 UI 개선"}},"remote_bindings":[{"alias":"remote-host","prepared":true},{"alias":"lab-gpu","prepared":true}],"policy":{"enabled":true,"model_ids":["a","b"],"desired_revision":1,"effective_revision":1},"usage":{"windows":[{"label":"5시간","remaining_percent":72},{"label":"주간","remaining_percent":46,"resets_at":1800000000}],"reset_credits":{"available":0,"expires_at":null}}},
+            {"id":"fixture-01","alias":"01 · 개인 개발 · 아주 긴 계정 이름도 한 줄에 표시","status":"ready","runtime_state":{"opened_task":{"thread_id":"layout-task","title":"작업 공간 UI 개선"}},"remote_bindings":[{"alias":"build-linux","prepared":true},{"alias":"remote-host","prepared":true},{"alias":"lab-gpu","prepared":true}],"policy":{"enabled":true,"model_ids":["a","b"],"desired_revision":1,"effective_revision":1},"usage":{"windows":[{"label":"5시간","remaining_percent":72},{"label":"주간","remaining_percent":46,"resets_at":1800000000}],"reset_credits":{"available":0,"expires_at":null}}},
             {"id":"fixture-02","alias":"02 · 작업용","status":"running","policy":{"enabled":false,"model_ids":[],"desired_revision":1,"effective_revision":1},"usage":{"windows":[{"label":"5시간","remaining_percent":28},{"label":"주간","remaining_percent":81,"resets_at":1800000000}],"reset_credits":{"available":2,"expires_at":null}}},
-            {"id":"fixture-03","alias":"03 · 외부 모델","auth_mode":"external","external_model_name":"Example Model","status":"stopped","policy":{"enabled":true,"selection_mode":"external_only","model_ids":["a"],"desired_revision":2,"effective_revision":1},"usage":{"windows":[{"label":"주간","remaining_percent":50}],"reset_credits":{"available":9}}}
+            {"id":"fixture-03","alias":"03 · 외부 모델","auth_mode":"external","external_model_name":"Example Model","status":"stopped","policy":{"enabled":true,"selection_mode":"external_only","model_ids":["a"],"desired_revision":2,"effective_revision":1},"usage":{"windows":[{"label":"주간","remaining_percent":50}],"reset_credits":{"available":9}}},
+            {"id":"fixture-04","alias":"04 · Claude 작업","auth_mode":"claude_code","status":"running","claude_settings":{"model":"claude-opus-5-5","reasoning_effort":"max"},"claude_status":{"state":"signed_in","logged_in":true,"subscription_type":"max"},"remote_bindings":[{"alias":"build-linux","prepared":true},{"alias":"remote-host","prepared":true},{"alias":"lab-gpu","prepared":true}],"usage":{"provider":"claude_code","freshness":"stale","observed_at":"2026-10-04T13:26:00Z","error":{"code":"usage_auth","message":"Claude 사용량 조회 인증을 확인하지 못했습니다. 이 프로필의 로그인을 다시 확인해 주세요."},"windows":[{"key":"five_hour","remaining_percent":91,"resets_at":1790654400},{"key":"seven_day","remaining_percent":97,"resets_at":1791259200}]}},
+            {"id":"fixture-05","alias":"05 · 주간만 확인","status":"running","policy":{"enabled":false,"model_ids":[]},"usage":{"windows":[{"label":"주간","remaining_percent":18,"resets_at":1800000000}],"reset_credits":{"available":1}}},
+            {"id":"fixture-06","alias":"06 · 새 계정","status":"stopped","policy":{"enabled":false,"model_ids":[]}}
           ],
+          "profile_warmup":{"worker_active":true,"profiles":[{"profile_id":"fixture-06","state":"opening"}]},
           "shortcuts":[
             {"id":"task-01","alias":"Codex 작업 공간 개발","profile_id":"fixture-01","host_id":"local"},
             {"id":"task-02","alias":"서버 API 정리","profile_id":"fixture-01","host_id":"remote-dev"},
@@ -69,33 +73,36 @@ internal static class LayoutSelfTest
         var directory = Path.GetDirectoryName(report)!;
         string Png(string suffix) => Path.Combine(directory, Path.GetFileNameWithoutExtension(report) + suffix + ".png");
 
-        // Default: a 64-DIP rail and the docked 280-DIP shortcut column.
-        Require(Math.Abs(grid.ColumnDefinitions[0].ActualWidth - 64) < 0.5, "The profile list does not start as the 64-DIP rail.");
+        // Default: a 68-DIP rail and the docked 280-DIP shortcut column.
+        Require(Math.Abs(grid.ColumnDefinitions[0].ActualWidth - 68) < 0.5, "The profile list does not start as the 68-DIP rail.");
         Require(Math.Abs(grid.ColumnDefinitions[1].ActualWidth - SidebarLayout.DefaultShortcutWidth) < 0.5, "The shortcut column does not start at 280 DIP.");
         Require(grid.ColumnDefinitions[3].ActualWidth >= MainWindow.MinWorkspaceWidth, "The workspace lost its minimum width beside the docked column.");
         AssertActionsReachable(window, layout);
         AssertRail(window, layout);
         var tooltipPng = Png("-rail-tooltip");
-        AssertRailTooltip(window, tooltipPng);
-        AssertSummary(window, layout, "46%", "리딤 0회");
+        AssertProfileTooltips(window, tooltipPng, Png("-rail-tooltip-claude"));
+        AssertSummary(window, layout);
         AssertShortcutCards(window, layout);
         AssertShortcutFilter(window);
         AssertUpdateDetails(window, fixture.RootElement);
         // Exercise real bindings after a count-only refresh; all these values are
         // unknown, while the baseline fixture proves that integer zero is known.
+        // The count is tooltip-only: it never appears on the rail or header.
         foreach (var count in new double?[] { null, 1.5, -1 })
         {
             var variant = JsonNode.Parse(fixture.RootElement.GetRawText())!;
             variant["profiles"]![0]!["usage"]!["reset_credits"] = count is null ? null : new JsonObject { ["available"] = count.Value };
             window.UseFixture(JsonSerializer.SerializeToElement(variant));
             window.UpdateLayout();
-            AssertSummary(window, layout, "46%", "리딤 확인 안 됨");
-            if (VisibleTexts(Named<ContentControl>(layout, "ProfileUsageHost")).Contains("리딤 0회"))
-                throw new InvalidOperationException("An unknown reset-credit count was displayed as zero.");
+            AssertSummary(window, layout);
+            var tip = TipTexts(Field<ListBox>(window, "_profiles").Items.OfType<Choice>().Single(item => item.Id == "fixture-01"));
+            Require(tip.Contains("리딤 확인 안 됨") && !tip.Contains("리딤 0회"), "An unknown reset-credit count was displayed as zero.");
         }
         window.UseFixture(fixture.RootElement.Clone());
         window.UpdateLayout();
         AssertRail(window, layout);
+        AssertClaudeHeader(window, layout, Png("-header-claude"));
+        await AssertScaledRailAsync(window, layout, Png("-rail-125"), Png("-rail-150"));
         var details = Descendants(layout).OfType<Button>().Single(button => button.Name == "WorkspaceDetails");
         var detailsPanel = Named<Border>(layout, "WorkspaceDetailsPanel");
         if (Field<Popup>(window, "_settingsFlyout").IsOpen || detailsPanel.IsVisible || Descendants(layout).OfType<TaskNotesPanel>().Any(panel => panel.IsVisible)
@@ -193,7 +200,9 @@ internal static class LayoutSelfTest
         await AssertSidebarSplitAsync(window, fixtureRoot, fixture.RootElement, FixtureRequest, crowdedPng);
         if (unexpectedRequests.Count != 0) throw new InvalidOperationException("Layout interactions issued backend requests: " + string.Join(", ", unexpectedRequests));
         File.WriteAllText(report, JsonSerializer.Serialize(new { ok = true, width = layout.ActualWidth, height = layout.ActualHeight,
-            rail_dip = 64, expanded_profiles_dip = 304, shortcut_column_dip = SidebarLayout.DefaultShortcutWidth, min_workspace_dip = MainWindow.MinWorkspaceWidth,
+            rail_dip = 68, expanded_profiles_dip = 304,
+            rail_selection_concentric = true, usage_rings_zero_one_two_windows = true, long_notes_tooltip_only = true, ssh_hosts_tooltip_only = true,
+            transient_state_on_pill = true, single_warning_chip = true, rail_scaled_125_150_rendered = true, shortcut_column_dip = SidebarLayout.DefaultShortcutWidth, min_workspace_dip = MainWindow.MinWorkspaceWidth,
             grouped_actions_reachable = true, secondary_panels_collapsed = true, minimum_window_checked = true,
             rail_avatars_rings_status_and_selection = true, rail_tooltip_details = true, header_summary_meters_and_chips = true,
             zero_positive_unknown_credits_checked = true, malformed_credits_unknown = true, external_api_quota_hidden = true,
@@ -206,84 +215,178 @@ internal static class LayoutSelfTest
             shortcut_column_drag_checked = true, independent_list_scrolling = true, sidebar_selection_preserved = true,
             sidebar_extremes_and_compact_settings_checked = true, sidebar_width_reloaded = true, sidebar_scroll_preserved_on_refresh = true,
             source = "synthetic WPF controls only; no live profile or Codex process", png, sidebar_png = sidebarPng, expanded_png = expandedPng,
-            settings_png = Png("-settings"), rail_tooltip_png = tooltipPng, crowded_png = crowdedPng, notes_png = notesPng, notes_detail_png = notesDetailPng, compact_png = narrowPng, overlay_png = overlayPng },
+            settings_png = Png("-settings"), rail_tooltip_png = tooltipPng, rail_tooltip_claude_png = Png("-rail-tooltip-claude"),
+            header_claude_png = Png("-header-claude"), rail_125_png = Png("-rail-125"), rail_150_png = Png("-rail-150"), crowded_png = crowdedPng, notes_png = notesPng, notes_detail_png = notesDetailPng, compact_png = narrowPng, overlay_png = overlayPng },
             new JsonSerializerOptions { WriteIndented = true }));
         window.Close();
     }
 
-    // Rail: one avatar per profile with its short label, the weekly ring when
-    // known, a status dot, the selection indicator and a rich tooltip.
+    // Rail: one avatar per profile with only its short label, usage rings for
+    // the windows it knows (0, 1 or 2), a status dot below the rings, and a
+    // selection ring concentric with the avatar beside the edge bar.
     private static void AssertRail(MainWindow window, FrameworkElement layout)
     {
         var list = Field<ListBox>(window, "_profiles");
         Require(list.ItemTemplate == ProfileCards.Rail(), "The collapsed profile list does not use the rail template.");
-        foreach (var (id, label, ring) in new[] { ("fixture-01", "01", 46d), ("fixture-02", "02", 81d), ("fixture-03", "03", double.NaN) })
+        foreach (var (id, label, rings) in new[] { ("fixture-01", "01", 2), ("fixture-02", "02", 2), ("fixture-03", "03", 0),
+            ("fixture-04", "04", 2), ("fixture-05", "05", 1), ("fixture-06", "06", 0) })
         {
             var item = Card(layout, id);
             AssertVisible(item, layout);
-            Require(item.ActualWidth <= 64 && item.ActualHeight is >= 52 and <= 64, "A rail avatar does not fit the rail: " + id);
+            var choice = (Choice)item.DataContext;
+            Require(item.ActualWidth <= 68 && item.ActualHeight is >= 60 and <= 70, $"A rail avatar does not fit the rail: {id} {item.ActualWidth}x{item.ActualHeight}");
             var texts = Descendants(item).OfType<TextBlock>().Where(block => block.IsVisible).Select(block => block.Text).ToArray();
-            Require(texts.SequenceEqual([label]), $"Rail avatar {id} shows {string.Join("|", texts)} instead of its short label.");
-            var arc = Descendants(item).OfType<System.Windows.Shapes.Path>().Single();
-            Require(double.IsNaN(ring) ? arc.Data.IsEmpty() || arc.Data == Geometry.Empty : !arc.Data.IsEmpty() && arc.IsVisible,
-                "The rail ring does not follow the weekly remaining usage: " + id);
+            Require(texts.SequenceEqual([label]), $"Rail avatar {id} shows {string.Join("|", texts)} instead of only its short label.");
+            var drawn = Descendants(item).OfType<System.Windows.Shapes.Path>().Count(path => path.IsVisible && !path.Data.IsEmpty());
+            Require(choice.Card.RingCount == rings && drawn == rings, $"Rail avatar {id} draws {drawn} usage rings for {rings} known windows.");
             var name = AutomationProperties.GetName(item);
-            Require(name.StartsWith(((Choice)item.DataContext).Card.Name, StringComparison.Ordinal)
-                && (double.IsNaN(ring) || name.Contains($"주간 남음 {ring:0}%")), "A rail avatar has no descriptive accessible name: " + name);
+            Require(name.StartsWith(choice.Card.Name, StringComparison.Ordinal) && (rings == 0 || name.Contains('%')),
+                "A rail avatar has no descriptive accessible name: " + name);
             var avatar = Descendants(item).OfType<Grid>().First(g => Equals(g.Tag, "ProfileDragItem"));
-            Require(avatar.ToolTip is ToolTip { ContentTemplate: not null }, "A rail avatar has no rich tooltip.");
+            Require(avatar.ToolTip is ToolTip, "A rail avatar has no rich tooltip.");
+            var frame = Bounds(Named<Grid>(item, "AvatarFrame"), item);
+            var dot = Bounds(Named<System.Windows.Shapes.Ellipse>(item, "StatusDot"), item);
+            Require(dot.Top >= frame.Bottom + 1 && dot.Bottom <= item.ActualHeight + 0.5 && dot.Width >= 7,
+                "The status dot overlaps the avatar rings or is clipped: " + id);
         }
         var selected = Card(layout, "fixture-01");
-        Require(selected.IsSelected && Descendants(selected).OfType<Border>().Any(border => border.Width == 3 && border.IsVisible),
-            "The selected profile has no rail indicator.");
-        Require(!Descendants(Card(layout, "fixture-02")).OfType<Border>().Any(border => border.Width == 3 && border.IsVisible),
-            "An unselected profile shows the selection indicator.");
+        Require(selected.IsSelected, "The selected profile was lost.");
+        var selection = Named<System.Windows.Shapes.Ellipse>(selected, "SelectionRing");
+        var indicator = Named<Border>(selected, "Indicator");
+        Require(selection.IsVisible && indicator.IsVisible, "The selected profile has no selection ring or rail indicator.");
+        var ring = Bounds(selection, selected);
+        var disc = Bounds(Descendants(selected).OfType<Viewbox>().First(), selected);
+        var bar = Bounds(indicator, selected);
+        Require(Math.Abs(ring.Left + ring.Width / 2 - (disc.Left + disc.Width / 2)) < 0.5
+            && Math.Abs(ring.Top + ring.Height / 2 - (disc.Top + disc.Height / 2)) < 0.5,
+            $"The selection ring is not concentric with the avatar: ring {ring}, avatar {disc}.");
+        Require(ring.Width - disc.Width is >= 6 and <= 12 && Math.Abs(ring.Width - ring.Height) < 0.5,
+            "The selection ring does not sit just outside the usage rings.");
+        Require(bar.Right <= ring.Left - 2 && Math.Abs(bar.Top + bar.Height / 2 - (ring.Top + ring.Height / 2)) < 0.5,
+            $"The selection bar touches the ring or is not level with the avatar: bar {bar}, ring {ring}.");
+        var other = Card(layout, "fixture-02");
+        Require(!Named<System.Windows.Shapes.Ellipse>(other, "SelectionRing").IsVisible && !Named<Border>(other, "Indicator").IsVisible,
+            "An unselected profile shows the selection ring or indicator.");
     }
 
-    // The hover card of a rail avatar, laid out offscreen exactly as its
-    // tooltip instantiates it: everything the collapsed rail leaves out.
-    private static void AssertRailTooltip(MainWindow window, string png)
+    // The rich tooltip, laid out offscreen exactly as a tooltip instantiates it.
+    private static (Border Tip, string[] Texts) RenderTip(Choice choice)
     {
-        var choice = Field<ListBox>(window, "_profiles").Items.OfType<Choice>().Single(item => item.Id == "fixture-01");
         var tip = new Border { Background = WorkspaceAppearance.Color("#30343D"), BorderBrush = WorkspaceAppearance.Color("#596273"),
             BorderThickness = new Thickness(1), Padding = new Thickness(10), CornerRadius = new CornerRadius(5), MaxWidth = 360,
-            Child = new ContentControl { Content = choice, ContentTemplate = (DataTemplate)ProfileCards.Rail().Resources["RailTip"] } };
+            Child = new ContentControl { Content = choice, ContentTemplate = ProfileCards.Tip() } };
         Layout(tip, 360, double.PositiveInfinity);
-        var texts = Descendants(tip).OfType<TextBlock>().Where(block => block.ActualWidth > 0).Select(block => block.Text).ToArray();
-        foreach (var expected in new[] { choice.Card.Name, "준비됨", "GPT", "주간 남음", "46%", "5시간 남음", "72%", "리딤 0회",
-            "하위 에이전트 · 혼합", "SSH 연결 · remote-host, lab-gpu" })
-            Require(texts.Contains(expected), $"The rail tooltip does not show '{expected}': {string.Join("|", texts)}");
-        Require(texts.Any(text => text.EndsWith(" 초기화", StringComparison.Ordinal)), "The rail tooltip has no reset time.");
-        SaveImage(tip, png);
+        return (tip, Descendants(tip).OfType<TextBlock>().Where(block => block.ActualWidth > 0).Select(block => block.Text).ToArray());
     }
 
-    // The selected profile in the header: name, status, provider, agent chip,
-    // SSH hosts, both usage windows with numbers, reset and redeem.
-    private static void AssertSummary(MainWindow window, FrameworkElement layout, string weekly, string redeem)
+    private static string[] TipTexts(Choice choice) => RenderTip(choice).Texts;
+
+    // Everything the cards leave out is in the tooltip: resets, redeem count,
+    // subscription, the provider's long note, last check and SSH hosts.
+    private static void AssertProfileTooltips(MainWindow window, string png, string claudePng)
+    {
+        var profiles = Field<ListBox>(window, "_profiles").Items.OfType<Choice>().ToArray();
+        var (gpt, gptTexts) = RenderTip(profiles.Single(item => item.Id == "fixture-01"));
+        foreach (var expected in new[] { profiles[0].Card.Name, "준비됨", "GPT", "주간 남음", "46%", "5시간 남음", "72%", "리딤 0회",
+            "하위 에이전트 · 혼합", "SSH 연결 · build-linux, remote-host, lab-gpu" })
+            Require(gptTexts.Contains(expected), $"The profile tooltip does not show '{expected}': {string.Join("|", gptTexts)}");
+        Require(gptTexts.Any(text => text.EndsWith(" 초기화", StringComparison.Ordinal)), "The profile tooltip has no reset time.");
+        SaveImage(gpt, png);
+        var (claude, claudeTexts) = RenderTip(profiles.Single(item => item.Id == "fixture-04"));
+        foreach (var expected in new[] { "04 · Claude 작업", "로그인됨", "Claude · Opus 5.5", "주간 남음", "97% · 이전 값", "5시간 남음", "91% · 이전 값",
+            "구독 · max", "SSH 연결 · build-linux, remote-host, lab-gpu" })
+            Require(claudeTexts.Contains(expected), $"The Claude tooltip does not show '{expected}': {string.Join("|", claudeTexts)}");
+        var notes = claudeTexts.Where(text => text.Contains("인증을 확인하지 못했습니다", StringComparison.Ordinal)).ToArray();
+        Require(notes.Length == 1 && notes[0].Contains("마지막 확인", StringComparison.Ordinal) && notes[0].StartsWith("이전 사용량", StringComparison.Ordinal),
+            "The Claude usage note must appear once, whole, in the tooltip.");
+        Require(claudeTexts.Count(text => text.EndsWith(" 초기화", StringComparison.Ordinal)) == 2, "The Claude tooltip lost a window's reset time.");
+        SaveImage(claude, claudePng);
+    }
+
+    // The selected profile in the header: line 1 name, status pill and
+    // provider chip; line 2 labelled usage gauges. Nothing else inline.
+    private static void AssertSummary(MainWindow window, FrameworkElement layout)
     {
         var summary = Named<ContentControl>(layout, "ProfileSummaryHost");
-        var usage = Named<ContentControl>(layout, "ProfileUsageHost");
-        AssertVisible(summary, layout); AssertVisible(usage, layout);
-        var blocks = Descendants(summary).Concat(Descendants(usage)).OfType<TextBlock>().Where(block => block.IsVisible).ToArray();
+        AssertVisible(summary, layout);
+        var blocks = Descendants(summary).OfType<TextBlock>().Where(block => block.IsVisible && block.ActualWidth > 0).ToArray();
         var texts = blocks.Select(block => block.Text).ToArray();
-        foreach (var expected in new[] { "01", "준비됨", "GPT", "하위 에이전트 · 혼합", "SSH · remote-host +1", "주간 남음", weekly, "5시간 남음", "72%", redeem })
+        foreach (var expected in new[] { "01", "준비됨", "GPT", "주간", "46%", "5시간", "72%" })
             Require(texts.Contains(expected), $"The header summary does not show '{expected}': {string.Join("|", texts)}");
-        Require(texts.Any(text => text.EndsWith(" 초기화", StringComparison.Ordinal)), "The header summary has no reset time.");
+        AssertNotInline(texts, "header", "SSH", "리딤", "초기화", "하위 에이전트", "↳", "이전 값", "마지막 확인");
         var name = blocks.Single(block => block.Text.StartsWith("01 · 개인 개발 · "));
         Require(name.TextTrimming == TextTrimming.CharacterEllipsis && name.TextWrapping == TextWrapping.NoWrap && Equals(name.ToolTip, name.Text)
-            && name.FontSize >= 16, "The header profile name is not a prominent single line with its full name in a tooltip.");
-        var meters = Descendants(usage).OfType<ProgressBar>().Where(meter => meter.IsVisible).Select(meter => meter.Value).ToArray();
-        // The usage line is a single clipped row: every value must fit inside it.
-        foreach (var block in Descendants(usage).OfType<TextBlock>().Where(block => block.IsVisible && block.Text.Length > 0))
+            && name.FontSize >= 18, "The header profile name is not a large single line with its full name in a tooltip.");
+        var gauges = Descendants(summary).OfType<System.Windows.Shapes.Path>().Where(path => path.StrokeThickness == 5 && path.IsVisible).ToArray();
+        Require(gauges.Length == 2 && gauges.All(path => !path.Data.IsEmpty()), "The header does not show the weekly and 5-hour ring gauges.");
+        foreach (var block in blocks)
         {
-            var bounds = block.TransformToAncestor(usage).TransformBounds(new Rect(block.RenderSize));
-            Require(bounds.Right <= usage.ActualWidth + 0.5, "A header usage value is clipped: " + block.Text);
+            var bounds = block.TransformToAncestor(summary).TransformBounds(new Rect(block.RenderSize));
+            Require(bounds.Right <= summary.ActualWidth + 0.5, "A header value is clipped: " + block.Text);
         }
-        Require(meters.SequenceEqual([46d, 72d]), "The header meters do not show the weekly and 5-hour windows: " + string.Join(",", meters));
-        foreach (var block in blocks.Where(block => block.Text.EndsWith('%') || block.Text.EndsWith(" 초기화") || block.Text.StartsWith("리딤")))
-            Require(block.TextWrapping == TextWrapping.NoWrap && block.FontSize >= 12, "A header usage value can wrap or is too small: " + block.Text);
+        foreach (var block in blocks.Where(block => block.Text.EndsWith('%')))
+            Require(block.TextWrapping == TextWrapping.NoWrap && block.FontSize >= 16, "A header percentage can wrap or is not large: " + block.Text);
+        Require(summary.ActualHeight <= 76, $"The header summary is taller than two lines ({summary.ActualHeight:F0} DIP).");
         Require(Named<TextBlock>(layout, "WorkspaceTask").Text == "최근 연 작업 · 작업 공간 UI 개선", "The recent task line was lost.");
         Require(!Named<TextBlock>(layout, "WorkspaceIdentity").IsVisible, "The plain identity line competes with the profile summary.");
+    }
+
+    // The dense real-world case: a Claude profile with old usage, a failed
+    // usage read and three SSH hosts shows two dimmed gauges and one chip.
+    private static void AssertClaudeHeader(MainWindow window, FrameworkElement layout, string png)
+    {
+        var selected = typeof(MainWindow).GetField("_selectedProfile", Private)!;
+        var render = typeof(MainWindow).GetMethod("Render", Private, Type.EmptyTypes)!;
+        selected.SetValue(window, "fixture-04"); render.Invoke(window, null); window.UpdateLayout();
+        try
+        {
+            var summary = Named<ContentControl>(layout, "ProfileSummaryHost");
+            var blocks = Descendants(summary).OfType<TextBlock>().Where(block => block.IsVisible && block.ActualWidth > 0).ToArray();
+            var texts = blocks.Select(block => block.Text).ToArray();
+            foreach (var expected in new[] { "04 · Claude 작업", "로그인됨", "Claude · Opus 5.5", "주간", "97%", "5시간", "91%", "사용량 확인 필요" })
+                Require(texts.Contains(expected), $"The Claude header does not show '{expected}': {string.Join("|", texts)}");
+            AssertNotInline(texts, "Claude header", "인증", "이전 값", "마지막 확인", "max", "SSH", "초기화", "구독");
+            Require(texts.Count(text => text == "") == 2, "Old Claude values are not marked with the clock icon.");
+            Require(blocks.Where(block => block.Text.EndsWith('%')).All(block => Equals(block.Foreground, ProfileCardData.StaleBrush)),
+                "Old Claude values are not dimmed.");
+            var warning = blocks.Single(block => block.Text == "사용량 확인 필요");
+            Require(Ancestors(warning).OfType<Border>().Any(border => border.ToolTip is string tip && tip.Contains("인증을 확인하지 못했습니다")),
+                "The warning chip does not explain itself in its tooltip.");
+            Require(summary.ActualHeight <= 76, "The dense Claude header is taller than two lines.");
+            SaveImage(layout, png);
+        }
+        finally { selected.SetValue(window, "fixture-01"); render.Invoke(window, null); window.UpdateLayout(); }
+    }
+
+    // The rail and shortcut column rasterized at 125% and 150%. Layout is in
+    // DIPs, so the geometry asserted above holds at every scale.
+    private static Task AssertScaledRailAsync(MainWindow window, FrameworkElement layout, string png125, string png150)
+    {
+        var grid = Named<Grid>(layout, "WorkspaceLayout");
+        var region = new Rect(0, 0, grid.ColumnDefinitions[0].ActualWidth + grid.ColumnDefinitions[1].ActualWidth, 520);
+        SaveImage(layout, png125, region, 120);
+        SaveImage(layout, png150, region, 144);
+        using (var image = File.OpenRead(png150))
+        {
+            var frame = BitmapDecoder.Create(image, BitmapCreateOptions.None, BitmapCacheOption.OnLoad).Frames[0];
+            Require(frame.PixelWidth == (int)Math.Ceiling(region.Width * 1.5), "The 150% rail image was not rendered at scale.");
+        }
+        return Task.CompletedTask;
+    }
+
+    private static void AssertNotInline(string[] texts, string where, params string[] fragments)
+    {
+        foreach (var fragment in fragments)
+            Require(!texts.Any(text => text.Contains(fragment, StringComparison.Ordinal)),
+                $"The {where} shows '{fragment}' inline; it belongs in the tooltip: {string.Join("|", texts)}");
+    }
+
+    private static Rect Bounds(FrameworkElement element, Visual ancestor) =>
+        element.TransformToAncestor(ancestor).TransformBounds(new Rect(element.RenderSize));
+
+    private static IEnumerable<DependencyObject> Ancestors(DependencyObject element)
+    {
+        for (var node = VisualTreeHelper.GetParent(element); node is not null; node = VisualTreeHelper.GetParent(node)) yield return node;
     }
 
     private static void AssertShortcutCards(MainWindow window, FrameworkElement layout)
@@ -298,8 +401,10 @@ internal static class LayoutSelfTest
             Require(title.TextWrapping == TextWrapping.Wrap && title.MaxHeight <= 40 && title.FontSize >= 14, "A shortcut title does not wrap to two lines: " + id);
             Require(blocks.Any(block => block.Text == card.StateText) && blocks.Any(block => block.Text == card.ProfileName)
                 && blocks.Any(block => block.Text == card.AccountShort), "A shortcut card lost its status, profile badge or ring label: " + id);
-            Require(host.Length == 0 ? !blocks.Any(block => block.Text.StartsWith("SSH")) : blocks.Any(block => block.Text == "SSH · " + host),
-                $"The SSH host chip is wrong: {id} · {string.Join("|", blocks.Select(block => block.Text))}");
+            // The SSH host is in the card tooltip (and the search), never a chip.
+            Require(!blocks.Any(block => block.Text.Contains("SSH") || (host.Length > 0 && block.Text.Contains(host)))
+                && (host.Length == 0 || card.Detail.Contains("SSH · " + host)),
+                $"The SSH host is shown on the card or missing from its tooltip: {id} · {string.Join("|", blocks.Select(block => block.Text))}");
             Require(blocks.Where(block => block != title).All(block => block.FontSize >= 11), "Shortcut meta text is too small: " + id);
             Require(Descendants(item).OfType<Button>().Any(button => Equals(button.Tag, "menu") && button.IsVisible), "A shortcut card has no ⋯ menu: " + id);
         }
@@ -355,52 +460,62 @@ internal static class LayoutSelfTest
         finally { reopened.Close(); }
         Click(layout, "ToggleProfilePanel");
         await Settle(window);
-        Require(Math.Abs(grid.ColumnDefinitions[0].ActualWidth - 64) < 0.5, "The profile toggle did not collapse the cards into the rail.");
+        Require(Math.Abs(grid.ColumnDefinitions[0].ActualWidth - 68) < 0.5, "The profile toggle did not collapse the cards into the rail.");
         using (var saved = JsonDocument.Parse(File.ReadAllText(Path.Combine(fixtureRoot, "work", "control-center", "sidebar-layout.json"))))
             Require(!saved.RootElement.GetProperty("profiles_expanded").GetBoolean(), "Collapsing the profiles was not saved.");
         AssertRail(window, layout);
     }
 
+    // Expanded cards stay scannable: name and one pill, the usage values with
+    // thin bars, one provider chip, the subagent mode and at most one warning.
     private static void AssertProfileCards(MainWindow window, FrameworkElement layout)
     {
-        foreach (var (id, weekly, shortWindow, redeem) in new[] { ("fixture-01", 46d, 72d, "리딤 0회"), ("fixture-02", 81d, 28d, "리딤 2회") })
+        string[] Visible(ListBoxItem card) => Descendants(card).OfType<TextBlock>().Where(block => block.IsVisible && block.ActualWidth > 0)
+            .Select(block => block.Text).ToArray();
+        foreach (var (id, pill, chip, values, rings, warning) in new[]
+        {
+            ("fixture-01", "준비됨", "GPT", new[] { 46d, 72d }, 2, ""),
+            ("fixture-02", "실행 중", "GPT", new[] { 81d, 28d }, 2, "업데이트 필요"),
+            ("fixture-03", "닫힘", "API · Example Model", Array.Empty<double>(), 0, ""),
+            ("fixture-04", "로그인됨", "Claude · Opus 5.5", new[] { 97d, 91d }, 2, "사용량 확인 필요"),
+            ("fixture-05", "실행 중", "GPT", new[] { 18d }, 1, ""),
+            ("fixture-06", "여는 중", "GPT", Array.Empty<double>(), 0, "")
+        })
         {
             var card = Card(layout, id);
-            var blocks = Descendants(card).OfType<TextBlock>().ToArray();
-            foreach (var expected in new[] { "주간 남음", $"{weekly:0}%", "5시간 남음", $"{shortWindow:0}%", redeem })
-                AssertScrollContentReachable(blocks.Single(block => block.Text == expected && block.IsVisible), layout);
-            var meters = Descendants(card).OfType<ProgressBar>().Where(meter => meter.IsVisible).ToArray();
-            if (meters.Length != 2 || meters[0].Value != weekly || meters[1].Value != shortWindow || meters.Any(meter => meter.ActualWidth <= 0))
-                throw new InvalidOperationException("The quota meters do not represent the weekly and 5-hour windows.");
-            foreach (var block in blocks.Where(block => BindingOperations.GetBinding(block, TextBlock.TextProperty)?.Path.Path
-                is "Label" or "Text" or "Card.ResetText" or "Card.RedeemText"))
-            {
-                if (block.TextWrapping != TextWrapping.NoWrap)
-                    throw new InvalidOperationException("A quota or reset value can wrap within its text: " + block.Text);
-                if (block.IsVisible) AssertScrollContentReachable(block, layout);
-            }
-            Require(blocks.Any(block => block.IsVisible && block.Text == (id == "fixture-01" ? "준비됨" : "실행 중")), "A card lost its status pill: " + id);
+            AssertScrollContentReachable(card, layout);
+            var texts = Visible(card);
+            foreach (var expected in new[] { pill, chip }.Concat(values.Select(value => $"{value:0.#}%")))
+                Require(texts.Contains(expected), $"Card {id} does not show '{expected}': {string.Join("|", texts)}");
+            Require(warning.Length == 0 ? !texts.Contains("") : texts.Count(text => text == "") == 1 && texts.Contains(warning),
+                $"Card {id} must show {(warning.Length == 0 ? "no warning" : "exactly one warning: " + warning)}: {string.Join("|", texts)}");
+            AssertNotInline(texts, "card " + id, "SSH", "리딤", "초기화", "이전 값", "마지막 확인", "인증", "구독", "max", "업데이트 확인 필요", "백그라운드에서");
+            var bars = Descendants(card).OfType<ProgressBar>().Where(meter => meter.IsVisible).Select(meter => meter.Value).ToArray();
+            Require(bars.SequenceEqual(values) && Descendants(card).OfType<ProgressBar>().Where(meter => meter.IsVisible).All(meter => meter.ActualWidth > 20),
+                $"Card {id} usage bars {string.Join(",", bars)} do not match its windows.");
+            var drawn = Descendants(card).OfType<System.Windows.Shapes.Path>().Count(path => path.IsVisible && !path.Data.IsEmpty());
+            Require(drawn == rings, $"Card {id} avatar draws {drawn} usage rings for {rings} known windows.");
+            Require(card.ActualHeight <= 132, $"Card {id} is {card.ActualHeight:F0} DIP tall; it should stay scannable.");
+            foreach (var block in Descendants(card).OfType<TextBlock>().Where(block => block.IsVisible && block.Text.EndsWith('%')))
+                Require(block.TextWrapping == TextWrapping.NoWrap && block.FontSize >= 12, $"A card value can wrap or is too small: {block.Text}");
         }
+        var claude = Descendants(Card(layout, "fixture-04")).OfType<TextBlock>().Where(block => block.IsVisible && block.Text.EndsWith('%')).ToArray();
+        Require(claude.Length == 2 && claude.All(block => Equals(block.Foreground, ProfileCardData.StaleBrush))
+            && Descendants(Card(layout, "fixture-04")).OfType<TextBlock>().Count(block => block.IsVisible && block.Text == "") == 2,
+            "Old Claude values are not dimmed with a clock icon.");
+        Require(Visible(Card(layout, "fixture-01")).Contains("↳ 혼합") && Visible(Card(layout, "fixture-03")).Contains("↳ 외부 전용 · 대기"),
+            "The subagent mode chip is missing.");
         var selected = Card(layout, "fixture-01");
         if (!selected.IsSelected) throw new InvalidOperationException("The selected profile was lost during card refresh.");
         var name = Descendants(selected).OfType<TextBlock>().Single(block => block.Text.StartsWith("01 · 개인 개발 · "));
-        if (name.TextWrapping != TextWrapping.Wrap || name.MaxHeight > 40 || name.ActualHeight < 30 || name.ToolTip?.ToString() != name.Text)
-            throw new InvalidOperationException("A long profile name does not wrap to two lines with its full name in a tooltip.");
+        if (name.TextWrapping != TextWrapping.Wrap || name.MaxHeight > 40 || name.ActualHeight < 30 || name.FontSize < 14)
+            throw new InvalidOperationException("A long profile name does not wrap to two lines.");
+        Require(Descendants(selected).OfType<Grid>().First(grid => grid.Name == "ProfileCard").ToolTip is ToolTip,
+            "An expanded card has no rich tooltip.");
         var shortName = Descendants(Card(layout, "fixture-02")).OfType<TextBlock>().Single(block => block.Text == "02 · 작업용");
         Require(shortName.ActualHeight < 24, "A short profile name took more than one line.");
-        AssertScrollContentReachable(name, layout);
-        AssertScrollContentReachable(Descendants(selected).OfType<TextBlock>().Single(block => block.Text == "하위 에이전트 · 혼합"), layout);
-        AssertScrollContentReachable(Descendants(selected).OfType<TextBlock>().Single(block => block.Text == "SSH · remote-host +1"), layout);
-        var external = Card(layout, "fixture-03");
-        var externalBlocks = Descendants(external).OfType<TextBlock>().Where(block => block.IsVisible).ToArray();
-        if (!externalBlocks.Any(block => block.Text == "API") || !externalBlocks.Any(block => block.Text == "Example Model")
-            || externalBlocks.Any(block => block.Text.Contains("리딤") || block.Text.EndsWith("%") || block.Text.EndsWith(" 초기화")))
-            throw new InvalidOperationException("An external API card exposes native quota or reset-credit information.");
-        if (Descendants(external).OfType<ProgressBar>().Any(meter => meter.IsVisible))
-            throw new InvalidOperationException("An external API card exposes a native quota meter.");
-        AssertScrollContentReachable(Descendants(external).OfType<TextBlock>().Single(block => block.Text == "하위 에이전트 · 외부 전용 · 대기"), layout);
-        Require(Descendants(Card(layout, "fixture-02")).OfType<TextBlock>().Any(block => block.IsVisible && block.Text == "업데이트 확인 필요"),
-            "A profile update notice is missing from its card.");
+        Require(Visible(Card(layout, "fixture-06")).Contains("미확인") && Visible(Card(layout, "fixture-06")).Contains("사용량"),
+            "A profile without usage does not say so briefly.");
         if (!Card(layout, "fixture-01").IsSelected) throw new InvalidOperationException("Scrolling profile cards changed the selected account.");
     }
 
@@ -475,7 +590,7 @@ internal static class LayoutSelfTest
     {
         Require(grid.ColumnDefinitions[1].ActualWidth == 0 && grid.ColumnDefinitions[2].ActualWidth == 0,
             "The narrow window still docks the shortcut column beside the workspace.");
-        Require(grid.ColumnDefinitions[3].ActualWidth >= layout.ActualWidth - 64 - 0.5, "The narrow window does not give the workspace the freed width.");
+        Require(grid.ColumnDefinitions[3].ActualWidth >= layout.ActualWidth - 68 - 0.5, "The narrow window does not give the workspace the freed width.");
         var toggle = Named<Button>(layout, "ShortcutOverlayToggle");
         AssertVisible(toggle, layout);
         Require(Field<Border>(window, "_shortcutPanel").Parent == Field<Border>(window, "_overlayFrame"), "The shortcut column did not move into the overlay.");
@@ -575,7 +690,7 @@ internal static class LayoutSelfTest
         window.Width = 1440; window.Height = 960;
         var crowded = JsonNode.Parse(baseline.GetRawText())!;
         var profileRows = (JsonArray)crowded["profiles"]!;
-        for (int index = 4; index <= 24; index++)
+        for (int index = 7; index <= 24; index++)
         {
             var profile = profileRows[0]!.DeepClone();
             profile["id"] = $"fixture-{index:00}";
@@ -810,10 +925,10 @@ internal static class LayoutSelfTest
         element.UpdateLayout();
     }
 
-    private static void SaveImage(FrameworkElement element, string path, Rect? region = null)
+    private static void SaveImage(FrameworkElement element, string path, Rect? region = null, double dpi = 96)
     {
         var area = region ?? new Rect(0, 0, element.ActualWidth, element.ActualHeight);
-        var bitmap = new RenderTargetBitmap((int)Math.Ceiling(area.Width), (int)Math.Ceiling(area.Height), 96, 96, PixelFormats.Pbgra32);
+        var bitmap = new RenderTargetBitmap((int)Math.Ceiling(area.Width * dpi / 96), (int)Math.Ceiling(area.Height * dpi / 96), dpi, dpi, PixelFormats.Pbgra32);
         // Render at the origin even when the element is in a right-hand column.
         var visual = new DrawingVisual();
         var offset = VisualTreeHelper.GetOffset(element);

@@ -36,7 +36,10 @@ internal static class NativeWindowShutdown
                     token, mode = "shutdown", visible = false
                 }));
                 File.Move(temporary, path, overwrite: true);
-                await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(15));
+                // 26.930's quit path runs its own cleanup (app-server shutdown,
+                // startup-requirement session) and often needs more than 15 s,
+                // more so when every profile quits at once.
+                await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(60));
                 return true;
             }
             catch (TimeoutException) { return false; }

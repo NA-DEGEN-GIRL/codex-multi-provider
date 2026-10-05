@@ -17,7 +17,7 @@ namespace Codex.ControlCenter.Shell;
 // the manager, so anything drawn over it must be a Popup.
 public sealed partial class MainWindow
 {
-    private const double RailWidth = 64, ExpandedProfileWidth = 304, ShortcutSplitWidth = 6, OverlayMaxWidth = 360;
+    private const double RailWidth = 68, ExpandedProfileWidth = 304, ShortcutSplitWidth = 6, OverlayMaxWidth = 360;
     // The workspace keeps at least this width beside the docked shortcut
     // column; below it the column becomes an overlay instead of squeezing Codex.
     internal const double MinWorkspaceWidth = 760;
@@ -56,8 +56,6 @@ public sealed partial class MainWindow
     private readonly ScrollViewer _settingsScroll = new() { Name = "SettingsFlyoutScroll", VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
         HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled };
     private readonly ContentControl _profileSummary = new() { Name = "ProfileSummaryHost", Focusable = false, IsTabStop = false,
-        Visibility = Visibility.Collapsed };
-    private readonly ContentControl _profileUsage = new() { Name = "ProfileUsageHost", Focusable = false, IsTabStop = false,
         Visibility = Visibility.Collapsed };
     private readonly Border _updateBanner = new() { Name = "WorkspaceUpdateBanner", CornerRadius = new CornerRadius(6),
         Padding = new Thickness(10, 6, 6, 6), Margin = new Thickness(0, 10, 0, 0), Visibility = Visibility.Collapsed, Cursor = Cursors.Hand };
@@ -278,7 +276,7 @@ public sealed partial class MainWindow
         _profileColumn.Width = new GridLength(expanded ? ExpandedProfileWidth : RailWidth);
         _profileHeader.Visibility = expanded ? Visibility.Visible : Visibility.Collapsed;
         _profiles.ItemTemplate = expanded ? ProfileCards.Create() : ProfileCards.Rail();
-        _profiles.ItemContainerStyle = expanded ? ProfileCards.ContainerStyle() : ProfileCards.RailContainerStyle();
+        _profiles.ItemContainerStyle = expanded ? ProfileCards.ProfileContainerStyle() : ProfileCards.RailContainerStyle();
         _profiles.Margin = expanded ? new Thickness(8, 0, 8, 8) : new Thickness(0, 10, 0, 6);
         ScrollViewer.SetVerticalScrollBarVisibility(_profiles, expanded ? ScrollBarVisibility.Auto : ScrollBarVisibility.Hidden);
         ArrangeProfileTools(expanded);
@@ -503,8 +501,8 @@ public sealed partial class MainWindow
     {
         var choice = _viewingCatalog || _selectedProfile is null ? null
             : _profiles.Items.OfType<Choice>().FirstOrDefault(c => c.Id == _selectedProfile);
-        if (!ReferenceEquals(_profileSummary.Content, choice)) _profileSummary.Content = _profileUsage.Content = choice;
-        _profileSummary.Visibility = _profileUsage.Visibility = choice is null ? Visibility.Collapsed : Visibility.Visible;
+        if (!ReferenceEquals(_profileSummary.Content, choice)) _profileSummary.Content = choice;
+        _profileSummary.Visibility = choice is null ? Visibility.Collapsed : Visibility.Visible;
         _identity.Visibility = choice is null ? Visibility.Visible : Visibility.Collapsed;
         AutomationProperties.SetName(_profileSummary, choice?.Card.AccessibleName ?? "");
     }

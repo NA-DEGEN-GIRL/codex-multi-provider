@@ -66,7 +66,7 @@ class IsolatedPackageTests(unittest.TestCase):
         self.assertEqual(result['status'], 'complete', result)
         self.assertTrue(result['profiles_preserved'])
         self.assertEqual(result['managed_versions'], ['26.917.1.0'])
-        self.assertIn('별도 호환 지원', result['message'])
+        self.assertIn('다시 열면', result['message'])
         self.assertEqual(self.case.live, self.original_live)
         self.assertEqual(len(self.case.installs), 1)
         self.assertFalse(self.case.closed or self.case.restored)
@@ -210,6 +210,7 @@ class IsolatedPackageTests(unittest.TestCase):
     def test_deferred_registration_is_not_reported_as_complete_or_installed_again(self):
         def defer(*args):
             self.case.installs.append(True)
+        self.case.live.append(self.unreadable)
         with patch.object(self.manager, '_install', defer):
             plan = self.manager.plan()
             result = self.manager.apply(plan)
@@ -231,9 +232,15 @@ class IsolatedPackageTests(unittest.TestCase):
         self.assertFalse(recovered['recovery_required'])
         self.assertFalse(self.case.installs)
 
+    # Another account's process whose image cannot be read keeps the
+    # registration deferred, as an open window of the package would.
+    unreadable = dict(process_id=999, executable=None)
+
     def prepare_pending(self):
+        self.case.live.append(self.unreadable)
         with patch.object(self.manager, '_install'):
             result = self.manager.apply(self.manager.plan())
+        self.case.live.remove(self.unreadable)
         self.assertEqual(result['status'], 'registration_pending')
         return result
 
@@ -263,11 +270,19 @@ class IsolatedPackageTests(unittest.TestCase):
             result = action()
         return result, contexts
 
-    def test_finalize_stops_the_package_service_only_when_no_codex_window_runs(self):
+    def test_finalize_stops_the_package_service_while_only_managed_copies_run(self):
         self.prepare_pending()
-        # A managed window is still open: only a regular registration attempt.
+        # Managed copies have no package identity; only the service is stopped.
         result, contexts = self.install_contexts(lambda: separate.finalize(self.manager))
         self.assertEqual(result['status'], 'complete', result)
+        self.assertTrue(contexts[0]['force_shutdown'])
+        self.assertEqual(self.case.live, self.original_live)
+        self.assertFalse(self.case.closed)
+
+    def test_unreadable_process_keeps_the_registration_deferred(self):
+        self.prepare_pending()
+        self.case.live.append(self.unreadable)
+        result, contexts = self.install_contexts(lambda: separate.finalize(self.manager))
         self.assertNotIn('force_shutdown', contexts[0])
 
     def test_full_exit_finalize_requests_forced_registration(self):

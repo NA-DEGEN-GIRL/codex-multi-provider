@@ -184,8 +184,8 @@ internal static class ClaudeProfileSelfTest
                 }
             }
             var labels = Descendants(window).OfType<TextBlock>().Where(block => block.IsVisible).Select(block => block.Text).ToArray();
-            Require(labels.Contains("Claude") && labels.Contains("Sonnet") && !labels.Any(label => label.Contains('@'))
-                && labels.Contains("5시간 남음") && labels.Contains("주간 남음") && labels.Contains("73.5%") && labels.Contains("0%"),
+            Require(labels.Contains("Claude · Sonnet") && !labels.Any(label => label.Contains('@'))
+                && labels.Contains("5시간") && labels.Contains("주간") && labels.Contains("73.5%") && labels.Contains("0%"),
                 "Claude card bindings did not hide email or render both usage windows.");
             var layout = (FrameworkElement)window.Content;
             var image = new RenderTargetBitmap((int)layout.ActualWidth, (int)layout.ActualHeight, 96, 96, PixelFormats.Pbgra32);

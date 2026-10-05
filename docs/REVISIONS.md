@@ -35,6 +35,15 @@
 
 ## 최근 수정
 
+### 수정 116 — 작업 중 공식 앱 업데이트 적용, 26.930.4958 지원, 관리창 정보 정리
+
+- 실행 중인 Codex가 모두 관리용 사본이면(패키지 신원 없음) 패키지 서비스만 멈추고 바로 등록한다. 원래 공식 앱 창이 열려 있거나
+  경로를 읽지 못한 프로세스가 있으면 이전처럼 미룬다. 26.930.4958의 바뀐 바인딩(React `Z5`, 추론 검사기 `kve`)을 추가했다.
+- 완전 종료의 정상 종료 대기를 15초에서 60초로 늘렸다(26.930의 종료 정리가 더 오래 걸린다).
+- 관리창: 선택 고리를 아바타와 같은 중심으로, 카드·상단은 이름·상태·사용량(주간·5시간 이중 링)·경고 하나만 보이고 나머지는 도움말로 옮겼다.
+  SSH 호스트는 카드·상단에서 뺐다(도움말·연결 상세·검색에는 남음).
+- [원인·변경·검증](design/update-flow-ui-polish-116.md).
+
 ### 수정 115 — 프로필이 공식 Codex 26.930 사용, 공식 앱 업데이트 적용, 관리창 화면 개편
 
 - 공식 앱 업데이트 보류의 원인은 패키지의 자동 시작 서비스 `CodexSandboxService.OpenAI.Codex`였다. Codex 창이 하나도 없을 때만
@@ -318,3 +327,4 @@
 | 113 | [claude-long-handoff-images-update-113](design/claude-long-handoff-images-update-113.md) | GPT 긴 작업의 Claude 전환, Claude 이미지, 공식 앱 업데이트 보류 |
 | 114 | [claude-ultracode-workflows-114](design/claude-ultracode-workflows-114.md) | Claude Ultracode 선택 메뉴와 백그라운드 워크플로 |
 | 115 | [desktop-930-update-ui-115](design/desktop-930-update-ui-115.md) | 프로필의 공식 Codex 26.930 사용, 공식 앱 업데이트 적용, 관리창 화면 개편 |
+| 116 | [update-flow-ui-polish-116](design/update-flow-ui-polish-116.md) | 작업 중 공식 앱 업데이트 적용, 26.930.4958 지원, 관리창 정보 정리 |
