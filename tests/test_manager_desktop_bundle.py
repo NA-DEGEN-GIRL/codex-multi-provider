@@ -286,6 +286,41 @@ const results = {};
         (self.source / 'chrome.dll').write_bytes(b'dL7pKGdnNz796PbbjQWNKmHXBZaB9tsX\x01\x09101110011')
         with self.assertRaises(ValueError): bundle.check_archive_support(self.source)
 
+    def enforce_integrity(self, digest=None):
+        (self.source / 'chrome.dll').write_bytes(b'dL7pKGdnNz796PbbjQWNKmHXBZaB9tsX\x01\x09010011001')
+        record = (b'[{"file":"resources\\\\app.asar","alg":"SHA256","value":"'
+                  + (digest or bundle.header_digest(self.path)).encode() + b'"}]PADDINGX')
+        (self.source / 'ChatGPT.exe').write_bytes(b'MZ executable ' + record + b' tail')
+
+    def test_integrity_enforced_copy_keeps_validation_and_carries_its_own_archive_digest(self):
+        self.enforce_integrity()
+        installed = {p.relative_to(self.source): p.read_bytes() for p in self.source.rglob('*') if p.is_file()}
+        bundle.check_archive_support(self.source)
+        result = bundle.prepare(self.root, self.app)
+        copy = Path(result['executable']).parent
+        sealed = bundle.header_digest(copy / 'resources/app.asar')
+        self.assertNotEqual(sealed, bundle.header_digest(self.path))
+        executable = (copy / 'ChatGPT.exe').read_bytes()
+        self.assertEqual(len(executable), len(installed[Path('ChatGPT.exe')]))
+        self.assertEqual(executable, installed[Path('ChatGPT.exe')].replace(
+            bundle.header_digest(self.path).encode(), sealed.encode()))
+        marker = json.loads((copy / 'manager-desktop.json').read_text(encoding='utf-8'))
+        self.assertEqual(marker['integrity']['sealed'], sealed)
+        self.assertEqual(marker['hashes']['ChatGPT.exe'], hashlib.sha256(executable).hexdigest())
+        # The fuse itself is untouched, and the installed package is unchanged.
+        self.assertEqual((copy / 'chrome.dll').read_bytes(), installed[Path('chrome.dll')])
+        self.assertEqual({p.relative_to(self.source): p.read_bytes() for p in self.source.rglob('*') if p.is_file()}, installed)
+
+    def test_integrity_record_that_does_not_match_the_installed_archive_is_refused(self):
+        self.enforce_integrity('0' * 64)
+        with self.assertRaisesRegex(ValueError, '무결성'):
+            bundle.check_archive_support(self.source)
+        self.enforce_integrity()
+        executable = (self.source / 'ChatGPT.exe').read_bytes()
+        (self.source / 'ChatGPT.exe').write_bytes(executable + executable)  # two records
+        with self.assertRaisesRegex(ValueError, '무결성'):
+            bundle.check_archive_support(self.source)
+
     def test_names_are_distinct_and_cannot_escape_namespace(self):
         a, b = str(uuid4()), str(uuid4())
         self.assertNotEqual(bundle.pipe_name(a), bundle.pipe_name(b))

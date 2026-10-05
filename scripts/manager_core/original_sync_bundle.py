@@ -7,7 +7,7 @@ import shutil
 import struct
 from uuid import uuid4
 
-from .desktop_bundle import read_header, _entries, check_archive_support, _long_path
+from .desktop_bundle import read_header, _entries, check_archive_support, _long_path, seal_archive_integrity
 from .store import atomic_json
 
 PATCHES = {
@@ -62,8 +62,22 @@ def renderer_plugin_patches(data):
     return {matches[0].group(0): replacement}
 
 
+# 26.930 (webview app-shared chunk): onNotification takes a timestamp, and the
+# hydration guard also checks a cancellation callback l.
+RENDERER_PATCHES_930 = {
+    b'onNotification(e,t,n=null,r,i=Date.now()){if(this.assertActive(),':
+        b'onNotification(e,t,n=null,r,i=Date.now()){globalThis.__codexRendererRecordSync?.observe(this,e,t);if(this.assertActive(),',
+    b'this.requestClient=n;let y=this.settings.restricted;': RENDERER_PATCHES[b'this.requestClient=n;let y=this.settings.restricted;'],
+    b'shouldApplyHydratedThread:()=>f===this.hydrationGeneration&&(l?.()??!0)&&(n?.isCurrent()??!0)':
+        b'shouldApplyHydratedThread:()=>f===this.hydrationGeneration&&(l?.()??!0)&&(n?.isCurrent()??!0)'
+        b'&&(globalThis.__codexRendererRecordSync?.canApply(this)??true)',
+}
+
+
 def renderer_patches_for(data):
-    return RENDERER_PATCHES if all(data.count(key)==1 for key in RENDERER_PATCHES) else None
+    found = [patches for patches in (RENDERER_PATCHES, RENDERER_PATCHES_930)
+             if all(data.count(key) == 1 for key in patches)]
+    return found[0] if len(found) == 1 else None
 
 
 # Renderer names: selected host, host managers, archived IDs per host, catalog
@@ -72,6 +86,7 @@ def renderer_patches_for(data):
 _HOST_IDENTITY_VARIANTS = (
     (b'RE', b'WE', b'n5n', b'AT', b'QZn', b'MT', b'uf', b'$', b'rf'),  # 26.915
     (b'oE', b'pE', b'KRn', b'Fw', b'Ckn', b'Rw', b'ns', b'X', b'Go'),  # 26.917
+    (b'P3', b'B3', b'J3', b'uFn', b'gFn', b'wZ', b'Kk', b'Q', b'zk'),  # 26.930 (app-shared)
 )
 
 
@@ -109,6 +124,7 @@ def renderer_host_identity_patches(data):
 # and canonical (pwd -P) remote project root lookups.
 _REMOTE_ROOT_VARIANTS = (
     (b'TYr', b'gXr', b'wXr', b'hXr', b'R', b'_Xr', b'vXr', b'CYr', b'dXr'),  # 26.917
+    (b'NFn', b'MIn', b'BIn', b'jIn', b'Ch', b'NIn', b'PIn', b'jFn', b'DIn'),  # 26.930
 )
 
 
@@ -202,47 +218,112 @@ def patches_for(data):
     return {**matches[0], **main_projectless_pin_patches(data)} if len(matches) == 1 else None
 
 
+# 26.930 splits these points over main-*.js and bootstrap-*.js, binds the IPC
+# message as a, gives onNotification a timestamp and the hydration guard a
+# cancellation callback. Each point must still occur exactly once.
+SPLIT_PATCHES = {
+    b'getGlobalStateValue(e){return': PATCHES[b'getGlobalStateValue(e){return'],
+    b'ensureProjectsReady(){if(this.disposed||!this.connected)': PATCHES[b'ensureProjectsReady(){if(this.disposed||!this.connected)'],
+    b'if(a.type===`remote-hosted-pip-active-thread-changed`){':
+        b'if(a.type===`manager-record-changed`){globalThis.__codexRecordSync?.publish(a.threadId,a.hostId,a.kind);return}'
+        b'if(a.type===`remote-hosted-pip-active-thread-changed`){',
+    b'onNotification(e,t,n=null,r,i=Date.now()){if(this.assertActive(),':
+        b'onNotification(e,t,n=null,r,i=Date.now()){globalThis.__codexRecordSync?.observe(this,e,t);if(this.assertActive(),',
+    b'this.requestClient=n;let b=this.settings.restricted;':
+        b'this.requestClient=n;globalThis.__codexRecordSync?.register(this);let b=this.settings.restricted;',
+    b'requestStartupSync(){if(!this.syncEnabled)': PATCHES[b'requestStartupSync(){if(!this.syncEnabled)'],
+    b'shouldApplyHydratedThread:()=>p===this.hydrationGeneration&&(u?.()??!0)&&(n?.isCurrent()??!0)':
+        b'shouldApplyHydratedThread:()=>p===this.hydrationGeneration&&(u?.()??!0)&&(n?.isCurrent()??!0)'
+        b'&&(globalThis.__codexRecordSync?.canApply(this)??true)',
+}
+
+
+def main_sync_plan(modules):
+    """({module: patches}, adapter module) for the main-process sync, or None.
+
+    modules is [(name, data)] of every main-process bundle. The adapters go to
+    the module holding getGlobalStateValue, which also creates the others.
+    """
+    single = [(name, patches) for name, data in modules if (patches := patches_for(data))]
+    if len(single) > 1:
+        raise ValueError('Ambiguous desktop main synchronization entry point.')
+    if single:
+        return {single[0][0]: single[0][1]}, single[0][0]
+    located = {}
+    for key in SPLIT_PATCHES:
+        holders = [(name, data.count(key)) for name, data in modules if key in data]
+        if len(holders) != 1 or holders[0][1] != 1:
+            return None
+        located[key] = holders[0][0]
+    plan = {}
+    for key, name in located.items():
+        plan.setdefault(name, {})[key] = SPLIT_PATCHES[key]
+    pins = [(name, found) for name, data in modules if (found := main_projectless_pin_patches(data))]
+    if len(pins) > 1:
+        raise ValueError('Ambiguous desktop project folder assignment.')
+    for name, found in pins:
+        plan.setdefault(name, {}).update(found)
+    return plan, located[b'getGlobalStateValue(e){return']
+
+
 def patch_archive(source, destination):
     with Path(source).open('rb') as stream:
         header, base = read_header(stream)
         entries = list(_entries(header))
-        matched = []
-        renderers = []
+        main_modules, renderers, webviews = [], [], {}
         for name, entry in entries:
-            if not name.endswith('.js') or not (name.startswith('.vite/build/') or name.startswith('webview/assets/app-initial')):
+            web = name.startswith('webview/assets/app-initial') or name.startswith('webview/assets/app-shared')
+            if not name.endswith('.js') or not (name.startswith('.vite/build/') or web):
                 continue
             stream.seek(base + int(entry['offset']))
             data = stream.read(entry['size'])
-            patches = renderer_patches_for(data) if name.startswith('webview/') else patches_for(data)
+            if not web:
+                main_modules.append((name, entry, data))
+                continue
+            webviews[name] = (entry, data)
+            patches = renderer_patches_for(data)
             if patches:
-                (renderers if name.startswith('webview/') else matched).append((name, entry, data, patches))
-        if len(matched) != 1 or len(renderers) != 1:
+                renderers.append((name, entry, data, patches))
+        plan = main_sync_plan([(name, data) for name, _, data in main_modules])
+        if plan is None or len(renderers) != 1:
             raise ValueError('Desktop main/renderer synchronization entry points are not verified for this version.')
-        name, target, before, patches = matched[0]
-        segments = []
-        for module, entry, data, replacements in matched + renderers:
-            updated = data
+        module_patches, name = plan
+        entries_by_name = {module: (entry, data) for module, entry, data in main_modules}
+        entries_by_name.update(webviews)
+        changes = {}
+        helper = lambda file: Path(__file__).with_name(file).read_bytes() + b'\n'
+        for module, replacements in module_patches.items():
+            updated = entries_by_name[module][1]
             for pattern, replacement in replacements.items():
                 updated = updated.replace(pattern, replacement)
-            if module.startswith('webview/'):
-                for pattern, replacement in renderer_plugin_patches(data).items():
-                    updated = updated.replace(pattern, replacement)
-                for pattern, replacement in renderer_host_identity_patches(data).items():
-                    updated = updated.replace(pattern, replacement)
-                for pattern, replacement in renderer_remote_root_patches(data).items():
-                    updated = updated.replace(pattern, replacement)
-            helper = 'desktop_renderer_record_sync.cjs' if module.startswith('webview/') else 'desktop_record_sync.cjs'
-            updated = Path(__file__).with_name(helper).read_bytes() + b'\n' + updated
-            if module.startswith('webview/'):
-                updated = Path(__file__).with_name('desktop_plugin_renderer_sync.cjs').read_bytes() + b'\n' + updated
-            updated = Path(__file__).with_name('desktop_profile_resume.cjs').read_bytes() + b'\n' + updated
-            if not module.startswith('webview/'):
-                updated = b'\n'.join(Path(__file__).with_name(name).read_bytes() for name in (
-                    'desktop_signal_files.cjs', 'desktop_workspace_sync.cjs', 'desktop_project_membership.cjs', 'desktop_local_workspace_sync.cjs',
-                    'desktop_plugin_sync.cjs')) + b'\n' + updated
             if module == name:
-                updated = Path(__file__).with_name('desktop_network_policy.cjs').read_bytes() + b'\n' + updated
-                after = updated
+                updated = (helper('desktop_network_policy.cjs') + b''.join(helper(file) for file in (
+                    'desktop_signal_files.cjs', 'desktop_workspace_sync.cjs', 'desktop_project_membership.cjs',
+                    'desktop_local_workspace_sync.cjs', 'desktop_plugin_sync.cjs')) + helper('desktop_profile_resume.cjs')
+                    + helper('desktop_record_sync.cjs') + updated)
+            changes[module] = updated
+        renderer, _, data, replacements = renderers[0]
+        updated = data
+        for pattern, replacement in {**replacements, **renderer_plugin_patches(data)}.items():
+            updated = updated.replace(pattern, replacement)
+        changes[renderer] = updated
+        # 26.917 keeps the host filter and grouping beside the sync; 26.930
+        # moved the filter to app-shared. Each exists in at most one chunk.
+        for patches_of, label in ((renderer_host_identity_patches, 'host-specific archive filter'),
+                                  (renderer_remote_root_patches, 'remote project grouping')):
+            found = [(module, patches) for module, (_, data) in webviews.items() if (patches := patches_of(data))]
+            if len(found) > 1:
+                raise ValueError('Ambiguous desktop ' + label + '.')
+            for module, patches in found:
+                updated = changes.get(module, webviews[module][1])
+                for pattern, replacement in patches.items():
+                    updated = updated.replace(pattern, replacement)
+                changes[module] = updated
+        changes[renderer] = (helper('desktop_profile_resume.cjs') + helper('desktop_plugin_renderer_sync.cjs')
+                             + helper('desktop_renderer_record_sync.cjs') + changes[renderer])
+        segments = []
+        for module, updated in changes.items():
+            entry = entries_by_name[module][0]
             offset, size = int(entry['offset']), entry['size']
             segments.append((offset,size,updated))
             block = entry.get('integrity', {}).get('blockSize',4*1024*1024)
@@ -269,7 +350,8 @@ def patch_archive(source, destination):
                 output.write(data);position=offset+size
             stream.seek(base+position)
             shutil.copyfileobj(stream,output)
-    return dict(module=name, original_sha256=hashlib.sha256(before).hexdigest(), patched_sha256=hashlib.sha256(after).hexdigest())
+    return dict(module=name, original_sha256=hashlib.sha256(entries_by_name[name][1]).hexdigest(),
+                patched_sha256=hashlib.sha256(changes[name]).hexdigest())
 
 
 def prepare(root, app):
@@ -294,7 +376,7 @@ def prepare(root, app):
     target = Path(root).resolve()/'artifacts/original-sync-desktop'/key
     from .desktop_publication import publish
     target, value, fallback = publish(source, target, identity, 'original-sync.json',
-        patch_archive, check_archive_support, _long_path)
+        patch_archive, check_archive_support, _long_path, seal_archive_integrity)
     atomic_json(target.parent/'last-selection.json',dict(directory=str(target),
         installed_version=app['Version'], selected_version=value['source']['version'], compatibility_notice=fallback))
     return target/'ChatGPT.exe'

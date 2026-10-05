@@ -101,9 +101,10 @@
     if (!verified.has(coordinator)) {
       let ok = false;
       try {
-        ok = /^observeThread\((\w+)\)\{this\.observeThreads\(\[\1\]\);let (\w+)=[\w$]+\(\1,this\.store\.hostId\);if\(\2==null\)\{this\.publishMutation\(this\.store\.applyAuthoritativeRemoval\(\1\.id\),\[\]\);return\}this\.publishMutation\(this\.store\.applyObservedEntry\(\2\),\[\2\]\)\}$/
+        // 26.930 publishes a mutation without the explicit entry list.
+        ok = /^observeThread\((\w+)\)\{this\.observeThreads\(\[\1\]\);let (\w+)=[\w$]+\(\1,this\.store\.hostId\);if\(\2==null\)\{this\.publishMutation\(this\.store\.applyAuthoritativeRemoval\(\1\.id\)(?:,\[\])?\);return\}this\.publishMutation\(this\.store\.applyObservedEntry\(\2\)(?:,\[\2\])?\)\}$/
             .test(Function.prototype.toString.call(coordinator.observeThread)) &&
-          /(\w+)\.onAccepted\?\.\(this\),this\.publishMutation\(this\.store\.applyObservedEntry\(\1\.entry\),\[\1\.entry\]\)/
+          /(\w+)\.onAccepted\?\.\(this\),this\.publishMutation\(this\.store\.applyObservedEntry\(\1\.entry\)(?:,\[\1\.entry\])?\)/
             .test(Function.prototype.toString.call(coordinator.refreshThread));
       } catch { /* Unknown coordinator: native path. */ }
       verified.set(coordinator, ok);

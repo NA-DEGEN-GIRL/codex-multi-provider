@@ -46,6 +46,8 @@ def read_request(path, *, verify_worker=False):
         raise ValueError('Invalid installer request identity')
     if 'defer_registration' in value and type(value['defer_registration']) is not bool:
         raise ValueError('Invalid deferred registration option')
+    if 'force_shutdown' in value and type(value['force_shutdown']) is not bool:
+        raise ValueError('Invalid package shutdown option')
     validate_identity(value['installed_before'])
     validate_identity(value['target'], value['installed_before'])
     package = Path(value['package_path'])
@@ -82,6 +84,8 @@ class PackageInstaller:
             target={k: transaction['target'][k] for k in IDENTITY_FIELDS if k in transaction['target']})
         if transaction.get('defer_registration') is True:
             request['defer_registration'] = True
+        if transaction.get('force_shutdown') is True:
+            request['force_shutdown'] = True
         atomic_json(path, request)
         read_request(path, verify_worker=True)
         reference = dict(version=1, job_id=job_id, request_sha256=digest(path), package_sha256=package_sha256)
@@ -115,6 +119,7 @@ class PackageInstaller:
             if (root != self.root or digest(path) != reference.get('request_sha256')
                     or request['package_sha256'] != reference.get('package_sha256')
                     or request.get('defer_registration', False) != transaction.get('defer_registration', False)
+                    or request.get('force_shutdown', False) != transaction.get('force_shutdown', False)
                     or any(request[field] != {k: transaction[field][k] for k in IDENTITY_FIELDS if k in transaction[field]}
                            for field in ('installed_before', 'target'))):
                 return result

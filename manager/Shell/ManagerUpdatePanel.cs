@@ -20,6 +20,9 @@ internal sealed class ManagerUpdatePanel : Border, IDisposable
         Foreground = WorkspaceAppearance.Muted, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 3, 0, 0) };
     private readonly Button _check;
     private bool _checking, _disposed;
+    // The settings badge and the header banner mirror this panel's notice.
+    internal ManagerUpdateNotice Notice { get; private set; } = ManagerUpdateNotice.Checking;
+    internal event Action<ManagerUpdateNotice>? NoticeChanged;
 
     internal ManagerUpdatePanel(string root, Func<CancellationToken, Task<JsonElement?>> service, bool fixture)
     {
@@ -76,7 +79,13 @@ internal sealed class ManagerUpdatePanel : Border, IDisposable
             _ => WorkspaceAppearance.Muted
         };
         ToolTip = notice.Title + "\n" + notice.Detail + "\n30초마다 자동 확인합니다. ↻ 버튼으로 지금 확인할 수 있습니다.";
+        Notice = notice;
+        NoticeChanged?.Invoke(notice);
     }
+
+    // States to act on before closing the window; mirrored in the header and settings badge.
+    internal static bool NeedsAttention(ManagerUpdateNotice notice) =>
+        notice.State is ManagerUpdateState.Ready or ManagerUpdateState.NeedsStop or ManagerUpdateState.Deferred;
 
     public void Dispose()
     {

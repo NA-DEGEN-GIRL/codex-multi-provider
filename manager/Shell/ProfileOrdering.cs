@@ -9,34 +9,37 @@ namespace Codex.ControlCenter.Shell;
 
 internal sealed record ProfileMove(string ProfileId, string TargetProfileId, string Position);
 
-// Drag only the grip: selecting/opening an account remains a separate action.
+// A grip only drags. A whole avatar or card ("ProfileDragItem") drags once the
+// pointer moves past the system threshold; released in place, it is a click
+// that selects or reopens the account. Keyboard selection is unchanged.
 internal sealed class ProfileOrdering
 {
     private readonly ListBox list;
     private readonly Func<ProfileMove, Task> save;
+    private readonly Func<Choice, int, Task>? click;
     private readonly DispatcherTimer scroll = new() { Interval = TimeSpan.FromMilliseconds(100) };
     private string? source;
     private Point origin;
-    private bool dragging, saving;
+    private bool dragging, saving, itemPress;
     private InsertionLine? line;
     internal bool IsInteracting => source is not null || saving;
 
-    internal ProfileOrdering(ListBox list, Func<ProfileMove, Task> save)
+    internal ProfileOrdering(ListBox list, Func<ProfileMove, Task> save, Func<Choice, int, Task>? click = null)
     {
-        this.list = list; this.save = save;
+        this.list = list; this.save = save; this.click = click;
         list.PreviewMouseLeftButtonDown += (_, e) =>
         {
-            if (!IsGrip(e.OriginalSource)) return;
+            if (Handle(e.OriginalSource) is not { } kind) return;
             e.Handled = true;
             if (IsInteracting || ItemAt(e.GetPosition(list))?.DataContext is not Choice choice) return;
-            Begin(choice.Id, e.GetPosition(list));
+            Begin(choice.Id, e.GetPosition(list), item: kind == "ProfileDragItem" && click is not null);
             if (!list.CaptureMouse()) Cancel();
         };
         list.PreviewMouseMove += (_, e) => { if (source is not null) { Update(e.GetPosition(list)); e.Handled = true; } };
         list.PreviewMouseLeftButtonUp += async (_, e) =>
         {
             if (source is null) return;
-            e.Handled = true; await CompleteAsync(e.GetPosition(list));
+            e.Handled = true; await CompleteAsync(e.GetPosition(list), e.Timestamp);
         };
         list.LostMouseCapture += (_, _) => Cancel();
         list.PreviewKeyDown += async (_, e) =>
@@ -59,20 +62,20 @@ internal sealed class ProfileOrdering
 
     internal static DataTemplate Template() => ProfileCards.Create();
 
-    private static bool IsGrip(object source)
+    private static string? Handle(object source)
     {
-        for (var node = source as DependencyObject; node is not null; node = VisualTreeHelper.GetParent(node))
-            if (node is FrameworkElement { Tag: "ProfileDragGrip" }) return true;
-        return false;
+        for (var node = source as DependencyObject; node is not null; node = node is Visual ? VisualTreeHelper.GetParent(node) : LogicalTreeHelper.GetParent(node))
+            if (node is FrameworkElement { Tag: "ProfileDragGrip" or "ProfileDragItem" } handle) return (string)handle.Tag;
+        return null;
     }
 
-    internal void Begin(string id, Point point) { source = id; origin = point; }
+    internal void Begin(string id, Point point, bool item = false) { source = id; origin = point; itemPress = item; }
     internal void Update(Point point)
     {
         if (source is null) return;
         if (!dragging && (Math.Abs(point.X - origin.X) >= SystemParameters.MinimumHorizontalDragDistance ||
             Math.Abs(point.Y - origin.Y) >= SystemParameters.MinimumVerticalDragDistance))
-        { dragging = true; scroll.Start(); }
+        { dragging = true; scroll.Start(); list.Cursor = Cursors.SizeNS; }
         ClearLine();
         if (!dragging || Target(point) is not { } target) return;
         if (list.ItemContainerGenerator.ContainerFromItem(list.Items.OfType<Choice>().First(c => c.Id == target.TargetProfileId)) is UIElement item &&
@@ -99,11 +102,13 @@ internal sealed class ProfileOrdering
         }
         return last;
     }
-    internal async Task CompleteAsync(Point point)
+    internal async Task CompleteAsync(Point point, int timestamp = 0)
     {
         var move = dragging ? Target(point) : null;
+        var clicked = !dragging && itemPress ? list.Items.OfType<Choice>().FirstOrDefault(c => c.Id == source) : null;
         Cancel();
         if (move is not null) await SaveAsync(move);
+        else if (clicked is not null && click is not null) await click(clicked, timestamp);
     }
     internal async Task MoveByAsync(string id, int delta)
     {
@@ -121,7 +126,7 @@ internal sealed class ProfileOrdering
     }
     internal void Cancel()
     {
-        source = null; dragging = false; scroll.Stop(); ClearLine();
+        source = null; dragging = false; itemPress = false; scroll.Stop(); ClearLine(); list.ClearValue(FrameworkElement.CursorProperty);
         if (list.IsMouseCaptured) list.ReleaseMouseCapture();
     }
     private void ClearLine()

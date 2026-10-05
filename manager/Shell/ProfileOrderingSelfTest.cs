@@ -47,6 +47,18 @@ internal static class ProfileOrderingSelfTest
             await ordering.MoveByAsync("03", -1); await ordering.MoveByAsync("02", 1);
             Require(saved[^2] == new ProfileMove("03", "02", "before") && saved[^1] == new ProfileMove("02", "03", "after"), "menu and keyboard moves use current adjacent rows");
             Require(selectedChanges == 0 && ((Choice)list.SelectedItem).Id == "02", "reordering never changes selected account");
+            // A whole avatar or card: released in place it is a click, dragged it reorders.
+            var clicked = new List<string>();
+            var cards = new ProfileOrdering(list, move => { saved.Add(move); return Task.CompletedTask; },
+                (choice, _) => { clicked.Add(choice.Id); return Task.CompletedTask; });
+            var savedBefore = saved.Count;
+            cards.Begin("03", At(2, .5), item: true); await cards.CompleteAsync(At(2, .5));
+            Require(clicked.SequenceEqual(["03"]) && saved.Count == savedBefore && !cards.IsInteracting, "a press released in place clicks the card without saving");
+            cards.Begin("03", At(2, .5), item: true); cards.Update(At(0, .1)); await cards.CompleteAsync(At(0, .1));
+            Require(clicked.Count == 1 && saved.Count == savedBefore + 1 && saved[^1] == new ProfileMove("03", "04", "before"), "a dragged card reorders without clicking");
+            cards.Begin("01", At(3, .5)); await cards.CompleteAsync(At(3, .5));
+            Require(clicked.Count == 1, "a grip press never clicks");
+            Require(selectedChanges == 0, "card presses never change the selection by themselves");
             var pending = new TaskCompletionSource();
             var delayed = new ProfileOrdering(new ListBox { Items = { new Choice("a", "a"), new Choice("b", "b") } }, _ => pending.Task);
             var request = delayed.MoveByAsync("a", 1);

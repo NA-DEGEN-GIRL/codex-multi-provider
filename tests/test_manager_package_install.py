@@ -337,6 +337,19 @@ os._exit(0)
         self.assertTrue(proof['installer_settled'])
         self.assertEqual(proof['installer_result_code'], 'package_in_use')
 
+    def test_quiet_workspace_installer_may_stop_only_package_processes_when_no_window_runs(self):
+        request = dict(package_path=str(self.package), package_sha256=digest(self.package),
+            installed_before=self.transaction['installed_before'], target=self.transaction['target'],
+            defer_registration=True, force_shutdown=True)
+        with patch.object(install_worker.UpdateManager, '_validate_download'), \
+             patch.object(install_worker, '_powershell', return_value='{"status":"command_completed"}') as shell:
+            install_worker.perform_install(self.root, request, lambda: None)
+        command = shell.call_args.args[0]
+        self.assertIn('-ForceApplicationShutdown', command)
+        self.assertNotIn('-DeferRegistrationWhenPackagesAreInUse', command)
+        # A Codex window that opened after the manager's check keeps it waiting.
+        self.assertLess(command.index('Get-Process -Name ChatGPT'), command.index('Add-AppxPackage'))
+
 
 if __name__ == '__main__':
     unittest.main()

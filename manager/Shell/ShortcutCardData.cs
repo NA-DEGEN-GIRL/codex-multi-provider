@@ -11,9 +11,15 @@ namespace Codex.ControlCenter.Shell;
 // card only when one of them changed; brushes and geometry are derived.
 internal sealed record ShortcutCardData(string Title, string Account, string AccountShort, string Host,
     string State, string StateText, double Outer, double Inner, string OuterLabel, string InnerLabel,
-    bool External, string Agent, string Detail)
+    bool External, string Agent, string Detail, string ProfileName = "", string Provider = "gpt", string When = "")
 {
     public Visibility AgentVisibility => Agent.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
+    // Local tasks need no location chip; SSH tasks show their host alias.
+    public Visibility HostVisibility => Host is "" or "Windows" ? Visibility.Collapsed : Visibility.Visible;
+    public string HostLabel => "SSH · " + Host;
+    public Visibility WhenVisibility => When.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
+    public Brush BadgeBrush => WorkspaceAppearance.Tint(Provider).Fill;
+    public Brush BadgeTextBrush => WorkspaceAppearance.Tint(Provider).Text;
     // Ring geometry in a 40-DIP box: outer track radius 17.5, inner 12.5.
     private const double Center = 20, OuterRadius = 17.5, InnerRadius = 12.5;
 
@@ -80,7 +86,7 @@ internal sealed record ShortcutCardData(string Title, string Account, string Acc
     }
 
     internal static ShortcutCardData Create(JsonElement shortcut, JsonElement owner,
-        IReadOnlyDictionary<string, (string State, string Alias)> activity, JsonElement[] models)
+        IReadOnlyDictionary<string, (string State, string Alias)> activity, JsonElement[] models, DateTimeOffset? now = null)
     {
         var alias = owner.ValueKind == JsonValueKind.Object ? owner.S("alias") : "";
         var claude = ClaudeProfilePresentation.IsClaude(owner);
@@ -111,7 +117,30 @@ internal sealed record ShortcutCardData(string Title, string Account, string Acc
         var detail = $"{shortcut.S("alias", "이름 없는 작업")}\n{(alias == "" ? "계정 지정 필요" : alias + " 계정")} · {host}\n" +
                      $"{stateText}{where}\n{usage}\n{agentDetail}\n누르면 이 계정에서 열립니다. ⋯ 버튼으로 계정 이동·별칭 변경·링크 삭제.";
         return new(shortcut.S("alias", "이름 없는 작업"), alias == "" ? "계정 지정 필요" : alias,
-            Short(alias), host, state, stateText + runner, outer, inner, outerLabel, innerLabel, external && !claude, agent, detail);
+            alias == "" ? "?" : ProfileBadge.Short(alias), host, state, stateText + runner, outer, inner, outerLabel, innerLabel, external && !claude, agent, detail,
+            ProfileBadge.Name(alias), alias == "" ? "gpt" : ProfileBadge.Provider(owner), RelativeTime(shortcut, now ?? DateTimeOffset.Now));
+    }
+
+    // Relative time of the link's last use, when the store reports one.
+    internal static string RelativeTime(JsonElement shortcut, DateTimeOffset now)
+    {
+        DateTimeOffset? at = null;
+        foreach (var name in new[] { "last_opened_at", "opened_at", "updated_at" })
+        {
+            var value = shortcut.Get(name);
+            if (value.ValueKind == JsonValueKind.Number && value.TryGetInt64(out var seconds) && seconds > 0)
+            {
+                try { at = DateTimeOffset.FromUnixTimeSeconds(seconds); } catch (ArgumentOutOfRangeException) { }
+            }
+            else if (value.ValueKind == JsonValueKind.String && DateTimeOffset.TryParse(value.GetString(), CultureInfo.InvariantCulture,
+                DateTimeStyles.RoundtripKind, out var parsed)) at = parsed;
+            if (at is not null) break;
+        }
+        if (at is not { } time) return "";
+        var age = now - time;
+        return age < TimeSpan.FromMinutes(1) ? "방금" : age < TimeSpan.FromHours(1) ? $"{(int)age.TotalMinutes}분 전"
+            : age < TimeSpan.FromDays(1) ? $"{(int)age.TotalHours}시간 전" : age < TimeSpan.FromDays(7) ? $"{(int)age.TotalDays}일 전"
+            : time.ToLocalTime().ToString("M/d", CultureInfo.InvariantCulture);
     }
 
     // Compact chip: the external model an API profile runs, or the saved
@@ -137,17 +166,6 @@ internal sealed record ShortcutCardData(string Title, string Account, string Acc
     }
 
     private static string Clip(string text) => text.Length <= 16 ? text : text[..15] + "…";
-
-    private static string Short(string alias)
-    {
-        if (alias.Length == 0) return "?";
-        // Three narrow characters fit inside the ring; wide (e.g. Hangul) ones only two.
-        var limit = alias.Any(c => c > 0x2E7F) ? 2 : 3;
-        var elements = StringInfo.GetTextElementEnumerator(alias);
-        var text = "";
-        while (elements.MoveNext() && new StringInfo(text).LengthInTextElements < limit) text += elements.GetTextElement();
-        return text;
-    }
 
     private static (double, string, double, string) Quota(JsonElement owner, bool external)
     {

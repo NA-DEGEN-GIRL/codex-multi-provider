@@ -98,6 +98,19 @@ def complete_message(proof):
             f'작업 공간은 검증된 관리용 Codex {versions}을 계속 사용합니다. 새 화면 적용은 별도 호환 지원이 필요합니다.')
 
 
+def _quiet(manager, installed):
+    """True when no Codex window of the package or of a managed copy runs.
+
+    The package's own background service (CodexSandboxService, automatic start,
+    LocalSystem) then still keeps the package in use, and Windows defers every
+    registration while it runs. Only in this state may the installer stop it.
+    """
+    try:
+        return not manager.processes(installed)
+    except (OSError, ValueError, UpdateError):
+        return False
+
+
 def _registration_pending(manager, transaction, actual):
     return manager._journal(transaction, 'registration_pending',
         '공식 Codex 업데이트 파일이 준비됐습니다. «준비된 업데이트 적용»을 누르면 작업 공간에서 설치를 마칩니다. 원본 앱을 열 필요는 없습니다.',
@@ -147,7 +160,12 @@ def finalize(manager):
         proof = inspect(manager, actual, proof)
         if proof is None or proof['blockers']:
             return _blocked(manager, transaction, proof)
-        manager._journal(transaction, 'installing', '원본 앱을 열지 않고 Windows 업데이트 적용을 마칩니다.',
+        if _quiet(manager, actual):
+            transaction['force_shutdown'] = True
+        manager._journal(transaction, 'installing',
+                         '실행 중인 Codex가 없어 Codex 백그라운드 서비스를 잠시 멈추고 Windows 업데이트 적용을 마칩니다.'
+                         if transaction.get('force_shutdown') else
+                         '원본 앱을 열지 않고 Windows 업데이트 적용을 마칩니다.',
                          install_outcome='unknown')
         started = True
         manager._install_transaction = transaction
@@ -211,6 +229,10 @@ def apply(manager, trusted, plan_path):
         if proof is None or proof['blockers']:
             return _blocked(manager, transaction, proof)
         transaction['isolation'] = proof
+        if _quiet(manager, actual):
+            # Nothing to preserve: register now instead of deferring behind the
+            # package's background service.
+            transaction.update(defer_registration=False, force_shutdown=True)
         manager._journal(transaction, 'installing', '작업 공간의 실행을 유지하며 Windows 공식 Codex만 업데이트합니다.',
                          install_outcome='unknown')
         install_started = True

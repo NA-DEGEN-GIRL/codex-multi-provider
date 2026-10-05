@@ -253,6 +253,40 @@ class IsolatedPackageTests(unittest.TestCase):
         self.assertEqual(self.case.live, self.original_live)
         self.assertFalse(self.case.closed or self.case.restored)
 
+    def install_contexts(self, action):
+        install = self.manager._install
+        contexts = []
+        def record(*args):
+            contexts.append(deepcopy(self.manager._install_transaction))
+            install(*args)
+        with patch.object(self.manager, '_install', record):
+            result = action()
+        return result, contexts
+
+    def test_finalize_stops_the_package_service_only_when_no_codex_window_runs(self):
+        self.prepare_pending()
+        # A managed window is still open: only a regular registration attempt.
+        result, contexts = self.install_contexts(lambda: separate.finalize(self.manager))
+        self.assertEqual(result['status'], 'complete', result)
+        self.assertNotIn('force_shutdown', contexts[0])
+
+    def test_full_exit_finalize_requests_forced_registration(self):
+        # After a full exit only the package's background service holds it.
+        self.prepare_pending()
+        self.case.live = []
+        result, contexts = self.install_contexts(lambda: separate.finalize(self.manager))
+        self.assertEqual(result['status'], 'complete', result)
+        self.assertTrue(contexts[0]['force_shutdown'])
+        self.assertFalse(contexts[0]['defer_registration'])
+
+    def test_install_with_no_codex_window_registers_at_once(self):
+        self.case.live = []
+        plan = self.manager.plan()
+        result, contexts = self.install_contexts(lambda: self.manager.apply(plan))
+        self.assertEqual(result['status'], 'complete', result)
+        self.assertTrue(contexts[0]['force_shutdown'])
+        self.assertFalse(contexts[0]['defer_registration'])
+
     def test_finalize_rejected_by_windows_remains_actionable_without_retry_loop(self):
         self.prepare_pending()
         with patch.object(self.manager, '_install', side_effect=updates.UpdateError('package_in_use', 'busy')) as install, \

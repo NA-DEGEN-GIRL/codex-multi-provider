@@ -34,7 +34,8 @@ _REF_ERROR = b'--ref is only supported for git marketplace sources'
 _ADD_VARIANTS = ((b'e',),)
 # Native-host sync (26.917): the sync entry g2 and its extension-id helper WS;
 # the v2 writer's same-install test w2 and that module's node:path binding s.
-_HOST_VARIANTS = ((b'g2', b'WS', b'w2', b's'),)
+_HOST_VARIANTS = ((b'g2', b'WS', b'w2', b's'),
+                  (b'kF', b'r.Wr', b'LF', b'g'))  # 26.930 (bootstrap module)
 
 
 def _add(e):

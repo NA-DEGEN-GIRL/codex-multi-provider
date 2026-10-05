@@ -60,6 +60,7 @@ public sealed partial class MainWindow
             return choice with { Data = profile, ProfileEmail = ProfileEmailText(profile) };
         }), _selectedProfile); }
         finally { _rendering = rendering; }
+        UpdateProfileSummary();
     }
 
     private async Task ToggleProfileEmailsAsync()

@@ -19,14 +19,19 @@ def perform_install(root, request, dispatching):
     dispatching()
     # Keep the final byte check in the same PowerShell process that invokes the
     # official cmdlet. Deferred registration preserves active applications.
-    defer = ' -DeferRegistrationWhenPackagesAreInUse' if request.get('defer_registration') is True else ''
+    # With no Codex window running, only the package's background service holds
+    # it in use; that request may stop the service. A window that opened since
+    # the manager's check keeps it from doing so.
+    force = request.get('force_shutdown') is True
+    defer = ' -DeferRegistrationWhenPackagesAreInUse' if request.get('defer_registration') is True and not force else ''
+    guard = "if(Get-Process -Name ChatGPT -ErrorAction SilentlyContinue){@{status='package_in_use'} | ConvertTo-Json -Compress}else{" if force else 'if($true){'
     output = _powershell('$p=' + _ps_quote(str(package)) + '; '
         'if((Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToLower() -ne '
-        + _ps_quote(request['package_sha256']) + "){throw 'Package changed'}; "
-        'try {Add-AppxPackage -Path $p' + defer + ' -ErrorAction Stop; '
+        + _ps_quote(request['package_sha256']) + "){throw 'Package changed'}; " + guard +
+        'try {Add-AppxPackage -Path $p' + defer + (' -ForceApplicationShutdown' if force else '') + ' -ErrorAction Stop; '
         "@{status='command_completed'} | ConvertTo-Json -Compress} catch {"
         "if($_.Exception.Message -match '0x80073D02' -or $_.ErrorDetails.Message -match '0x80073D02'){"
-        "@{status='package_in_use'} | ConvertTo-Json -Compress}else{throw}}", timeout=None)
+        "@{status='package_in_use'} | ConvertTo-Json -Compress}else{throw}}}", timeout=None)
     if output and json.loads(output).get('status') == 'package_in_use':
         raise UpdateError('package_in_use', 'Windows가 실행 중인 Codex의 교체를 보류했습니다.')
 

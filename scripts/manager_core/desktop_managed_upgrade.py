@@ -66,6 +66,10 @@ def _baseline(source, current):
     if old['adapters'] != expected:
         raise ValueError('Managed desktop upgrade requires unchanged non-reasoning adapters.')
     # The package's existing Electron protection is checked without modifying it.
+    # This path rewrites only the archive, so the pinned baseline must not
+    # enforce archive integrity (normal publication re-seals such builds).
+    if bundle._integrity_enforced(source):
+        raise ValueError('이 관리용 Codex 사본은 화면 업그레이드를 지원하지 않습니다.')
     bundle.check_archive_support(source)
     return value
 

@@ -35,6 +35,15 @@
 
 ## 최근 수정
 
+### 수정 115 — 프로필이 공식 Codex 26.930 사용, 공식 앱 업데이트 적용, 관리창 화면 개편
+
+- 공식 앱 업데이트 보류의 원인은 패키지의 자동 시작 서비스 `CodexSandboxService.OpenAI.Codex`였다. Codex 창이 하나도 없을 때만
+  `-ForceApplicationShutdown`으로 등록을 마친다(창 확인은 설치 직전에 다시 한다).
+- 26.930의 ASAR 무결성 검사를 켠 채로 관리용 사본을 만든다: 사본 `ChatGPT.exe`의 무결성 값만 패치한 아카이브 헤더 해시로 다시 봉인한다.
+  26.930의 새 패치 위치(나뉜 주 프로세스 동기화, app-shared 청크, 알림·맥락·선택기 변형)를 추가했다.
+- 관리창 왼쪽을 프로필 레일(펼치면 두 줄 프로필 카드) + 전체 높이 작업 바로가기(검색, 두 줄 카드)로 바꾸고, 선택한 프로필 요약을 상단에 둔다.
+- [원인·변경·검증](design/desktop-930-update-ui-115.md).
+
 ### 수정 114 — Claude Ultracode 선택 메뉴 표시와 백그라운드 워크플로 실행
 
 - 관리용 26.917 데스크톱의 모델·추론 강도 메뉴가 별도 행 생성 함수에서 `ultracode`를 걸러 Ultracode를 고를 수 없던 문제를 고쳤다
@@ -308,3 +317,4 @@
 | 110 | [full-exit-local-restart-110](design/full-exit-local-restart-110.md) | 로컬 설정 예약의 종료 충돌, 이전 어댑터 정리와 SSH 종료 연속 처리 |
 | 113 | [claude-long-handoff-images-update-113](design/claude-long-handoff-images-update-113.md) | GPT 긴 작업의 Claude 전환, Claude 이미지, 공식 앱 업데이트 보류 |
 | 114 | [claude-ultracode-workflows-114](design/claude-ultracode-workflows-114.md) | Claude Ultracode 선택 메뉴와 백그라운드 워크플로 |
+| 115 | [desktop-930-update-ui-115](design/desktop-930-update-ui-115.md) | 프로필의 공식 Codex 26.930 사용, 공식 앱 업데이트 적용, 관리창 화면 개편 |

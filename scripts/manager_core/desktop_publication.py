@@ -198,7 +198,7 @@ def _fallback(parent, marker_name, identity):
     return None
 
 
-def publish(source, target, identity, marker_name, patch_archive, check_support, long_path):
+def publish(source, target, identity, marker_name, patch_archive, check_support, long_path, seal=None):
     parent = target.parent
     with publication_lock(parent):
         ready = validated(target, marker_name, identity)
@@ -222,8 +222,11 @@ def publish(source, target, identity, marker_name, patch_archive, check_support,
             original = (source / 'resources/app.asar').stat()
             if original.st_size != identity['size'] or original.st_mtime_ns != identity['modified']:
                 raise OSError('Installed desktop changed during preparation; reopen the profile to retry.')
+            # An integrity-enforced build validates its archive against a digest
+            # in the executable; the private copy carries its own archive's.
+            sealed = seal(source, stage) if seal else None
             archive = (stage / 'resources/app.asar').stat()
-            value = dict(source=identity, patch=patch,
+            value = dict(source=identity, patch=patch, **({'integrity': sealed} if sealed else {}),
                 archive=dict(size=archive.st_size, modified=archive.st_mtime_ns), files=_inventory(stage),
                 hashes={name: _hash(stage / name) for name in ('ChatGPT.exe', 'chrome.dll', 'resources/app.asar')})
             atomic_json(stage / marker_name, value)

@@ -39,7 +39,7 @@ const source=fs.readFileSync(process.argv[2],'utf8');
 const start=source.indexOf('if(process.platform===`win32`){let p=process.env.CODEX_MANAGER_DESKTOP_PIPE;');
 const end=source.indexOf(';}',start)+2;
 if(start<0||end<start)throw Error('missing resolver');
-const pipe=vm.runInNewContext('(function(){'+source.slice(start,end)+'})()', {process,i:require('path'),s:require('path')});
+const pipe=vm.runInNewContext('(function(){'+source.slice(start,end)+'})()', {process,i:require('path'),s:require('path'),o:require('path'),c:require('path')});
 if(!pipe.endsWith(process.env.CODEX_MANAGER_DESKTOP_PIPE))throw Error('invalid pipe');
 if(process.argv[3]==='server'){
  const server=net.createServer(s=>s.once('data',d=>s.end(JSON.stringify({profile:process.env.CODEX_MANAGER_DESKTOP_PIPE,thread:d.toString()}))));
@@ -96,10 +96,16 @@ if(process.argv[3]==='server'){
                 try: process.wait(timeout=5)
                 except subprocess.TimeoutExpired: process.kill();process.wait(timeout=5)
                 process.stdout.close();process.stderr.close()
+    from manager_core.desktop_bundle import header_digest
+    installed = Path(original['executable']).parent
     for file in ('ChatGPT.exe','chrome.dll'):
-        def digest(path):
-            with path.open('rb') as stream: return hashlib.file_digest(stream,'sha256').hexdigest()
-        checks[file+'_unchanged'] = digest(assets/file)==digest(Path(original['executable']).parent/file)
+        copied, source = (assets/file).read_bytes(), (installed/file).read_bytes()
+        if file == 'ChatGPT.exe':
+            # An integrity-enforced build carries its own archive's digest; the
+            # executable may differ from the installed one in that value only.
+            copied = copied.replace(header_digest(assets/'resources/app.asar').encode(),
+                                    header_digest(installed/'resources/app.asar').encode())
+        checks[file+'_unchanged'] = copied == source
     report = dict(verified=all(checks.values()), app_version=app['Version'], checks=checks,
                   scope='Bundled Node + resolver extracted from published ASAR; desktop app is NOT launched; no GUI, auth, or model turn', module=name)
     print(json.dumps(report,ensure_ascii=False,indent=2))

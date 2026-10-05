@@ -25,8 +25,9 @@ internal sealed record Choice(string Id, string Label, JsonElement Data = defaul
     public string ProfileNotice { get; init; } = "";
     public string ProfileCache { get; init; } = "";
     public string ProfileCacheTone { get; init; } = "";
+    public string ProfileNoticeTone { get; init; } = "";
     public string ProfileEmail { get; init; } = "";
-    public ProfileCardData Card => ProfileCardData.Create(Data, Label, ProfileNotice, ProfileCache, ProfileCacheTone) with { Email = ProfileEmail };
+    public ProfileCardData Card => ProfileCardData.Create(Data, Label, ProfileNotice, ProfileCache, ProfileCacheTone, ProfileNoticeTone) with { Email = ProfileEmail };
     public ShortcutCardData? Shortcut { get; init; }
     public string AgentBadge => ProfileAgentPresentation.Badge(Data);
     public string AgentHint => ProfileAgentPresentation.Hint(Data);
