@@ -91,6 +91,15 @@ class ControlCenterTests(unittest.TestCase):
         moved=self.store.shortcut_move(item['id'],self.two['id'])
         self.assertEqual(renamed,{**item,'alias':'쉬운 별칭','revision':1})
         self.assertEqual(moved,{**renamed,'profile_id':self.two['id'],'revision':2})
+    def test_shortcut_reorder_moves_one_link_and_keeps_identity(self):
+        links=[self.store.shortcut_add(f'작업 {n}',self.one['id'],str(uuid4()),'local','manager:'+self.one['id']) for n in range(3)]
+        ids=[link['id'] for link in links]
+        result=self.store.shortcut_reorder(ids[2],ids[0],'before')
+        self.assertEqual(result['shortcut_ids'],[ids[2],ids[0],ids[1]])
+        self.assertEqual(self.store.shortcut_reorder(ids[2],ids[1],'after')['shortcut_ids'],[ids[0],ids[1],ids[2]])
+        self.assertEqual(self.store.read()['shortcuts'],links)
+        with self.assertRaises(ValueError):self.store.shortcut_reorder(ids[0],ids[1],'inside')
+        with self.assertRaises(ValueError):self.store.shortcut_reorder(ids[0],str(uuid4()),'before')
     def test_delete_undo_preserves_source_files(self):
         marker=self.root/'original.jsonl';marker.write_text('preserve',encoding='utf-8')
         item=self.link();result=self.store.shortcut_delete(item['id'])

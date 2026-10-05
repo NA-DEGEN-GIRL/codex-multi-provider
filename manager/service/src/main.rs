@@ -359,6 +359,7 @@ fn allowed(command: &str) -> bool {
         "shortcut.add",
         "shortcut.move",
         "shortcut.rename",
+        "shortcut.reorder",
         "shortcut.delete",
         "shortcut.undo",
         "conversation.open",

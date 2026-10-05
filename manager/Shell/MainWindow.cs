@@ -39,7 +39,8 @@ public sealed partial class MainWindow : Window
     private JsonElement _state;
     private readonly ListBox _profiles = new();
     private readonly TextBlock _profileCount = new() { Foreground = Muted, FontSize = 12, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(8, 0, 0, 0) };
-    private readonly ProfileOrdering _profileOrdering;
+    private readonly ListOrdering _profileOrdering;
+    private readonly ListOrdering _shortcutOrdering;
     private readonly ListBox _shortcuts = new();
     private readonly TextBlock _status = new() { Name = "WorkspaceStatus", TextWrapping = TextWrapping.NoWrap, TextTrimming = TextTrimming.CharacterEllipsis, FontSize = 12, Foreground = Muted, VerticalAlignment = VerticalAlignment.Center };
     private readonly TextBlock _executionMode = new() { TextWrapping = TextWrapping.Wrap, FontSize = 12, LineHeight = 18, Foreground = Muted, Margin = new Thickness(10, 4, 6, 4) };
@@ -198,8 +199,8 @@ public sealed partial class MainWindow : Window
         profileMenu.ContextMenu.Items.Add(emailItem);
         profileMenu.ContextMenu.Opened += (_, _) => emailItem.Header = _profileEmailsVisible ? "계정 이메일 숨기기" : "계정 이메일 표시";
         // A press on an avatar or card selects it when released in place and
-        // reorders the profiles once dragged (ProfileOrdering).
-        _profileOrdering = new ProfileOrdering(_profiles, move => Safe(() => MoveProfileAsync(move)), ProfileClickedAsync);
+        // reorders the profiles once dragged (ListOrdering).
+        _profileOrdering = new ListOrdering(_profiles, move => Safe(() => MoveProfileAsync(move)), ProfileClickedAsync);
         _profiles.SelectionChanged += async (_, _) => { if (!_rendering && _profiles.SelectedItem is Choice choice) await Safe(() => ShowProfileAsync(choice.Id)); };
         _profiles.PreviewMouseLeftButtonDown += (_, e) =>
         {
@@ -235,6 +236,11 @@ public sealed partial class MainWindow : Window
         VirtualizingPanel.SetScrollUnit(_shortcuts, ScrollUnit.Pixel);
         _shortcuts.ItemTemplate = ShortcutCards.Create();
         _shortcuts.ItemContainerStyle = ProfileCards.ContainerStyle();
+        // Press-and-drag on a card reorders the links; released in place it
+        // opens the task. A filtered list has no reliable neighbours, so search
+        // turns reordering off and the cards are plain buttons again.
+        _shortcutOrdering = new ListOrdering(_shortcuts, move => Safe(() => MoveShortcutAsync(move)), ShortcutClickedAsync,
+            () => _shortcutFilter.Text.Trim().Length == 0, [ListOrdering.ItemTag, "open"]);
         ShortcutCards.Attach(_shortcuts, async (choice, action, button) =>
         {
             if (action == "menu")
@@ -247,8 +253,24 @@ public sealed partial class MainWindow : Window
             }
             if (action == "open") { CloseShortcutOverlay(); await Safe(() => OpenShortcutAsync(choice.Id)); }
         });
-        _shortcuts.ContextMenu = Menu(("열기", () => { CloseShortcutOverlay(); return OpenShortcutAsync(RequireContextShortcut()); }), ("다른 프로필로 이동", () => MoveShortcutByIdAsync(RequireContextShortcut())), ("별칭 변경", () => RenameShortcutByIdAsync(RequireContextShortcut())), ("링크 삭제", () => DeleteShortcutByIdAsync(RequireContextShortcut())));
-        _shortcuts.ContextMenu.Opened += (_, _) => _shortcuts.ContextMenu.Tag = _contextShortcut ?? (_shortcuts.SelectedItem as Choice)?.Id;
+        _shortcuts.ContextMenu = Menu(("위로 이동", () => _shortcutOrdering.MoveByAsync(RequireContextShortcut(), -1)), ("아래로 이동", () => _shortcutOrdering.MoveByAsync(RequireContextShortcut(), 1)),
+            ("열기", () => { CloseShortcutOverlay(); return OpenShortcutAsync(RequireContextShortcut()); }), ("다른 프로필로 이동", () => MoveShortcutByIdAsync(RequireContextShortcut())), ("별칭 변경", () => RenameShortcutByIdAsync(RequireContextShortcut())), ("링크 삭제", () => DeleteShortcutByIdAsync(RequireContextShortcut())));
+        _shortcuts.ContextMenu.Opened += (_, _) =>
+        {
+            // WPF closes the popup before dispatching MenuItem.Click; keep the target.
+            var target = _contextShortcut ?? (_shortcuts.SelectedItem as Choice)?.Id;
+            _shortcuts.ContextMenu.Tag = target;
+            var ids = _shortcuts.Items.OfType<Choice>().Select(c => c.Id).ToArray();
+            var index = Array.IndexOf(ids, target);
+            var free = _shortcutOrdering.CanReorder && !_shortcutOrdering.IsInteracting;
+            foreach (var (item, enabled) in new[] { ((MenuItem)_shortcuts.ContextMenu.Items[0], free && index > 0),
+                ((MenuItem)_shortcuts.ContextMenu.Items[1], free && index >= 0 && index < ids.Length - 1) })
+            {
+                item.IsEnabled = enabled;
+                item.ToolTip = _shortcutOrdering.CanReorder ? null : "검색 중에는 순서를 바꿀 수 없습니다. 검색어를 지운 뒤 이동하세요.";
+                ToolTipService.SetShowOnDisabled(item, true);
+            }
+        };
         // The card buttons are not focusable; Enter opens the selected card.
         _shortcuts.KeyDown += async (_, e) =>
         {
@@ -818,14 +840,14 @@ public sealed partial class MainWindow : Window
     }
     private async Task RefreshAsync()
     {
-        if ((_client is null && !FixtureRefreshesState) || _refreshing || _closing || _profileOrdering.IsInteracting) return;
+        if ((_client is null && !FixtureRefreshesState) || _refreshing || _closing || _profileOrdering.IsInteracting || _shortcutOrdering.IsInteracting) return;
         _refreshing = true;
         var navigation = _navigation;
         var revision = _stateRevision;
         try
         {
             var state = await Request("state");
-            if (_closing || navigation != _navigation || revision != _stateRevision || _profileOrdering.IsInteracting) return;
+            if (_closing || navigation != _navigation || revision != _stateRevision || _profileOrdering.IsInteracting || _shortcutOrdering.IsInteracting) return;
             // Every show bumps _stateRevision, so this state was requested after
             // each launch still kept in _shownProfiles.
             _state = state; _shownProfiles.Clear();
@@ -907,7 +929,8 @@ public sealed partial class MainWindow : Window
                 return ProfileCacheLine.Apply(new Choice(p.S("id"), $"{label}\n{usage} · {Status(p.S("status"))}" + suffix, p)
                     { ProfileNotice = suffix, ProfileNoticeTone = noticeTone, ProfileNoticeShort = noticeShort, ProfileEmail = ProfileEmailText(p) }, _state, _selectedTask);
             }), _selectedProfile);
-            using (_responsiveness?.Stage("shell.shortcut_list", 25)) RenderShortcuts();
+            using (_responsiveness?.Stage("shell.shortcut_list", 25))
+            if (!_shortcutOrdering.IsInteracting) RenderShortcuts();
             var p = Profile();
             if (_viewingCatalog)
             {
@@ -1071,12 +1094,25 @@ public sealed partial class MainWindow : Window
         var items = values.ToArray();
         var old = box.Items.OfType<Choice>().ToArray();
         static object Appearance(Choice x) => (x.Id, x.Label, x.Hint, x.AgentBadge, x.AgentHint, x.Card, x.Shortcut);
-        if (old.Select(x => x.Id).SequenceEqual(items.Select(x => x.Id)))
+        var ids = items.Select(x => x.Id).ToArray();
+        if (old.Length == items.Length && ids.Distinct().Count() == ids.Length && new HashSet<string>(ids).SetEquals(old.Select(x => x.Id)))
         {
             // Status/usage refreshes must not reset the virtualized panel's
-            // measured card heights and shift the user's scroll position.
+            // measured card heights and shift the user's scroll position. A
+            // reorder moves only the items whose place changed, so the other
+            // cards keep their containers and the viewport stays put.
             for (var index = 0; index < items.Length; index++)
-                if (!Equals(Appearance(old[index]), Appearance(items[index]))) box.Items[index] = items[index];
+            {
+                var current = (Choice)box.Items[index]!;
+                if (current.Id != items[index].Id)
+                {
+                    var from = index + 1;
+                    while (((Choice)box.Items[from]!).Id != items[index].Id) from++;
+                    box.Items.RemoveAt(from);
+                    box.Items.Insert(index, items[index]);
+                }
+                else if (!Equals(Appearance(current), Appearance(items[index]))) box.Items[index] = items[index];
+            }
         }
         else
         {
@@ -2228,10 +2264,10 @@ public sealed partial class MainWindow : Window
         var result = await Request("profile.rename", new { profile_id = id, alias }); await RefreshAsync(); SetStatus(result.Message("별칭을 변경했습니다."));
     }
     private Task MoveProfileByAsync(int delta) => _profileOrdering.MoveByAsync(_contextProfile ?? RequireProfile(), delta);
-    private async Task MoveProfileAsync(ProfileMove move)
+    private async Task MoveProfileAsync(ListMove move)
     {
         ++_stateRevision; // Discard any state read that started before this move.
-        var result = await Request("profile.move", new { profile_id = move.ProfileId, target_profile_id = move.TargetProfileId, position = move.Position });
+        var result = await Request("profile.move", new { profile_id = move.Id, target_profile_id = move.TargetId, position = move.Position });
         var ids = result.Arr("profile_ids").Select(p => p.GetString()).ToArray();
         var profiles = _state.Arr("profiles").OrderBy(p => Array.IndexOf(ids, p.S("id"))).ToArray();
         _state = JsonSerializer.SerializeToElement(_state.EnumerateObject().ToDictionary(p => p.Name,
@@ -2242,6 +2278,31 @@ public sealed partial class MainWindow : Window
         finally { _rendering = false; }
         UpdateProfileSummary();
         SetStatus(result.Message("프로필 순서를 저장했습니다."));
+    }
+    // The service returns the saved order; the list follows it at once and
+    // keeps the highlighted card (the open task's), without a state request.
+    private async Task MoveShortcutAsync(ListMove move)
+    {
+        ++_stateRevision; // Discard any state read that started before this move.
+        var result = await Request("shortcut.reorder", new { shortcut_id = move.Id, target_shortcut_id = move.TargetId, position = move.Position });
+        var ids = result.Arr("shortcut_ids").Select(id => id.ValueKind == JsonValueKind.String ? id.GetString() ?? "" : "").ToArray();
+        if (ids.Length > 0)
+        {
+            int Rank(JsonElement shortcut) { var index = Array.IndexOf(ids, shortcut.S("id")); return index < 0 ? int.MaxValue : index; }
+            var shortcuts = _state.Arr("shortcuts").OrderBy(Rank).ToArray();
+            _state = JsonSerializer.SerializeToElement(_state.EnumerateObject().ToDictionary(p => p.Name,
+                p => p.Name == "shortcuts" ? JsonSerializer.SerializeToElement(shortcuts) : p.Value));
+        }
+        _rendering = true;
+        try { RenderShortcuts(); }
+        finally { _rendering = false; }
+        SetStatus(result.Message("작업 바로가기 순서를 저장했습니다."));
+    }
+    // A card press released in place (ListOrdering) opens the task, like the card button.
+    private async Task ShortcutClickedAsync(Choice choice, int timestamp)
+    {
+        CloseShortcutOverlay();
+        await Safe(() => OpenShortcutAsync(choice.Id));
     }
     private Task RemoveProfileAsync() => RemoveProfileAsync(RequireProfile());
     private async Task RemoveProfileAsync(string id)

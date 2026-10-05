@@ -35,6 +35,14 @@
 
 ## 최근 수정
 
+### 수정 117 — Claude 토큰 자동 갱신, GPT 새 모델 목록, 작업 바로가기 순서 바꾸기
+
+- 원격·위임 Claude 작업은 Windows 공식 Claude 로그인의 접근 토큰을 빌려 쓰는데, 로컬 CLI가 실행되지 않아 토큰이 만료된 채로 남았다
+  ("the selected Claude account is unavailable", 사용량 인증 실패). 만료·임박 시 공식 CLI의 내장 `/usage`를 숨겨 실행해 CLI가 스스로 갱신하게 한다.
+- 관리 런타임(0.153.4)이 모델 목록을 0.160.0 기준으로 요청해 공식 앱과 같은 모델(gpt-6.1-sol 등)을 받는다(목록 요청에만 적용).
+- 작업 바로가기를 끌어서 순서를 바꾼다(`shortcut.reorder`).
+- [원인·변경·검증](design/token-models-shortcut-order-117.md).
+
 ### 수정 116 — 작업 중 공식 앱 업데이트 적용, 26.930.4958 지원, 관리창 정보 정리
 
 - 실행 중인 Codex가 모두 관리용 사본이면(패키지 신원 없음) 패키지 서비스만 멈추고 바로 등록한다. 원래 공식 앱 창이 열려 있거나
@@ -328,3 +336,4 @@
 | 114 | [claude-ultracode-workflows-114](design/claude-ultracode-workflows-114.md) | Claude Ultracode 선택 메뉴와 백그라운드 워크플로 |
 | 115 | [desktop-930-update-ui-115](design/desktop-930-update-ui-115.md) | 프로필의 공식 Codex 26.930 사용, 공식 앱 업데이트 적용, 관리창 화면 개편 |
 | 116 | [update-flow-ui-polish-116](design/update-flow-ui-polish-116.md) | 작업 중 공식 앱 업데이트 적용, 26.930.4958 지원, 관리창 정보 정리 |
+| 117 | [token-models-shortcut-order-117](design/token-models-shortcut-order-117.md) | Claude 토큰 자동 갱신, GPT 새 모델 목록, 작업 바로가기 순서 |

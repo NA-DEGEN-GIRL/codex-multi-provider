@@ -1,5 +1,5 @@
 diff --git a/codex-rs/Cargo.lock b/codex-rs/Cargo.lock
-index e217b70..a3bb73b 100644
+index e217b7024..a3bb73b15 100644
 --- a/codex-rs/Cargo.lock
 +++ b/codex-rs/Cargo.lock
 @@ -394,7 +394,7 @@ checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
@@ -1345,7 +1345,7 @@ index e217b70..a3bb73b 100644
   "anyhow",
   "codex-login",
 diff --git a/codex-rs/agent-roles/src/agent_role_config.rs b/codex-rs/agent-roles/src/agent_role_config.rs
-index 0e53a71..9abf837 100644
+index 0e53a7195..9abf83772 100644
 --- a/codex-rs/agent-roles/src/agent_role_config.rs
 +++ b/codex-rs/agent-roles/src/agent_role_config.rs
 @@ -1,4 +1,5 @@
@@ -1398,7 +1398,7 @@ index 0e53a71..9abf837 100644
      })
  }
 diff --git a/codex-rs/agent-roles/src/loader.rs b/codex-rs/agent-roles/src/loader.rs
-index a82649b..12f00e4 100644
+index a82649b8e..12f00e4ad 100644
 --- a/codex-rs/agent-roles/src/loader.rs
 +++ b/codex-rs/agent-roles/src/loader.rs
 @@ -4,6 +4,7 @@ use crate::agent_role_config::normalize_agent_role_description;
@@ -1535,7 +1535,7 @@ index a82649b..12f00e4 100644
              },
          );
 diff --git a/codex-rs/app-server-protocol/schema/json/ClientRequest.json b/codex-rs/app-server-protocol/schema/json/ClientRequest.json
-index 666a341..34d6628 100644
+index 666a34107..34d6628fa 100644
 --- a/codex-rs/app-server-protocol/schema/json/ClientRequest.json
 +++ b/codex-rs/app-server-protocol/schema/json/ClientRequest.json
 @@ -833,6 +833,24 @@
@@ -1565,7 +1565,7 @@ index 666a341..34d6628 100644
          "enablement": {
 diff --git a/codex-rs/app-server-protocol/schema/json/ExecutionPresetAuthTokensReadParams.json b/codex-rs/app-server-protocol/schema/json/ExecutionPresetAuthTokensReadParams.json
 new file mode 100644
-index 0000000..84f83a3
+index 000000000..84f83a391
 --- /dev/null
 +++ b/codex-rs/app-server-protocol/schema/json/ExecutionPresetAuthTokensReadParams.json
 @@ -0,0 +1,40 @@
@@ -1612,7 +1612,7 @@ index 0000000..84f83a3
 \ No newline at end of file
 diff --git a/codex-rs/app-server-protocol/schema/json/ExecutionPresetAuthTokensReadResponse.json b/codex-rs/app-server-protocol/schema/json/ExecutionPresetAuthTokensReadResponse.json
 new file mode 100644
-index 0000000..99437b5
+index 000000000..99437b52e
 --- /dev/null
 +++ b/codex-rs/app-server-protocol/schema/json/ExecutionPresetAuthTokensReadResponse.json
 @@ -0,0 +1,36 @@
@@ -1654,7 +1654,7 @@ index 0000000..99437b5
 +}
 \ No newline at end of file
 diff --git a/codex-rs/app-server-protocol/schema/json/ServerNotification.json b/codex-rs/app-server-protocol/schema/json/ServerNotification.json
-index b15474f..0bb591c 100644
+index b15474ffc..0bb591ca4 100644
 --- a/codex-rs/app-server-protocol/schema/json/ServerNotification.json
 +++ b/codex-rs/app-server-protocol/schema/json/ServerNotification.json
 @@ -1272,6 +1272,24 @@
@@ -1747,7 +1747,7 @@ index b15474f..0bb591c 100644
            "type": "string"
          },
 diff --git a/codex-rs/app-server-protocol/schema/json/ServerRequest.json b/codex-rs/app-server-protocol/schema/json/ServerRequest.json
-index 242ee4c..dcf518a 100644
+index 242ee4c3b..dcf518abb 100644
 --- a/codex-rs/app-server-protocol/schema/json/ServerRequest.json
 +++ b/codex-rs/app-server-protocol/schema/json/ServerRequest.json
 @@ -543,6 +543,44 @@
@@ -1827,7 +1827,7 @@ index 242ee4c..dcf518a 100644
        "description": "Generate a fresh upstream attestation result on demand.",
        "properties": {
 diff --git a/codex-rs/app-server-protocol/schema/json/codex_app_server_protocol.schemas.json b/codex-rs/app-server-protocol/schema/json/codex_app_server_protocol.schemas.json
-index 47e75d1..bff253a 100644
+index 47e75d11d..bff253a3a 100644
 --- a/codex-rs/app-server-protocol/schema/json/codex_app_server_protocol.schemas.json
 +++ b/codex-rs/app-server-protocol/schema/json/codex_app_server_protocol.schemas.json
 @@ -2919,6 +2919,82 @@
@@ -2080,7 +2080,7 @@ index 47e75d1..bff253a 100644
              "type": "string"
            },
 diff --git a/codex-rs/app-server-protocol/schema/json/codex_app_server_protocol.v2.schemas.json b/codex-rs/app-server-protocol/schema/json/codex_app_server_protocol.v2.schemas.json
-index fce5c1d..8e23574 100644
+index fce5c1d1b..8e2357447 100644
 --- a/codex-rs/app-server-protocol/schema/json/codex_app_server_protocol.v2.schemas.json
 +++ b/codex-rs/app-server-protocol/schema/json/codex_app_server_protocol.v2.schemas.json
 @@ -6576,6 +6576,24 @@
@@ -2203,7 +2203,7 @@ index fce5c1d..8e23574 100644
            "type": "string"
          },
 diff --git a/codex-rs/app-server-protocol/schema/json/v1/InitializeResponse.json b/codex-rs/app-server-protocol/schema/json/v1/InitializeResponse.json
-index 1de65f8..879d887 100644
+index 1de65f82f..879d8870c 100644
 --- a/codex-rs/app-server-protocol/schema/json/v1/InitializeResponse.json
 +++ b/codex-rs/app-server-protocol/schema/json/v1/InitializeResponse.json
 @@ -15,6 +15,15 @@
@@ -2223,7 +2223,7 @@ index 1de65f8..879d887 100644
        "description": "Platform family for the running app-server target, for example `\"unix\"` or `\"windows\"`.",
        "type": "string"
 diff --git a/codex-rs/app-server-protocol/schema/json/v2/ThreadForkResponse.json b/codex-rs/app-server-protocol/schema/json/v2/ThreadForkResponse.json
-index e0aa43d..0ef82b9 100644
+index e0aa43dd2..0ef82b9c6 100644
 --- a/codex-rs/app-server-protocol/schema/json/v2/ThreadForkResponse.json
 +++ b/codex-rs/app-server-protocol/schema/json/v2/ThreadForkResponse.json
 @@ -732,6 +732,26 @@
@@ -2274,7 +2274,7 @@ index e0aa43d..0ef82b9 100644
      },
      "ThreadHistoryMode": {
 diff --git a/codex-rs/app-server-protocol/schema/json/v2/ThreadListResponse.json b/codex-rs/app-server-protocol/schema/json/v2/ThreadListResponse.json
-index 576edc3..e67d6a8 100644
+index 576edc360..e67d6a8ac 100644
 --- a/codex-rs/app-server-protocol/schema/json/v2/ThreadListResponse.json
 +++ b/codex-rs/app-server-protocol/schema/json/v2/ThreadListResponse.json
 @@ -654,6 +654,26 @@
@@ -2325,7 +2325,7 @@ index 576edc3..e67d6a8 100644
      },
      "ThreadHistoryMode": {
 diff --git a/codex-rs/app-server-protocol/schema/json/v2/ThreadMetadataUpdateResponse.json b/codex-rs/app-server-protocol/schema/json/v2/ThreadMetadataUpdateResponse.json
-index 6db9cbc..c474f41 100644
+index 6db9cbc2e..c474f4124 100644
 --- a/codex-rs/app-server-protocol/schema/json/v2/ThreadMetadataUpdateResponse.json
 +++ b/codex-rs/app-server-protocol/schema/json/v2/ThreadMetadataUpdateResponse.json
 @@ -654,6 +654,26 @@
@@ -2376,7 +2376,7 @@ index 6db9cbc..c474f41 100644
      },
      "ThreadHistoryMode": {
 diff --git a/codex-rs/app-server-protocol/schema/json/v2/ThreadReadResponse.json b/codex-rs/app-server-protocol/schema/json/v2/ThreadReadResponse.json
-index 8682470..1325154 100644
+index 8682470d1..1325154ab 100644
 --- a/codex-rs/app-server-protocol/schema/json/v2/ThreadReadResponse.json
 +++ b/codex-rs/app-server-protocol/schema/json/v2/ThreadReadResponse.json
 @@ -654,6 +654,26 @@
@@ -2427,7 +2427,7 @@ index 8682470..1325154 100644
      },
      "ThreadHistoryMode": {
 diff --git a/codex-rs/app-server-protocol/schema/json/v2/ThreadResumeResponse.json b/codex-rs/app-server-protocol/schema/json/v2/ThreadResumeResponse.json
-index 030a48b..3cdce9f 100644
+index 030a48b1b..3cdce9f97 100644
 --- a/codex-rs/app-server-protocol/schema/json/v2/ThreadResumeResponse.json
 +++ b/codex-rs/app-server-protocol/schema/json/v2/ThreadResumeResponse.json
 @@ -732,6 +732,26 @@
@@ -2478,7 +2478,7 @@ index 030a48b..3cdce9f 100644
      },
      "ThreadHistoryMode": {
 diff --git a/codex-rs/app-server-protocol/schema/json/v2/ThreadRevertResponse.json b/codex-rs/app-server-protocol/schema/json/v2/ThreadRevertResponse.json
-index f92e720..543a59e 100644
+index f92e7201a..543a59ed6 100644
 --- a/codex-rs/app-server-protocol/schema/json/v2/ThreadRevertResponse.json
 +++ b/codex-rs/app-server-protocol/schema/json/v2/ThreadRevertResponse.json
 @@ -654,6 +654,26 @@
@@ -2529,7 +2529,7 @@ index f92e720..543a59e 100644
      },
      "ThreadHistoryMode": {
 diff --git a/codex-rs/app-server-protocol/schema/json/v2/ThreadRollbackResponse.json b/codex-rs/app-server-protocol/schema/json/v2/ThreadRollbackResponse.json
-index da1efc5..9cbdfee 100644
+index da1efc5a2..9cbdfeee9 100644
 --- a/codex-rs/app-server-protocol/schema/json/v2/ThreadRollbackResponse.json
 +++ b/codex-rs/app-server-protocol/schema/json/v2/ThreadRollbackResponse.json
 @@ -654,6 +654,26 @@
@@ -2580,7 +2580,7 @@ index da1efc5..9cbdfee 100644
      },
      "ThreadHistoryMode": {
 diff --git a/codex-rs/app-server-protocol/schema/json/v2/ThreadSettingsUpdatedNotification.json b/codex-rs/app-server-protocol/schema/json/v2/ThreadSettingsUpdatedNotification.json
-index f3296fa..5f6d526 100644
+index f3296fa37..5f6d526b0 100644
 --- a/codex-rs/app-server-protocol/schema/json/v2/ThreadSettingsUpdatedNotification.json
 +++ b/codex-rs/app-server-protocol/schema/json/v2/ThreadSettingsUpdatedNotification.json
 @@ -99,6 +99,24 @@
@@ -2626,7 +2626,7 @@ index f3296fa..5f6d526 100644
            "type": "string"
          },
 diff --git a/codex-rs/app-server-protocol/schema/json/v2/ThreadStartResponse.json b/codex-rs/app-server-protocol/schema/json/v2/ThreadStartResponse.json
-index 984dc14..ac44dc4 100644
+index 984dc14b6..ac44dc40b 100644
 --- a/codex-rs/app-server-protocol/schema/json/v2/ThreadStartResponse.json
 +++ b/codex-rs/app-server-protocol/schema/json/v2/ThreadStartResponse.json
 @@ -732,6 +732,26 @@
@@ -2677,7 +2677,7 @@ index 984dc14..ac44dc4 100644
      },
      "ThreadHistoryMode": {
 diff --git a/codex-rs/app-server-protocol/schema/json/v2/ThreadStartedNotification.json b/codex-rs/app-server-protocol/schema/json/v2/ThreadStartedNotification.json
-index 63cc9d2..593513e 100644
+index 63cc9d2e9..593513e95 100644
 --- a/codex-rs/app-server-protocol/schema/json/v2/ThreadStartedNotification.json
 +++ b/codex-rs/app-server-protocol/schema/json/v2/ThreadStartedNotification.json
 @@ -654,6 +654,26 @@
@@ -2728,7 +2728,7 @@ index 63cc9d2..593513e 100644
      },
      "ThreadHistoryMode": {
 diff --git a/codex-rs/app-server-protocol/schema/json/v2/ThreadUnarchiveResponse.json b/codex-rs/app-server-protocol/schema/json/v2/ThreadUnarchiveResponse.json
-index 04e4301..f67635b 100644
+index 04e430114..f67635b84 100644
 --- a/codex-rs/app-server-protocol/schema/json/v2/ThreadUnarchiveResponse.json
 +++ b/codex-rs/app-server-protocol/schema/json/v2/ThreadUnarchiveResponse.json
 @@ -654,6 +654,26 @@
@@ -14310,7 +14310,7 @@ EDnjvMdH?_b
 
 diff --git a/codex-rs/app-server-protocol/schema/typescript/ExecutionPresetSelection.ts b/codex-rs/app-server-protocol/schema/typescript/ExecutionPresetSelection.ts
 new file mode 100644
-index 0000000..5144c52
+index 000000000..5144c52ef
 --- /dev/null
 +++ b/codex-rs/app-server-protocol/schema/typescript/ExecutionPresetSelection.ts
 @@ -0,0 +1,8 @@
@@ -14323,7 +14323,7 @@ index 0000000..5144c52
 + */
 +export type ExecutionPresetSelection = { id: string, revision: number, };
 diff --git a/codex-rs/app-server-protocol/schema/typescript/InitializeResponse.ts b/codex-rs/app-server-protocol/schema/typescript/InitializeResponse.ts
-index f1f79d1..a18c4a9 100644
+index f1f79d173..a18c4a965 100644
 --- a/codex-rs/app-server-protocol/schema/typescript/InitializeResponse.ts
 +++ b/codex-rs/app-server-protocol/schema/typescript/InitializeResponse.ts
 @@ -3,7 +3,11 @@
@@ -14340,7 +14340,7 @@ index f1f79d1..a18c4a9 100644
   * Absolute path to the server's $CODEX_HOME directory.
   */
 diff --git a/codex-rs/app-server-protocol/schema/typescript/ServerRequest.ts b/codex-rs/app-server-protocol/schema/typescript/ServerRequest.ts
-index 89a5440..c58f08d 100644
+index 89a544005..c58f08d12 100644
 --- a/codex-rs/app-server-protocol/schema/typescript/ServerRequest.ts
 +++ b/codex-rs/app-server-protocol/schema/typescript/ServerRequest.ts
 @@ -8,6 +8,7 @@ import type { AttestationGenerateParams } from "./v2/AttestationGenerateParams";
@@ -14358,7 +14358,7 @@ index 89a5440..c58f08d 100644
 -export type ServerRequest ={ "method": "item/commandExecution/requestApproval", id: RequestId, params: CommandExecutionRequestApprovalParams, } | { "method": "item/fileChange/requestApproval", id: RequestId, params: FileChangeRequestApprovalParams, } | { "method": "item/tool/requestUserInput", id: RequestId, params: ToolRequestUserInputParams, } | { "method": "mcpServer/elicitation/request", id: RequestId, params: McpServerElicitationRequestParams, } | { "method": "item/permissions/requestApproval", id: RequestId, params: PermissionsRequestApprovalParams, } | { "method": "item/tool/call", id: RequestId, params: DynamicToolCallParams, } | { "method": "account/chatgptAuthTokens/refresh", id: RequestId, params: ChatgptAuthTokensRefreshParams, } | { "method": "attestation/generate", id: RequestId, params: AttestationGenerateParams, } | { "method": "applyPatchApproval", id: RequestId, params: ApplyPatchApprovalParams, } | { "method": "execCommandApproval", id: RequestId, params: ExecCommandApprovalParams, };
 +export type ServerRequest ={ "method": "item/commandExecution/requestApproval", id: RequestId, params: CommandExecutionRequestApprovalParams, } | { "method": "item/fileChange/requestApproval", id: RequestId, params: FileChangeRequestApprovalParams, } | { "method": "item/tool/requestUserInput", id: RequestId, params: ToolRequestUserInputParams, } | { "method": "mcpServer/elicitation/request", id: RequestId, params: McpServerElicitationRequestParams, } | { "method": "item/permissions/requestApproval", id: RequestId, params: PermissionsRequestApprovalParams, } | { "method": "item/tool/call", id: RequestId, params: DynamicToolCallParams, } | { "method": "account/chatgptAuthTokens/refresh", id: RequestId, params: ChatgptAuthTokensRefreshParams, } | { "method": "account/executionPresetAuthTokens/read", id: RequestId, params: ExecutionPresetAuthTokensReadParams, } | { "method": "attestation/generate", id: RequestId, params: AttestationGenerateParams, } | { "method": "applyPatchApproval", id: RequestId, params: ApplyPatchApprovalParams, } | { "method": "execCommandApproval", id: RequestId, params: ExecCommandApprovalParams, };
 diff --git a/codex-rs/app-server-protocol/schema/typescript/index.ts b/codex-rs/app-server-protocol/schema/typescript/index.ts
-index 893117f..9234d2d 100644
+index 893117f75..9234d2d53 100644
 --- a/codex-rs/app-server-protocol/schema/typescript/index.ts
 +++ b/codex-rs/app-server-protocol/schema/typescript/index.ts
 @@ -19,6 +19,7 @@ export type { ConversationTextRole } from "./ConversationTextRole";
@@ -14371,7 +14371,7 @@ index 893117f..9234d2d 100644
  export type { FunctionCallOutputBody } from "./FunctionCallOutputBody";
 diff --git a/codex-rs/app-server-protocol/schema/typescript/v2/ExecutionPresetAuthTokensReadParams.ts b/codex-rs/app-server-protocol/schema/typescript/v2/ExecutionPresetAuthTokensReadParams.ts
 new file mode 100644
-index 0000000..e8f3535
+index 000000000..e8f35353c
 --- /dev/null
 +++ b/codex-rs/app-server-protocol/schema/typescript/v2/ExecutionPresetAuthTokensReadParams.ts
 @@ -0,0 +1,8 @@
@@ -14385,7 +14385,7 @@ index 0000000..e8f3535
 +export type ExecutionPresetAuthTokensReadParams = { ownerProfileId: string, roleId: string | null, profileId: string, kind: string, expectedAccountFingerprint: string | null, expectedAccountIdentity: string | null, };
 diff --git a/codex-rs/app-server-protocol/schema/typescript/v2/ExecutionPresetAuthTokensReadResponse.ts b/codex-rs/app-server-protocol/schema/typescript/v2/ExecutionPresetAuthTokensReadResponse.ts
 new file mode 100644
-index 0000000..ae51276
+index 000000000..ae51276c3
 --- /dev/null
 +++ b/codex-rs/app-server-protocol/schema/typescript/v2/ExecutionPresetAuthTokensReadResponse.ts
 @@ -0,0 +1,5 @@
@@ -14396,7 +14396,7 @@ index 0000000..ae51276
 +export type ExecutionPresetAuthTokensReadResponse = { kind: string, accessToken: string, chatgptAccountId: string | null, expiresAt: number | null, accountIdentity: string | null, };
 diff --git a/codex-rs/app-server-protocol/schema/typescript/v2/ManagedRecordOrigin.ts b/codex-rs/app-server-protocol/schema/typescript/v2/ManagedRecordOrigin.ts
 new file mode 100644
-index 0000000..46c5efb
+index 000000000..46c5efb7f
 --- /dev/null
 +++ b/codex-rs/app-server-protocol/schema/typescript/v2/ManagedRecordOrigin.ts
 @@ -0,0 +1,9 @@
@@ -14410,7 +14410,7 @@ index 0000000..46c5efb
 + */
 +export type ManagedRecordOrigin = { hostId: string, sourceStoreId: string, canonicalThreadId: string, };
 diff --git a/codex-rs/app-server-protocol/schema/typescript/v2/ThreadExtra.ts b/codex-rs/app-server-protocol/schema/typescript/v2/ThreadExtra.ts
-index aa35e45..77974c0 100644
+index aa35e45f0..77974c044 100644
 --- a/codex-rs/app-server-protocol/schema/typescript/v2/ThreadExtra.ts
 +++ b/codex-rs/app-server-protocol/schema/typescript/v2/ThreadExtra.ts
 @@ -1,8 +1,13 @@
@@ -14430,7 +14430,7 @@ index aa35e45..77974c0 100644
 +managedRecord: ManagedRecordOrigin | null, };
 diff --git a/codex-rs/app-server-protocol/schema/typescript/v2/ThreadManagedIdleBlocker.ts b/codex-rs/app-server-protocol/schema/typescript/v2/ThreadManagedIdleBlocker.ts
 new file mode 100644
-index 0000000..b0fc4a6
+index 000000000..b0fc4a64d
 --- /dev/null
 +++ b/codex-rs/app-server-protocol/schema/typescript/v2/ThreadManagedIdleBlocker.ts
 @@ -0,0 +1,8 @@
@@ -14444,7 +14444,7 @@ index 0000000..b0fc4a6
 +export type ThreadManagedIdleBlocker = { threadId: string, kind: string, };
 diff --git a/codex-rs/app-server-protocol/schema/typescript/v2/ThreadManagedIdleProofScope.ts b/codex-rs/app-server-protocol/schema/typescript/v2/ThreadManagedIdleProofScope.ts
 new file mode 100644
-index 0000000..f99b004
+index 000000000..f99b00478
 --- /dev/null
 +++ b/codex-rs/app-server-protocol/schema/typescript/v2/ThreadManagedIdleProofScope.ts
 @@ -0,0 +1,8 @@
@@ -14457,7 +14457,7 @@ index 0000000..f99b004
 + */
 +export type ThreadManagedIdleProofScope = "advisory";
 diff --git a/codex-rs/app-server-protocol/schema/typescript/v2/ThreadSettings.ts b/codex-rs/app-server-protocol/schema/typescript/v2/ThreadSettings.ts
-index b034ea8..fe64064 100644
+index b034ea80b..fe6406441 100644
 --- a/codex-rs/app-server-protocol/schema/typescript/v2/ThreadSettings.ts
 +++ b/codex-rs/app-server-protocol/schema/typescript/v2/ThreadSettings.ts
 @@ -3,6 +3,7 @@
@@ -14475,7 +14475,7 @@ index b034ea8..fe64064 100644
 -export type ThreadSettings = {cwd: AbsolutePathBuf, approvalPolicy: AskForApproval, approvalsReviewer: ApprovalsReviewer, sandboxPolicy: SandboxPolicy, activePermissionProfile: ActivePermissionProfile | null, model: string, modelProvider: string, serviceTier: string | null, effort: ReasoningEffort | null, summary: ReasoningSummary | null, collaborationMode: CollaborationMode, personality: Personality | null};
 +export type ThreadSettings = {executionPreset: ExecutionPresetSelection | null, cwd: AbsolutePathBuf, approvalPolicy: AskForApproval, approvalsReviewer: ApprovalsReviewer, sandboxPolicy: SandboxPolicy, activePermissionProfile: ActivePermissionProfile | null, model: string, modelProvider: string, serviceTier: string | null, effort: ReasoningEffort | null, summary: ReasoningSummary | null, collaborationMode: CollaborationMode, personality: Personality | null};
 diff --git a/codex-rs/app-server-protocol/schema/typescript/v2/index.ts b/codex-rs/app-server-protocol/schema/typescript/v2/index.ts
-index fefe723..3c855d2 100644
+index fefe72338..3c855d269 100644
 --- a/codex-rs/app-server-protocol/schema/typescript/v2/index.ts
 +++ b/codex-rs/app-server-protocol/schema/typescript/v2/index.ts
 @@ -130,6 +130,8 @@ export type { DynamicToolSpec } from "./DynamicToolSpec";
@@ -14505,7 +14505,7 @@ index fefe723..3c855d2 100644
  export type { ThreadMetadataUpdateParams } from "./ThreadMetadataUpdateParams";
  export type { ThreadMetadataUpdateResponse } from "./ThreadMetadataUpdateResponse";
 diff --git a/codex-rs/app-server-protocol/scripts/write_schema_fixtures.py b/codex-rs/app-server-protocol/scripts/write_schema_fixtures.py
-index f23da4f..d701c13 100644
+index f23da4fc8..d701c1333 100644
 --- a/codex-rs/app-server-protocol/scripts/write_schema_fixtures.py
 +++ b/codex-rs/app-server-protocol/scripts/write_schema_fixtures.py
 @@ -39,15 +39,15 @@ def main() -> None:
@@ -14530,7 +14530,7 @@ index f23da4f..d701c13 100644
          cwd=workspace_root,
          env=env,
 diff --git a/codex-rs/app-server-protocol/src/protocol/common.rs b/codex-rs/app-server-protocol/src/protocol/common.rs
-index 6c00f88..69e3197 100644
+index 6c00f889f..69e3197a7 100644
 --- a/codex-rs/app-server-protocol/src/protocol/common.rs
 +++ b/codex-rs/app-server-protocol/src/protocol/common.rs
 @@ -508,6 +508,14 @@ client_request_definitions! {
@@ -14597,7 +14597,7 @@ index 6c00f88..69e3197 100644
                      approval_policy: v2::AskForApproval::Never,
                      approvals_reviewer: v2::ApprovalsReviewer::User,
 diff --git a/codex-rs/app-server-protocol/src/protocol/thread_history.rs b/codex-rs/app-server-protocol/src/protocol/thread_history.rs
-index 028069a..19aef3b 100644
+index 028069a0f..19aef3bee 100644
 --- a/codex-rs/app-server-protocol/src/protocol/thread_history.rs
 +++ b/codex-rs/app-server-protocol/src/protocol/thread_history.rs
 @@ -4096,6 +4096,8 @@ mod tests {
@@ -14610,7 +14610,7 @@ index 028069a..19aef3b 100644
              RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
                  turn_id: "turn-compact".into(),
 diff --git a/codex-rs/app-server-protocol/src/protocol/thread_history_projection_tests.rs b/codex-rs/app-server-protocol/src/protocol/thread_history_projection_tests.rs
-index a6d0077..575e428 100644
+index a6d007777..575e428c2 100644
 --- a/codex-rs/app-server-protocol/src/protocol/thread_history_projection_tests.rs
 +++ b/codex-rs/app-server-protocol/src/protocol/thread_history_projection_tests.rs
 @@ -209,6 +209,8 @@ fn ignores_legacy_abort_without_turn_id_and_context_only_records() {
@@ -14623,7 +14623,7 @@ index a6d0077..575e428 100644
      let security_risk = project(RolloutItem::SecurityRiskScore(SecurityRiskScore {
          scores: BTreeMap::from([("action_risk".to_string(), 0.92)]),
 diff --git a/codex-rs/app-server-protocol/src/protocol/v1.rs b/codex-rs/app-server-protocol/src/protocol/v1.rs
-index 17013b5..ca62a75 100644
+index 17013b528..ca62a75a7 100644
 --- a/codex-rs/app-server-protocol/src/protocol/v1.rs
 +++ b/codex-rs/app-server-protocol/src/protocol/v1.rs
 @@ -68,6 +68,10 @@ pub struct InitializeCapabilities {
@@ -14638,7 +14638,7 @@ index 17013b5..ca62a75 100644
      /// Absolute path to the server's $CODEX_HOME directory.
      pub codex_home: AbsolutePathBuf,
 diff --git a/codex-rs/app-server-protocol/src/protocol/v2/account.rs b/codex-rs/app-server-protocol/src/protocol/v2/account.rs
-index 47990a4..ff7f82d 100644
+index 47990a49a..ff7f82d3b 100644
 --- a/codex-rs/app-server-protocol/src/protocol/v2/account.rs
 +++ b/codex-rs/app-server-protocol/src/protocol/v2/account.rs
 @@ -298,6 +298,40 @@ pub struct ChatgptAuthTokensRefreshResponse {
@@ -14684,7 +14684,7 @@ index 47990a4..ff7f82d 100644
          f.debug_struct("ChatgptAuthTokensRefreshResponse")
 diff --git a/codex-rs/app-server-protocol/src/protocol/v2/managed_instance.rs b/codex-rs/app-server-protocol/src/protocol/v2/managed_instance.rs
 new file mode 100644
-index 0000000..9718e6d
+index 000000000..9718e6d4a
 --- /dev/null
 +++ b/codex-rs/app-server-protocol/src/protocol/v2/managed_instance.rs
 @@ -0,0 +1,24 @@
@@ -14714,7 +14714,7 @@ index 0000000..9718e6d
 +}
 diff --git a/codex-rs/app-server-protocol/src/protocol/v2/managed_thread.rs b/codex-rs/app-server-protocol/src/protocol/v2/managed_thread.rs
 new file mode 100644
-index 0000000..21a5c67
+index 000000000..21a5c677c
 --- /dev/null
 +++ b/codex-rs/app-server-protocol/src/protocol/v2/managed_thread.rs
 @@ -0,0 +1,95 @@
@@ -14814,7 +14814,7 @@ index 0000000..21a5c67
 +    pub binding_reloaded: bool,
 +}
 diff --git a/codex-rs/app-server-protocol/src/protocol/v2/mod.rs b/codex-rs/app-server-protocol/src/protocol/v2/mod.rs
-index 75416d1..8342c00 100644
+index 75416d13a..8342c0085 100644
 --- a/codex-rs/app-server-protocol/src/protocol/v2/mod.rs
 +++ b/codex-rs/app-server-protocol/src/protocol/v2/mod.rs
 @@ -17,6 +17,8 @@ mod feedback;
@@ -14836,7 +14836,7 @@ index 75416d1..8342c00 100644
  pub use model::*;
  pub use notification::*;
 diff --git a/codex-rs/app-server-protocol/src/protocol/v2/thread.rs b/codex-rs/app-server-protocol/src/protocol/v2/thread.rs
-index 2a08c9f..aeed859 100644
+index 2a08c9fd1..aeed8590f 100644
 --- a/codex-rs/app-server-protocol/src/protocol/v2/thread.rs
 +++ b/codex-rs/app-server-protocol/src/protocol/v2/thread.rs
 @@ -225,6 +225,15 @@ impl ThreadStartResponse {
@@ -14864,7 +14864,7 @@ index 2a08c9f..aeed859 100644
      pub approval_policy: AskForApproval,
      pub approvals_reviewer: ApprovalsReviewer,
 diff --git a/codex-rs/app-server-protocol/src/protocol/v2/thread_data.rs b/codex-rs/app-server-protocol/src/protocol/v2/thread_data.rs
-index 649a94b..96b786f 100644
+index 649a94be4..96b786fee 100644
 --- a/codex-rs/app-server-protocol/src/protocol/v2/thread_data.rs
 +++ b/codex-rs/app-server-protocol/src/protocol/v2/thread_data.rs
 @@ -163,7 +163,21 @@ impl From<ThreadSource> for CoreThreadSource {
@@ -14891,7 +14891,7 @@ index 649a94b..96b786f 100644
  #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
  #[serde(rename_all = "camelCase")]
 diff --git a/codex-rs/app-server-transport/src/transport/mod.rs b/codex-rs/app-server-transport/src/transport/mod.rs
-index c8b0e57..8324a2b 100644
+index c8b0e57e4..8324a2bc5 100644
 --- a/codex-rs/app-server-transport/src/transport/mod.rs
 +++ b/codex-rs/app-server-transport/src/transport/mod.rs
 @@ -370,6 +370,7 @@ mod tests {
@@ -14903,7 +14903,7 @@ index c8b0e57..8324a2b 100644
                      codex_home,
                      platform_family: "unix".to_string(),
 diff --git a/codex-rs/app-server-transport/src/transport/remote_control/segment_tests.rs b/codex-rs/app-server-transport/src/transport/remote_control/segment_tests.rs
-index 3b2406b..66af4b9 100644
+index 3b2406b6f..66af4b900 100644
 --- a/codex-rs/app-server-transport/src/transport/remote_control/segment_tests.rs
 +++ b/codex-rs/app-server-transport/src/transport/remote_control/segment_tests.rs
 @@ -136,6 +136,7 @@ fn invalid_response_becomes_remote_control_jsonrpc_error() {
@@ -14915,7 +14915,7 @@ index 3b2406b..66af4b9 100644
                      codex_home,
                      platform_family: "unix".to_string(),
 diff --git a/codex-rs/app-server-transport/src/transport/remote_control/tests.rs b/codex-rs/app-server-transport/src/transport/remote_control/tests.rs
-index 0114a0b..ad2f0c7 100644
+index 0114a0bad..ad2f0c746 100644
 --- a/codex-rs/app-server-transport/src/transport/remote_control/tests.rs
 +++ b/codex-rs/app-server-transport/src/transport/remote_control/tests.rs
 @@ -1623,6 +1623,7 @@ async fn remote_control_http_mode_enrolls_before_connecting() {
@@ -14927,7 +14927,7 @@ index 0114a0b..ad2f0c7 100644
                              codex_home: codex_home.path().abs(),
                              platform_family: "test-family".to_string(),
 diff --git a/codex-rs/app-server-transport/src/transport/stdio.rs b/codex-rs/app-server-transport/src/transport/stdio.rs
-index 2d30296..1453c67 100644
+index 2d30296cd..1453c6792 100644
 --- a/codex-rs/app-server-transport/src/transport/stdio.rs
 +++ b/codex-rs/app-server-transport/src/transport/stdio.rs
 @@ -8,15 +8,15 @@ use crate::outgoing_message::QueuedOutgoingMessage;
@@ -15015,7 +15015,7 @@ index 2d30296..1453c67 100644
  
      stdio_handles.push(tokio::spawn(async move {
 diff --git a/codex-rs/app-server/Cargo.toml b/codex-rs/app-server/Cargo.toml
-index 2f08b0f..6c6d5e9 100644
+index 2f08b0fdc..6c6d5e9c9 100644
 --- a/codex-rs/app-server/Cargo.toml
 +++ b/codex-rs/app-server/Cargo.toml
 @@ -112,7 +112,7 @@ tokio-util = { workspace = true }
@@ -15028,7 +15028,7 @@ index 2f08b0f..6c6d5e9 100644
  [target.'cfg(windows)'.dependencies]
  codex-windows-sandbox = { workspace = true }
 diff --git a/codex-rs/app-server/README.md b/codex-rs/app-server/README.md
-index a0aa92b..ddbe256 100644
+index a0aa92b7f..ddbe256f6 100644
 --- a/codex-rs/app-server/README.md
 +++ b/codex-rs/app-server/README.md
 @@ -1,5 +1,53 @@
@@ -15335,7 +15335,7 @@ index a0aa92b..ddbe256 100644
  
  `thread/unsubscribe` removes the current connection's subscription to a thread. The response status is one of:
 diff --git a/codex-rs/app-server/src/command_exec.rs b/codex-rs/app-server/src/command_exec.rs
-index 53449ac..2e074d3 100644
+index 53449ac09..2e074d32e 100644
 --- a/codex-rs/app-server/src/command_exec.rs
 +++ b/codex-rs/app-server/src/command_exec.rs
 @@ -174,6 +174,7 @@ impl CommandExecManager {
@@ -15364,7 +15364,7 @@ index 53449ac..2e074d3 100644
                  outgoing,
 diff --git a/codex-rs/app-server/src/execution_preset_auth.rs b/codex-rs/app-server/src/execution_preset_auth.rs
 new file mode 100644
-index 0000000..4c609ed
+index 000000000..4c609ed41
 --- /dev/null
 +++ b/codex-rs/app-server/src/execution_preset_auth.rs
 @@ -0,0 +1,113 @@
@@ -15483,7 +15483,7 @@ index 0000000..4c609ed
 +mod tests;
 diff --git a/codex-rs/app-server/src/execution_preset_auth_tests.rs b/codex-rs/app-server/src/execution_preset_auth_tests.rs
 new file mode 100644
-index 0000000..b10fc1a
+index 000000000..b10fc1a61
 --- /dev/null
 +++ b/codex-rs/app-server/src/execution_preset_auth_tests.rs
 @@ -0,0 +1,170 @@
@@ -15658,7 +15658,7 @@ index 0000000..b10fc1a
 +    assert!(!outgoing.cancel_request(request.id()).await);
 +}
 diff --git a/codex-rs/app-server/src/lib.rs b/codex-rs/app-server/src/lib.rs
-index 0b4fe17..4a1e064 100644
+index 0b4fe1749..4a1e064c6 100644
 --- a/codex-rs/app-server/src/lib.rs
 +++ b/codex-rs/app-server/src/lib.rs
 @@ -108,6 +108,7 @@ mod current_time;
@@ -15893,7 +15893,7 @@ index 0b4fe17..4a1e064 100644
          assert_eq!(LogFormat::from_env_value(Some("json")), LogFormat::Json);
 diff --git a/codex-rs/app-server/src/managed_activation_gate_tests.rs b/codex-rs/app-server/src/managed_activation_gate_tests.rs
 new file mode 100644
-index 0000000..f70cc2c
+index 000000000..f70cc2c97
 --- /dev/null
 +++ b/codex-rs/app-server/src/managed_activation_gate_tests.rs
 @@ -0,0 +1,205 @@
@@ -16104,7 +16104,7 @@ index 0000000..f70cc2c
 +}
 diff --git a/codex-rs/app-server/src/managed_instance_activity.rs b/codex-rs/app-server/src/managed_instance_activity.rs
 new file mode 100644
-index 0000000..93c6285
+index 000000000..93c6285b5
 --- /dev/null
 +++ b/codex-rs/app-server/src/managed_instance_activity.rs
 @@ -0,0 +1,260 @@
@@ -16370,7 +16370,7 @@ index 0000000..93c6285
 +mod tests;
 diff --git a/codex-rs/app-server/src/managed_instance_activity_tests.rs b/codex-rs/app-server/src/managed_instance_activity_tests.rs
 new file mode 100644
-index 0000000..138075b
+index 000000000..138075b71
 --- /dev/null
 +++ b/codex-rs/app-server/src/managed_instance_activity_tests.rs
 @@ -0,0 +1,289 @@
@@ -16665,7 +16665,7 @@ index 0000000..138075b
 +}
 diff --git a/codex-rs/app-server/src/managed_instance_shutdown.rs b/codex-rs/app-server/src/managed_instance_shutdown.rs
 new file mode 100644
-index 0000000..0ca5a71
+index 000000000..0ca5a71f2
 --- /dev/null
 +++ b/codex-rs/app-server/src/managed_instance_shutdown.rs
 @@ -0,0 +1,151 @@
@@ -16822,7 +16822,7 @@ index 0000000..0ca5a71
 +}
 diff --git a/codex-rs/app-server/src/managed_read_list_tests.rs b/codex-rs/app-server/src/managed_read_list_tests.rs
 new file mode 100644
-index 0000000..2221e76
+index 000000000..2221e7661
 --- /dev/null
 +++ b/codex-rs/app-server/src/managed_read_list_tests.rs
 @@ -0,0 +1,177 @@
@@ -17005,7 +17005,7 @@ index 0000000..2221e76
 +}
 diff --git a/codex-rs/app-server/src/managed_read_store.rs b/codex-rs/app-server/src/managed_read_store.rs
 new file mode 100644
-index 0000000..be6cb46
+index 000000000..be6cb46f4
 --- /dev/null
 +++ b/codex-rs/app-server/src/managed_read_store.rs
 @@ -0,0 +1,293 @@
@@ -17304,7 +17304,7 @@ index 0000000..be6cb46
 +mod tests;
 diff --git a/codex-rs/app-server/src/managed_read_store_tests.rs b/codex-rs/app-server/src/managed_read_store_tests.rs
 new file mode 100644
-index 0000000..83309af
+index 000000000..83309afbc
 --- /dev/null
 +++ b/codex-rs/app-server/src/managed_read_store_tests.rs
 @@ -0,0 +1,333 @@
@@ -17643,7 +17643,7 @@ index 0000000..83309af
 +}
 diff --git a/codex-rs/app-server/src/managed_request_gate.rs b/codex-rs/app-server/src/managed_request_gate.rs
 new file mode 100644
-index 0000000..6424e76
+index 000000000..6424e765a
 --- /dev/null
 +++ b/codex-rs/app-server/src/managed_request_gate.rs
 @@ -0,0 +1,313 @@
@@ -17962,7 +17962,7 @@ index 0000000..6424e76
 +mod activation_tests;
 diff --git a/codex-rs/app-server/src/managed_request_gate_tests.rs b/codex-rs/app-server/src/managed_request_gate_tests.rs
 new file mode 100644
-index 0000000..1aa93b2
+index 000000000..1aa93b20a
 --- /dev/null
 +++ b/codex-rs/app-server/src/managed_request_gate_tests.rs
 @@ -0,0 +1,74 @@
@@ -18042,7 +18042,7 @@ index 0000000..1aa93b2
 +}
 diff --git a/codex-rs/app-server/src/managed_sources.rs b/codex-rs/app-server/src/managed_sources.rs
 new file mode 100644
-index 0000000..c0b2227
+index 000000000..c0b2227bc
 --- /dev/null
 +++ b/codex-rs/app-server/src/managed_sources.rs
 @@ -0,0 +1,522 @@
@@ -18570,7 +18570,7 @@ index 0000000..c0b2227
 +mod tests;
 diff --git a/codex-rs/app-server/src/managed_sources_tests.rs b/codex-rs/app-server/src/managed_sources_tests.rs
 new file mode 100644
-index 0000000..bdce6c1
+index 000000000..bdce6c10c
 --- /dev/null
 +++ b/codex-rs/app-server/src/managed_sources_tests.rs
 @@ -0,0 +1,199 @@
@@ -18775,7 +18775,7 @@ index 0000000..bdce6c1
 +}
 diff --git a/codex-rs/app-server/src/manager_catalog_guard.rs b/codex-rs/app-server/src/manager_catalog_guard.rs
 new file mode 100644
-index 0000000..25cedac
+index 000000000..25cedaca7
 --- /dev/null
 +++ b/codex-rs/app-server/src/manager_catalog_guard.rs
 @@ -0,0 +1,94 @@
@@ -18875,7 +18875,7 @@ index 0000000..25cedac
 +}
 diff --git a/codex-rs/app-server/src/manager_catalog_index.rs b/codex-rs/app-server/src/manager_catalog_index.rs
 new file mode 100644
-index 0000000..33f4e50
+index 000000000..33f4e503c
 --- /dev/null
 +++ b/codex-rs/app-server/src/manager_catalog_index.rs
 @@ -0,0 +1,40 @@
@@ -18921,7 +18921,7 @@ index 0000000..33f4e50
 +}
 diff --git a/codex-rs/app-server/src/manager_catalog_legacy.rs b/codex-rs/app-server/src/manager_catalog_legacy.rs
 new file mode 100644
-index 0000000..b742e95
+index 000000000..b742e959e
 --- /dev/null
 +++ b/codex-rs/app-server/src/manager_catalog_legacy.rs
 @@ -0,0 +1,144 @@
@@ -19071,7 +19071,7 @@ index 0000000..b742e95
 +}
 diff --git a/codex-rs/app-server/src/manager_catalog_list_watch.rs b/codex-rs/app-server/src/manager_catalog_list_watch.rs
 new file mode 100644
-index 0000000..95aa0e7
+index 000000000..95aa0e760
 --- /dev/null
 +++ b/codex-rs/app-server/src/manager_catalog_list_watch.rs
 @@ -0,0 +1,274 @@
@@ -19351,7 +19351,7 @@ index 0000000..95aa0e7
 +}
 diff --git a/codex-rs/app-server/src/manager_catalog_metadata.rs b/codex-rs/app-server/src/manager_catalog_metadata.rs
 new file mode 100644
-index 0000000..04d8db1
+index 000000000..04d8db109
 --- /dev/null
 +++ b/codex-rs/app-server/src/manager_catalog_metadata.rs
 @@ -0,0 +1,97 @@
@@ -19454,7 +19454,7 @@ index 0000000..04d8db1
 +}
 diff --git a/codex-rs/app-server/src/manager_catalog_names.rs b/codex-rs/app-server/src/manager_catalog_names.rs
 new file mode 100644
-index 0000000..a3479b6
+index 000000000..a3479b659
 --- /dev/null
 +++ b/codex-rs/app-server/src/manager_catalog_names.rs
 @@ -0,0 +1,111 @@
@@ -19571,7 +19571,7 @@ index 0000000..a3479b6
 +}
 diff --git a/codex-rs/app-server/src/manager_catalog_projects.rs b/codex-rs/app-server/src/manager_catalog_projects.rs
 new file mode 100644
-index 0000000..3ffd43c
+index 000000000..3ffd43c7f
 --- /dev/null
 +++ b/codex-rs/app-server/src/manager_catalog_projects.rs
 @@ -0,0 +1,97 @@
@@ -19674,7 +19674,7 @@ index 0000000..3ffd43c
 +}
 diff --git a/codex-rs/app-server/src/manager_catalog_projects_tests.rs b/codex-rs/app-server/src/manager_catalog_projects_tests.rs
 new file mode 100644
-index 0000000..d581009
+index 000000000..d5810092e
 --- /dev/null
 +++ b/codex-rs/app-server/src/manager_catalog_projects_tests.rs
 @@ -0,0 +1,93 @@
@@ -19773,7 +19773,7 @@ index 0000000..d581009
 +}
 diff --git a/codex-rs/app-server/src/manager_catalog_roots.rs b/codex-rs/app-server/src/manager_catalog_roots.rs
 new file mode 100644
-index 0000000..277e50d
+index 000000000..277e50d85
 --- /dev/null
 +++ b/codex-rs/app-server/src/manager_catalog_roots.rs
 @@ -0,0 +1,90 @@
@@ -19869,7 +19869,7 @@ index 0000000..277e50d
 +}
 diff --git a/codex-rs/app-server/src/manager_catalog_snapshot.rs b/codex-rs/app-server/src/manager_catalog_snapshot.rs
 new file mode 100644
-index 0000000..623cae2
+index 000000000..623cae2dc
 --- /dev/null
 +++ b/codex-rs/app-server/src/manager_catalog_snapshot.rs
 @@ -0,0 +1,271 @@
@@ -20146,7 +20146,7 @@ index 0000000..623cae2
 +}
 diff --git a/codex-rs/app-server/src/manager_catalog_sources.rs b/codex-rs/app-server/src/manager_catalog_sources.rs
 new file mode 100644
-index 0000000..8c153de
+index 000000000..8c153deee
 --- /dev/null
 +++ b/codex-rs/app-server/src/manager_catalog_sources.rs
 @@ -0,0 +1,424 @@
@@ -20576,7 +20576,7 @@ index 0000000..8c153de
 +}
 diff --git a/codex-rs/app-server/src/manager_catalog_watch.rs b/codex-rs/app-server/src/manager_catalog_watch.rs
 new file mode 100644
-index 0000000..1161775
+index 000000000..116177511
 --- /dev/null
 +++ b/codex-rs/app-server/src/manager_catalog_watch.rs
 @@ -0,0 +1,175 @@
@@ -20757,7 +20757,7 @@ index 0000000..1161775
 +}
 diff --git a/codex-rs/app-server/src/manager_record_catalog.rs b/codex-rs/app-server/src/manager_record_catalog.rs
 new file mode 100644
-index 0000000..3af176b
+index 000000000..3af176b3f
 --- /dev/null
 +++ b/codex-rs/app-server/src/manager_record_catalog.rs
 @@ -0,0 +1,1282 @@
@@ -22045,7 +22045,7 @@ index 0000000..3af176b
 +mod tests;
 diff --git a/codex-rs/app-server/src/manager_record_catalog_history.rs b/codex-rs/app-server/src/manager_record_catalog_history.rs
 new file mode 100644
-index 0000000..7f347ea
+index 000000000..7f347eaef
 --- /dev/null
 +++ b/codex-rs/app-server/src/manager_record_catalog_history.rs
 @@ -0,0 +1,233 @@
@@ -22284,7 +22284,7 @@ index 0000000..7f347ea
 +}
 diff --git a/codex-rs/app-server/src/manager_record_catalog_listing.rs b/codex-rs/app-server/src/manager_record_catalog_listing.rs
 new file mode 100644
-index 0000000..9a98016
+index 000000000..9a980160d
 --- /dev/null
 +++ b/codex-rs/app-server/src/manager_record_catalog_listing.rs
 @@ -0,0 +1,330 @@
@@ -22620,7 +22620,7 @@ index 0000000..9a98016
 +}
 diff --git a/codex-rs/app-server/src/manager_record_catalog_tests.rs b/codex-rs/app-server/src/manager_record_catalog_tests.rs
 new file mode 100644
-index 0000000..b419db5
+index 000000000..b419db5cb
 --- /dev/null
 +++ b/codex-rs/app-server/src/manager_record_catalog_tests.rs
 @@ -0,0 +1,1612 @@
@@ -24238,7 +24238,7 @@ index 0000000..b419db5
 +}
 diff --git a/codex-rs/app-server/src/manager_shared_catalog_tests.rs b/codex-rs/app-server/src/manager_shared_catalog_tests.rs
 new file mode 100644
-index 0000000..a43126d
+index 000000000..a43126d64
 --- /dev/null
 +++ b/codex-rs/app-server/src/manager_shared_catalog_tests.rs
 @@ -0,0 +1,175 @@
@@ -24419,7 +24419,7 @@ index 0000000..a43126d
 +}
 diff --git a/codex-rs/app-server/src/manager_shared_execution.rs b/codex-rs/app-server/src/manager_shared_execution.rs
 new file mode 100644
-index 0000000..a0047d3
+index 000000000..a0047d31b
 --- /dev/null
 +++ b/codex-rs/app-server/src/manager_shared_execution.rs
 @@ -0,0 +1,426 @@
@@ -24851,7 +24851,7 @@ index 0000000..a0047d3
 +mod tests;
 diff --git a/codex-rs/app-server/src/manager_shared_execution_tests.rs b/codex-rs/app-server/src/manager_shared_execution_tests.rs
 new file mode 100644
-index 0000000..d23e1b2
+index 000000000..d23e1b2c6
 --- /dev/null
 +++ b/codex-rs/app-server/src/manager_shared_execution_tests.rs
 @@ -0,0 +1,203 @@
@@ -25060,7 +25060,7 @@ index 0000000..d23e1b2
 +}
 diff --git a/codex-rs/app-server/src/manager_shared_routes.rs b/codex-rs/app-server/src/manager_shared_routes.rs
 new file mode 100644
-index 0000000..f4d7e22
+index 000000000..f4d7e2267
 --- /dev/null
 +++ b/codex-rs/app-server/src/manager_shared_routes.rs
 @@ -0,0 +1,171 @@
@@ -25237,7 +25237,7 @@ index 0000000..f4d7e22
 +mod tests;
 diff --git a/codex-rs/app-server/src/manager_shared_routes_tests.rs b/codex-rs/app-server/src/manager_shared_routes_tests.rs
 new file mode 100644
-index 0000000..c9020a2
+index 000000000..c9020a238
 --- /dev/null
 +++ b/codex-rs/app-server/src/manager_shared_routes_tests.rs
 @@ -0,0 +1,89 @@
@@ -25331,7 +25331,7 @@ index 0000000..c9020a2
 +    assert_eq!(std::fs::read(&path).unwrap(), b"partial-json");
 +}
 diff --git a/codex-rs/app-server/src/message_processor.rs b/codex-rs/app-server/src/message_processor.rs
-index 8e78c92..3056c86 100644
+index 8e78c929e..3056c8681 100644
 --- a/codex-rs/app-server/src/message_processor.rs
 +++ b/codex-rs/app-server/src/message_processor.rs
 @@ -292,6 +292,7 @@ impl MessageProcessor {
@@ -25539,7 +25539,7 @@ index 8e78c92..3056c86 100644
 +#[path = "managed_instance_shutdown.rs"]
 +mod managed_instance_shutdown;
 diff --git a/codex-rs/app-server/src/otel_reloader.rs b/codex-rs/app-server/src/otel_reloader.rs
-index 9f46caa..13b5cb5 100644
+index 9f46caa23..13b5cb5ad 100644
 --- a/codex-rs/app-server/src/otel_reloader.rs
 +++ b/codex-rs/app-server/src/otel_reloader.rs
 @@ -19,6 +19,17 @@ type OtelReloadLayers<S> = (
@@ -25590,7 +25590,7 @@ index 9f46caa..13b5cb5 100644
 +mod tests;
 diff --git a/codex-rs/app-server/src/otel_reloader_tests.rs b/codex-rs/app-server/src/otel_reloader_tests.rs
 new file mode 100644
-index 0000000..b6f406f
+index 000000000..b6f406fdd
 --- /dev/null
 +++ b/codex-rs/app-server/src/otel_reloader_tests.rs
 @@ -0,0 +1,95 @@
@@ -25690,7 +25690,7 @@ index 0000000..b6f406f
 +    assert!(!*state.released.lock().expect("release lock"));
 +}
 diff --git a/codex-rs/app-server/src/outgoing_message.rs b/codex-rs/app-server/src/outgoing_message.rs
-index 6624df8..c878597 100644
+index 6624df823..c878597c9 100644
 --- a/codex-rs/app-server/src/outgoing_message.rs
 +++ b/codex-rs/app-server/src/outgoing_message.rs
 @@ -1,5 +1,6 @@
@@ -25979,7 +25979,7 @@ index 6624df8..c878597 100644
          &self,
          request_id: ConnectionRequestId,
 diff --git a/codex-rs/app-server/src/request_processors.rs b/codex-rs/app-server/src/request_processors.rs
-index 60875fa..7a549d0 100644
+index 60875fada..7a549d039 100644
 --- a/codex-rs/app-server/src/request_processors.rs
 +++ b/codex-rs/app-server/src/request_processors.rs
 @@ -682,6 +682,9 @@ fn resolve_runtime_workspace_roots(workspace_roots: Vec<AbsolutePathBuf>) -> Vec
@@ -25993,7 +25993,7 @@ index 60875fa..7a549d0 100644
  mod thread_delete;
  mod thread_goal_processor;
 diff --git a/codex-rs/app-server/src/request_processors/account_processor.rs b/codex-rs/app-server/src/request_processors/account_processor.rs
-index d3e9165..a2b84dd 100644
+index d3e9165a7..a2b84dd1f 100644
 --- a/codex-rs/app-server/src/request_processors/account_processor.rs
 +++ b/codex-rs/app-server/src/request_processors/account_processor.rs
 @@ -620,6 +620,9 @@ impl AccountRequestProcessor {
@@ -26057,7 +26057,7 @@ index d3e9165..a2b84dd 100644
          let payload_login_completed = AccountLoginCompletedNotification {
              login_id: login_id.map(|id| id.to_string()),
 diff --git a/codex-rs/app-server/src/request_processors/feedback_processor.rs b/codex-rs/app-server/src/request_processors/feedback_processor.rs
-index 1365cf7..b8a7a2a 100644
+index 1365cf7ec..b8a7a2a2f 100644
 --- a/codex-rs/app-server/src/request_processors/feedback_processor.rs
 +++ b/codex-rs/app-server/src/request_processors/feedback_processor.rs
 @@ -721,6 +721,7 @@ mod tests {
@@ -26077,7 +26077,7 @@ index 1365cf7..b8a7a2a 100644
              }
          }));
 diff --git a/codex-rs/app-server/src/request_processors/initialize_processor.rs b/codex-rs/app-server/src/request_processors/initialize_processor.rs
-index 442b71f..53b47ff 100644
+index 442b71f33..53b47ff73 100644
 --- a/codex-rs/app-server/src/request_processors/initialize_processor.rs
 +++ b/codex-rs/app-server/src/request_processors/initialize_processor.rs
 @@ -22,6 +22,7 @@ pub(crate) struct InitializeRequestProcessor {
@@ -26147,7 +26147,7 @@ index 442b71f..53b47ff 100644
              self.outgoing
 diff --git a/codex-rs/app-server/src/request_processors/managed_thread_activation.rs b/codex-rs/app-server/src/request_processors/managed_thread_activation.rs
 new file mode 100644
-index 0000000..8d830ae
+index 000000000..8d830aefb
 --- /dev/null
 +++ b/codex-rs/app-server/src/request_processors/managed_thread_activation.rs
 @@ -0,0 +1,133 @@
@@ -26286,7 +26286,7 @@ index 0000000..8d830ae
 +}
 diff --git a/codex-rs/app-server/src/request_processors/managed_thread_drain.rs b/codex-rs/app-server/src/request_processors/managed_thread_drain.rs
 new file mode 100644
-index 0000000..8ac862a
+index 000000000..8ac862a6c
 --- /dev/null
 +++ b/codex-rs/app-server/src/request_processors/managed_thread_drain.rs
 @@ -0,0 +1,405 @@
@@ -26697,7 +26697,7 @@ index 0000000..8ac862a
 +}
 diff --git a/codex-rs/app-server/src/request_processors/managed_thread_idle_status.rs b/codex-rs/app-server/src/request_processors/managed_thread_idle_status.rs
 new file mode 100644
-index 0000000..8e15415
+index 000000000..8e15415c2
 --- /dev/null
 +++ b/codex-rs/app-server/src/request_processors/managed_thread_idle_status.rs
 @@ -0,0 +1,224 @@
@@ -26926,7 +26926,7 @@ index 0000000..8e15415
 +    });
 +}
 diff --git a/codex-rs/app-server/src/request_processors/mcp_processor.rs b/codex-rs/app-server/src/request_processors/mcp_processor.rs
-index 405a1fe..7fc123c 100644
+index 405a1fe8c..7fc123c2d 100644
 --- a/codex-rs/app-server/src/request_processors/mcp_processor.rs
 +++ b/codex-rs/app-server/src/request_processors/mcp_processor.rs
 @@ -123,6 +123,9 @@ impl McpRequestProcessor {
@@ -26948,7 +26948,7 @@ index 405a1fe..7fc123c 100644
                  Ok(()) => (true, None),
                  Err(err) => (false, Some(err.to_string())),
 diff --git a/codex-rs/app-server/src/request_processors/persisted_resume_settings_tests.rs b/codex-rs/app-server/src/request_processors/persisted_resume_settings_tests.rs
-index 792fc34..76fa0ee 100644
+index 792fc344a..76fa0eeec 100644
 --- a/codex-rs/app-server/src/request_processors/persisted_resume_settings_tests.rs
 +++ b/codex-rs/app-server/src/request_processors/persisted_resume_settings_tests.rs
 @@ -30,6 +30,9 @@ fn settings_item(
@@ -26978,7 +26978,7 @@ index 792fc34..76fa0ee 100644
  }
  
 diff --git a/codex-rs/app-server/src/request_processors/process_exec_processor.rs b/codex-rs/app-server/src/request_processors/process_exec_processor.rs
-index e44a75e..550c0fb 100644
+index e44a75e92..550c0fb06 100644
 --- a/codex-rs/app-server/src/request_processors/process_exec_processor.rs
 +++ b/codex-rs/app-server/src/request_processors/process_exec_processor.rs
 @@ -291,6 +291,7 @@ impl ProcessExecManager {
@@ -26999,7 +26999,7 @@ index e44a75e..550c0fb 100644
                  request_id,
 diff --git a/codex-rs/app-server/src/request_processors/shared_history_resume.rs b/codex-rs/app-server/src/request_processors/shared_history_resume.rs
 new file mode 100644
-index 0000000..5e57a7f
+index 000000000..5e57a7ff3
 --- /dev/null
 +++ b/codex-rs/app-server/src/request_processors/shared_history_resume.rs
 @@ -0,0 +1,356 @@
@@ -27360,7 +27360,7 @@ index 0000000..5e57a7f
 +    ))
 +}
 diff --git a/codex-rs/app-server/src/request_processors/thread_delete.rs b/codex-rs/app-server/src/request_processors/thread_delete.rs
-index c83140d..45ae0ec 100644
+index c83140d7a..45ae0ec7b 100644
 --- a/codex-rs/app-server/src/request_processors/thread_delete.rs
 +++ b/codex-rs/app-server/src/request_processors/thread_delete.rs
 @@ -11,6 +11,10 @@ impl ThreadRequestProcessor {
@@ -27375,7 +27375,7 @@ index c83140d..45ae0ec 100644
              self.thread_delete_response(params, &mut deleted_thread_ids)
                  .await
 diff --git a/codex-rs/app-server/src/request_processors/thread_goal_processor.rs b/codex-rs/app-server/src/request_processors/thread_goal_processor.rs
-index c277dd9..16d9c3a 100644
+index c277dd9f1..16d9c3a07 100644
 --- a/codex-rs/app-server/src/request_processors/thread_goal_processor.rs
 +++ b/codex-rs/app-server/src/request_processors/thread_goal_processor.rs
 @@ -91,8 +91,14 @@ impl ThreadGoalRequestProcessor {
@@ -27477,7 +27477,7 @@ index c277dd9..16d9c3a 100644
              .await
              .map_err(|err| {
 diff --git a/codex-rs/app-server/src/request_processors/thread_lifecycle.rs b/codex-rs/app-server/src/request_processors/thread_lifecycle.rs
-index 8354a4e..7f807a7 100644
+index 8354a4e0d..7f807a7dd 100644
 --- a/codex-rs/app-server/src/request_processors/thread_lifecycle.rs
 +++ b/codex-rs/app-server/src/request_processors/thread_lifecycle.rs
 @@ -735,6 +735,7 @@ pub(super) async fn handle_pending_thread_resume_request(
@@ -27505,7 +27505,7 @@ index 8354a4e..7f807a7 100644
  
  pub(super) async fn send_thread_goal_snapshot_notification(
 diff --git a/codex-rs/app-server/src/request_processors/thread_processor.rs b/codex-rs/app-server/src/request_processors/thread_processor.rs
-index 56eb6fd..56cdcb5 100644
+index 56eb6fdc9..56cdcb537 100644
 --- a/codex-rs/app-server/src/request_processors/thread_processor.rs
 +++ b/codex-rs/app-server/src/request_processors/thread_processor.rs
 @@ -24,6 +24,9 @@ use codex_protocol::mcp::ClientMcpExtensions;
@@ -29071,7 +29071,7 @@ index 56eb6fd..56cdcb5 100644
          can_accept_direct_input: None,
          thread_source: thread.thread_source.map(Into::into),
 diff --git a/codex-rs/app-server/src/request_processors/thread_processor_tests.rs b/codex-rs/app-server/src/request_processors/thread_processor_tests.rs
-index 60f36d6..af3225f 100644
+index 60f36d636..af3225fc4 100644
 --- a/codex-rs/app-server/src/request_processors/thread_processor_tests.rs
 +++ b/codex-rs/app-server/src/request_processors/thread_processor_tests.rs
 @@ -590,6 +590,7 @@ mod thread_processor_behavior_tests {
@@ -29091,7 +29091,7 @@ index 60f36d6..af3225f 100644
              model_provider_id: "openai".to_string(),
              service_tier: Some("flex".to_string()),
 diff --git a/codex-rs/app-server/src/request_processors/thread_queue_processor.rs b/codex-rs/app-server/src/request_processors/thread_queue_processor.rs
-index 6fe5336..1a0407e 100644
+index 6fe5336dc..1a0407e44 100644
 --- a/codex-rs/app-server/src/request_processors/thread_queue_processor.rs
 +++ b/codex-rs/app-server/src/request_processors/thread_queue_processor.rs
 @@ -2,6 +2,7 @@ use std::sync::Arc;
@@ -29251,7 +29251,7 @@ index 6fe5336..1a0407e 100644
      }
  }
 diff --git a/codex-rs/app-server/src/request_processors/thread_summary.rs b/codex-rs/app-server/src/request_processors/thread_summary.rs
-index df5beea..7c79c2b 100644
+index df5beea0c..7c79c2b15 100644
 --- a/codex-rs/app-server/src/request_processors/thread_summary.rs
 +++ b/codex-rs/app-server/src/request_processors/thread_summary.rs
 @@ -176,6 +176,7 @@ pub(crate) fn thread_settings_from_config_snapshot(
@@ -29263,7 +29263,7 @@ index df5beea..7c79c2b 100644
          approval_policy: config_snapshot.approval_policy.into(),
          approvals_reviewer: config_snapshot.approvals_reviewer.into(),
 diff --git a/codex-rs/app-server/src/request_processors/turn_processor.rs b/codex-rs/app-server/src/request_processors/turn_processor.rs
-index 833475f..89bf16c 100644
+index 833475ff2..89bf16cb1 100644
 --- a/codex-rs/app-server/src/request_processors/turn_processor.rs
 +++ b/codex-rs/app-server/src/request_processors/turn_processor.rs
 @@ -113,6 +113,7 @@ fn map_additional_context(
@@ -29325,7 +29325,7 @@ index 833475f..89bf16c 100644
                      approval_policy: params.approval_policy,
                      approvals_reviewer: params.approvals_reviewer,
 diff --git a/codex-rs/app-server/src/request_processors/windows_sandbox_processor.rs b/codex-rs/app-server/src/request_processors/windows_sandbox_processor.rs
-index c0917d9..7e63a82 100644
+index c0917d933..7e63a824c 100644
 --- a/codex-rs/app-server/src/request_processors/windows_sandbox_processor.rs
 +++ b/codex-rs/app-server/src/request_processors/windows_sandbox_processor.rs
 @@ -41,6 +41,9 @@ impl WindowsSandboxRequestProcessor {
@@ -29347,7 +29347,7 @@ index c0917d9..7e63a82 100644
                  mode: setup_mode,
                  permission_profile: config.permissions.effective_permission_profile(),
 diff --git a/codex-rs/app-server/src/thread_state.rs b/codex-rs/app-server/src/thread_state.rs
-index 3795638..3826790 100644
+index 3795638cd..38267907d 100644
 --- a/codex-rs/app-server/src/thread_state.rs
 +++ b/codex-rs/app-server/src/thread_state.rs
 @@ -265,6 +265,7 @@ mod tests {
@@ -29379,7 +29379,7 @@ index 3795638..3826790 100644
          &self,
          thread_id: ThreadId,
 diff --git a/codex-rs/app-server/src/turn_cost_worker_tests.rs b/codex-rs/app-server/src/turn_cost_worker_tests.rs
-index c1b6269..a815ec3 100644
+index c1b62699f..a815ec360 100644
 --- a/codex-rs/app-server/src/turn_cost_worker_tests.rs
 +++ b/codex-rs/app-server/src/turn_cost_worker_tests.rs
 @@ -68,6 +68,7 @@ async fn handle_observes_only_matching_model_provider() {
@@ -29407,7 +29407,7 @@ index c1b6269..a815ec3 100644
          base_url: Some(server.uri()),
          requires_openai_auth: true,
 diff --git a/codex-rs/app-server/tests/suite/v2/connection_handling_websocket.rs b/codex-rs/app-server/tests/suite/v2/connection_handling_websocket.rs
-index 14a604f..61b361f 100644
+index 14a604fc8..61b361f6f 100644
 --- a/codex-rs/app-server/tests/suite/v2/connection_handling_websocket.rs
 +++ b/codex-rs/app-server/tests/suite/v2/connection_handling_websocket.rs
 @@ -489,6 +489,15 @@ pub(super) async fn spawn_websocket_server_with_args(
@@ -29444,7 +29444,7 @@ index 14a604f..61b361f 100644
          .kill_on_drop(true)
          .spawn()
 diff --git a/codex-rs/app-server/tests/suite/v2/initialize.rs b/codex-rs/app-server/tests/suite/v2/initialize.rs
-index 923bb41..cac35be 100644
+index 923bb4153..cac35be9f 100644
 --- a/codex-rs/app-server/tests/suite/v2/initialize.rs
 +++ b/codex-rs/app-server/tests/suite/v2/initialize.rs
 @@ -55,6 +55,7 @@ async fn initialize_uses_client_info_name_as_originator() -> Result<()> {
@@ -29465,7 +29465,7 @@ index 923bb41..cac35be 100644
          platform_family,
 diff --git a/codex-rs/app-server/tests/suite/v2/managed_catalog_children.rs b/codex-rs/app-server/tests/suite/v2/managed_catalog_children.rs
 new file mode 100644
-index 0000000..5f1183d
+index 000000000..5f1183dd9
 --- /dev/null
 +++ b/codex-rs/app-server/tests/suite/v2/managed_catalog_children.rs
 @@ -0,0 +1,166 @@
@@ -29637,7 +29637,7 @@ index 0000000..5f1183d
 +}
 diff --git a/codex-rs/app-server/tests/suite/v2/managed_catalog_derived_history.rs b/codex-rs/app-server/tests/suite/v2/managed_catalog_derived_history.rs
 new file mode 100644
-index 0000000..36d8694
+index 000000000..36d8694db
 --- /dev/null
 +++ b/codex-rs/app-server/tests/suite/v2/managed_catalog_derived_history.rs
 @@ -0,0 +1,154 @@
@@ -29797,7 +29797,7 @@ index 0000000..36d8694
 +}
 diff --git a/codex-rs/app-server/tests/suite/v2/managed_catalog_foreign.rs b/codex-rs/app-server/tests/suite/v2/managed_catalog_foreign.rs
 new file mode 100644
-index 0000000..ff77325
+index 000000000..ff7732564
 --- /dev/null
 +++ b/codex-rs/app-server/tests/suite/v2/managed_catalog_foreign.rs
 @@ -0,0 +1,199 @@
@@ -30002,7 +30002,7 @@ index 0000000..ff77325
 +}
 diff --git a/codex-rs/app-server/tests/suite/v2/managed_catalog_mixed.rs b/codex-rs/app-server/tests/suite/v2/managed_catalog_mixed.rs
 new file mode 100644
-index 0000000..7683462
+index 000000000..768346247
 --- /dev/null
 +++ b/codex-rs/app-server/tests/suite/v2/managed_catalog_mixed.rs
 @@ -0,0 +1,621 @@
@@ -30629,7 +30629,7 @@ index 0000000..7683462
 +}
 diff --git a/codex-rs/app-server/tests/suite/v2/managed_catalog_shared_history.rs b/codex-rs/app-server/tests/suite/v2/managed_catalog_shared_history.rs
 new file mode 100644
-index 0000000..fe7cea6
+index 000000000..fe7cea6d0
 --- /dev/null
 +++ b/codex-rs/app-server/tests/suite/v2/managed_catalog_shared_history.rs
 @@ -0,0 +1,152 @@
@@ -30787,7 +30787,7 @@ index 0000000..fe7cea6
 +}
 diff --git a/codex-rs/app-server/tests/suite/v2/managed_catalog_sources.rs b/codex-rs/app-server/tests/suite/v2/managed_catalog_sources.rs
 new file mode 100644
-index 0000000..e86555b
+index 000000000..e86555b5b
 --- /dev/null
 +++ b/codex-rs/app-server/tests/suite/v2/managed_catalog_sources.rs
 @@ -0,0 +1,276 @@
@@ -31069,7 +31069,7 @@ index 0000000..e86555b
 +}
 diff --git a/codex-rs/app-server/tests/suite/v2/managed_handoff.rs b/codex-rs/app-server/tests/suite/v2/managed_handoff.rs
 new file mode 100644
-index 0000000..5e14e93
+index 000000000..5e14e93b5
 --- /dev/null
 +++ b/codex-rs/app-server/tests/suite/v2/managed_handoff.rs
 @@ -0,0 +1,570 @@
@@ -31645,7 +31645,7 @@ index 0000000..5e14e93
 +}
 diff --git a/codex-rs/app-server/tests/suite/v2/managed_handoff_names.rs b/codex-rs/app-server/tests/suite/v2/managed_handoff_names.rs
 new file mode 100644
-index 0000000..31ab91d
+index 000000000..31ab91dcb
 --- /dev/null
 +++ b/codex-rs/app-server/tests/suite/v2/managed_handoff_names.rs
 @@ -0,0 +1,142 @@
@@ -31793,7 +31793,7 @@ index 0000000..31ab91d
 +}
 diff --git a/codex-rs/app-server/tests/suite/v2/managed_instance_activity.rs b/codex-rs/app-server/tests/suite/v2/managed_instance_activity.rs
 new file mode 100644
-index 0000000..9dfa0b3
+index 000000000..9dfa0b390
 --- /dev/null
 +++ b/codex-rs/app-server/tests/suite/v2/managed_instance_activity.rs
 @@ -0,0 +1,192 @@
@@ -31991,7 +31991,7 @@ index 0000000..9dfa0b3
 +}
 diff --git a/codex-rs/app-server/tests/suite/v2/managed_instance_shutdown_websocket.rs b/codex-rs/app-server/tests/suite/v2/managed_instance_shutdown_websocket.rs
 new file mode 100644
-index 0000000..e2c9d2d
+index 000000000..e2c9d2d80
 --- /dev/null
 +++ b/codex-rs/app-server/tests/suite/v2/managed_instance_shutdown_websocket.rs
 @@ -0,0 +1,142 @@
@@ -32139,7 +32139,7 @@ index 0000000..e2c9d2d
 +}
 diff --git a/codex-rs/app-server/tests/suite/v2/manager_catalog_list_watch.rs b/codex-rs/app-server/tests/suite/v2/manager_catalog_list_watch.rs
 new file mode 100644
-index 0000000..0579d19
+index 000000000..0579d1972
 --- /dev/null
 +++ b/codex-rs/app-server/tests/suite/v2/manager_catalog_list_watch.rs
 @@ -0,0 +1,280 @@
@@ -32425,7 +32425,7 @@ index 0000000..0579d19
 +}
 diff --git a/codex-rs/app-server/tests/suite/v2/manager_catalog_names.rs b/codex-rs/app-server/tests/suite/v2/manager_catalog_names.rs
 new file mode 100644
-index 0000000..a02acb4
+index 000000000..a02acb4a5
 --- /dev/null
 +++ b/codex-rs/app-server/tests/suite/v2/manager_catalog_names.rs
 @@ -0,0 +1,203 @@
@@ -32634,7 +32634,7 @@ index 0000000..a02acb4
 +}
 diff --git a/codex-rs/app-server/tests/suite/v2/manager_catalog_watch.rs b/codex-rs/app-server/tests/suite/v2/manager_catalog_watch.rs
 new file mode 100644
-index 0000000..4dd2fa8
+index 000000000..4dd2fa8be
 --- /dev/null
 +++ b/codex-rs/app-server/tests/suite/v2/manager_catalog_watch.rs
 @@ -0,0 +1,478 @@
@@ -33118,7 +33118,7 @@ index 0000000..4dd2fa8
 +}
 diff --git a/codex-rs/app-server/tests/suite/v2/manager_record_catalog.rs b/codex-rs/app-server/tests/suite/v2/manager_record_catalog.rs
 new file mode 100644
-index 0000000..4464a67
+index 000000000..4464a6733
 --- /dev/null
 +++ b/codex-rs/app-server/tests/suite/v2/manager_record_catalog.rs
 @@ -0,0 +1,326 @@
@@ -33449,7 +33449,7 @@ index 0000000..4464a67
 +    Ok(())
 +}
 diff --git a/codex-rs/app-server/tests/suite/v2/mcp_server_elicitation.rs b/codex-rs/app-server/tests/suite/v2/mcp_server_elicitation.rs
-index 45a5b69..a025a49 100644
+index 45a5b6900..a025a496d 100644
 --- a/codex-rs/app-server/tests/suite/v2/mcp_server_elicitation.rs
 +++ b/codex-rs/app-server/tests/suite/v2/mcp_server_elicitation.rs
 @@ -2,6 +2,7 @@ use std::borrow::Cow;
@@ -33579,7 +33579,7 @@ index 45a5b69..a025a49 100644
      assert_eq!(completed.turn.id, turn.id);
      assert_eq!(completed.turn.status, TurnStatus::Completed);
 diff --git a/codex-rs/app-server/tests/suite/v2/mod.rs b/codex-rs/app-server/tests/suite/v2/mod.rs
-index c7578db..1885cdc 100644
+index c7578dbed..1885cdc8d 100644
 --- a/codex-rs/app-server/tests/suite/v2/mod.rs
 +++ b/codex-rs/app-server/tests/suite/v2/mod.rs
 @@ -44,6 +44,11 @@ mod hooks_list;
@@ -33620,7 +33620,7 @@ index c7578db..1885cdc 100644
  mod thread_metadata_update;
  mod thread_name_websocket;
 diff --git a/codex-rs/app-server/tests/suite/v2/multi_agent_v2_developer_instructions.rs b/codex-rs/app-server/tests/suite/v2/multi_agent_v2_developer_instructions.rs
-index 76f2635..e95cd34 100644
+index 76f263532..e95cd3459 100644
 --- a/codex-rs/app-server/tests/suite/v2/multi_agent_v2_developer_instructions.rs
 +++ b/codex-rs/app-server/tests/suite/v2/multi_agent_v2_developer_instructions.rs
 @@ -190,7 +190,9 @@ async fn spawned_subagents_apply_configured_developer_instruction_precedence(
@@ -33697,7 +33697,7 @@ index 76f2635..e95cd34 100644
              "developer_instructions = {PARENT_INSTRUCTIONS:?}\nmodel_reasoning_effort = \"high\""
 diff --git a/codex-rs/app-server/tests/suite/v2/portable_context.rs b/codex-rs/app-server/tests/suite/v2/portable_context.rs
 new file mode 100644
-index 0000000..c55eb98
+index 000000000..c55eb98db
 --- /dev/null
 +++ b/codex-rs/app-server/tests/suite/v2/portable_context.rs
 @@ -0,0 +1,3141 @@
@@ -36844,7 +36844,7 @@ index 0000000..c55eb98
 +}
 diff --git a/codex-rs/app-server/tests/suite/v2/shared_history_refresh.rs b/codex-rs/app-server/tests/suite/v2/shared_history_refresh.rs
 new file mode 100644
-index 0000000..a84d6ff
+index 000000000..a84d6ff46
 --- /dev/null
 +++ b/codex-rs/app-server/tests/suite/v2/shared_history_refresh.rs
 @@ -0,0 +1,563 @@
@@ -37412,7 +37412,7 @@ index 0000000..a84d6ff
 +    assert_refreshed_without_worker(&fixture, &mut owner, &root_id, &worker_id).await
 +}
 diff --git a/codex-rs/app-server/tests/suite/v2/thread_delete.rs b/codex-rs/app-server/tests/suite/v2/thread_delete.rs
-index 7f3741e..a7a8370 100644
+index 7f3741e8b..a7a837004 100644
 --- a/codex-rs/app-server/tests/suite/v2/thread_delete.rs
 +++ b/codex-rs/app-server/tests/suite/v2/thread_delete.rs
 @@ -4,12 +4,15 @@ use app_test_support::TestAppServer;
@@ -37579,7 +37579,7 @@ index 7f3741e..a7a8370 100644
          codex_home,
 diff --git a/codex-rs/app-server/tests/suite/v2/thread_managed_close_idle.rs b/codex-rs/app-server/tests/suite/v2/thread_managed_close_idle.rs
 new file mode 100644
-index 0000000..69f2f8f
+index 000000000..69f2f8f39
 --- /dev/null
 +++ b/codex-rs/app-server/tests/suite/v2/thread_managed_close_idle.rs
 @@ -0,0 +1,237 @@
@@ -37822,7 +37822,7 @@ index 0000000..69f2f8f
 +}
 diff --git a/codex-rs/app-server/tests/suite/v2/thread_managed_close_idle_cold.rs b/codex-rs/app-server/tests/suite/v2/thread_managed_close_idle_cold.rs
 new file mode 100644
-index 0000000..e2f7052
+index 000000000..e2f7052e3
 --- /dev/null
 +++ b/codex-rs/app-server/tests/suite/v2/thread_managed_close_idle_cold.rs
 @@ -0,0 +1,493 @@
@@ -38321,7 +38321,7 @@ index 0000000..e2f7052
 +}
 diff --git a/codex-rs/app-server/tests/suite/v2/thread_managed_idle_status.rs b/codex-rs/app-server/tests/suite/v2/thread_managed_idle_status.rs
 new file mode 100644
-index 0000000..ab7d236
+index 000000000..ab7d23681
 --- /dev/null
 +++ b/codex-rs/app-server/tests/suite/v2/thread_managed_idle_status.rs
 @@ -0,0 +1,462 @@
@@ -38788,7 +38788,7 @@ index 0000000..ab7d236
 +    Ok(())
 +}
 diff --git a/codex-rs/app-server/tests/suite/v2/thread_resume.rs b/codex-rs/app-server/tests/suite/v2/thread_resume.rs
-index a6f728d..e66dddc 100644
+index a6f728deb..e66dddc38 100644
 --- a/codex-rs/app-server/tests/suite/v2/thread_resume.rs
 +++ b/codex-rs/app-server/tests/suite/v2/thread_resume.rs
 @@ -204,6 +204,8 @@ async fn thread_resume_paginated_model_context_preserves_original_metadata() ->
@@ -38993,7 +38993,7 @@ index a6f728d..e66dddc 100644
      MockResponsesConfig::new(server_uri)
          .with_model("gpt-5.4")
 diff --git a/codex-rs/codex-api/src/endpoint/responses.rs b/codex-rs/codex-api/src/endpoint/responses.rs
-index 69a8c68..d470dd5 100644
+index 69a8c686d..d470dd5cc 100644
 --- a/codex-rs/codex-api/src/endpoint/responses.rs
 +++ b/codex-rs/codex-api/src/endpoint/responses.rs
 @@ -14,6 +14,7 @@ use codex_client::EncodedJsonBody;
@@ -39112,7 +39112,7 @@ index 69a8c68..d470dd5 100644
              )
              .await?;
 diff --git a/codex-rs/codex-api/src/lib.rs b/codex-rs/codex-api/src/lib.rs
-index 17e3ceb..2e0f4a8 100644
+index 17e3ceb69..2e0f4a878 100644
 --- a/codex-rs/codex-api/src/lib.rs
 +++ b/codex-rs/codex-api/src/lib.rs
 @@ -5,6 +5,7 @@ pub(crate) mod endpoint;
@@ -39125,7 +39125,7 @@ index 17e3ceb..2e0f4a8 100644
  pub(crate) mod requests;
 diff --git a/codex-rs/codex-api/src/prefix_check.rs b/codex-rs/codex-api/src/prefix_check.rs
 new file mode 100644
-index 0000000..9060b4f
+index 000000000..9060b4fc3
 --- /dev/null
 +++ b/codex-rs/codex-api/src/prefix_check.rs
 @@ -0,0 +1,450 @@
@@ -39581,7 +39581,7 @@ index 0000000..9060b4f
 +mod tests;
 diff --git a/codex-rs/codex-api/src/prefix_check_tests.rs b/codex-rs/codex-api/src/prefix_check_tests.rs
 new file mode 100644
-index 0000000..3ccb7b3
+index 000000000..3ccb7b325
 --- /dev/null
 +++ b/codex-rs/codex-api/src/prefix_check_tests.rs
 @@ -0,0 +1,265 @@
@@ -39851,7 +39851,7 @@ index 0000000..3ccb7b3
 +    );
 +}
 diff --git a/codex-rs/codex-api/src/provider.rs b/codex-rs/codex-api/src/provider.rs
-index 849513a..aafb40b 100644
+index 849513af5..aafb40bc2 100644
 --- a/codex-rs/codex-api/src/provider.rs
 +++ b/codex-rs/codex-api/src/provider.rs
 @@ -81,6 +81,7 @@ impl Provider {
@@ -39863,7 +39863,7 @@ index 849513a..aafb40b 100644
          }
      }
 diff --git a/codex-rs/codex-api/src/requests/responses.rs b/codex-rs/codex-api/src/requests/responses.rs
-index 9a16ceb..7c83fed 100644
+index 9a16ceb1c..7c83fed7c 100644
 --- a/codex-rs/codex-api/src/requests/responses.rs
 +++ b/codex-rs/codex-api/src/requests/responses.rs
 @@ -2,5 +2,7 @@
@@ -39875,7 +39875,7 @@ index 9a16ceb..7c83fed 100644
      Zstd,
  }
 diff --git a/codex-rs/config/src/config_toml.rs b/codex-rs/config/src/config_toml.rs
-index 5f0cc99..a2aff0c 100644
+index 5f0cc99a4..a2aff0cf3 100644
 --- a/codex-rs/config/src/config_toml.rs
 +++ b/codex-rs/config/src/config_toml.rs
 @@ -161,6 +161,10 @@ pub struct ConfigToml {
@@ -39890,7 +39890,7 @@ index 5f0cc99..a2aff0c 100644
      pub model_context_window: Option<i64>,
  
 diff --git a/codex-rs/config/src/loader/mod.rs b/codex-rs/config/src/loader/mod.rs
-index 48ea0d3..6e633e9 100644
+index 48ea0d3bc..6e633e91d 100644
 --- a/codex-rs/config/src/loader/mod.rs
 +++ b/codex-rs/config/src/loader/mod.rs
 @@ -79,6 +79,7 @@ const PROJECT_LOCAL_CONFIG_DENYLIST: &[&str] = &[
@@ -39902,7 +39902,7 @@ index 48ea0d3..6e633e9 100644
      "profile",
      "profiles",
 diff --git a/codex-rs/config/src/thread_config.rs b/codex-rs/config/src/thread_config.rs
-index 76d76fd..20f14fe 100644
+index 76d76fd59..20f14fe66 100644
 --- a/codex-rs/config/src/thread_config.rs
 +++ b/codex-rs/config/src/thread_config.rs
 @@ -296,6 +296,7 @@ mod tests {
@@ -39914,7 +39914,7 @@ index 76d76fd..20f14fe 100644
              base_url: Some("http://127.0.0.1:8061/api/codex".to_string()),
              env_key: None,
 diff --git a/codex-rs/config/src/thread_config/remote.rs b/codex-rs/config/src/thread_config/remote.rs
-index 8d5b8fe..d76e708 100644
+index 8d5b8febe..d76e70834 100644
 --- a/codex-rs/config/src/thread_config/remote.rs
 +++ b/codex-rs/config/src/thread_config/remote.rs
 @@ -171,6 +171,7 @@ fn model_provider_from_proto(
@@ -39934,7 +39934,7 @@ index 8d5b8fe..d76e708 100644
              base_url: Some("http://127.0.0.1:8061/api/codex".to_string()),
              env_key: None,
 diff --git a/codex-rs/core/Cargo.toml b/codex-rs/core/Cargo.toml
-index eb0137c..678dddf 100644
+index eb0137c03..678dddf2b 100644
 --- a/codex-rs/core/Cargo.toml
 +++ b/codex-rs/core/Cargo.toml
 @@ -103,6 +103,7 @@ rmcp = { workspace = true, default-features = false, features = [
@@ -39946,7 +39946,7 @@ index eb0137c..678dddf 100644
  similar = { workspace = true }
  tempfile = { workspace = true }
 diff --git a/codex-rs/core/config.schema.json b/codex-rs/core/config.schema.json
-index 24d7988..1cc185e 100644
+index 24d7988b0..1cc185e13 100644
 --- a/codex-rs/core/config.schema.json
 +++ b/codex-rs/core/config.schema.json
 @@ -6,6 +6,62 @@
@@ -40042,7 +40042,7 @@ index 24d7988..1cc185e 100644
        "description": "Suppress warnings about unstable (under development) features.",
        "type": "boolean"
 diff --git a/codex-rs/core/src/agent/control.rs b/codex-rs/core/src/agent/control.rs
-index 141aadd..72bb70c 100644
+index 141aaddc6..72bb70c57 100644
 --- a/codex-rs/core/src/agent/control.rs
 +++ b/codex-rs/core/src/agent/control.rs
 @@ -72,6 +72,8 @@ use self::residency::V2Residency;
@@ -40151,7 +40151,7 @@ index 141aadd..72bb70c 100644
      async fn live_thread_spawn_descendants(
 diff --git a/codex-rs/core/src/agent/control/leaf_completion_tests.rs b/codex-rs/core/src/agent/control/leaf_completion_tests.rs
 new file mode 100644
-index 0000000..e648f25
+index 000000000..e648f254d
 --- /dev/null
 +++ b/codex-rs/core/src/agent/control/leaf_completion_tests.rs
 @@ -0,0 +1,163 @@
@@ -40319,7 +40319,7 @@ index 0000000..e648f25
 +    assert_eq!(results, expected);
 +}
 diff --git a/codex-rs/core/src/agent/control/legacy.rs b/codex-rs/core/src/agent/control/legacy.rs
-index f6bff6c..ab9151e 100644
+index f6bff6cd9..ab9151e4a 100644
 --- a/codex-rs/core/src/agent/control/legacy.rs
 +++ b/codex-rs/core/src/agent/control/legacy.rs
 @@ -48,10 +48,12 @@ impl AgentControl {
@@ -40359,7 +40359,7 @@ index f6bff6c..ab9151e 100644
                              agent_id,
 diff --git a/codex-rs/core/src/agent/control/managed_admission.rs b/codex-rs/core/src/agent/control/managed_admission.rs
 new file mode 100644
-index 0000000..ee43476
+index 000000000..ee434766d
 --- /dev/null
 +++ b/codex-rs/core/src/agent/control/managed_admission.rs
 @@ -0,0 +1,174 @@
@@ -40539,7 +40539,7 @@ index 0000000..ee43476
 +}
 diff --git a/codex-rs/core/src/agent/control/managed_graph_restore_tests.rs b/codex-rs/core/src/agent/control/managed_graph_restore_tests.rs
 new file mode 100644
-index 0000000..9135c77
+index 000000000..9135c777c
 --- /dev/null
 +++ b/codex-rs/core/src/agent/control/managed_graph_restore_tests.rs
 @@ -0,0 +1,680 @@
@@ -41225,7 +41225,7 @@ index 0000000..9135c77
 +}
 diff --git a/codex-rs/core/src/agent/control/model_provider.rs b/codex-rs/core/src/agent/control/model_provider.rs
 new file mode 100644
-index 0000000..ab28666
+index 000000000..ab286664a
 --- /dev/null
 +++ b/codex-rs/core/src/agent/control/model_provider.rs
 @@ -0,0 +1,139 @@
@@ -41369,7 +41369,7 @@ index 0000000..ab28666
 +        })
 +}
 diff --git a/codex-rs/core/src/agent/control/residency_tests.rs b/codex-rs/core/src/agent/control/residency_tests.rs
-index d5d58b4..64819ae 100644
+index d5d58b42a..64819ae41 100644
 --- a/codex-rs/core/src/agent/control/residency_tests.rs
 +++ b/codex-rs/core/src/agent/control/residency_tests.rs
 @@ -1,10 +1,13 @@
@@ -41482,7 +41482,7 @@ index d5d58b4..64819ae 100644
      control: &AgentControl,
      state: &Arc<ThreadManagerState>,
 diff --git a/codex-rs/core/src/agent/control/spawn.rs b/codex-rs/core/src/agent/control/spawn.rs
-index e5518b2..8e86668 100644
+index e5518b272..8e86668cb 100644
 --- a/codex-rs/core/src/agent/control/spawn.rs
 +++ b/codex-rs/core/src/agent/control/spawn.rs
 @@ -1,6 +1,8 @@
@@ -41919,7 +41919,7 @@ index e5518b2..8e86668 100644
          Ok((resumed_thread.thread_id, multi_agent_version))
      }
 diff --git a/codex-rs/core/src/agent/control_tests.rs b/codex-rs/core/src/agent/control_tests.rs
-index a7acf93..3baf0fa 100644
+index a7acf9316..3baf0fa5e 100644
 --- a/codex-rs/core/src/agent/control_tests.rs
 +++ b/codex-rs/core/src/agent/control_tests.rs
 @@ -17,6 +17,7 @@ use crate::init_state_db;
@@ -42338,7 +42338,7 @@ index a7acf93..3baf0fa 100644
      let _ = harness
          .control
 diff --git a/codex-rs/core/src/agent/role.rs b/codex-rs/core/src/agent/role.rs
-index cb20377..15aa303 100644
+index cb203776e..15aa3036c 100644
 --- a/codex-rs/core/src/agent/role.rs
 +++ b/codex-rs/core/src/agent/role.rs
 @@ -22,6 +22,7 @@ use codex_protocol::config_types::ServiceTier;
@@ -42545,7 +42545,7 @@ index cb20377..15aa303 100644
                      }
                  ),
 diff --git a/codex-rs/core/src/agent/role_tests.rs b/codex-rs/core/src/agent/role_tests.rs
-index 6abe361..a2b46ec 100644
+index 6abe3610d..a2b46ece9 100644
 --- a/codex-rs/core/src/agent/role_tests.rs
 +++ b/codex-rs/core/src/agent/role_tests.rs
 @@ -2,8 +2,11 @@ use super::*;
@@ -43102,7 +43102,7 @@ index 6abe361..a2b46ec 100644
          },
      )]);
 diff --git a/codex-rs/core/src/agent_communication.rs b/codex-rs/core/src/agent_communication.rs
-index 91022fd..677af7c 100644
+index 91022fdc3..677af7c8c 100644
 --- a/codex-rs/core/src/agent_communication.rs
 +++ b/codex-rs/core/src/agent_communication.rs
 @@ -25,7 +25,7 @@ impl AgentCommunicationKind {
@@ -43115,7 +43115,7 @@ index 91022fd..677af7c 100644
  
  impl AgentCommunicationContext {
 diff --git a/codex-rs/core/src/client.rs b/codex-rs/core/src/client.rs
-index 9f03c93..26b9c93 100644
+index 9f03c939e..26b9c93d6 100644
 --- a/codex-rs/core/src/client.rs
 +++ b/codex-rs/core/src/client.rs
 @@ -121,6 +121,8 @@ use crate::attestation::X_OAI_ATTESTATION_HEADER;
@@ -43312,7 +43312,7 @@ index 9f03c93..26b9c93 100644
              };
              let ws_payload = ResponseCreateWsRequest {
 diff --git a/codex-rs/core/src/client_common.rs b/codex-rs/core/src/client_common.rs
-index f2d6be2..ee34fff 100644
+index f2d6be2a2..ee34fff84 100644
 --- a/codex-rs/core/src/client_common.rs
 +++ b/codex-rs/core/src/client_common.rs
 @@ -1,8 +1,12 @@
@@ -43457,7 +43457,7 @@ index f2d6be2..ee34fff 100644
      for item in items {
          match item {
 diff --git a/codex-rs/core/src/client_common_tests.rs b/codex-rs/core/src/client_common_tests.rs
-index 1c8625a..3b4283f 100644
+index 1c8625af5..3b4283f2a 100644
 --- a/codex-rs/core/src/client_common_tests.rs
 +++ b/codex-rs/core/src/client_common_tests.rs
 @@ -112,6 +112,107 @@ fn responses_lite_request_copies_strip_image_details() {
@@ -43570,7 +43570,7 @@ index 1c8625a..3b4283f 100644
      let input: Vec<ResponseItem> = vec![];
 diff --git a/codex-rs/core/src/client_plaintext_reasoning_tests.rs b/codex-rs/core/src/client_plaintext_reasoning_tests.rs
 new file mode 100644
-index 0000000..8d40e22
+index 000000000..8d40e22c7
 --- /dev/null
 +++ b/codex-rs/core/src/client_plaintext_reasoning_tests.rs
 @@ -0,0 +1,133 @@
@@ -43708,7 +43708,7 @@ index 0000000..8d40e22
 +    assert_eq!(items, normalized);
 +}
 diff --git a/codex-rs/core/src/client_tests.rs b/codex-rs/core/src/client_tests.rs
-index 6eda1c8..de5d86b 100644
+index 6eda1c86b..de5d86b2a 100644
 --- a/codex-rs/core/src/client_tests.rs
 +++ b/codex-rs/core/src/client_tests.rs
 @@ -93,6 +93,9 @@ use wiremock::ResponseTemplate;
@@ -43947,7 +43947,7 @@ index 6eda1c8..de5d86b 100644
      SessionTelemetry::new(
          ThreadId::new(),
 diff --git a/codex-rs/core/src/codex_delegate.rs b/codex-rs/core/src/codex_delegate.rs
-index af19409..175aa6c 100644
+index af194098e..175aa6c47 100644
 --- a/codex-rs/core/src/codex_delegate.rs
 +++ b/codex-rs/core/src/codex_delegate.rs
 @@ -65,6 +65,7 @@ pub(crate) async fn run_codex_thread_interactive(
@@ -43993,7 +43993,7 @@ index af19409..175aa6c 100644
              session_loop_termination,
          },
 diff --git a/codex-rs/core/src/codex_delegate_tests.rs b/codex-rs/core/src/codex_delegate_tests.rs
-index f79ff41..fa202ad 100644
+index f79ff413f..fa202ad8b 100644
 --- a/codex-rs/core/src/codex_delegate_tests.rs
 +++ b/codex-rs/core/src/codex_delegate_tests.rs
 @@ -39,7 +39,7 @@ async fn forward_events_filters_private_events_before_blocked_send_is_cancelled(
@@ -44070,7 +44070,7 @@ index f79ff41..fa202ad 100644
  async fn guardian_delegates_do_not_inherit_parent_extensions() {
      let (mut parent_session, parent_ctx, _rx_events) =
 diff --git a/codex-rs/core/src/codex_thread.rs b/codex-rs/core/src/codex_thread.rs
-index 172726f..7c279a5 100644
+index 172726f98..7c279a57f 100644
 --- a/codex-rs/core/src/codex_thread.rs
 +++ b/codex-rs/core/src/codex_thread.rs
 @@ -80,6 +80,7 @@ static LIVE_THREADS: Gauge = Gauge::new("core.threads.live");
@@ -44192,7 +44192,7 @@ index 172726f..7c279a5 100644
                  model,
                  effort,
 diff --git a/codex-rs/core/src/compact.rs b/codex-rs/core/src/compact.rs
-index 49306c3..f865802 100644
+index 49306c357..f865802c9 100644
 --- a/codex-rs/core/src/compact.rs
 +++ b/codex-rs/core/src/compact.rs
 @@ -33,7 +33,11 @@ use codex_analytics::now_unix_seconds;
@@ -44566,7 +44566,7 @@ index 49306c3..f865802 100644
              Ok(_) => continue,
              Err(e) => return Err(e),
 diff --git a/codex-rs/core/src/compact_remote.rs b/codex-rs/core/src/compact_remote.rs
-index 3d16daf..eda3fdc 100644
+index 3d16dafd9..eda3fdc82 100644
 --- a/codex-rs/core/src/compact_remote.rs
 +++ b/codex-rs/core/src/compact_remote.rs
 @@ -301,6 +301,10 @@ async fn run_remote_compact_task_inner_impl(
@@ -44581,7 +44581,7 @@ index 3d16daf..eda3fdc 100644
      )
      .await;
 diff --git a/codex-rs/core/src/compact_remote_v2.rs b/codex-rs/core/src/compact_remote_v2.rs
-index 68e2eae..4ee9489 100644
+index 68e2eaeda..4ee94898f 100644
 --- a/codex-rs/core/src/compact_remote_v2.rs
 +++ b/codex-rs/core/src/compact_remote_v2.rs
 @@ -2,6 +2,7 @@ use std::sync::Arc;
@@ -44709,7 +44709,7 @@ index 68e2eae..4ee9489 100644
                              ..Default::default()
                          }),
 diff --git a/codex-rs/core/src/compact_remote_v2_attempt.rs b/codex-rs/core/src/compact_remote_v2_attempt.rs
-index 8827ba1..fcdcd08 100644
+index 8827ba1d2..fcdcd08ca 100644
 --- a/codex-rs/core/src/compact_remote_v2_attempt.rs
 +++ b/codex-rs/core/src/compact_remote_v2_attempt.rs
 @@ -6,11 +6,13 @@ use crate::Prompt;
@@ -44814,7 +44814,7 @@ index 8827ba1..fcdcd08 100644
      })
  }
 diff --git a/codex-rs/core/src/compact_remote_v2_image_budget_tests.rs b/codex-rs/core/src/compact_remote_v2_image_budget_tests.rs
-index ffc3a6f..e769d20 100644
+index ffc3a6f85..e769d2095 100644
 --- a/codex-rs/core/src/compact_remote_v2_image_budget_tests.rs
 +++ b/codex-rs/core/src/compact_remote_v2_image_budget_tests.rs
 @@ -146,6 +146,7 @@ fn image_treatment_preserves_client_developer_boundary_behavior() {
@@ -44826,7 +44826,7 @@ index ffc3a6f..e769d20 100644
              ..Default::default()
          }),
 diff --git a/codex-rs/core/src/config/config_loader_tests.rs b/codex-rs/core/src/config/config_loader_tests.rs
-index bb25c2c..a2aee29 100644
+index bb25c2c54..a2aee2922 100644
 --- a/codex-rs/core/src/config/config_loader_tests.rs
 +++ b/codex-rs/core/src/config/config_loader_tests.rs
 @@ -3740,6 +3740,7 @@ model_provider = "attacker"
@@ -44863,7 +44863,7 @@ index bb25c2c..a2aee29 100644
  }
  
 diff --git a/codex-rs/core/src/config/config_tests.rs b/codex-rs/core/src/config/config_tests.rs
-index 8796f53..9249531 100644
+index 8796f539b..9249531dd 100644
 --- a/codex-rs/core/src/config/config_tests.rs
 +++ b/codex-rs/core/src/config/config_tests.rs
 @@ -8300,6 +8300,10 @@ async fn load_config_rejects_missing_agent_role_config_file() -> std::io::Result
@@ -45001,7 +45001,7 @@ index 8796f53..9249531 100644
          std::fs::write(
 diff --git a/codex-rs/core/src/config/execution_presets.rs b/codex-rs/core/src/config/execution_presets.rs
 new file mode 100644
-index 0000000..379bcbc
+index 000000000..379bcbc9b
 --- /dev/null
 +++ b/codex-rs/core/src/config/execution_presets.rs
 @@ -0,0 +1,408 @@
@@ -45415,7 +45415,7 @@ index 0000000..379bcbc
 +mod tests;
 diff --git a/codex-rs/core/src/config/execution_presets_tests.rs b/codex-rs/core/src/config/execution_presets_tests.rs
 new file mode 100644
-index 0000000..b1e935d
+index 000000000..b1e935d9d
 --- /dev/null
 +++ b/codex-rs/core/src/config/execution_presets_tests.rs
 @@ -0,0 +1,350 @@
@@ -45770,7 +45770,7 @@ index 0000000..b1e935d
 +    assert_eq!(returned.execution_preset_selection(), Some(selection()));
 +}
 diff --git a/codex-rs/core/src/config/mod.rs b/codex-rs/core/src/config/mod.rs
-index dca329a..d6543d2 100644
+index dca329ab9..d6543d2fb 100644
 --- a/codex-rs/core/src/config/mod.rs
 +++ b/codex-rs/core/src/config/mod.rs
 @@ -162,6 +162,7 @@ use toml_edit::DocumentMut;
@@ -45887,7 +45887,7 @@ index dca329a..d6543d2 100644
          .await
 diff --git a/codex-rs/core/src/config/subagent_model_provider.rs b/codex-rs/core/src/config/subagent_model_provider.rs
 new file mode 100644
-index 0000000..994d288
+index 000000000..994d2889f
 --- /dev/null
 +++ b/codex-rs/core/src/config/subagent_model_provider.rs
 @@ -0,0 +1,140 @@
@@ -46033,7 +46033,7 @@ index 0000000..994d288
 +mod tests;
 diff --git a/codex-rs/core/src/config/subagent_model_provider_tests.rs b/codex-rs/core/src/config/subagent_model_provider_tests.rs
 new file mode 100644
-index 0000000..6adbdec
+index 000000000..6adbdec43
 --- /dev/null
 +++ b/codex-rs/core/src/config/subagent_model_provider_tests.rs
 @@ -0,0 +1,87 @@
@@ -46125,7 +46125,7 @@ index 0000000..6adbdec
 +    assert!(config.validate_subagent_selection().is_err());
 +}
 diff --git a/codex-rs/core/src/context/mod.rs b/codex-rs/core/src/context/mod.rs
-index 58ad814..bf688c3 100644
+index 58ad8140c..bf688c347 100644
 --- a/codex-rs/core/src/context/mod.rs
 +++ b/codex-rs/core/src/context/mod.rs
 @@ -32,6 +32,8 @@ mod node_repl_review_evidence;
@@ -46149,7 +46149,7 @@ index 58ad814..bf688c3 100644
  pub(crate) use realtime_end_instructions::RealtimeEndInstructions;
 diff --git a/codex-rs/core/src/context/portable_context_note.rs b/codex-rs/core/src/context/portable_context_note.rs
 new file mode 100644
-index 0000000..83035fb
+index 000000000..83035fbe2
 --- /dev/null
 +++ b/codex-rs/core/src/context/portable_context_note.rs
 @@ -0,0 +1,71 @@
@@ -46226,7 +46226,7 @@ index 0000000..83035fb
 +}
 diff --git a/codex-rs/core/src/context/provider_handoff_note.rs b/codex-rs/core/src/context/provider_handoff_note.rs
 new file mode 100644
-index 0000000..072fa9c
+index 000000000..072fa9c0b
 --- /dev/null
 +++ b/codex-rs/core/src/context/provider_handoff_note.rs
 @@ -0,0 +1,54 @@
@@ -46285,7 +46285,7 @@ index 0000000..072fa9c
 +    }
 +}
 diff --git a/codex-rs/core/src/context_manager/history_tests.rs b/codex-rs/core/src/context_manager/history_tests.rs
-index 7e732f7..7984e78 100644
+index 7e732f776..7984e7834 100644
 --- a/codex-rs/core/src/context_manager/history_tests.rs
 +++ b/codex-rs/core/src/context_manager/history_tests.rs
 @@ -313,6 +313,7 @@ fn developer_msg_with_fragments(texts: &[&str]) -> ResponseItem {
@@ -46305,7 +46305,7 @@ index 7e732f7..7984e78 100644
  }
  
 diff --git a/codex-rs/core/src/guardian/review_session.rs b/codex-rs/core/src/guardian/review_session.rs
-index c7ea001..e1cf37f 100644
+index c7ea001e5..e1cf37f48 100644
 --- a/codex-rs/core/src/guardian/review_session.rs
 +++ b/codex-rs/core/src/guardian/review_session.rs
 @@ -429,6 +429,7 @@ impl GuardianReviewSessionManager {
@@ -46333,7 +46333,7 @@ index c7ea001..e1cf37f 100644
          let parent_history = params.parent_session.clone_history().await;
          let parent_compaction = params
 diff --git a/codex-rs/core/src/guardian/review_session_tests.rs b/codex-rs/core/src/guardian/review_session_tests.rs
-index 0b0c6b6..5bed3ef 100644
+index 0b0c6b6f4..5bed3efb8 100644
 --- a/codex-rs/core/src/guardian/review_session_tests.rs
 +++ b/codex-rs/core/src/guardian/review_session_tests.rs
 @@ -26,7 +26,7 @@ async fn test_review_session() -> (
@@ -46346,7 +46346,7 @@ index 0b0c6b6..5bed3ef 100644
                  agent_status,
                  session_loop_termination: crate::session::completed_session_loop_termination(),
 diff --git a/codex-rs/core/src/hook_runtime.rs b/codex-rs/core/src/hook_runtime.rs
-index 4964905..d22189d 100644
+index 496490541..d22189d23 100644
 --- a/codex-rs/core/src/hook_runtime.rs
 +++ b/codex-rs/core/src/hook_runtime.rs
 @@ -2,6 +2,9 @@ use std::future::Future;
@@ -46361,7 +46361,7 @@ index 4964905..d22189d 100644
  use codex_analytics::build_track_events_context;
 diff --git a/codex-rs/core/src/hook_runtime/managed_close.rs b/codex-rs/core/src/hook_runtime/managed_close.rs
 new file mode 100644
-index 0000000..ef75a8a
+index 000000000..ef75a8a02
 --- /dev/null
 +++ b/codex-rs/core/src/hook_runtime/managed_close.rs
 @@ -0,0 +1,40 @@
@@ -46406,7 +46406,7 @@ index 0000000..ef75a8a
 +    Ok(())
 +}
 diff --git a/codex-rs/core/src/lib.rs b/codex-rs/core/src/lib.rs
-index b4e9792..7659683 100644
+index b4e979289..7659683b1 100644
 --- a/codex-rs/core/src/lib.rs
 +++ b/codex-rs/core/src/lib.rs
 @@ -33,6 +33,8 @@ mod compact_remote;
@@ -46440,7 +46440,7 @@ index b4e9792..7659683 100644
  pub use thread_manager::ThreadManager;
 diff --git a/codex-rs/core/src/managed_idle_status.rs b/codex-rs/core/src/managed_idle_status.rs
 new file mode 100644
-index 0000000..b16e106
+index 000000000..b16e10636
 --- /dev/null
 +++ b/codex-rs/core/src/managed_idle_status.rs
 @@ -0,0 +1,54 @@
@@ -46500,7 +46500,7 @@ index 0000000..b16e106
 +}
 diff --git a/codex-rs/core/src/portable_context.rs b/codex-rs/core/src/portable_context.rs
 new file mode 100644
-index 0000000..7f92d3c
+index 000000000..7f92d3cc0
 --- /dev/null
 +++ b/codex-rs/core/src/portable_context.rs
 @@ -0,0 +1,770 @@
@@ -47276,7 +47276,7 @@ index 0000000..7f92d3c
 +mod tests;
 diff --git a/codex-rs/core/src/portable_context/agent_summary.rs b/codex-rs/core/src/portable_context/agent_summary.rs
 new file mode 100644
-index 0000000..8631395
+index 000000000..8631395bb
 --- /dev/null
 +++ b/codex-rs/core/src/portable_context/agent_summary.rs
 @@ -0,0 +1,111 @@
@@ -47393,7 +47393,7 @@ index 0000000..8631395
 +mod tests;
 diff --git a/codex-rs/core/src/portable_context/agent_summary_tests.rs b/codex-rs/core/src/portable_context/agent_summary_tests.rs
 new file mode 100644
-index 0000000..78d8f98
+index 000000000..78d8f98c4
 --- /dev/null
 +++ b/codex-rs/core/src/portable_context/agent_summary_tests.rs
 @@ -0,0 +1,63 @@
@@ -47462,7 +47462,7 @@ index 0000000..78d8f98
 +}
 diff --git a/codex-rs/core/src/portable_context/budget.rs b/codex-rs/core/src/portable_context/budget.rs
 new file mode 100644
-index 0000000..74db4c5
+index 000000000..74db4c54d
 --- /dev/null
 +++ b/codex-rs/core/src/portable_context/budget.rs
 @@ -0,0 +1,77 @@
@@ -47545,7 +47545,7 @@ index 0000000..74db4c5
 +}
 diff --git a/codex-rs/core/src/portable_context/foreign_state.rs b/codex-rs/core/src/portable_context/foreign_state.rs
 new file mode 100644
-index 0000000..b15f253
+index 000000000..b15f253cc
 --- /dev/null
 +++ b/codex-rs/core/src/portable_context/foreign_state.rs
 @@ -0,0 +1,205 @@
@@ -47756,7 +47756,7 @@ index 0000000..b15f253
 +}
 diff --git a/codex-rs/core/src/portable_context/rebuild.rs b/codex-rs/core/src/portable_context/rebuild.rs
 new file mode 100644
-index 0000000..c1f21c8
+index 000000000..c1f21c899
 --- /dev/null
 +++ b/codex-rs/core/src/portable_context/rebuild.rs
 @@ -0,0 +1,679 @@
@@ -48441,7 +48441,7 @@ index 0000000..c1f21c8
 +}
 diff --git a/codex-rs/core/src/portable_context/rebuild/recent.rs b/codex-rs/core/src/portable_context/rebuild/recent.rs
 new file mode 100644
-index 0000000..2d36f8a
+index 000000000..2d36f8afa
 --- /dev/null
 +++ b/codex-rs/core/src/portable_context/rebuild/recent.rs
 @@ -0,0 +1,222 @@
@@ -48669,7 +48669,7 @@ index 0000000..2d36f8a
 +}
 diff --git a/codex-rs/core/src/portable_context/rebuild/start.rs b/codex-rs/core/src/portable_context/rebuild/start.rs
 new file mode 100644
-index 0000000..ada7cc39
+index 000000000..ada7cc39a
 --- /dev/null
 +++ b/codex-rs/core/src/portable_context/rebuild/start.rs
 @@ -0,0 +1,154 @@
@@ -48829,7 +48829,7 @@ index 0000000..ada7cc39
 +}
 diff --git a/codex-rs/core/src/portable_context/splice.rs b/codex-rs/core/src/portable_context/splice.rs
 new file mode 100644
-index 0000000..b0e4042
+index 000000000..b0e40420c
 --- /dev/null
 +++ b/codex-rs/core/src/portable_context/splice.rs
 @@ -0,0 +1,452 @@
@@ -49287,7 +49287,7 @@ index 0000000..b0e4042
 +mod tests;
 diff --git a/codex-rs/core/src/portable_context/splice_tests.rs b/codex-rs/core/src/portable_context/splice_tests.rs
 new file mode 100644
-index 0000000..e67f40b
+index 000000000..e67f40b8b
 --- /dev/null
 +++ b/codex-rs/core/src/portable_context/splice_tests.rs
 @@ -0,0 +1,497 @@
@@ -49790,7 +49790,7 @@ index 0000000..e67f40b
 +}
 diff --git a/codex-rs/core/src/portable_context_tests.rs b/codex-rs/core/src/portable_context_tests.rs
 new file mode 100644
-index 0000000..7684cc5
+index 000000000..7684cc510
 --- /dev/null
 +++ b/codex-rs/core/src/portable_context_tests.rs
 @@ -0,0 +1,395 @@
@@ -50191,7 +50191,7 @@ index 0000000..7684cc5
 +}
 diff --git a/codex-rs/core/src/session/claude_code.rs b/codex-rs/core/src/session/claude_code.rs
 new file mode 100644
-index 0000000..84e44b2
+index 000000000..84e44b276
 --- /dev/null
 +++ b/codex-rs/core/src/session/claude_code.rs
 @@ -0,0 +1,75 @@
@@ -50271,7 +50271,7 @@ index 0000000..84e44b2
 +    }
 +}
 diff --git a/codex-rs/core/src/session/handlers.rs b/codex-rs/core/src/session/handlers.rs
-index e4594f7..583f615 100644
+index e4594f78b..583f6153e 100644
 --- a/codex-rs/core/src/session/handlers.rs
 +++ b/codex-rs/core/src/session/handlers.rs
 @@ -25,6 +25,8 @@ use crate::tasks::UserShellCommandMode;
@@ -50434,7 +50434,7 @@ index e4594f7..583f615 100644
                      false
 diff --git a/codex-rs/core/src/session/idle_shutdown.rs b/codex-rs/core/src/session/idle_shutdown.rs
 new file mode 100644
-index 0000000..605cbce
+index 000000000..605cbce2b
 --- /dev/null
 +++ b/codex-rs/core/src/session/idle_shutdown.rs
 @@ -0,0 +1,248 @@
@@ -50687,7 +50687,7 @@ index 0000000..605cbce
 +    }
 +}
 diff --git a/codex-rs/core/src/session/inject.rs b/codex-rs/core/src/session/inject.rs
-index 6c103f2..5da5129 100644
+index 6c103f266..5da5129f3 100644
 --- a/codex-rs/core/src/session/inject.rs
 +++ b/codex-rs/core/src/session/inject.rs
 @@ -100,6 +100,7 @@ impl Session {
@@ -50699,7 +50699,7 @@ index 6c103f2..5da5129 100644
              ..Default::default()
          });
 diff --git a/codex-rs/core/src/session/input_queue.rs b/codex-rs/core/src/session/input_queue.rs
-index e6bd3ba..72538d4 100644
+index e6bd3ba38..72538d459 100644
 --- a/codex-rs/core/src/session/input_queue.rs
 +++ b/codex-rs/core/src/session/input_queue.rs
 @@ -139,6 +139,38 @@ impl InputQueue {
@@ -50751,7 +50751,7 @@ index e6bd3ba..72538d4 100644
              }),
 diff --git a/codex-rs/core/src/session/internal_sessions.rs b/codex-rs/core/src/session/internal_sessions.rs
 new file mode 100644
-index 0000000..1ccb399
+index 000000000..1ccb39949
 --- /dev/null
 +++ b/codex-rs/core/src/session/internal_sessions.rs
 @@ -0,0 +1,318 @@
@@ -51075,7 +51075,7 @@ index 0000000..1ccb399
 +mod tests;
 diff --git a/codex-rs/core/src/session/internal_sessions_tests.rs b/codex-rs/core/src/session/internal_sessions_tests.rs
 new file mode 100644
-index 0000000..eb02256
+index 000000000..eb0225606
 --- /dev/null
 +++ b/codex-rs/core/src/session/internal_sessions_tests.rs
 @@ -0,0 +1,119 @@
@@ -51199,7 +51199,7 @@ index 0000000..eb02256
 +    assert!(matches!(receiver.recv().await.unwrap().op, Op::Interrupt));
 +}
 diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
-index 9130036..c31e18b 100644
+index 91300365b..c31e18b8d 100644
 --- a/codex-rs/core/src/session/mod.rs
 +++ b/codex-rs/core/src/session/mod.rs
 @@ -162,6 +162,7 @@ use codex_terminal_detection::user_agent;
@@ -51693,7 +51693,7 @@ index 9130036..c31e18b 100644
      }
 diff --git a/codex-rs/core/src/session/provider_switch.rs b/codex-rs/core/src/session/provider_switch.rs
 new file mode 100644
-index 0000000..a6fc1aa
+index 000000000..a6fc1aab6
 --- /dev/null
 +++ b/codex-rs/core/src/session/provider_switch.rs
 @@ -0,0 +1,228 @@
@@ -51926,7 +51926,7 @@ index 0000000..a6fc1aa
 +        .and_then(|served_by| served_by.request_head.clone())
 +}
 diff --git a/codex-rs/core/src/session/rollout_reconstruction.rs b/codex-rs/core/src/session/rollout_reconstruction.rs
-index 786e26c..05be1ac 100644
+index 786e26c2d..05be1ac95 100644
 --- a/codex-rs/core/src/session/rollout_reconstruction.rs
 +++ b/codex-rs/core/src/session/rollout_reconstruction.rs
 @@ -236,6 +236,11 @@ impl Session {
@@ -51942,7 +51942,7 @@ index 786e26c..05be1ac 100644
                          active_segment.get_or_insert_with(ActiveReplaySegment::default);
                      // `TurnContextItem` can attach metadata to an existing segment, but only a
 diff --git a/codex-rs/core/src/session/rollout_reconstruction_tests.rs b/codex-rs/core/src/session/rollout_reconstruction_tests.rs
-index f6a86d5..04d47b8 100644
+index f6a86d5f0..04d47b822 100644
 --- a/codex-rs/core/src/session/rollout_reconstruction_tests.rs
 +++ b/codex-rs/core/src/session/rollout_reconstruction_tests.rs
 @@ -127,6 +127,46 @@ fn completed_user_turn_rollout(
@@ -52254,7 +52254,7 @@ index f6a86d5..04d47b8 100644
          // A newer TurnStarted replaces the incomplete compacted turn without a matching
          // completion/abort for the old one.
 diff --git a/codex-rs/core/src/session/session.rs b/codex-rs/core/src/session/session.rs
-index 6d1953e..9f49c0f 100644
+index 6d1953e3a..9f49c0f01 100644
 --- a/codex-rs/core/src/session/session.rs
 +++ b/codex-rs/core/src/session/session.rs
 @@ -70,6 +70,7 @@ pub(crate) struct Session {
@@ -52341,7 +52341,7 @@ index 6d1953e..9f49c0f 100644
                  fork_persistence,
 diff --git a/codex-rs/core/src/session/submission_admission.rs b/codex-rs/core/src/session/submission_admission.rs
 new file mode 100644
-index 0000000..d7b3645
+index 000000000..d7b3645b8
 --- /dev/null
 +++ b/codex-rs/core/src/session/submission_admission.rs
 @@ -0,0 +1,162 @@
@@ -52509,7 +52509,7 @@ index 0000000..d7b3645
 +mod tests;
 diff --git a/codex-rs/core/src/session/submission_admission_tests.rs b/codex-rs/core/src/session/submission_admission_tests.rs
 new file mode 100644
-index 0000000..b646c5a
+index 000000000..b646c5a23
 --- /dev/null
 +++ b/codex-rs/core/src/session/submission_admission_tests.rs
 @@ -0,0 +1,56 @@
@@ -52570,7 +52570,7 @@ index 0000000..b646c5a
 +    assert!(receiver.is_empty());
 +}
 diff --git a/codex-rs/core/src/session/tests.rs b/codex-rs/core/src/session/tests.rs
-index b5931b3..3451dca 100644
+index b5931b330..3451dcabc 100644
 --- a/codex-rs/core/src/session/tests.rs
 +++ b/codex-rs/core/src/session/tests.rs
 @@ -2232,6 +2232,8 @@ async fn reconstruct_history_uses_replacement_history_verbatim() {
@@ -52797,7 +52797,7 @@ index b5931b3..3451dca 100644
  
      let user3 = user_message("third user");
 diff --git a/codex-rs/core/src/session/thread_settings.rs b/codex-rs/core/src/session/thread_settings.rs
-index 44b9d34..e0daa81 100644
+index 44b9d344b..e0daa814b 100644
 --- a/codex-rs/core/src/session/thread_settings.rs
 +++ b/codex-rs/core/src/session/thread_settings.rs
 @@ -40,6 +40,7 @@ pub(super) async fn update(
@@ -52817,7 +52817,7 @@ index 44b9d34..e0daa81 100644
              model,
              effort,
 diff --git a/codex-rs/core/src/session/turn.rs b/codex-rs/core/src/session/turn.rs
-index f7c4268..56cbe6b 100644
+index f7c42680c..56cbe6bea 100644
 --- a/codex-rs/core/src/session/turn.rs
 +++ b/codex-rs/core/src/session/turn.rs
 @@ -286,6 +286,10 @@ pub(crate) async fn run_turn(
@@ -52858,7 +52858,7 @@ index f7c4268..56cbe6b 100644
                  reason,
                  phase,
 diff --git a/codex-rs/core/src/session/turn_context.rs b/codex-rs/core/src/session/turn_context.rs
-index e5a371e..3cdba3f 100644
+index e5a371e9d..3cdba3ffc 100644
 --- a/codex-rs/core/src/session/turn_context.rs
 +++ b/codex-rs/core/src/session/turn_context.rs
 @@ -441,6 +441,11 @@ impl TurnContext {
@@ -52895,7 +52895,7 @@ index e5a371e..3cdba3f 100644
      }
  
 diff --git a/codex-rs/core/src/session/turn_input.rs b/codex-rs/core/src/session/turn_input.rs
-index 2882931..fa62dda 100644
+index 2882931bc..fa62ddad6 100644
 --- a/codex-rs/core/src/session/turn_input.rs
 +++ b/codex-rs/core/src/session/turn_input.rs
 @@ -313,9 +313,15 @@ async fn start_or_steer(
@@ -52937,7 +52937,7 @@ index 2882931..fa62dda 100644
          turn_id: submission_id,
      })
 diff --git a/codex-rs/core/src/state/mod.rs b/codex-rs/core/src/state/mod.rs
-index 16297ea..b37087e 100644
+index 16297ea41..b37087e2a 100644
 --- a/codex-rs/core/src/state/mod.rs
 +++ b/codex-rs/core/src/state/mod.rs
 @@ -9,7 +9,9 @@ pub(crate) use additional_context::AdditionalContextStore;
@@ -52951,7 +52951,7 @@ index 16297ea..b37087e 100644
  pub(crate) use turn::MailboxDeliveryPhase;
  pub(crate) use turn::PendingRequestPermissions;
 diff --git a/codex-rs/core/src/state/session.rs b/codex-rs/core/src/state/session.rs
-index e9e42cf..ee44ea5 100644
+index e9e42cf00..ee44ea51d 100644
 --- a/codex-rs/core/src/state/session.rs
 +++ b/codex-rs/core/src/state/session.rs
 @@ -18,7 +18,9 @@ use crate::session::PreviousTurnSettings;
@@ -53061,7 +53061,7 @@ index e9e42cf..ee44ea5 100644
          self.latest_token_usage_record = Some(record.clone());
          record
 diff --git a/codex-rs/core/src/state/session_tests.rs b/codex-rs/core/src/state/session_tests.rs
-index 533bd2d..3b7b82d 100644
+index 533bd2df2..3b7b82d9e 100644
 --- a/codex-rs/core/src/state/session_tests.rs
 +++ b/codex-rs/core/src/state/session_tests.rs
 @@ -28,6 +28,7 @@ async fn record_token_usage_continues_restored_totals() {
@@ -53081,7 +53081,7 @@ index 533bd2d..3b7b82d 100644
      );
  }
 diff --git a/codex-rs/core/src/stream_events_utils.rs b/codex-rs/core/src/stream_events_utils.rs
-index a75dbe2..27eb8f8 100644
+index a75dbe2af..27eb8f8c6 100644
 --- a/codex-rs/core/src/stream_events_utils.rs
 +++ b/codex-rs/core/src/stream_events_utils.rs
 @@ -306,7 +306,8 @@ pub(crate) async fn handle_output_item_done(
@@ -53105,7 +53105,7 @@ index a75dbe2..27eb8f8 100644
              output.needs_follow_up = true;
 diff --git a/codex-rs/core/src/tasks/claude_code.rs b/codex-rs/core/src/tasks/claude_code.rs
 new file mode 100644
-index 0000000..a97dab2
+index 000000000..a97dab2f4
 --- /dev/null
 +++ b/codex-rs/core/src/tasks/claude_code.rs
 @@ -0,0 +1,447 @@
@@ -53558,7 +53558,7 @@ index 0000000..a97dab2
 +}
 diff --git a/codex-rs/core/src/tasks/claude_code/bridge.rs b/codex-rs/core/src/tasks/claude_code/bridge.rs
 new file mode 100644
-index 0000000..64333cb
+index 000000000..64333cba1
 --- /dev/null
 +++ b/codex-rs/core/src/tasks/claude_code/bridge.rs
 @@ -0,0 +1,134 @@
@@ -53698,7 +53698,7 @@ index 0000000..64333cb
 +}
 diff --git a/codex-rs/core/src/tasks/claude_code/context.rs b/codex-rs/core/src/tasks/claude_code/context.rs
 new file mode 100644
-index 0000000..09aa3ed
+index 000000000..09aa3ed10
 --- /dev/null
 +++ b/codex-rs/core/src/tasks/claude_code/context.rs
 @@ -0,0 +1,245 @@
@@ -53949,7 +53949,7 @@ index 0000000..09aa3ed
 +}
 diff --git a/codex-rs/core/src/tasks/claude_code/context_tests.rs b/codex-rs/core/src/tasks/claude_code/context_tests.rs
 new file mode 100644
-index 0000000..cd70b99
+index 000000000..cd70b99fc
 --- /dev/null
 +++ b/codex-rs/core/src/tasks/claude_code/context_tests.rs
 @@ -0,0 +1,142 @@
@@ -54097,7 +54097,7 @@ index 0000000..cd70b99
 +}
 diff --git a/codex-rs/core/src/tasks/claude_code/delegation.rs b/codex-rs/core/src/tasks/claude_code/delegation.rs
 new file mode 100644
-index 0000000..2e73dfb
+index 000000000..2e73dfbf9
 --- /dev/null
 +++ b/codex-rs/core/src/tasks/claude_code/delegation.rs
 @@ -0,0 +1,221 @@
@@ -54324,7 +54324,7 @@ index 0000000..2e73dfb
 +mod tests;
 diff --git a/codex-rs/core/src/tasks/claude_code/delegation_tests.rs b/codex-rs/core/src/tasks/claude_code/delegation_tests.rs
 new file mode 100644
-index 0000000..895daf3
+index 000000000..895daf35b
 --- /dev/null
 +++ b/codex-rs/core/src/tasks/claude_code/delegation_tests.rs
 @@ -0,0 +1,69 @@
@@ -54399,7 +54399,7 @@ index 0000000..895daf3
 +}
 diff --git a/codex-rs/core/src/tasks/claude_code/events.rs b/codex-rs/core/src/tasks/claude_code/events.rs
 new file mode 100644
-index 0000000..49aedd8
+index 000000000..49aedd8dd
 --- /dev/null
 +++ b/codex-rs/core/src/tasks/claude_code/events.rs
 @@ -0,0 +1,431 @@
@@ -54836,7 +54836,7 @@ index 0000000..49aedd8
 +}
 diff --git a/codex-rs/core/src/tasks/claude_code/events_tests.rs b/codex-rs/core/src/tasks/claude_code/events_tests.rs
 new file mode 100644
-index 0000000..983f103
+index 000000000..983f1037e
 --- /dev/null
 +++ b/codex-rs/core/src/tasks/claude_code/events_tests.rs
 @@ -0,0 +1,25 @@
@@ -54867,7 +54867,7 @@ index 0000000..983f103
 +}
 diff --git a/codex-rs/core/src/tasks/claude_code/images.rs b/codex-rs/core/src/tasks/claude_code/images.rs
 new file mode 100644
-index 0000000..06e2d8f
+index 000000000..06e2d8f2e
 --- /dev/null
 +++ b/codex-rs/core/src/tasks/claude_code/images.rs
 @@ -0,0 +1,306 @@
@@ -55179,7 +55179,7 @@ index 0000000..06e2d8f
 +mod tests;
 diff --git a/codex-rs/core/src/tasks/claude_code/images_tests.rs b/codex-rs/core/src/tasks/claude_code/images_tests.rs
 new file mode 100644
-index 0000000..8575d46
+index 000000000..8575d469f
 --- /dev/null
 +++ b/codex-rs/core/src/tasks/claude_code/images_tests.rs
 @@ -0,0 +1,256 @@
@@ -55441,7 +55441,7 @@ index 0000000..8575d46
 +}
 diff --git a/codex-rs/core/src/tasks/claude_code/messages.rs b/codex-rs/core/src/tasks/claude_code/messages.rs
 new file mode 100644
-index 0000000..dc4f07f
+index 000000000..dc4f07f99
 --- /dev/null
 +++ b/codex-rs/core/src/tasks/claude_code/messages.rs
 @@ -0,0 +1,20 @@
@@ -55467,7 +55467,7 @@ index 0000000..dc4f07f
 +mod tests;
 diff --git a/codex-rs/core/src/tasks/claude_code/messages_tests.rs b/codex-rs/core/src/tasks/claude_code/messages_tests.rs
 new file mode 100644
-index 0000000..ab90ad1
+index 000000000..ab90ad1a3
 --- /dev/null
 +++ b/codex-rs/core/src/tasks/claude_code/messages_tests.rs
 @@ -0,0 +1,35 @@
@@ -55507,7 +55507,7 @@ index 0000000..ab90ad1
 +    assert!(plaintext(&content("가".repeat(2731))).is_err());
 +}
 diff --git a/codex-rs/core/src/tasks/compact.rs b/codex-rs/core/src/tasks/compact.rs
-index 99e2113..3a5b386 100644
+index 99e211348..3a5b386ca 100644
 --- a/codex-rs/core/src/tasks/compact.rs
 +++ b/codex-rs/core/src/tasks/compact.rs
 @@ -32,6 +32,11 @@ impl SessionTask for CompactTask {
@@ -55523,7 +55523,7 @@ index 99e2113..3a5b386 100644
          if ctx.config.features.enabled(Feature::TokenBudget) {
              crate::compact_token_budget::run_manual_compact_task(session, ctx).await?;
 diff --git a/codex-rs/core/src/tasks/mod.rs b/codex-rs/core/src/tasks/mod.rs
-index 5bf4101..8582e93 100644
+index 5bf41019d..8582e93d8 100644
 --- a/codex-rs/core/src/tasks/mod.rs
 +++ b/codex-rs/core/src/tasks/mod.rs
 @@ -1,3 +1,4 @@
@@ -55558,7 +55558,7 @@ index 5bf4101..8582e93 100644
  
      pub async fn abort_all_tasks(self: &Arc<Self>, reason: TurnAbortReason) {
 diff --git a/codex-rs/core/src/tasks/review.rs b/codex-rs/core/src/tasks/review.rs
-index 42ec842..507457e 100644
+index 42ec842e7..507457e06 100644
 --- a/codex-rs/core/src/tasks/review.rs
 +++ b/codex-rs/core/src/tasks/review.rs
 @@ -58,6 +58,11 @@ impl SessionTask for ReviewTask {
@@ -55574,7 +55574,7 @@ index 42ec842..507457e 100644
              .services
              .session_telemetry
 diff --git a/codex-rs/core/src/thread_manager.rs b/codex-rs/core/src/thread_manager.rs
-index cfa6196..0a1a136 100644
+index cfa619697..0a1a13600 100644
 --- a/codex-rs/core/src/thread_manager.rs
 +++ b/codex-rs/core/src/thread_manager.rs
 @@ -73,6 +73,7 @@ use codex_thread_store::InMemoryThreadStore;
@@ -56196,7 +56196,7 @@ index cfa6196..0a1a136 100644
              new_thread.thread.session.request_mcp_runtime_refresh();
 diff --git a/codex-rs/core/src/thread_manager/internal_sessions.rs b/codex-rs/core/src/thread_manager/internal_sessions.rs
 new file mode 100644
-index 0000000..8eae755
+index 000000000..8eae75525
 --- /dev/null
 +++ b/codex-rs/core/src/thread_manager/internal_sessions.rs
 @@ -0,0 +1,31 @@
@@ -56233,7 +56233,7 @@ index 0000000..8eae755
 +mod tests;
 diff --git a/codex-rs/core/src/thread_manager/internal_sessions_tests.rs b/codex-rs/core/src/thread_manager/internal_sessions_tests.rs
 new file mode 100644
-index 0000000..20a14c6
+index 000000000..20a14c63e
 --- /dev/null
 +++ b/codex-rs/core/src/thread_manager/internal_sessions_tests.rs
 @@ -0,0 +1,67 @@
@@ -56306,7 +56306,7 @@ index 0000000..20a14c6
 +}
 diff --git a/codex-rs/core/src/thread_manager/managed_activation.rs b/codex-rs/core/src/thread_manager/managed_activation.rs
 new file mode 100644
-index 0000000..6a78dcc
+index 000000000..6a78dcceb
 --- /dev/null
 +++ b/codex-rs/core/src/thread_manager/managed_activation.rs
 @@ -0,0 +1,313 @@
@@ -56625,7 +56625,7 @@ index 0000000..6a78dcc
 +mod tests;
 diff --git a/codex-rs/core/src/thread_manager/managed_activation_tests.rs b/codex-rs/core/src/thread_manager/managed_activation_tests.rs
 new file mode 100644
-index 0000000..c1a2014
+index 000000000..c1a20148d
 --- /dev/null
 +++ b/codex-rs/core/src/thread_manager/managed_activation_tests.rs
 @@ -0,0 +1,867 @@
@@ -57498,7 +57498,7 @@ index 0000000..c1a2014
 +}
 diff --git a/codex-rs/core/src/thread_manager/managed_agent_graph.rs b/codex-rs/core/src/thread_manager/managed_agent_graph.rs
 new file mode 100644
-index 0000000..e32a68a
+index 000000000..e32a68a49
 --- /dev/null
 +++ b/codex-rs/core/src/thread_manager/managed_agent_graph.rs
 @@ -0,0 +1,177 @@
@@ -57681,7 +57681,7 @@ index 0000000..e32a68a
 +mod tests;
 diff --git a/codex-rs/core/src/thread_manager/managed_agent_graph_tests.rs b/codex-rs/core/src/thread_manager/managed_agent_graph_tests.rs
 new file mode 100644
-index 0000000..2853f79
+index 000000000..2853f79e6
 --- /dev/null
 +++ b/codex-rs/core/src/thread_manager/managed_agent_graph_tests.rs
 @@ -0,0 +1,595 @@
@@ -58282,7 +58282,7 @@ index 0000000..2853f79
 +}
 diff --git a/codex-rs/core/src/thread_manager/managed_cold_drain.rs b/codex-rs/core/src/thread_manager/managed_cold_drain.rs
 new file mode 100644
-index 0000000..47663a5
+index 000000000..47663a568
 --- /dev/null
 +++ b/codex-rs/core/src/thread_manager/managed_cold_drain.rs
 @@ -0,0 +1,373 @@
@@ -58661,7 +58661,7 @@ index 0000000..47663a5
 +mod tests;
 diff --git a/codex-rs/core/src/thread_manager/managed_cold_drain_tests.rs b/codex-rs/core/src/thread_manager/managed_cold_drain_tests.rs
 new file mode 100644
-index 0000000..5b2e2a8
+index 000000000..5b2e2a8e6
 --- /dev/null
 +++ b/codex-rs/core/src/thread_manager/managed_cold_drain_tests.rs
 @@ -0,0 +1,683 @@
@@ -59350,7 +59350,7 @@ index 0000000..5b2e2a8
 +}
 diff --git a/codex-rs/core/src/thread_manager/managed_records.rs b/codex-rs/core/src/thread_manager/managed_records.rs
 new file mode 100644
-index 0000000..04deb30
+index 000000000..04deb3079
 --- /dev/null
 +++ b/codex-rs/core/src/thread_manager/managed_records.rs
 @@ -0,0 +1,181 @@
@@ -59537,7 +59537,7 @@ index 0000000..04deb30
 +mod tests;
 diff --git a/codex-rs/core/src/thread_manager/managed_records_tests.rs b/codex-rs/core/src/thread_manager/managed_records_tests.rs
 new file mode 100644
-index 0000000..b92ea62
+index 000000000..b92ea6240
 --- /dev/null
 +++ b/codex-rs/core/src/thread_manager/managed_records_tests.rs
 @@ -0,0 +1,312 @@
@@ -59855,7 +59855,7 @@ index 0000000..b92ea62
 +}
 diff --git a/codex-rs/core/src/thread_manager/preset_auth.rs b/codex-rs/core/src/thread_manager/preset_auth.rs
 new file mode 100644
-index 0000000..ab7441c
+index 000000000..ab7441c6a
 --- /dev/null
 +++ b/codex-rs/core/src/thread_manager/preset_auth.rs
 @@ -0,0 +1,224 @@
@@ -60085,7 +60085,7 @@ index 0000000..ab7441c
 +mod tests;
 diff --git a/codex-rs/core/src/thread_manager/preset_auth_resolver.rs b/codex-rs/core/src/thread_manager/preset_auth_resolver.rs
 new file mode 100644
-index 0000000..de67518
+index 000000000..de675188d
 --- /dev/null
 +++ b/codex-rs/core/src/thread_manager/preset_auth_resolver.rs
 @@ -0,0 +1,150 @@
@@ -60241,7 +60241,7 @@ index 0000000..de67518
 +}
 diff --git a/codex-rs/core/src/thread_manager/preset_auth_tests.rs b/codex-rs/core/src/thread_manager/preset_auth_tests.rs
 new file mode 100644
-index 0000000..319163b
+index 000000000..319163b26
 --- /dev/null
 +++ b/codex-rs/core/src/thread_manager/preset_auth_tests.rs
 @@ -0,0 +1,160 @@
@@ -60406,7 +60406,7 @@ index 0000000..319163b
 +    );
 +}
 diff --git a/codex-rs/core/src/thread_manager_tests.rs b/codex-rs/core/src/thread_manager_tests.rs
-index 74cdb32..dbff7bb 100644
+index 74cdb32dc..dbff7bb51 100644
 --- a/codex-rs/core/src/thread_manager_tests.rs
 +++ b/codex-rs/core/src/thread_manager_tests.rs
 @@ -15,6 +15,7 @@ use crate::windows_sandbox::WindowsSandboxLevelExt;
@@ -60467,7 +60467,7 @@ index 74cdb32..dbff7bb 100644
  #[test]
  fn thread_id_generator_defaults_to_standard_ids() {
 diff --git a/codex-rs/core/src/tools/context.rs b/codex-rs/core/src/tools/context.rs
-index 72f9481..70afcef 100644
+index 72f9481ff..70afcefe7 100644
 --- a/codex-rs/core/src/tools/context.rs
 +++ b/codex-rs/core/src/tools/context.rs
 @@ -55,6 +55,29 @@ pub enum ToolCallSource {
@@ -60501,7 +60501,7 @@ index 72f9481..70afcef 100644
  pub struct ToolInvocation {
      pub session: Arc<Session>,
 diff --git a/codex-rs/core/src/tools/handlers/mod.rs b/codex-rs/core/src/tools/handlers/mod.rs
-index 25a2ae1..7390056 100644
+index 25a2ae150..7390056c3 100644
 --- a/codex-rs/core/src/tools/handlers/mod.rs
 +++ b/codex-rs/core/src/tools/handlers/mod.rs
 @@ -10,6 +10,7 @@ pub(crate) mod list_available_plugins_to_install_spec;
@@ -60514,7 +60514,7 @@ index 25a2ae1..7390056 100644
  pub(crate) mod multi_agents_spec;
 diff --git a/codex-rs/core/src/tools/handlers/multi_agent_message.rs b/codex-rs/core/src/tools/handlers/multi_agent_message.rs
 new file mode 100644
-index 0000000..4ded62f
+index 000000000..4ded62f50
 --- /dev/null
 +++ b/codex-rs/core/src/tools/handlers/multi_agent_message.rs
 @@ -0,0 +1,287 @@
@@ -60807,7 +60807,7 @@ index 0000000..4ded62f
 +mod tests;
 diff --git a/codex-rs/core/src/tools/handlers/multi_agent_message_tests.rs b/codex-rs/core/src/tools/handlers/multi_agent_message_tests.rs
 new file mode 100644
-index 0000000..c53f5b9
+index 000000000..c53f5b949
 --- /dev/null
 +++ b/codex-rs/core/src/tools/handlers/multi_agent_message_tests.rs
 @@ -0,0 +1,261 @@
@@ -61073,7 +61073,7 @@ index 0000000..c53f5b9
 +    )));
 +}
 diff --git a/codex-rs/core/src/tools/handlers/multi_agents_common.rs b/codex-rs/core/src/tools/handlers/multi_agents_common.rs
-index 77442ad..512dc3d 100644
+index 77442ad43..512dc3d8d 100644
 --- a/codex-rs/core/src/tools/handlers/multi_agents_common.rs
 +++ b/codex-rs/core/src/tools/handlers/multi_agents_common.rs
 @@ -5,10 +5,12 @@ use crate::config::HARD_MAX_MULTI_AGENT_V2_TIMEOUT_MS;
@@ -61152,7 +61152,7 @@ index 77442ad..512dc3d 100644
          .await;
      if model_info.used_fallback_model_metadata {
 diff --git a/codex-rs/core/src/tools/handlers/multi_agents_spec.rs b/codex-rs/core/src/tools/handlers/multi_agents_spec.rs
-index 8d9d48e..f15e2ff 100644
+index 8d9d48ef3..f15e2ffe3 100644
 --- a/codex-rs/core/src/tools/handlers/multi_agents_spec.rs
 +++ b/codex-rs/core/src/tools/handlers/multi_agents_spec.rs
 @@ -11,6 +11,18 @@ use serde_json::Value;
@@ -61391,7 +61391,7 @@ index 8d9d48e..f15e2ff 100644
  
  fn hide_spawn_agent_metadata_options(properties: &mut BTreeMap<String, JsonSchema>) {
 diff --git a/codex-rs/core/src/tools/handlers/multi_agents_spec_tests.rs b/codex-rs/core/src/tools/handlers/multi_agents_spec_tests.rs
-index 9e100aa..13bd3fa 100644
+index 9e100aa3b..13bd3faf8 100644
 --- a/codex-rs/core/src/tools/handlers/multi_agents_spec_tests.rs
 +++ b/codex-rs/core/src/tools/handlers/multi_agents_spec_tests.rs
 @@ -126,6 +126,88 @@ fn spawn_agent_tool_v2_requires_task_name_and_lists_visible_models() {
@@ -61484,7 +61484,7 @@ index 9e100aa..13bd3fa 100644
  fn spawn_agent_tool_v1_keeps_legacy_fork_context_field() {
      let tool = create_spawn_agent_tool_v1(SpawnAgentToolOptions {
 diff --git a/codex-rs/core/src/tools/handlers/multi_agents_tests.rs b/codex-rs/core/src/tools/handlers/multi_agents_tests.rs
-index 0979e8b..dab9dd7 100644
+index 0979e8b1e..dab9dd7a4 100644
 --- a/codex-rs/core/src/tools/handlers/multi_agents_tests.rs
 +++ b/codex-rs/core/src/tools/handlers/multi_agents_tests.rs
 @@ -15,6 +15,7 @@ use crate::session::turn_context::TurnContext;
@@ -61882,7 +61882,7 @@ index 0979e8b..dab9dd7 100644
  async fn multi_agent_v2_interrupt_agent_rejects_root_target_and_id() {
      let (mut session, mut turn) = make_session_and_context().await;
 diff --git a/codex-rs/core/src/tools/handlers/multi_agents_v2.rs b/codex-rs/core/src/tools/handlers/multi_agents_v2.rs
-index b82bdd6..3031ae0 100644
+index b82bdd6a0..3031ae08b 100644
 --- a/codex-rs/core/src/tools/handlers/multi_agents_v2.rs
 +++ b/codex-rs/core/src/tools/handlers/multi_agents_v2.rs
 @@ -2,9 +2,6 @@
@@ -61966,7 +61966,7 @@ index b82bdd6..3031ae0 100644
 -    InterAgentCommunication::new(author, recipient, Vec::new(), content, trigger_turn)
 -}
 diff --git a/codex-rs/core/src/tools/handlers/multi_agents_v2/followup_task.rs b/codex-rs/core/src/tools/handlers/multi_agents_v2/followup_task.rs
-index 19de4d8..ee0daff 100644
+index 19de4d842..ee0daffa6 100644
 --- a/codex-rs/core/src/tools/handlers/multi_agents_v2/followup_task.rs
 +++ b/codex-rs/core/src/tools/handlers/multi_agents_v2/followup_task.rs
 @@ -3,10 +3,19 @@ use super::message_tool::FollowupTaskArgs;
@@ -62020,7 +62020,7 @@ index 19de4d8..ee0daff 100644
          matches!(payload, ToolPayload::Function { .. })
      }
 diff --git a/codex-rs/core/src/tools/handlers/multi_agents_v2/message_tool.rs b/codex-rs/core/src/tools/handlers/multi_agents_v2/message_tool.rs
-index 9f0ac3c..37b4dd2 100644
+index 9f0ac3cb1..37b4dd259 100644
 --- a/codex-rs/core/src/tools/handlers/multi_agents_v2/message_tool.rs
 +++ b/codex-rs/core/src/tools/handlers/multi_agents_v2/message_tool.rs
 @@ -8,6 +8,7 @@ use super::*;
@@ -62121,7 +62121,7 @@ index 9f0ac3c..37b4dd2 100644
          MessageDeliveryMode::QueueOnly => AgentCommunicationKind::Message,
          MessageDeliveryMode::TriggerTurn => AgentCommunicationKind::Followup,
 diff --git a/codex-rs/core/src/tools/handlers/multi_agents_v2/send_message.rs b/codex-rs/core/src/tools/handlers/multi_agents_v2/send_message.rs
-index 70fc7d4..83a2663 100644
+index 70fc7d435..83a266350 100644
 --- a/codex-rs/core/src/tools/handlers/multi_agents_v2/send_message.rs
 +++ b/codex-rs/core/src/tools/handlers/multi_agents_v2/send_message.rs
 @@ -3,10 +3,19 @@ use super::message_tool::MessageDeliveryMode;
@@ -62175,7 +62175,7 @@ index 70fc7d4..83a2663 100644
          matches!(payload, ToolPayload::Function { .. })
      }
 diff --git a/codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs b/codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs
-index 3684156..d4e5f23 100644
+index 3684156f9..d4e5f23b7 100644
 --- a/codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs
 +++ b/codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs
 @@ -7,10 +7,10 @@ use crate::agent_communication::AgentCommunicationContext;
@@ -62369,7 +62369,7 @@ index 3684156..d4e5f23 100644
      }
 diff --git a/codex-rs/core/src/tools/handlers/multi_agents_v2/surface.rs b/codex-rs/core/src/tools/handlers/multi_agents_v2/surface.rs
 new file mode 100644
-index 0000000..1524c49
+index 000000000..1524c49ba
 --- /dev/null
 +++ b/codex-rs/core/src/tools/handlers/multi_agents_v2/surface.rs
 @@ -0,0 +1,227 @@
@@ -62601,7 +62601,7 @@ index 0000000..1524c49
 +    }
 +}
 diff --git a/codex-rs/core/src/tools/handlers/view_image.rs b/codex-rs/core/src/tools/handlers/view_image.rs
-index 7f80995..a69ea48 100644
+index 7f8099585..a69ea4895 100644
 --- a/codex-rs/core/src/tools/handlers/view_image.rs
 +++ b/codex-rs/core/src/tools/handlers/view_image.rs
 @@ -194,8 +194,35 @@ impl ViewImageHandler {
@@ -62729,7 +62729,7 @@ index 7f80995..a69ea48 100644
  
          let result = output.code_mode_result(&ToolPayload::Function {
 diff --git a/codex-rs/core/src/tools/parallel.rs b/codex-rs/core/src/tools/parallel.rs
-index 7de5663..6448396 100644
+index 7de566390..6448396f4 100644
 --- a/codex-rs/core/src/tools/parallel.rs
 +++ b/codex-rs/core/src/tools/parallel.rs
 @@ -70,14 +70,17 @@ impl ToolCallRuntime {
@@ -62784,7 +62784,7 @@ index 7de5663..6448396 100644
              .await
              .expect("timed out waiting for lifecycle notification to start")
 diff --git a/codex-rs/core/src/tools/registry.rs b/codex-rs/core/src/tools/registry.rs
-index e73711f..7f4b2d5 100644
+index e73711f8e..7f4b2d5b2 100644
 --- a/codex-rs/core/src/tools/registry.rs
 +++ b/codex-rs/core/src/tools/registry.rs
 @@ -13,6 +13,7 @@ use crate::memory_usage::emit_metric_for_tool_read;
@@ -62808,7 +62808,7 @@ index e73711f..7f4b2d5 100644
      fn is_builtin_control_tool(&self) -> bool {
          false
 diff --git a/codex-rs/core/src/tools/router.rs b/codex-rs/core/src/tools/router.rs
-index 8d5bde3..237d1c0 100644
+index 8d5bde308..237d1c03e 100644
 --- a/codex-rs/core/src/tools/router.rs
 +++ b/codex-rs/core/src/tools/router.rs
 @@ -41,25 +41,6 @@ pub struct ToolCall {
@@ -62852,7 +62852,7 @@ index 8d5bde3..237d1c0 100644
      pub fn build_tool_call(item: ResponseItem) -> Result<Option<ToolCall>, FunctionCallError> {
          match item {
 diff --git a/codex-rs/core/src/tools/router_tests.rs b/codex-rs/core/src/tools/router_tests.rs
-index 1d6b1d3..cb31642 100644
+index 1d6b1d322..cb316427b 100644
 --- a/codex-rs/core/src/tools/router_tests.rs
 +++ b/codex-rs/core/src/tools/router_tests.rs
 @@ -228,7 +228,6 @@ async fn build_tool_call_uses_namespace_for_registry_name() -> anyhow::Result<()
@@ -62864,7 +62864,7 @@ index 1d6b1d3..cb31642 100644
          ToolPayload::Function { arguments } => {
              assert_eq!(arguments, "{}");
 diff --git a/codex-rs/core/src/tools/spec_plan.rs b/codex-rs/core/src/tools/spec_plan.rs
-index 908bb14..c944a25 100644
+index 908bb143a..c944a2500 100644
 --- a/codex-rs/core/src/tools/spec_plan.rs
 +++ b/codex-rs/core/src/tools/spec_plan.rs
 @@ -5,7 +5,6 @@ use crate::image_preparation::unified_image_budget_enabled;
@@ -63080,7 +63080,7 @@ index 908bb14..c944a25 100644
      left: &codex_code_mode::ToolDefinition,
      right: &codex_code_mode::ToolDefinition,
 diff --git a/codex-rs/core/src/tools/spec_plan_tests.rs b/codex-rs/core/src/tools/spec_plan_tests.rs
-index c77936f..a70f2b7 100644
+index c77936fc9..a70f2b77b 100644
 --- a/codex-rs/core/src/tools/spec_plan_tests.rs
 +++ b/codex-rs/core/src/tools/spec_plan_tests.rs
 @@ -2,6 +2,7 @@ use crate::session::tests::update_turn_settings_for_test;
@@ -63200,7 +63200,7 @@ index c77936f..a70f2b7 100644
  async fn multi_agent_v2_can_disable_wait_agent() {
      let plan = probe(|turn| {
 diff --git a/codex-rs/core/tests/responses_headers.rs b/codex-rs/core/tests/responses_headers.rs
-index 9beca45..d3c3d09 100644
+index 9beca451b..d3c3d091a 100644
 --- a/codex-rs/core/tests/responses_headers.rs
 +++ b/codex-rs/core/tests/responses_headers.rs
 @@ -72,6 +72,7 @@ async fn responses_stream_includes_subagent_header_on_review() {
@@ -63228,7 +63228,7 @@ index 9beca45..d3c3d09 100644
          base_url: Some(format!("{}/v1", server.uri())),
          env_key: None,
 diff --git a/codex-rs/core/tests/suite/agent_execution.rs b/codex-rs/core/tests/suite/agent_execution.rs
-index ace2f50..e65800c 100644
+index ace2f50a7..e65800ce9 100644
 --- a/codex-rs/core/tests/suite/agent_execution.rs
 +++ b/codex-rs/core/tests/suite/agent_execution.rs
 @@ -50,25 +50,100 @@ fn has_function_call_output(request: &wiremock::Request, call_id: &str) -> bool
@@ -63377,7 +63377,7 @@ index ace2f50..e65800c 100644
          "followup-call",
 diff --git a/codex-rs/core/tests/suite/claude_code.rs b/codex-rs/core/tests/suite/claude_code.rs
 new file mode 100644
-index 0000000..29461af
+index 000000000..29461af89
 --- /dev/null
 +++ b/codex-rs/core/tests/suite/claude_code.rs
 @@ -0,0 +1,110 @@
@@ -63492,7 +63492,7 @@ index 0000000..29461af
 +    Ok(())
 +}
 diff --git a/codex-rs/core/tests/suite/client.rs b/codex-rs/core/tests/suite/client.rs
-index c209df5..3edce1d 100644
+index c209df576..3edce1d31 100644
 --- a/codex-rs/core/tests/suite/client.rs
 +++ b/codex-rs/core/tests/suite/client.rs
 @@ -1506,6 +1506,7 @@ async fn amazon_bedrock_proxy_uses_command_auth_and_custom_headers() {
@@ -63528,7 +63528,7 @@ index c209df5..3edce1d 100644
          base_url: Some(format!("{}/openai", server.uri())),
          // Reuse the existing environment variable to avoid using unsafe code
 diff --git a/codex-rs/core/tests/suite/client_websockets.rs b/codex-rs/core/tests/suite/client_websockets.rs
-index 3263b9e..4d9da4b 100755
+index 3263b9e4c..4d9da4bd1 100755
 --- a/codex-rs/core/tests/suite/client_websockets.rs
 +++ b/codex-rs/core/tests/suite/client_websockets.rs
 @@ -2490,6 +2490,7 @@ fn websocket_provider_with_connect_timeout(
@@ -63540,7 +63540,7 @@ index 3263b9e..4d9da4b 100755
          base_url: Some(format!("{}/v1", server.uri())),
          env_key: None,
 diff --git a/codex-rs/core/tests/suite/compact.rs b/codex-rs/core/tests/suite/compact.rs
-index 3473e39..65fd74a 100644
+index 3473e3962..65fd74ac6 100644
 --- a/codex-rs/core/tests/suite/compact.rs
 +++ b/codex-rs/core/tests/suite/compact.rs
 @@ -152,6 +152,15 @@ fn auto_summary(summary: &str) -> String {
@@ -63621,7 +63621,7 @@ index 3473e39..65fd74a 100644
  
 diff --git a/codex-rs/core/tests/suite/cross_provider_subagents.rs b/codex-rs/core/tests/suite/cross_provider_subagents.rs
 new file mode 100644
-index 0000000..01b8343
+index 000000000..01b8343e1
 --- /dev/null
 +++ b/codex-rs/core/tests/suite/cross_provider_subagents.rs
 @@ -0,0 +1,1006 @@
@@ -64633,7 +64633,7 @@ index 0000000..01b8343
 +}
 diff --git a/codex-rs/core/tests/suite/managed_close_idle.rs b/codex-rs/core/tests/suite/managed_close_idle.rs
 new file mode 100644
-index 0000000..59dba3b
+index 000000000..59dba3b20
 --- /dev/null
 +++ b/codex-rs/core/tests/suite/managed_close_idle.rs
 @@ -0,0 +1,350 @@
@@ -64988,7 +64988,7 @@ index 0000000..59dba3b
 +    Ok(())
 +}
 diff --git a/codex-rs/core/tests/suite/mod.rs b/codex-rs/core/tests/suite/mod.rs
-index 8d43ca0..24e8c9e 100644
+index 8d43ca03e..24e8c9e2d 100644
 --- a/codex-rs/core/tests/suite/mod.rs
 +++ b/codex-rs/core/tests/suite/mod.rs
 @@ -1,4 +1,5 @@
@@ -65022,7 +65022,7 @@ index 8d43ca0..24e8c9e 100644
  mod prompt_cache_key;
  mod prompt_caching;
 diff --git a/codex-rs/core/tests/suite/multi_agent_resume.rs b/codex-rs/core/tests/suite/multi_agent_resume.rs
-index 5cffeb3..026714e 100644
+index 5cffeb3a7..026714e9b 100644
 --- a/codex-rs/core/tests/suite/multi_agent_resume.rs
 +++ b/codex-rs/core/tests/suite/multi_agent_resume.rs
 @@ -129,10 +129,7 @@ async fn mount_root_collaboration_call(
@@ -65081,7 +65081,7 @@ index 5cffeb3..026714e 100644
      assert_eq!(
 diff --git a/codex-rs/core/tests/suite/plaintext_reasoning.rs b/codex-rs/core/tests/suite/plaintext_reasoning.rs
 new file mode 100644
-index 0000000..3cc6af9
+index 000000000..3cc6af9b8
 --- /dev/null
 +++ b/codex-rs/core/tests/suite/plaintext_reasoning.rs
 @@ -0,0 +1,91 @@
@@ -65177,7 +65177,7 @@ index 0000000..3cc6af9
 +    Ok(())
 +}
 diff --git a/codex-rs/core/tests/suite/resume_warning.rs b/codex-rs/core/tests/suite/resume_warning.rs
-index e5dd6f6..47622be 100644
+index e5dd6f61b..47622beb6 100644
 --- a/codex-rs/core/tests/suite/resume_warning.rs
 +++ b/codex-rs/core/tests/suite/resume_warning.rs
 @@ -29,6 +29,7 @@ fn resume_history(
@@ -65197,7 +65197,7 @@ index e5dd6f6..47622be 100644
  
      InitialHistory::Resumed(ResumedHistory {
 diff --git a/codex-rs/core/tests/suite/spawn_agent_description.rs b/codex-rs/core/tests/suite/spawn_agent_description.rs
-index 317ce27..2648ad1 100644
+index 317ce27af..2648ad185 100644
 --- a/codex-rs/core/tests/suite/spawn_agent_description.rs
 +++ b/codex-rs/core/tests/suite/spawn_agent_description.rs
 @@ -315,6 +315,8 @@ async fn configured_agent_roles_control_spawn_agent_type(
@@ -65210,7 +65210,7 @@ index 317ce27..2648ad1 100644
                      },
                  );
 diff --git a/codex-rs/core/tests/suite/stream_error_allows_next_turn.rs b/codex-rs/core/tests/suite/stream_error_allows_next_turn.rs
-index 32ebbf2..444870e 100644
+index 32ebbf297..444870ecc 100644
 --- a/codex-rs/core/tests/suite/stream_error_allows_next_turn.rs
 +++ b/codex-rs/core/tests/suite/stream_error_allows_next_turn.rs
 @@ -64,6 +64,7 @@ async fn continue_after_stream_error() {
@@ -65222,7 +65222,7 @@ index 32ebbf2..444870e 100644
          base_url: Some(format!("{}/v1", server.uri())),
          env_key: Some("PATH".into()),
 diff --git a/codex-rs/core/tests/suite/stream_no_completed.rs b/codex-rs/core/tests/suite/stream_no_completed.rs
-index d9741d0..4492b4a 100644
+index d9741d038..4492b4a03 100644
 --- a/codex-rs/core/tests/suite/stream_no_completed.rs
 +++ b/codex-rs/core/tests/suite/stream_no_completed.rs
 @@ -46,6 +46,7 @@ async fn retries_on_early_close() {
@@ -65234,7 +65234,7 @@ index d9741d0..4492b4a 100644
          base_url: Some(format!("{}/v1", server.uri())),
          // Environment variable that should exist in the test environment.
 diff --git a/codex-rs/core/tests/suite/subagent_notifications.rs b/codex-rs/core/tests/suite/subagent_notifications.rs
-index 4adf018..4004476 100644
+index 4adf018bc..400447612 100644
 --- a/codex-rs/core/tests/suite/subagent_notifications.rs
 +++ b/codex-rs/core/tests/suite/subagent_notifications.rs
 @@ -1,3 +1,4 @@
@@ -65322,7 +65322,7 @@ index 4adf018..4004476 100644
          );
      });
 diff --git a/codex-rs/core/tests/suite/subagent_service_tier.rs b/codex-rs/core/tests/suite/subagent_service_tier.rs
-index 74d5592..0d6972d 100644
+index 74d559254..0d6972d2c 100644
 --- a/codex-rs/core/tests/suite/subagent_service_tier.rs
 +++ b/codex-rs/core/tests/suite/subagent_service_tier.rs
 @@ -79,6 +79,8 @@ fn configure_priority_role(config: &mut Config) {
@@ -65335,7 +65335,7 @@ index 74d5592..0d6972d 100644
          },
      );
 diff --git a/codex-rs/core/tests/suite/token_usage_rollout.rs b/codex-rs/core/tests/suite/token_usage_rollout.rs
-index db9e6c5..a5da54c 100644
+index db9e6c50e..a5da54cd3 100644
 --- a/codex-rs/core/tests/suite/token_usage_rollout.rs
 +++ b/codex-rs/core/tests/suite/token_usage_rollout.rs
 @@ -112,6 +112,28 @@ async fn observed_response_usage_accumulates_per_turn_and_thread() -> Result<()>
@@ -65368,7 +65368,7 @@ index db9e6c5..a5da54c 100644
      Ok(())
  }
 diff --git a/codex-rs/exec/src/lib.rs b/codex-rs/exec/src/lib.rs
-index 68cde23..5d56f4d 100644
+index 68cde2368..5d56f4d6f 100644
 --- a/codex-rs/exec/src/lib.rs
 +++ b/codex-rs/exec/src/lib.rs
 @@ -1876,7 +1876,8 @@ async fn handle_server_request(
@@ -65382,7 +65382,7 @@ index 68cde23..5d56f4d 100644
                  client,
                  request_id,
 diff --git a/codex-rs/ext/goal/Cargo.toml b/codex-rs/ext/goal/Cargo.toml
-index 22ee179..7fd7858 100644
+index 22ee1794f..7fd78588b 100644
 --- a/codex-rs/ext/goal/Cargo.toml
 +++ b/codex-rs/ext/goal/Cargo.toml
 @@ -31,6 +31,7 @@ tracing = { workspace = true }
@@ -65394,7 +65394,7 @@ index 22ee179..7fd7858 100644
  pretty_assertions = { workspace = true }
  tempfile = { workspace = true }
 diff --git a/codex-rs/ext/goal/src/api.rs b/codex-rs/ext/goal/src/api.rs
-index b414e9c..b063db7 100644
+index b414e9ccf..b063db7c5 100644
 --- a/codex-rs/ext/goal/src/api.rs
 +++ b/codex-rs/ext/goal/src/api.rs
 @@ -13,6 +13,7 @@ use codex_protocol::protocol::ThreadGoalUpdatedEvent;
@@ -65555,7 +65555,7 @@ index b414e9c..b063db7 100644
          self.runtimes.lock().unwrap_or_else(PoisonError::into_inner)
      }
 diff --git a/codex-rs/ext/goal/src/extension.rs b/codex-rs/ext/goal/src/extension.rs
-index 8984899..fb2f73e 100644
+index 89848996f..fb2f73e2d 100644
 --- a/codex-rs/ext/goal/src/extension.rs
 +++ b/codex-rs/ext/goal/src/extension.rs
 @@ -2,6 +2,7 @@ use std::sync::Arc;
@@ -65673,7 +65673,7 @@ index 8984899..fb2f73e 100644
                  self.analytics.clone(),
                  self.event_emitter.clone(),
 diff --git a/codex-rs/ext/goal/src/lib.rs b/codex-rs/ext/goal/src/lib.rs
-index ccd091a..6eeaba3 100644
+index ccd091aff..6eeaba3e6 100644
 --- a/codex-rs/ext/goal/src/lib.rs
 +++ b/codex-rs/ext/goal/src/lib.rs
 @@ -6,6 +6,7 @@ mod api;
@@ -65686,7 +65686,7 @@ index ccd091a..6eeaba3 100644
  mod steering;
 diff --git a/codex-rs/ext/goal/src/persistence.rs b/codex-rs/ext/goal/src/persistence.rs
 new file mode 100644
-index 0000000..414a17c
+index 000000000..414a17cd7
 --- /dev/null
 +++ b/codex-rs/ext/goal/src/persistence.rs
 @@ -0,0 +1,60 @@
@@ -65751,7 +65751,7 @@ index 0000000..414a17c
 +    }
 +}
 diff --git a/codex-rs/ext/goal/src/runtime.rs b/codex-rs/ext/goal/src/runtime.rs
-index 84fa420..432a10a 100644
+index 84fa4204b..432a10a5f 100644
 --- a/codex-rs/ext/goal/src/runtime.rs
 +++ b/codex-rs/ext/goal/src/runtime.rs
 @@ -18,6 +18,7 @@ use crate::analytics::GoalAnalytics;
@@ -65896,7 +65896,7 @@ index 84fa420..432a10a 100644
              .get_thread_goal(self.thread_id())
              .await
 diff --git a/codex-rs/ext/goal/src/tool.rs b/codex-rs/ext/goal/src/tool.rs
-index 582edf3..ca8c782 100644
+index 582edf39e..ca8c78265 100644
 --- a/codex-rs/ext/goal/src/tool.rs
 +++ b/codex-rs/ext/goal/src/tool.rs
 @@ -20,6 +20,7 @@ use crate::analytics::GoalAnalytics;
@@ -66055,7 +66055,7 @@ index 582edf3..ca8c782 100644
              .get_thread_goal(self.thread_id)
              .await
 diff --git a/codex-rs/ext/goal/tests/goal_extension_backend.rs b/codex-rs/ext/goal/tests/goal_extension_backend.rs
-index 2612414..579fddc 100644
+index 261241426..579fddc32 100644
 --- a/codex-rs/ext/goal/tests/goal_extension_backend.rs
 +++ b/codex-rs/ext/goal/tests/goal_extension_backend.rs
 @@ -51,6 +51,9 @@ use pretty_assertions::assert_eq;
@@ -66093,7 +66093,7 @@ index 2612414..579fddc 100644
              contributor
 diff --git a/codex-rs/ext/goal/tests/goal_extension_backend/managed_source_routing.rs b/codex-rs/ext/goal/tests/goal_extension_backend/managed_source_routing.rs
 new file mode 100644
-index 0000000..020e2fc
+index 000000000..020e2fc9d
 --- /dev/null
 +++ b/codex-rs/ext/goal/tests/goal_extension_backend/managed_source_routing.rs
 @@ -0,0 +1,370 @@
@@ -66468,7 +66468,7 @@ index 0000000..020e2fc
 +    Ok(())
 +}
 diff --git a/codex-rs/ext/queue/src/service.rs b/codex-rs/ext/queue/src/service.rs
-index e72f0c7..d708f7d 100644
+index e72f0c7cb..d708f7d3a 100644
 --- a/codex-rs/ext/queue/src/service.rs
 +++ b/codex-rs/ext/queue/src/service.rs
 @@ -6,6 +6,8 @@ use std::sync::Weak;
@@ -66891,7 +66891,7 @@ index e72f0c7..d708f7d 100644
              }
 diff --git a/codex-rs/ext/queue/tests/managed_queue.rs b/codex-rs/ext/queue/tests/managed_queue.rs
 new file mode 100644
-index 0000000..36e179b
+index 000000000..36e179bf3
 --- /dev/null
 +++ b/codex-rs/ext/queue/tests/managed_queue.rs
 @@ -0,0 +1,486 @@
@@ -67382,7 +67382,7 @@ index 0000000..36e179b
 +    Ok(())
 +}
 diff --git a/codex-rs/history/Cargo.toml b/codex-rs/history/Cargo.toml
-index 6188303..bd938d2 100644
+index 618830322..bd938d2c2 100644
 --- a/codex-rs/history/Cargo.toml
 +++ b/codex-rs/history/Cargo.toml
 @@ -16,8 +16,8 @@ workspace = true
@@ -67396,7 +67396,7 @@ index 6188303..bd938d2 100644
  pretty_assertions = { workspace = true }
 -serde_json = { workspace = true }
 diff --git a/codex-rs/history/src/lib.rs b/codex-rs/history/src/lib.rs
-index 069a243..25e10f8 100644
+index 069a243fe..25e10f8de 100644
 --- a/codex-rs/history/src/lib.rs
 +++ b/codex-rs/history/src/lib.rs
 @@ -21,6 +21,7 @@ use codex_protocol::protocol::SessionMetaLine;
@@ -67682,7 +67682,7 @@ index 069a243..25e10f8 100644
  
  impl Serialize for CompactedItem {
 diff --git a/codex-rs/history/src/rollout_payload.rs b/codex-rs/history/src/rollout_payload.rs
-index 7939b49..b1b5ffe 100644
+index 7939b493e..b1b5ffe40 100644
 --- a/codex-rs/history/src/rollout_payload.rs
 +++ b/codex-rs/history/src/rollout_payload.rs
 @@ -2,9 +2,13 @@ use std::borrow::Cow;
@@ -67786,7 +67786,7 @@ index 7939b49..b1b5ffe 100644
      }
  }
 diff --git a/codex-rs/history/src/tests.rs b/codex-rs/history/src/tests.rs
-index 18fca26..cd5a935 100644
+index 18fca26a7..cd5a935ab 100644
 --- a/codex-rs/history/src/tests.rs
 +++ b/codex-rs/history/src/tests.rs
 @@ -71,6 +71,7 @@ fn response_item_envelope_stores_metadata_beside_rollout_payload() -> Result<()>
@@ -68243,7 +68243,7 @@ index 18fca26..cd5a935 100644
 +    Ok(())
 +}
 diff --git a/codex-rs/hooks/src/engine/command_runner.rs b/codex-rs/hooks/src/engine/command_runner.rs
-index b68474f..46801dd 100644
+index b68474f0c..46801dddb 100644
 --- a/codex-rs/hooks/src/engine/command_runner.rs
 +++ b/codex-rs/hooks/src/engine/command_runner.rs
 @@ -9,6 +9,9 @@ use std::process::Stdio;
@@ -68392,7 +68392,7 @@ index b68474f..46801dd 100644
              let _ = codex_utils_pty::process_group::kill_process_group(process_id);
 diff --git a/codex-rs/hooks/src/engine/managed_close.rs b/codex-rs/hooks/src/engine/managed_close.rs
 new file mode 100644
-index 0000000..7586c36
+index 000000000..7586c36ad
 --- /dev/null
 +++ b/codex-rs/hooks/src/engine/managed_close.rs
 @@ -0,0 +1,119 @@
@@ -68517,7 +68517,7 @@ index 0000000..7586c36
 +mod tests;
 diff --git a/codex-rs/hooks/src/engine/managed_close_tests.rs b/codex-rs/hooks/src/engine/managed_close_tests.rs
 new file mode 100644
-index 0000000..77978cc
+index 000000000..77978cceb
 --- /dev/null
 +++ b/codex-rs/hooks/src/engine/managed_close_tests.rs
 @@ -0,0 +1,115 @@
@@ -68637,7 +68637,7 @@ index 0000000..77978cc
 +    runtime.shutdown().await;
 +}
 diff --git a/codex-rs/hooks/src/legacy_notify.rs b/codex-rs/hooks/src/legacy_notify.rs
-index 5be7d7b..962ba0d 100644
+index 5be7d7b32..962ba0d53 100644
 --- a/codex-rs/hooks/src/legacy_notify.rs
 +++ b/codex-rs/hooks/src/legacy_notify.rs
 @@ -8,6 +8,7 @@ use crate::Hook;
@@ -68683,7 +68683,7 @@ index 5be7d7b..962ba0d 100644
                  }
              })
 diff --git a/codex-rs/hooks/src/lib.rs b/codex-rs/hooks/src/lib.rs
-index 6abc173..9f10867 100644
+index 6abc17353..9f108677b 100644
 --- a/codex-rs/hooks/src/lib.rs
 +++ b/codex-rs/hooks/src/lib.rs
 @@ -16,6 +16,7 @@ pub use declarations::PluginHookDeclaration;
@@ -68695,7 +68695,7 @@ index 6abc173..9f10867 100644
  pub use engine::dispatcher::hook_handler_type_label;
  pub use events::common::SubagentHookContext;
 diff --git a/codex-rs/hooks/src/registry.rs b/codex-rs/hooks/src/registry.rs
-index b322da5..a2e25f1 100644
+index b322da55d..a2e25f1c5 100644
 --- a/codex-rs/hooks/src/registry.rs
 +++ b/codex-rs/hooks/src/registry.rs
 @@ -2,12 +2,14 @@ use crate::engine::ClaudeHooksEngine;
@@ -68957,7 +68957,7 @@ index b322da5..a2e25f1 100644
 +mod managed_close_tests;
 diff --git a/codex-rs/hooks/src/registry_managed_close_tests.rs b/codex-rs/hooks/src/registry_managed_close_tests.rs
 new file mode 100644
-index 0000000..43d7cba
+index 000000000..43d7cba1b
 --- /dev/null
 +++ b/codex-rs/hooks/src/registry_managed_close_tests.rs
 @@ -0,0 +1,319 @@
@@ -69281,7 +69281,7 @@ index 0000000..43d7cba
 +    assert!(refreshed.try_seal_for_managed_close().is_none());
 +}
 diff --git a/codex-rs/http-client/Cargo.toml b/codex-rs/http-client/Cargo.toml
-index 2d54ca7..7543914 100644
+index 2d54ca715..754391492 100644
 --- a/codex-rs/http-client/Cargo.toml
 +++ b/codex-rs/http-client/Cargo.toml
 @@ -6,6 +6,7 @@ version.workspace = true
@@ -69293,7 +69293,7 @@ index 2d54ca7..7543914 100644
  futures = { workspace = true }
  http = { workspace = true }
 diff --git a/codex-rs/http-client/src/request.rs b/codex-rs/http-client/src/request.rs
-index 7608860..0b79d07 100644
+index 7608860c3..0b79d07de 100644
 --- a/codex-rs/http-client/src/request.rs
 +++ b/codex-rs/http-client/src/request.rs
 @@ -43,6 +43,7 @@ pub enum RequestCompression {
@@ -69374,7 +69374,7 @@ index 7608860..0b79d07 100644
              headers.insert(
                  http::header::CONTENT_TYPE,
 diff --git a/codex-rs/http-client/src/transport.rs b/codex-rs/http-client/src/transport.rs
-index 337b1e8..47149d7 100644
+index 337b1e867..47149d7fb 100644
 --- a/codex-rs/http-client/src/transport.rs
 +++ b/codex-rs/http-client/src/transport.rs
 @@ -58,6 +58,7 @@ impl ReqwestTransport {
@@ -69386,7 +69386,7 @@ index 337b1e8..47149d7 100644
          } = req;
  
 diff --git a/codex-rs/login/src/auth_env_telemetry.rs b/codex-rs/login/src/auth_env_telemetry.rs
-index 86cbbfd..bfe744f 100644
+index 86cbbfd8f..bfe744f4b 100644
 --- a/codex-rs/login/src/auth_env_telemetry.rs
 +++ b/codex-rs/login/src/auth_env_telemetry.rs
 @@ -59,6 +59,7 @@ mod tests {
@@ -69398,7 +69398,7 @@ index 86cbbfd..bfe744f 100644
              base_url: None,
              env_key: Some("sk-should-not-leak".to_string()),
 diff --git a/codex-rs/model-provider-info/src/lib.rs b/codex-rs/model-provider-info/src/lib.rs
-index 3fb3e87..8dfa5c8 100644
+index 3fb3e87a2..8dfa5c852 100644
 --- a/codex-rs/model-provider-info/src/lib.rs
 +++ b/codex-rs/model-provider-info/src/lib.rs
 @@ -95,6 +95,9 @@ impl<'de> Deserialize<'de> for WireApi {
@@ -69523,7 +69523,7 @@ index 3fb3e87..8dfa5c8 100644
          base_url: Some(base_url.into()),
          env_key: None,
 diff --git a/codex-rs/model-provider-info/src/model_provider_info_tests.rs b/codex-rs/model-provider-info/src/model_provider_info_tests.rs
-index d08af0f..0fd87f8 100644
+index d08af0ffb..0fd87f839 100644
 --- a/codex-rs/model-provider-info/src/model_provider_info_tests.rs
 +++ b/codex-rs/model-provider-info/src/model_provider_info_tests.rs
 @@ -5,6 +5,73 @@ use pretty_assertions::assert_eq;
@@ -69649,7 +69649,7 @@ index d08af0f..0fd87f8 100644
              aws: Some(ModelProviderAwsAuthInfo {
                  profile: Some("codex-bedrock".to_string()),
 diff --git a/codex-rs/model-provider/src/auth.rs b/codex-rs/model-provider/src/auth.rs
-index f4d2764..be38b76 100644
+index f4d276465..be38b766d 100644
 --- a/codex-rs/model-provider/src/auth.rs
 +++ b/codex-rs/model-provider/src/auth.rs
 @@ -181,16 +181,25 @@ pub fn unauthenticated_auth_provider() -> SharedAuthProvider {
@@ -69683,7 +69683,7 @@ index f4d2764..be38b76 100644
  }
  
 diff --git a/codex-rs/model-provider/src/provider.rs b/codex-rs/model-provider/src/provider.rs
-index 027850b..3c8aca1 100644
+index 027850b78..3c8aca109 100644
 --- a/codex-rs/model-provider/src/provider.rs
 +++ b/codex-rs/model-provider/src/provider.rs
 @@ -28,6 +28,7 @@ use crate::amazon_bedrock::AmazonBedrockModelProvider;
@@ -69819,8 +69819,90 @@ index 027850b..3c8aca1 100644
 +        assert!(!requests[0].headers.contains_key("chatgpt-account-id"));
      }
  }
+diff --git a/codex-rs/models-manager/src/catalog_version_tests.rs b/codex-rs/models-manager/src/catalog_version_tests.rs
+new file mode 100644
+index 000000000..07d8e3c29
+--- /dev/null
++++ b/codex-rs/models-manager/src/catalog_version_tests.rs
+@@ -0,0 +1,17 @@
++use super::catalog_client_version;
++use pretty_assertions::assert_eq;
++
++#[test]
++fn catalog_version_never_drops_below_the_checked_official_catalog() {
++    assert_eq!(catalog_client_version((0, 153, 4), None), "0.160.0");
++    assert_eq!(catalog_client_version((0, 161, 2), None), "0.161.2");
++}
++
++#[test]
++fn manager_override_only_raises_a_valid_whole_version() {
++    assert_eq!(catalog_client_version((0, 153, 4), Some("0.163.1")), "0.163.1");
++    assert_eq!(catalog_client_version((0, 153, 4), Some("0.150.0")), "0.160.0");
++    for invalid in ["", "0.170", "0.170.0.1", "0.170.x", "latest"] {
++        assert_eq!(catalog_client_version((0, 153, 4), Some(invalid)), "0.160.0");
++    }
++}
+diff --git a/codex-rs/models-manager/src/lib.rs b/codex-rs/models-manager/src/lib.rs
+index cd7b59a05..6d79d5701 100644
+--- a/codex-rs/models-manager/src/lib.rs
++++ b/codex-rs/models-manager/src/lib.rs
+@@ -15,12 +15,49 @@ pub fn bundled_models_response()
+     serde_json::from_str(include_str!("../models.json"))
+ }
+ 
++/// Model catalog version of the official desktop's bundled CLI that this
++/// managed build was checked against. The service offers a model only to
++/// clients at or above its minimum version; the bundled 0.160.0 catalog parses
++/// with this build and lists its models from 0.153.0 up, so the managed runtime
++/// asks for the same catalog the official app shows to the account.
++const MODELS_CATALOG_CLIENT_VERSION: (u64, u64, u64) = (0, 160, 0);
++
++/// A manager may raise the catalog version further without a rebuild.
++const MODELS_CATALOG_CLIENT_VERSION_ENV: &str = "CODEX_MANAGER_MODELS_CLIENT_VERSION";
++
+ /// Convert the client version string to a whole version string (e.g. "1.2.3-alpha.4" -> "1.2.3").
++///
++/// Used only for the model catalog request and its cache key.
+ pub fn client_version_to_whole() -> String {
+-    format!(
+-        "{}.{}.{}",
+-        env!("CARGO_PKG_VERSION_MAJOR"),
+-        env!("CARGO_PKG_VERSION_MINOR"),
+-        env!("CARGO_PKG_VERSION_PATCH")
++    let own = (
++        env!("CARGO_PKG_VERSION_MAJOR").parse().unwrap_or(0),
++        env!("CARGO_PKG_VERSION_MINOR").parse().unwrap_or(0),
++        env!("CARGO_PKG_VERSION_PATCH").parse().unwrap_or(0),
++    );
++    catalog_client_version(
++        own,
++        std::env::var(MODELS_CATALOG_CLIENT_VERSION_ENV).ok().as_deref(),
+     )
+ }
++
++fn catalog_client_version(own: (u64, u64, u64), requested: Option<&str>) -> String {
++    let requested = requested.and_then(|value| {
++        let mut parts = value.trim().split('.').map(str::parse::<u64>);
++        match (parts.next(), parts.next(), parts.next(), parts.next()) {
++            (Some(Ok(major)), Some(Ok(minor)), Some(Ok(patch)), None) => {
++                Some((major, minor, patch))
++            }
++            _ => None,
++        }
++    });
++    let (major, minor, patch) = [Some(own), Some(MODELS_CATALOG_CLIENT_VERSION), requested]
++        .into_iter()
++        .flatten()
++        .max()
++        .unwrap_or(own);
++    format!("{major}.{minor}.{patch}")
++}
++
++#[cfg(test)]
++#[path = "catalog_version_tests.rs"]
++mod catalog_version_tests;
 diff --git a/codex-rs/protocol/src/protocol.rs b/codex-rs/protocol/src/protocol.rs
-index ae2107b..6d40ca2 100644
+index ae2107b80..6d40ca288 100644
 --- a/codex-rs/protocol/src/protocol.rs
 +++ b/codex-rs/protocol/src/protocol.rs
 @@ -519,6 +519,8 @@ pub enum TurnSettingsUpdateOutcome {
@@ -69962,7 +70044,7 @@ index ae2107b..6d40ca2 100644
  
          let value = serde_json::to_value(item)?;
 diff --git a/codex-rs/rollout/src/compression.rs b/codex-rs/rollout/src/compression.rs
-index 2e9ed39..c3f5d65 100644
+index 2e9ed3912..c3f5d6542 100644
 --- a/codex-rs/rollout/src/compression.rs
 +++ b/codex-rs/rollout/src/compression.rs
 @@ -55,6 +55,24 @@ pub async fn open_rollout_line_reader(path: &Path) -> io::Result<RolloutLineRead
@@ -70070,7 +70152,7 @@ index 2e9ed39..c3f5d65 100644
      }
  }
 diff --git a/codex-rs/rollout/src/compression_tests.rs b/codex-rs/rollout/src/compression_tests.rs
-index d2ac745..52de52d 100644
+index d2ac7450a..52de52df4 100644
 --- a/codex-rs/rollout/src/compression_tests.rs
 +++ b/codex-rs/rollout/src/compression_tests.rs
 @@ -178,6 +178,58 @@ async fn read_session_meta_line_preserves_pre_header_and_error_semantics() -> an
@@ -70133,7 +70215,7 @@ index d2ac745..52de52d 100644
  fn rollout_file_from_path_normalizes_compressed_file_names() -> anyhow::Result<()> {
      let home = TempDir::new()?;
 diff --git a/codex-rs/rollout/src/lib.rs b/codex-rs/rollout/src/lib.rs
-index 20f966a..7e787ea 100644
+index 20f966ae9..7e787eaaa 100644
 --- a/codex-rs/rollout/src/lib.rs
 +++ b/codex-rs/rollout/src/lib.rs
 @@ -12,6 +12,7 @@ pub(crate) mod list;
@@ -70173,7 +70255,7 @@ index 20f966a..7e787ea 100644
  pub use persistence_metrics::RolloutPersistenceTelemetry;
  pub use persistence_metrics::measure_and_filter_rollout_items;
 diff --git a/codex-rs/rollout/src/list.rs b/codex-rs/rollout/src/list.rs
-index d54aa44..759e765 100644
+index d54aa44a8..759e76575 100644
 --- a/codex-rs/rollout/src/list.rs
 +++ b/codex-rs/rollout/src/list.rs
 @@ -1293,32 +1293,21 @@ fn event_msg_preview(event: &EventMsg) -> Option<String> {
@@ -70265,7 +70347,7 @@ index d54aa44..759e765 100644
      Ok(compression::file_modified_time(path)
          .await?
 diff --git a/codex-rs/rollout/src/metadata_tests.rs b/codex-rs/rollout/src/metadata_tests.rs
-index 867d756..dfb975a 100644
+index 867d7565b..dfb975a10 100644
 --- a/codex-rs/rollout/src/metadata_tests.rs
 +++ b/codex-rs/rollout/src/metadata_tests.rs
 @@ -299,6 +299,8 @@ fn builder_from_items_falls_back_to_filename() {
@@ -70278,7 +70360,7 @@ index 867d756..dfb975a 100644
  
      let builder = builder_from_items(items.as_slice(), path.as_path()).expect("builder");
 diff --git a/codex-rs/rollout/src/model_context.rs b/codex-rs/rollout/src/model_context.rs
-index f5328ca..ee7d454 100644
+index f5328ca60..ee7d454be 100644
 --- a/codex-rs/rollout/src/model_context.rs
 +++ b/codex-rs/rollout/src/model_context.rs
 @@ -199,7 +199,7 @@ fn turn_ids_are_compatible(active_turn_id: Option<&str>, item_turn_id: Option<&s
@@ -70292,7 +70374,7 @@ index f5328ca..ee7d454 100644
          ResponseItem::Message { role, content, .. } => {
 diff --git a/codex-rs/rollout/src/model_transcript.rs b/codex-rs/rollout/src/model_transcript.rs
 new file mode 100644
-index 0000000..e88a528
+index 000000000..e88a5286f
 --- /dev/null
 +++ b/codex-rs/rollout/src/model_transcript.rs
 @@ -0,0 +1,715 @@
@@ -71013,7 +71095,7 @@ index 0000000..e88a528
 +mod attribution_tests;
 diff --git a/codex-rs/rollout/src/model_transcript_attribution_tests.rs b/codex-rs/rollout/src/model_transcript_attribution_tests.rs
 new file mode 100644
-index 0000000..8077cd5
+index 000000000..8077cd5db
 --- /dev/null
 +++ b/codex-rs/rollout/src/model_transcript_attribution_tests.rs
 @@ -0,0 +1,171 @@
@@ -71189,7 +71271,7 @@ index 0000000..8077cd5
 +    );
 +}
 diff --git a/codex-rs/rollout/src/ordinal.rs b/codex-rs/rollout/src/ordinal.rs
-index 3f002ae..82298e0 100644
+index 3f002aec8..82298e062 100644
 --- a/codex-rs/rollout/src/ordinal.rs
 +++ b/codex-rs/rollout/src/ordinal.rs
 @@ -2,17 +2,18 @@ use std::fs::File;
@@ -71334,7 +71416,7 @@ index 3f002ae..82298e0 100644
 +mod tests;
 diff --git a/codex-rs/rollout/src/ordinal_tests.rs b/codex-rs/rollout/src/ordinal_tests.rs
 new file mode 100644
-index 0000000..43222f7
+index 000000000..43222f7d1
 --- /dev/null
 +++ b/codex-rs/rollout/src/ordinal_tests.rs
 @@ -0,0 +1,165 @@
@@ -71504,7 +71586,7 @@ index 0000000..43222f7
 +    assert_eq!(ordinals, vec![Some(0), Some(1), Some(2), Some(3)]);
 +}
 diff --git a/codex-rs/rollout/src/recorder.rs b/codex-rs/rollout/src/recorder.rs
-index aa08d4a..81c4f84 100644
+index aa08d4a73..81c4f84a9 100644
 --- a/codex-rs/rollout/src/recorder.rs
 +++ b/codex-rs/rollout/src/recorder.rs
 @@ -74,6 +74,9 @@ use codex_protocol::protocol::ThreadSource;
@@ -71683,7 +71765,7 @@ index aa08d4a..81c4f84 100644
              ordinal,
 diff --git a/codex-rs/rollout/src/recorder_shared_append.rs b/codex-rs/rollout/src/recorder_shared_append.rs
 new file mode 100644
-index 0000000..fc2ca56
+index 000000000..fc2ca565e
 --- /dev/null
 +++ b/codex-rs/rollout/src/recorder_shared_append.rs
 @@ -0,0 +1,70 @@
@@ -71759,7 +71841,7 @@ index 0000000..fc2ca56
 +mod tests;
 diff --git a/codex-rs/rollout/src/recorder_shared_append_tests.rs b/codex-rs/rollout/src/recorder_shared_append_tests.rs
 new file mode 100644
-index 0000000..7c3cd06
+index 000000000..7c3cd06e0
 --- /dev/null
 +++ b/codex-rs/rollout/src/recorder_shared_append_tests.rs
 @@ -0,0 +1,163 @@
@@ -71927,7 +72009,7 @@ index 0000000..7c3cd06
 +    );
 +}
 diff --git a/codex-rs/rollout/src/recorder_tests.rs b/codex-rs/rollout/src/recorder_tests.rs
-index e1714f8..6068228 100644
+index e1714f814..60682285f 100644
 --- a/codex-rs/rollout/src/recorder_tests.rs
 +++ b/codex-rs/rollout/src/recorder_tests.rs
 @@ -945,6 +945,7 @@ async fn writer_state_retries_write_error_before_reporting_flush_success() -> st
@@ -71956,7 +72038,7 @@ index e1714f8..6068228 100644
      writeln!(file, "{}", serde_json::to_string(&turn_context)?)?;
 diff --git a/codex-rs/rollout/src/recorder_writer_lifetime.rs b/codex-rs/rollout/src/recorder_writer_lifetime.rs
 new file mode 100644
-index 0000000..2e76cb8
+index 000000000..2e76cb811
 --- /dev/null
 +++ b/codex-rs/rollout/src/recorder_writer_lifetime.rs
 @@ -0,0 +1,111 @@
@@ -72073,7 +72155,7 @@ index 0000000..2e76cb8
 +mod tests;
 diff --git a/codex-rs/rollout/src/recorder_writer_lifetime_tests.rs b/codex-rs/rollout/src/recorder_writer_lifetime_tests.rs
 new file mode 100644
-index 0000000..f5f9cd4
+index 000000000..f5f9cd43f
 --- /dev/null
 +++ b/codex-rs/rollout/src/recorder_writer_lifetime_tests.rs
 @@ -0,0 +1,63 @@
@@ -72141,7 +72223,7 @@ index 0000000..f5f9cd4
 +    assert_eq!(released.load(Ordering::SeqCst), 0);
 +}
 diff --git a/codex-rs/rollout/src/reverse_jsonl_scanner.rs b/codex-rs/rollout/src/reverse_jsonl_scanner.rs
-index 70919a7..20f2648 100644
+index 70919a7e6..20f26487a 100644
 --- a/codex-rs/rollout/src/reverse_jsonl_scanner.rs
 +++ b/codex-rs/rollout/src/reverse_jsonl_scanner.rs
 @@ -73,6 +73,20 @@ where
@@ -72205,7 +72287,7 @@ index 70919a7..20f2648 100644
          self.record_reversed.clear();
          outcome
 diff --git a/codex-rs/rollout/src/rollout_reference_index.rs b/codex-rs/rollout/src/rollout_reference_index.rs
-index 204e05f..c9d761d 100644
+index 204e05f18..c9d761d9c 100644
 --- a/codex-rs/rollout/src/rollout_reference_index.rs
 +++ b/codex-rs/rollout/src/rollout_reference_index.rs
 @@ -5,14 +5,30 @@ use std::collections::hash_map::Entry;
@@ -72506,7 +72588,7 @@ index 204e05f..c9d761d 100644
  #[path = "rollout_reference_index_tests.rs"]
  mod tests;
 diff --git a/codex-rs/rollout/src/rollout_reference_index_tests.rs b/codex-rs/rollout/src/rollout_reference_index_tests.rs
-index 091399f..fea3409 100644
+index 091399fa0..fea340944 100644
 --- a/codex-rs/rollout/src/rollout_reference_index_tests.rs
 +++ b/codex-rs/rollout/src/rollout_reference_index_tests.rs
 @@ -169,6 +169,161 @@ async fn self_history_base_does_not_count_as_reference() -> anyhow::Result<()> {
@@ -72672,7 +72754,7 @@ index 091399f..fea3409 100644
      home.join("sessions/2025/01/03")
          .join(format!("rollout-2025-01-03T12-00-00-{uuid}.jsonl"))
 diff --git a/codex-rs/state/src/audit.rs b/codex-rs/state/src/audit.rs
-index 57ef9f0..a2fdfe6 100644
+index 57ef9f067..a2fdfe6f2 100644
 --- a/codex-rs/state/src/audit.rs
 +++ b/codex-rs/state/src/audit.rs
 @@ -1,11 +1,227 @@
@@ -72905,7 +72987,7 @@ index 57ef9f0..a2fdfe6 100644
  pub struct ThreadStateAuditRow {
 diff --git a/codex-rs/state/src/audit_schema.rs b/codex-rs/state/src/audit_schema.rs
 new file mode 100644
-index 0000000..852e78e
+index 000000000..852e78eb5
 --- /dev/null
 +++ b/codex-rs/state/src/audit_schema.rs
 @@ -0,0 +1,55 @@
@@ -72966,7 +73048,7 @@ index 0000000..852e78e
 +}
 diff --git a/codex-rs/state/src/audit_tests.rs b/codex-rs/state/src/audit_tests.rs
 new file mode 100644
-index 0000000..211c332
+index 000000000..211c33247
 --- /dev/null
 +++ b/codex-rs/state/src/audit_tests.rs
 @@ -0,0 +1,149 @@
@@ -73120,7 +73202,7 @@ index 0000000..211c332
 +    Ok(())
 +}
 diff --git a/codex-rs/state/src/extract.rs b/codex-rs/state/src/extract.rs
-index 9437004..2d39cba 100644
+index 94370044b..2d39cbacf 100644
 --- a/codex-rs/state/src/extract.rs
 +++ b/codex-rs/state/src/extract.rs
 @@ -425,6 +425,7 @@ mod tests {
@@ -73198,7 +73280,7 @@ index 9437004..2d39cba 100644
                      model_provider_id: "updated-provider".to_string(),
                      service_tier: None,
 diff --git a/codex-rs/state/src/lib.rs b/codex-rs/state/src/lib.rs
-index c9a82df..2e5b362 100644
+index c9a82df96..2e5b362f4 100644
 --- a/codex-rs/state/src/lib.rs
 +++ b/codex-rs/state/src/lib.rs
 @@ -10,6 +10,7 @@ const _: () = assert!(
@@ -73226,7 +73308,7 @@ index c9a82df..2e5b362 100644
  pub use telemetry::DbTelemetryHandle;
  pub use telemetry::install_process_db_telemetry;
 diff --git a/codex-rs/state/src/runtime.rs b/codex-rs/state/src/runtime.rs
-index e7fa3cf..ea651c5 100644
+index e7fa3cffe..ea651c567 100644
 --- a/codex-rs/state/src/runtime.rs
 +++ b/codex-rs/state/src/runtime.rs
 @@ -53,7 +53,7 @@ mod rollout_migration;
@@ -73239,7 +73321,7 @@ index e7fa3cf..ea651c5 100644
  pub use external_agent_config_imports::ExternalAgentConfigImportDetailsRecord;
  pub use external_agent_config_imports::ExternalAgentConfigImportFailureRecord;
 diff --git a/codex-rs/state/src/runtime/threads.rs b/codex-rs/state/src/runtime/threads.rs
-index a18c051..02412d3 100644
+index a18c051d8..02412d362 100644
 --- a/codex-rs/state/src/runtime/threads.rs
 +++ b/codex-rs/state/src/runtime/threads.rs
 @@ -1183,16 +1183,26 @@ fn one_thread_id_from_rows(
@@ -73281,7 +73363,7 @@ index a18c051..02412d3 100644
          r#"
  SELECT
 diff --git a/codex-rs/state/src/sqlite.rs b/codex-rs/state/src/sqlite.rs
-index 536d56b..b62ef36 100644
+index 536d56bef..b62ef368d 100644
 --- a/codex-rs/state/src/sqlite.rs
 +++ b/codex-rs/state/src/sqlite.rs
 @@ -5,6 +5,10 @@
@@ -73297,7 +73379,7 @@ index 536d56b..b62ef36 100644
  use crate::runtime::RuntimeDbInitError;
 diff --git a/codex-rs/state/src/temporary_history.rs b/codex-rs/state/src/temporary_history.rs
 new file mode 100644
-index 0000000..4af37ba
+index 000000000..4af37baee
 --- /dev/null
 +++ b/codex-rs/state/src/temporary_history.rs
 @@ -0,0 +1,38 @@
@@ -73341,7 +73423,7 @@ index 0000000..4af37ba
 +mod tests;
 diff --git a/codex-rs/state/src/temporary_history_tests.rs b/codex-rs/state/src/temporary_history_tests.rs
 new file mode 100644
-index 0000000..99a1b19
+index 000000000..99a1b19c4
 --- /dev/null
 +++ b/codex-rs/state/src/temporary_history_tests.rs
 @@ -0,0 +1,26 @@
@@ -73372,7 +73454,7 @@ index 0000000..99a1b19
 +    two.close().await;
 +}
 diff --git a/codex-rs/thread-manager-sample/src/main.rs b/codex-rs/thread-manager-sample/src/main.rs
-index 2781624..6da7ab2 100644
+index 2781624fb..6da7ab200 100644
 --- a/codex-rs/thread-manager-sample/src/main.rs
 +++ b/codex-rs/thread-manager-sample/src/main.rs
 @@ -260,6 +260,7 @@ fn new_config(model: Option<String>, arg0_paths: Arg0DispatchPaths) -> anyhow::R
@@ -73384,7 +73466,7 @@ index 2781624..6da7ab2 100644
          sqlite: SqliteConfig::from_sqlite_home(codex_home.clone()),
          log_dir: codex_home.join("log").to_path_buf(),
 diff --git a/codex-rs/thread-store/src/lib.rs b/codex-rs/thread-store/src/lib.rs
-index a8b6a36..43c917f 100644
+index a8b6a3665..43c917f57 100644
 --- a/codex-rs/thread-store/src/lib.rs
 +++ b/codex-rs/thread-store/src/lib.rs
 @@ -8,6 +8,8 @@ mod error;
@@ -73428,7 +73510,7 @@ index a8b6a36..43c917f 100644
  pub use types::StoredThreadHistory;
  pub use types::StoredThreadItem;
 diff --git a/codex-rs/thread-store/src/live_thread.rs b/codex-rs/thread-store/src/live_thread.rs
-index 2f04380..42aeccd 100644
+index 2f043800f..42aeccdca 100644
 --- a/codex-rs/thread-store/src/live_thread.rs
 +++ b/codex-rs/thread-store/src/live_thread.rs
 @@ -152,16 +152,19 @@ impl LiveThread {
@@ -73497,7 +73579,7 @@ index 2f04380..42aeccd 100644
  
      async fn flush_pending_metadata_update(&self) -> ThreadStoreResult<()> {
 diff --git a/codex-rs/thread-store/src/local/delete_thread.rs b/codex-rs/thread-store/src/local/delete_thread.rs
-index 810153b..39e5083 100644
+index 810153b80..39e5083b3 100644
 --- a/codex-rs/thread-store/src/local/delete_thread.rs
 +++ b/codex-rs/thread-store/src/local/delete_thread.rs
 @@ -68,7 +68,7 @@ pub(super) async fn delete_thread(
@@ -73623,7 +73705,7 @@ index 810153b..39e5083 100644
      async fn delete_thread_ignores_unreadable_reference_metadata() {
          let home = TempDir::new().expect("temp dir");
 diff --git a/codex-rs/thread-store/src/local/helpers.rs b/codex-rs/thread-store/src/local/helpers.rs
-index 000c01d..6d9ccdf 100644
+index 000c01d1a..6d9ccdfd8 100644
 --- a/codex-rs/thread-store/src/local/helpers.rs
 +++ b/codex-rs/thread-store/src/local/helpers.rs
 @@ -73,7 +73,7 @@ pub(super) async fn owned_rollout_paths(
@@ -73636,7 +73718,7 @@ index 000c01d..6d9ccdf 100644
          .map_err(|err| ThreadStoreError::Internal {
              message: format!("failed to scan thread rollout files: {err}"),
 diff --git a/codex-rs/thread-store/src/local/live_writer.rs b/codex-rs/thread-store/src/local/live_writer.rs
-index 3c48136..417d529 100644
+index 3c4813627..417d52945 100644
 --- a/codex-rs/thread-store/src/local/live_writer.rs
 +++ b/codex-rs/thread-store/src/local/live_writer.rs
 @@ -1,4 +1,5 @@
@@ -73722,7 +73804,7 @@ index 3c48136..417d529 100644
      }
 diff --git a/codex-rs/thread-store/src/local/managed_scope.rs b/codex-rs/thread-store/src/local/managed_scope.rs
 new file mode 100644
-index 0000000..1aab179
+index 000000000..1aab179dc
 --- /dev/null
 +++ b/codex-rs/thread-store/src/local/managed_scope.rs
 @@ -0,0 +1,344 @@
@@ -74072,7 +74154,7 @@ index 0000000..1aab179
 +mod tests;
 diff --git a/codex-rs/thread-store/src/local/managed_scope_tests.rs b/codex-rs/thread-store/src/local/managed_scope_tests.rs
 new file mode 100644
-index 0000000..67e4096
+index 000000000..67e409613
 --- /dev/null
 +++ b/codex-rs/thread-store/src/local/managed_scope_tests.rs
 @@ -0,0 +1,429 @@
@@ -74507,7 +74589,7 @@ index 0000000..67e4096
 +}
 diff --git a/codex-rs/thread-store/src/local/managed_writer_reservation.rs b/codex-rs/thread-store/src/local/managed_writer_reservation.rs
 new file mode 100644
-index 0000000..8e04ce5
+index 000000000..8e04ce5a1
 --- /dev/null
 +++ b/codex-rs/thread-store/src/local/managed_writer_reservation.rs
 @@ -0,0 +1,235 @@
@@ -74748,7 +74830,7 @@ index 0000000..8e04ce5
 +mod tests;
 diff --git a/codex-rs/thread-store/src/local/managed_writer_reservation_tests.rs b/codex-rs/thread-store/src/local/managed_writer_reservation_tests.rs
 new file mode 100644
-index 0000000..a1d5c8d
+index 000000000..a1d5c8d6e
 --- /dev/null
 +++ b/codex-rs/thread-store/src/local/managed_writer_reservation_tests.rs
 @@ -0,0 +1,313 @@
@@ -75066,7 +75148,7 @@ index 0000000..a1d5c8d
 +    );
 +}
 diff --git a/codex-rs/thread-store/src/local/mod.rs b/codex-rs/thread-store/src/local/mod.rs
-index 34576f7..a3c5bed 100644
+index 34576f7fe..a3c5bed99 100644
 --- a/codex-rs/thread-store/src/local/mod.rs
 +++ b/codex-rs/thread-store/src/local/mod.rs
 @@ -4,11 +4,17 @@ mod delete_thread;
@@ -75518,7 +75600,7 @@ index 34576f7..a3c5bed 100644
          };
  
 diff --git a/codex-rs/thread-store/src/local/model_context.rs b/codex-rs/thread-store/src/local/model_context.rs
-index d27718e..539c448 100644
+index d27718e12..539c44817 100644
 --- a/codex-rs/thread-store/src/local/model_context.rs
 +++ b/codex-rs/thread-store/src/local/model_context.rs
 @@ -107,7 +107,7 @@ pub(super) async fn load_for_fork(
@@ -75531,7 +75613,7 @@ index d27718e..539c448 100644
      session_meta: SessionMetaLine,
  ) -> ThreadStoreResult<Vec<RolloutItem>> {
 diff --git a/codex-rs/thread-store/src/local/model_context_tests.rs b/codex-rs/thread-store/src/local/model_context_tests.rs
-index 2891baa..ca792e7 100644
+index 2891baacf..ca792e7ad 100644
 --- a/codex-rs/thread-store/src/local/model_context_tests.rs
 +++ b/codex-rs/thread-store/src/local/model_context_tests.rs
 @@ -728,6 +728,7 @@ fn agent_message(message: &str) -> RolloutItem {
@@ -75560,7 +75642,7 @@ index 2891baa..ca792e7 100644
  }
 diff --git a/codex-rs/thread-store/src/local/model_transcript.rs b/codex-rs/thread-store/src/local/model_transcript.rs
 new file mode 100644
-index 0000000..6799241
+index 000000000..679924142
 --- /dev/null
 +++ b/codex-rs/thread-store/src/local/model_transcript.rs
 @@ -0,0 +1,85 @@
@@ -75651,7 +75733,7 @@ index 0000000..6799241
 +}
 diff --git a/codex-rs/thread-store/src/local/model_transcript_tests.rs b/codex-rs/thread-store/src/local/model_transcript_tests.rs
 new file mode 100644
-index 0000000..2fe1f9b
+index 000000000..2fe1f9b53
 --- /dev/null
 +++ b/codex-rs/thread-store/src/local/model_transcript_tests.rs
 @@ -0,0 +1,976 @@
@@ -76632,7 +76714,7 @@ index 0000000..2fe1f9b
 +        .collect()
 +}
 diff --git a/codex-rs/thread-store/src/local/paginated_fork.rs b/codex-rs/thread-store/src/local/paginated_fork.rs
-index 0b14091..c4d4059 100644
+index 0b1409126..c4d4059aa 100644
 --- a/codex-rs/thread-store/src/local/paginated_fork.rs
 +++ b/codex-rs/thread-store/src/local/paginated_fork.rs
 @@ -44,7 +44,7 @@ pub(super) async fn prepare(
@@ -76645,7 +76727,7 @@ index 0b14091..c4d4059 100644
              operation: "prepare_fork",
          });
 diff --git a/codex-rs/thread-store/src/local/projects.rs b/codex-rs/thread-store/src/local/projects.rs
-index c2fda89..f5725cd 100644
+index c2fda8931..f5725cddb 100644
 --- a/codex-rs/thread-store/src/local/projects.rs
 +++ b/codex-rs/thread-store/src/local/projects.rs
 @@ -147,12 +147,9 @@ pub(super) async fn delete_project(
@@ -76666,7 +76748,7 @@ index c2fda89..f5725cd 100644
  fn internal(error: impl std::fmt::Display) -> ThreadStoreError {
 diff --git a/codex-rs/thread-store/src/local/read_only.rs b/codex-rs/thread-store/src/local/read_only.rs
 new file mode 100644
-index 0000000..9b800e2
+index 000000000..9b800e24e
 --- /dev/null
 +++ b/codex-rs/thread-store/src/local/read_only.rs
 @@ -0,0 +1,635 @@
@@ -77307,7 +77389,7 @@ index 0000000..9b800e2
 +}
 diff --git a/codex-rs/thread-store/src/local/read_only/derived_history.rs b/codex-rs/thread-store/src/local/read_only/derived_history.rs
 new file mode 100644
-index 0000000..e41076d
+index 000000000..e41076d6b
 --- /dev/null
 +++ b/codex-rs/thread-store/src/local/read_only/derived_history.rs
 @@ -0,0 +1,83 @@
@@ -77396,7 +77478,7 @@ index 0000000..e41076d
 +}
 diff --git a/codex-rs/thread-store/src/local/read_only/list.rs b/codex-rs/thread-store/src/local/read_only/list.rs
 new file mode 100644
-index 0000000..440bc05
+index 000000000..440bc0553
 --- /dev/null
 +++ b/codex-rs/thread-store/src/local/read_only/list.rs
 @@ -0,0 +1,191 @@
@@ -77593,7 +77675,7 @@ index 0000000..440bc05
 +}
 diff --git a/codex-rs/thread-store/src/local/read_only/roots.rs b/codex-rs/thread-store/src/local/read_only/roots.rs
 new file mode 100644
-index 0000000..2793e5c
+index 000000000..2793e5c39
 --- /dev/null
 +++ b/codex-rs/thread-store/src/local/read_only/roots.rs
 @@ -0,0 +1,74 @@
@@ -77673,7 +77755,7 @@ index 0000000..2793e5c
 +}
 diff --git a/codex-rs/thread-store/src/local/read_only_derived_tests.rs b/codex-rs/thread-store/src/local/read_only_derived_tests.rs
 new file mode 100644
-index 0000000..92a62e5
+index 000000000..92a62e5cd
 --- /dev/null
 +++ b/codex-rs/thread-store/src/local/read_only_derived_tests.rs
 @@ -0,0 +1,315 @@
@@ -77994,7 +78076,7 @@ index 0000000..92a62e5
 +}
 diff --git a/codex-rs/thread-store/src/local/read_only_shared_tests.rs b/codex-rs/thread-store/src/local/read_only_shared_tests.rs
 new file mode 100644
-index 0000000..1b24758
+index 000000000..1b247589d
 --- /dev/null
 +++ b/codex-rs/thread-store/src/local/read_only_shared_tests.rs
 @@ -0,0 +1,204 @@
@@ -78204,7 +78286,7 @@ index 0000000..1b24758
 +}
 diff --git a/codex-rs/thread-store/src/local/read_only_tests.rs b/codex-rs/thread-store/src/local/read_only_tests.rs
 new file mode 100644
-index 0000000..f850347
+index 000000000..f85034723
 --- /dev/null
 +++ b/codex-rs/thread-store/src/local/read_only_tests.rs
 @@ -0,0 +1,924 @@
@@ -79133,7 +79215,7 @@ index 0000000..f850347
 +    files
 +}
 diff --git a/codex-rs/thread-store/src/local/read_thread.rs b/codex-rs/thread-store/src/local/read_thread.rs
-index 02428a1..4e64f2f 100644
+index 02428a1df..4e64f2fdb 100644
 --- a/codex-rs/thread-store/src/local/read_thread.rs
 +++ b/codex-rs/thread-store/src/local/read_thread.rs
 @@ -359,6 +359,18 @@ pub(super) fn stored_thread_from_state_metadata(
@@ -79165,7 +79247,7 @@ index 02428a1..4e64f2f 100644
              metadata.model_provider
          },
 diff --git a/codex-rs/thread-store/src/local/rollout_lineage.rs b/codex-rs/thread-store/src/local/rollout_lineage.rs
-index ae3e1be..3d11bdc 100644
+index ae3e1bec6..3d11bdcc7 100644
 --- a/codex-rs/thread-store/src/local/rollout_lineage.rs
 +++ b/codex-rs/thread-store/src/local/rollout_lineage.rs
 @@ -34,11 +34,28 @@ impl LocalThreadStore {
@@ -79203,7 +79285,7 @@ index ae3e1be..3d11bdc 100644
  
      pub(super) async fn resolve_rollout_lineage_for_reference(
 diff --git a/codex-rs/thread-store/src/local/rollout_migration.rs b/codex-rs/thread-store/src/local/rollout_migration.rs
-index 79f7dd1..596baf3 100644
+index 79f7dd1bf..596baf3f6 100644
 --- a/codex-rs/thread-store/src/local/rollout_migration.rs
 +++ b/codex-rs/thread-store/src/local/rollout_migration.rs
 @@ -606,7 +606,7 @@ impl LocalThreadStore {
@@ -79225,7 +79307,7 @@ index 79f7dd1..596baf3 100644
                  .get_thread(thread_id)
                  .await
 diff --git a/codex-rs/thread-store/src/local/rollout_migration/startup.rs b/codex-rs/thread-store/src/local/rollout_migration/startup.rs
-index dbc48ed..829b0d1 100644
+index dbc48ed8c..829b0d12e 100644
 --- a/codex-rs/thread-store/src/local/rollout_migration/startup.rs
 +++ b/codex-rs/thread-store/src/local/rollout_migration/startup.rs
 @@ -59,7 +59,7 @@ enum StartupInspection {
@@ -79247,7 +79329,7 @@ index dbc48ed..829b0d1 100644
  }
  
 diff --git a/codex-rs/thread-store/src/local/rollout_migration_tests.rs b/codex-rs/thread-store/src/local/rollout_migration_tests.rs
-index 0440f38..a9118bb 100644
+index 0440f38f2..a9118bb49 100644
 --- a/codex-rs/thread-store/src/local/rollout_migration_tests.rs
 +++ b/codex-rs/thread-store/src/local/rollout_migration_tests.rs
 @@ -239,6 +239,8 @@ fn compacted(replacement_history: Vec<ResponseItem>) -> RolloutItem {
@@ -79518,7 +79600,7 @@ index 0440f38..a9118bb 100644
          .delete_thread(thread_id)
          .await
 diff --git a/codex-rs/thread-store/src/local/thread_history.rs b/codex-rs/thread-store/src/local/thread_history.rs
-index 7b31841..6dfeba1 100644
+index 7b3184184..6dfeba17b 100644
 --- a/codex-rs/thread-store/src/local/thread_history.rs
 +++ b/codex-rs/thread-store/src/local/thread_history.rs
 @@ -16,9 +16,13 @@ mod segment_paging;
@@ -79585,7 +79667,7 @@ index 7b31841..6dfeba1 100644
      // SQLite fails, it stays behind the durable rollout instead of claiming data it did not
      // materialize.
 diff --git a/codex-rs/thread-store/src/local/thread_history/read.rs b/codex-rs/thread-store/src/local/thread_history/read.rs
-index b2e3e67..8f8a39f 100644
+index b2e3e6713..8f8a39ff9 100644
 --- a/codex-rs/thread-store/src/local/thread_history/read.rs
 +++ b/codex-rs/thread-store/src/local/thread_history/read.rs
 @@ -106,10 +106,19 @@ pub(in crate::local) async fn list_turns(
@@ -79637,7 +79719,7 @@ index b2e3e67..8f8a39f 100644
      Ok(ItemPage {
          items: page.rows.into_iter().map(|row| row.item).collect(),
 diff --git a/codex-rs/thread-store/src/local/thread_history/realtime.rs b/codex-rs/thread-store/src/local/thread_history/realtime.rs
-index 0dd233b..284f277 100644
+index 0dd233b77..284f277f3 100644
 --- a/codex-rs/thread-store/src/local/thread_history/realtime.rs
 +++ b/codex-rs/thread-store/src/local/thread_history/realtime.rs
 @@ -54,6 +54,15 @@ pub(in crate::local) async fn list_timeline(
@@ -79657,7 +79739,7 @@ index 0dd233b..284f277 100644
          .cursor
          .as_deref()
 diff --git a/codex-rs/thread-store/src/local/thread_history/search.rs b/codex-rs/thread-store/src/local/thread_history/search.rs
-index f93fe61..49feaa3 100644
+index f93fe61eb..49feaa3e9 100644
 --- a/codex-rs/thread-store/src/local/thread_history/search.rs
 +++ b/codex-rs/thread-store/src/local/thread_history/search.rs
 @@ -68,13 +68,28 @@ pub(in crate::local) async fn search_thread_occurrences(
@@ -79708,7 +79790,7 @@ index f93fe61..49feaa3 100644
                      .rollout_ordinal;
                  effective_turn_ordinals.insert(row.turn_id.clone(), ordinal);
 diff --git a/codex-rs/thread-store/src/local/thread_history_materialization.rs b/codex-rs/thread-store/src/local/thread_history_materialization.rs
-index 58ea278..32b7bf8 100644
+index 58ea27880..32b7bf8ef 100644
 --- a/codex-rs/thread-store/src/local/thread_history_materialization.rs
 +++ b/codex-rs/thread-store/src/local/thread_history_materialization.rs
 @@ -5,6 +5,7 @@ use chrono::DateTime;
@@ -79850,7 +79932,7 @@ index 58ea278..32b7bf8 100644
              });
          }
 diff --git a/codex-rs/thread-store/src/local/thread_sections.rs b/codex-rs/thread-store/src/local/thread_sections.rs
-index acd6eae..20491b3 100644
+index acd6eae95..20491b39d 100644
 --- a/codex-rs/thread-store/src/local/thread_sections.rs
 +++ b/codex-rs/thread-store/src/local/thread_sections.rs
 @@ -84,7 +84,7 @@ fn state_db<'store>(
@@ -79863,7 +79945,7 @@ index acd6eae..20491b3 100644
  }
  
 diff --git a/codex-rs/thread-store/src/local/writer_lock.rs b/codex-rs/thread-store/src/local/writer_lock.rs
-index f6b2c85..9c9ef23 100644
+index f6b2c8564..9c9ef231a 100644
 --- a/codex-rs/thread-store/src/local/writer_lock.rs
 +++ b/codex-rs/thread-store/src/local/writer_lock.rs
 @@ -22,7 +22,12 @@ pub(super) struct WriterLockCoordinator {
@@ -79925,7 +80007,7 @@ index f6b2c85..9c9ef23 100644
              Ok(lock) => lock,
 diff --git a/codex-rs/thread-store/src/managed_authority.rs b/codex-rs/thread-store/src/managed_authority.rs
 new file mode 100644
-index 0000000..2e164ab
+index 000000000..2e164ab52
 --- /dev/null
 +++ b/codex-rs/thread-store/src/managed_authority.rs
 @@ -0,0 +1,282 @@
@@ -80213,7 +80295,7 @@ index 0000000..2e164ab
 +mod tests;
 diff --git a/codex-rs/thread-store/src/managed_authority_tests.rs b/codex-rs/thread-store/src/managed_authority_tests.rs
 new file mode 100644
-index 0000000..365ee4c
+index 000000000..365ee4cb0
 --- /dev/null
 +++ b/codex-rs/thread-store/src/managed_authority_tests.rs
 @@ -0,0 +1,168 @@
@@ -80387,7 +80469,7 @@ index 0000000..365ee4c
 +}
 diff --git a/codex-rs/thread-store/src/managed_source.rs b/codex-rs/thread-store/src/managed_source.rs
 new file mode 100644
-index 0000000..f5d6bc4
+index 000000000..f5d6bc452
 --- /dev/null
 +++ b/codex-rs/thread-store/src/managed_source.rs
 @@ -0,0 +1,314 @@
@@ -80707,7 +80789,7 @@ index 0000000..f5d6bc4
 +mod tests;
 diff --git a/codex-rs/thread-store/src/managed_source_tests.rs b/codex-rs/thread-store/src/managed_source_tests.rs
 new file mode 100644
-index 0000000..f2851eb
+index 000000000..f2851ebc2
 --- /dev/null
 +++ b/codex-rs/thread-store/src/managed_source_tests.rs
 @@ -0,0 +1,560 @@
@@ -81272,7 +81354,7 @@ index 0000000..f2851eb
 +    other_live.shutdown().await.expect("unrelated release");
 +}
 diff --git a/codex-rs/thread-store/src/store.rs b/codex-rs/thread-store/src/store.rs
-index 1e7c063..7992d94 100644
+index 1e7c0637a..7992d946e 100644
 --- a/codex-rs/thread-store/src/store.rs
 +++ b/codex-rs/thread-store/src/store.rs
 @@ -35,6 +35,7 @@ use crate::RevertThreadParams;
@@ -81330,7 +81412,7 @@ index 1e7c063..7992d94 100644
      ///
      /// Stores without reference-backed fork support can retain this default implementation.
 diff --git a/codex-rs/thread-store/src/thread_metadata_sync.rs b/codex-rs/thread-store/src/thread_metadata_sync.rs
-index 2fdadd9..07fbf89 100644
+index 2fdadd96d..07fbf89c1 100644
 --- a/codex-rs/thread-store/src/thread_metadata_sync.rs
 +++ b/codex-rs/thread-store/src/thread_metadata_sync.rs
 @@ -591,6 +591,8 @@ mod tests {
@@ -81353,7 +81435,7 @@ index 2fdadd9..07fbf89 100644
                      model_provider_id: "updated-provider".to_string(),
                      service_tier: None,
 diff --git a/codex-rs/thread-store/src/types.rs b/codex-rs/thread-store/src/types.rs
-index 5cedf0b..8bf4b97 100644
+index 5cedf0be0..8bf4b9731 100644
 --- a/codex-rs/thread-store/src/types.rs
 +++ b/codex-rs/thread-store/src/types.rs
 @@ -180,6 +180,18 @@ pub struct StoredModelContext {
@@ -81376,7 +81458,7 @@ index 5cedf0b..8bf4b97 100644
  #[derive(Clone, Debug, PartialEq, Eq)]
  pub enum ForkBoundary {
 diff --git a/codex-rs/tui/src/app/app_server_event_targets.rs b/codex-rs/tui/src/app/app_server_event_targets.rs
-index 27359fd..cc9ab7f 100644
+index 27359fd5c..cc9ab7f1d 100644
 --- a/codex-rs/tui/src/app/app_server_event_targets.rs
 +++ b/codex-rs/tui/src/app/app_server_event_targets.rs
 @@ -28,6 +28,7 @@ pub(super) fn server_request_thread_id(request: &ServerRequest) -> Option<Thread
@@ -81396,7 +81478,7 @@ index 27359fd..cc9ab7f 100644
              approval_policy: codex_app_server_protocol::AskForApproval::Never,
              approvals_reviewer: codex_app_server_protocol::ApprovalsReviewer::User,
 diff --git a/codex-rs/tui/src/app/app_server_requests.rs b/codex-rs/tui/src/app/app_server_requests.rs
-index 7598bbb..14b6d33 100644
+index 7598bbbca..14b6d331c 100644
 --- a/codex-rs/tui/src/app/app_server_requests.rs
 +++ b/codex-rs/tui/src/app/app_server_requests.rs
 @@ -164,6 +164,13 @@ impl PendingAppServerRequests {
@@ -81422,7 +81504,7 @@ index 7598bbb..14b6d33 100644
              | ServerRequest::CurrentTimeRead { .. }
              | ServerRequest::ApplyPatchApproval { .. }
 diff --git a/codex-rs/tui/src/app/side.rs b/codex-rs/tui/src/app/side.rs
-index ba08403..75a0f8d 100644
+index ba084038a..75a0f8d77 100644
 --- a/codex-rs/tui/src/app/side.rs
 +++ b/codex-rs/tui/src/app/side.rs
 @@ -100,6 +100,7 @@ impl SideParentStatus {
@@ -81434,7 +81516,7 @@ index ba08403..75a0f8d 100644
              | ServerRequest::CurrentTimeRead { .. }
              | ServerRequest::ChatgptAuthTokensRefresh { .. } => None,
 diff --git a/codex-rs/tui/src/app/tests.rs b/codex-rs/tui/src/app/tests.rs
-index 3a9b3db..e08f0b3 100644
+index 3a9b3db5a..e08f0b35d 100644
 --- a/codex-rs/tui/src/app/tests.rs
 +++ b/codex-rs/tui/src/app/tests.rs
 @@ -8418,6 +8418,7 @@ async fn inactive_thread_settings_notification_updates_cached_collaboration_mode
@@ -81446,7 +81528,7 @@ index 3a9b3db..e08f0b3 100644
              approval_policy: AskForApproval::OnRequest,
              approvals_reviewer: codex_app_server_protocol::ApprovalsReviewer::AutoReview,
 diff --git a/codex-rs/tui/src/app/tests/recap_generation_tests.rs b/codex-rs/tui/src/app/tests/recap_generation_tests.rs
-index 2420d0a..685a5b7 100644
+index 2420d0a4c..685a5b7b7 100644
 --- a/codex-rs/tui/src/app/tests/recap_generation_tests.rs
 +++ b/codex-rs/tui/src/app/tests/recap_generation_tests.rs
 @@ -91,6 +91,7 @@ stream_max_retries = 0
@@ -81458,7 +81540,7 @@ index 2420d0a..685a5b7 100644
          base_url: Some(format!("{}/v1", model_server.uri())),
          request_max_retries: Some(0),
 diff --git a/codex-rs/tui/src/app/tests/safety_buffering.rs b/codex-rs/tui/src/app/tests/safety_buffering.rs
-index 3d5950b..a2a1c65 100644
+index 3d5950b10..a2a1c657c 100644
 --- a/codex-rs/tui/src/app/tests/safety_buffering.rs
 +++ b/codex-rs/tui/src/app/tests/safety_buffering.rs
 @@ -190,6 +190,7 @@ stream_max_retries = 0
@@ -81478,7 +81560,7 @@ index 3d5950b..a2a1c65 100644
          base_url: Some(format!("{}/v1", server.uri())),
          request_max_retries: Some(0),
 diff --git a/codex-rs/tui/src/app/thread_title_tests.rs b/codex-rs/tui/src/app/thread_title_tests.rs
-index 6044fd8..958c4de 100644
+index 6044fd82a..958c4debe 100644
 --- a/codex-rs/tui/src/app/thread_title_tests.rs
 +++ b/codex-rs/tui/src/app/thread_title_tests.rs
 @@ -151,6 +151,7 @@ async fn slash_rename_generates_editable_title_through_embedded_app_server()
@@ -81490,7 +81572,7 @@ index 6044fd8..958c4de 100644
          base_url: Some(format!("{}/v1", server.uri())),
          request_max_retries: Some(0),
 diff --git a/codex-rs/tui/src/chatwidget/protocol_requests.rs b/codex-rs/tui/src/chatwidget/protocol_requests.rs
-index 36b47f6..1fd2670 100644
+index 36b47f6c6..1fd2670cb 100644
 --- a/codex-rs/tui/src/chatwidget/protocol_requests.rs
 +++ b/codex-rs/tui/src/chatwidget/protocol_requests.rs
 @@ -49,6 +49,7 @@ impl ChatWidget {
@@ -81502,7 +81584,7 @@ index 36b47f6..1fd2670 100644
              | ServerRequest::CurrentTimeRead { .. }
              | ServerRequest::ChatgptAuthTokensRefresh { .. }
 diff --git a/codex-rs/tui/src/chatwidget/tests/app_server.rs b/codex-rs/tui/src/chatwidget/tests/app_server.rs
-index f983ceb..cba7c2d 100644
+index f983ceb67..cba7c2d16 100644
 --- a/codex-rs/tui/src/chatwidget/tests/app_server.rs
 +++ b/codex-rs/tui/src/chatwidget/tests/app_server.rs
 @@ -14,6 +14,7 @@ fn thread_settings_for_test(
@@ -81514,7 +81596,7 @@ index f983ceb..cba7c2d 100644
              approval_policy: AskForApproval::OnRequest,
              approvals_reviewer: codex_app_server_protocol::ApprovalsReviewer::AutoReview,
 diff --git a/codex-rs/tui/src/resume_picker_transcript_preview_tests.rs b/codex-rs/tui/src/resume_picker_transcript_preview_tests.rs
-index d08b188..8914c36 100644
+index d08b188ea..8914c36e0 100644
 --- a/codex-rs/tui/src/resume_picker_transcript_preview_tests.rs
 +++ b/codex-rs/tui/src/resume_picker_transcript_preview_tests.rs
 @@ -82,6 +82,8 @@ fn legacy_transcript_preview_scans_tail_across_compaction() {
@@ -81545,7 +81627,7 @@ index d08b188..8914c36 100644
      let mut items = vec![rollout_user_message("older user")];
      items.extend(std::iter::repeat_n(compacted, 9));
 diff --git a/codex-rs/tui/src/status/tests.rs b/codex-rs/tui/src/status/tests.rs
-index 1515fb8..9fdde21 100644
+index 1515fb89e..9fdde21db 100644
 --- a/codex-rs/tui/src/status/tests.rs
 +++ b/codex-rs/tui/src/status/tests.rs
 @@ -787,6 +787,7 @@ async fn status_model_provider_uses_bedrock_runtime_base_url_and_gates_usage_lin
@@ -81557,7 +81639,7 @@ index 1515fb8..9fdde21 100644
          base_url: Some("https://openai-proxy.example/v1".to_string()),
          requires_openai_auth: true,
 diff --git a/justfile b/justfile
-index b8319d0..ac2cc33 100644
+index b8319d09a..ac2cc338b 100644
 --- a/justfile
 +++ b/justfile
 @@ -178,8 +178,13 @@ write-config-schema:

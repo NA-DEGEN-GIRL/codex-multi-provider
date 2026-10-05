@@ -242,7 +242,7 @@ internal static class LayoutSelfTest
             var name = AutomationProperties.GetName(item);
             Require(name.StartsWith(choice.Card.Name, StringComparison.Ordinal) && (rings == 0 || name.Contains('%')),
                 "A rail avatar has no descriptive accessible name: " + name);
-            var avatar = Descendants(item).OfType<Grid>().First(g => Equals(g.Tag, "ProfileDragItem"));
+            var avatar = Descendants(item).OfType<Grid>().First(g => Equals(g.Tag, ListOrdering.ItemTag));
             Require(avatar.ToolTip is ToolTip, "A rail avatar has no rich tooltip.");
             var frame = Bounds(Named<Grid>(item, "AvatarFrame"), item);
             var dot = Bounds(Named<System.Windows.Shapes.Ellipse>(item, "StatusDot"), item);
@@ -925,7 +925,7 @@ internal static class LayoutSelfTest
         element.UpdateLayout();
     }
 
-    private static void SaveImage(FrameworkElement element, string path, Rect? region = null, double dpi = 96)
+    internal static void SaveImage(FrameworkElement element, string path, Rect? region = null, double dpi = 96)
     {
         var area = region ?? new Rect(0, 0, element.ActualWidth, element.ActualHeight);
         var bitmap = new RenderTargetBitmap((int)Math.Ceiling(area.Width * dpi / 96), (int)Math.Ceiling(area.Height * dpi / 96), dpi, dpi, PixelFormats.Pbgra32);

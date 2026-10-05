@@ -20,8 +20,8 @@ namespace Codex.ControlCenter.Shell;
 // Avatar rings, in a 48-DIP box: the outer ring is the weekly window (or the
 // only known one), the inner ring the 5-hour window when both are known.
 //
-// The whole avatar or card is the drag handle (Tag "ProfileDragItem"):
-// ProfileOrdering turns a press into a click or, past the drag threshold, a
+// The whole avatar or card is the drag handle (Tag "DragItem"):
+// ListOrdering turns a press into a click or, past the drag threshold, a
 // reorder. Templates are parsed once and shared.
 internal static class ProfileCards
 {
@@ -230,7 +230,7 @@ internal static class ProfileCards
           <DataTemplate.Resources>
             {{Resources}}
           </DataTemplate.Resources>
-          <Grid x:Name="ProfileCard" Tag="ProfileDragItem" Background="Transparent" ToolTipService.ShowDuration="30000">
+          <Grid x:Name="ProfileCard" Tag="DragItem" Background="Transparent" ToolTipService.ShowDuration="30000">
             <Grid.ToolTip>
               {{ListTip}}
             </Grid.ToolTip>
@@ -287,7 +287,7 @@ internal static class ProfileCards
           <DataTemplate.Resources>
             {{Resources}}
           </DataTemplate.Resources>
-          <Grid x:Name="RailAvatar" Tag="ProfileDragItem" Background="Transparent" Height="66" ToolTipService.ShowDuration="30000">
+          <Grid x:Name="RailAvatar" Tag="DragItem" Background="Transparent" Height="66" ToolTipService.ShowDuration="30000">
             <Grid.ToolTip>
               {{ListTip}}
             </Grid.ToolTip>
@@ -387,9 +387,9 @@ internal static class ProfileCards
             <Setter.Value>
               <ControlTemplate TargetType="ListBoxItem">
                 <!-- The 1.5-DIP border is always reserved, so text never shifts when a card is selected.
-                     The tag makes the whole profile card, padding included, a drag handle; the
-                     shortcut list has no ProfileOrdering and ignores it. -->
-                <Border x:Name="Chrome" Tag="ProfileDragItem" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}"
+                     The tag makes the whole card, padding included, a drag handle for ListOrdering
+                     (profiles and task shortcuts). -->
+                <Border x:Name="Chrome" Tag="DragItem" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}"
                         BorderThickness="1.5" CornerRadius="8" UseLayoutRounding="True" Padding="{TemplateBinding Padding}">
                   <ContentPresenter/>
                 </Border>

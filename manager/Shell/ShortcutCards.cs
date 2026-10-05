@@ -11,8 +11,9 @@ namespace Codex.ControlCenter.Shell;
 // in the card tooltip (and the search), not on every card.
 // The leading ring is the owning account's remaining usage (outer: weekly,
 // inner: a shorter window when reported) around its short label. The whole
-// card opens the task; ⋯ holds move/rename/delete. Values come from
-// Choice.Shortcut (ShortcutCardData); this file only lays them out.
+// card opens the task, or reorders the list when dragged (ListOrdering takes
+// the press on the "open" button); ⋯ holds move/rename/delete. Values come
+// from Choice.Shortcut (ShortcutCardData); this file only lays them out.
 internal static class ShortcutCards
 {
     private static readonly DataTemplate Card = (DataTemplate)XamlReader.Parse(CardMarkup);

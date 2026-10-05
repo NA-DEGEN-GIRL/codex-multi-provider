@@ -551,6 +551,7 @@ class ControlCenter:
             return self.store.shortcut_add(args['alias'],args['profile_id'],args['thread_id'],host,source_id,catalog_source=discovered)
         if command=='shortcut.move':return self.store.shortcut_move(args['shortcut_id'],args['profile_id'])
         if command=='shortcut.rename':return self.store.shortcut_rename(args['shortcut_id'],args['alias'])
+        if command=='shortcut.reorder':return self.store.shortcut_reorder(args['shortcut_id'],args['target_shortcut_id'],args['position'])
         if command=='shortcut.delete':return self.store.shortcut_delete(args['shortcut_id'])
         if command=='shortcut.undo':return self.store.shortcut_undo()
         if command=='handoff.preview':

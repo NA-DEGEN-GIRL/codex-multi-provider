@@ -14,12 +14,12 @@ internal static class ProfileOrderingSelfTest
     {
         int checks = 0, selectedChanges = 0;
         void Require(bool condition, string message) { if (!condition) throw new InvalidOperationException(message); checks++; }
-        var list = new ListBox { ItemTemplate = ProfileOrdering.Template(), Width = 252, Height = 440, Margin = new Thickness(12) };
+        var list = new ListBox { ItemTemplate = ProfileCards.Create(), Width = 252, Height = 440, Margin = new Thickness(12) };
         foreach (var id in new[] { "04", "02", "03", "01" }) list.Items.Add(new Choice(id, $"{id}\n주간 53% 남음 · 실행 중"));
         list.SelectedItem = list.Items[1];
         list.SelectionChanged += (_, _) => selectedChanges++;
-        var saved = new List<ProfileMove>();
-        var ordering = new ProfileOrdering(list, move => { saved.Add(move); return Task.CompletedTask; });
+        var saved = new List<ListMove>();
+        var ordering = new ListOrdering(list, move => { saved.Add(move); return Task.CompletedTask; });
         var window = new Window { Content = new AdornerDecorator { Child = list }, Width = 300, Height = 500, Left = -28000, Top = -28000, ShowActivated = false, ShowInTaskbar = false };
         try
         {
@@ -30,11 +30,11 @@ internal static class ProfileOrderingSelfTest
                 return item.TranslatePoint(new Point(16, item.ActualHeight * fraction), list);
             }
             ordering.Begin("01", At(3, .5)); ordering.Update(At(0, .1));
-            Require(ordering.Target(At(0, .1)) == new ProfileMove("01", "04", "before"), "drag to top inserts before first row");
+            Require(ordering.Target(At(0, .1)) == new ListMove("01", "04", "before"), "drag to top inserts before first row");
             await ordering.CompleteAsync(At(0, .1));
             Require(saved.Count == 1 && !ordering.IsInteracting, "drop submits one save and releases drag state");
             ordering.Begin("04", At(0, .5)); ordering.Update(At(3, .9));
-            Require(ordering.Target(At(3, .9)) == new ProfileMove("04", "01", "after"), "drag to bottom inserts after last row");
+            Require(ordering.Target(At(3, .9)) == new ListMove("04", "01", "after"), "drag to bottom inserts after last row");
             await ordering.CompleteAsync(At(3, .9));
             ordering.Begin("03", At(2, .5)); await ordering.CompleteAsync(At(2, .5));
             Require(saved.Count == 2, "click on grip does not save or open a profile");
@@ -45,22 +45,22 @@ internal static class ProfileOrderingSelfTest
             await ordering.MoveByAsync("04", -1); await ordering.MoveByAsync("01", 1);
             Require(saved.Count == 2, "first and last rows cannot move beyond edges");
             await ordering.MoveByAsync("03", -1); await ordering.MoveByAsync("02", 1);
-            Require(saved[^2] == new ProfileMove("03", "02", "before") && saved[^1] == new ProfileMove("02", "03", "after"), "menu and keyboard moves use current adjacent rows");
+            Require(saved[^2] == new ListMove("03", "02", "before") && saved[^1] == new ListMove("02", "03", "after"), "menu and keyboard moves use current adjacent rows");
             Require(selectedChanges == 0 && ((Choice)list.SelectedItem).Id == "02", "reordering never changes selected account");
             // A whole avatar or card: released in place it is a click, dragged it reorders.
             var clicked = new List<string>();
-            var cards = new ProfileOrdering(list, move => { saved.Add(move); return Task.CompletedTask; },
+            var cards = new ListOrdering(list, move => { saved.Add(move); return Task.CompletedTask; },
                 (choice, _) => { clicked.Add(choice.Id); return Task.CompletedTask; });
             var savedBefore = saved.Count;
             cards.Begin("03", At(2, .5), item: true); await cards.CompleteAsync(At(2, .5));
             Require(clicked.SequenceEqual(["03"]) && saved.Count == savedBefore && !cards.IsInteracting, "a press released in place clicks the card without saving");
             cards.Begin("03", At(2, .5), item: true); cards.Update(At(0, .1)); await cards.CompleteAsync(At(0, .1));
-            Require(clicked.Count == 1 && saved.Count == savedBefore + 1 && saved[^1] == new ProfileMove("03", "04", "before"), "a dragged card reorders without clicking");
+            Require(clicked.Count == 1 && saved.Count == savedBefore + 1 && saved[^1] == new ListMove("03", "04", "before"), "a dragged card reorders without clicking");
             cards.Begin("01", At(3, .5)); await cards.CompleteAsync(At(3, .5));
             Require(clicked.Count == 1, "a grip press never clicks");
             Require(selectedChanges == 0, "card presses never change the selection by themselves");
             var pending = new TaskCompletionSource();
-            var delayed = new ProfileOrdering(new ListBox { Items = { new Choice("a", "a"), new Choice("b", "b") } }, _ => pending.Task);
+            var delayed = new ListOrdering(new ListBox { Items = { new Choice("a", "a"), new Choice("b", "b") } }, _ => pending.Task);
             var request = delayed.MoveByAsync("a", 1);
             Require(delayed.IsInteracting, "refresh blocked until order save completes");
             pending.SetResult(); await request;
@@ -70,7 +70,13 @@ internal static class ProfileOrderingSelfTest
             var bitmap = new RenderTargetBitmap((int)list.ActualWidth, (int)list.ActualHeight, 96, 96, PixelFormats.Pbgra32); bitmap.Render(visual);
             var png = Path.ChangeExtension(report, ".png");
             using (var file = File.Create(png)) { var encoder = new PngBitmapEncoder(); encoder.Frames.Add(BitmapFrame.Create(bitmap)); encoder.Save(file); }
-            File.WriteAllText(report, JsonSerializer.Serialize(new { passed = true, checks, png, isolation = "Synthetic WPF list; no account or app access" }));
+            // Task shortcuts reorder with the same ListOrdering, in a fixture workspace window.
+            var shortcutPng = Path.Combine(Path.GetDirectoryName(report)!, Path.GetFileNameWithoutExtension(report) + "-shortcuts.png");
+            var (shortcutChecks, shortcutNotes) = await ShortcutOrderingSelfTest.RunAsync(shortcutPng);
+            File.WriteAllText(report, JsonSerializer.Serialize(new { passed = true, checks = checks + shortcutChecks, profile_checks = checks,
+                shortcut_checks = shortcutChecks, shortcut_notes = shortcutNotes, png, shortcut_png = shortcutPng,
+                isolation = "Synthetic WPF list and fixture workspace window; no service, account or app access" },
+                new JsonSerializerOptions { WriteIndented = true }));
         }
         finally { window.Close(); }
     }

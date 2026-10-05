@@ -271,6 +271,24 @@ class Store:
             return link
         return self.mutate(move)
 
+    def shortcut_reorder(self, shortcut_id, target_shortcut_id, position):
+        """Move one shortcut before or after another, like profile.move."""
+        sid, target_id = identifier(shortcut_id), identifier(target_shortcut_id)
+        if position not in ('before', 'after'):
+            raise ValueError('바로가기 이동 위치가 올바르지 않습니다.')
+
+        def reorder(data):
+            link = next((x for x in data['shortcuts'] if x['id'] == sid), None)
+            target = next((x for x in data['shortcuts'] if x['id'] == target_id), None)
+            if link is None or target is None:
+                raise ValueError('바로가기를 찾을 수 없습니다. 목록을 새로고침하세요.')
+            if sid != target_id:
+                data['shortcuts'].remove(link)
+                data['shortcuts'].insert(data['shortcuts'].index(target) + (position == 'after'), link)
+            return dict(shortcut_ids=[x['id'] for x in data['shortcuts']],
+                        message='작업 바로가기 순서를 저장했습니다.')
+        return self.mutate(reorder)
+
     def shortcut_rename(self, shortcut_id, alias):
         sid, alias = identifier(shortcut_id), label(alias)
         def rename(data):

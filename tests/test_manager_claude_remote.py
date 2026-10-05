@@ -43,6 +43,10 @@ class BorrowedClaudeTests(unittest.TestCase):
         self.status_mock = self.status_patch.start()
         self.addCleanup(self.directory_patch.stop)
         self.addCleanup(self.status_patch.stop)
+        # Never start the official CLI in tests; a renewal is simulated per test.
+        self.refresh_patch = patch('manager_core.claude_borrowed_auth._refresh_with_cli')
+        self.refresh_mock = self.refresh_patch.start()
+        self.addCleanup(self.refresh_patch.stop)
 
     def read(self):
         return read_access_token(self.root, self.profile['id'], self.identity)
@@ -63,6 +67,35 @@ class BorrowedClaudeTests(unittest.TestCase):
                 atomic_json(self.directory / '.credentials.json', self.credentials)
                 with self.assertRaisesRegex(ClaudeError, 'current local login'):
                     self.read()
+
+    def test_expired_token_is_renewed_once_by_the_official_cli_then_read(self):
+        renewed = int(time.time()) + 8 * 3600
+        self.credentials['claudeAiOauth']['expiresAt'] = (int(time.time()) - 3600) * 1000
+        atomic_json(self.directory / '.credentials.json', self.credentials)
+        def renew(profile_id):
+            self.assertEqual(profile_id, self.profile['id'])
+            self.credentials['claudeAiOauth'].update(accessToken='renewed-access', expiresAt=renewed * 1000)
+            atomic_json(self.directory / '.credentials.json', self.credentials)
+        self.refresh_mock.side_effect = renew
+        self.assertEqual(self.read(), dict(accessToken='renewed-access', expiresAt=renewed,
+                                         accountIdentity=self.identity))
+        self.assertEqual(self.refresh_mock.call_count, 1)
+        # A current token never starts the CLI.
+        self.read()
+        self.assertEqual(self.refresh_mock.call_count, 1)
+
+    def test_failed_renewal_still_refuses_and_is_not_retried_within_cooldown(self):
+        from manager_core import claude_borrowed_auth as borrowed
+        self.refresh_patch.stop()
+        calls = []
+        self.credentials['claudeAiOauth']['expiresAt'] = (int(time.time()) - 3600) * 1000
+        atomic_json(self.directory / '.credentials.json', self.credentials)
+        with patch('manager_core.claude_usage_terminal.query', side_effect=lambda *a, **k: calls.append(a)),              patch.dict(borrowed._REFRESH_ATTEMPTS, clear=True):
+            for _ in range(2):
+                with self.assertRaisesRegex(ClaudeError, 'current local login'):
+                    self.read()
+        self.assertEqual(len(calls), 1)
+        self.refresh_patch.start()
 
     def test_credential_rotation_during_status_check_fails_closed(self):
         def status(*args):

@@ -507,7 +507,7 @@ public sealed partial class MainWindow
         AutomationProperties.SetName(_profileSummary, choice?.Card.AccessibleName ?? "");
     }
 
-    // A press released in place on an avatar or card (ProfileOrdering).
+    // A press released in place on an avatar or card (ListOrdering).
     private async Task ProfileClickedAsync(Choice choice, int timestamp)
     {
         if (timestamp != 0) _responsiveness?.Record("profile_click", new { queue_ms = unchecked((uint)(Environment.TickCount - timestamp)) });
