@@ -40,6 +40,32 @@ python3 scripts/remote_helpers/package_runtime.py --build
 
 Linux 묶음에는 `codex`, `codex-code-mode-host`, `bwrap` 세 실행 파일이 필요합니다. 빌드 도구는 upstream 순서대로 bubblewrap을 먼저 만들고 해시를 계산한 다음 그 해시를 Codex에 넣습니다. `libcap` 개발 헤더 등 Linux 빌드 의존성이 필요하며(Ubuntu: `pkg-config libcap-dev`, upstream CI와 같음), 샌드박스 파일이 없거나 해시가 다르면 준비를 거절합니다. 묶음 버전은 `<CLI 버전>-managed-<패치 SHA256 앞 16자>`이고 `build_source_sha256`에 패치 해시 전체를 남깁니다. 새 `codex` 해시는 `native_controller.py`의 `DRAIN_AUDITED_SHA256`에 넣어야 SSH 작업을 기다리는 안전한 재시작을 사용합니다.
 
+빌드 서버는 여러 사람이 함께 쓰므로 빌드는 기본적으로 `-j 64`, CPU 0-31·64-95(물리 코어 32개, 하드웨어 스레드 64개), `nice 10`으로 돌고, 열린 파일 한도를 65536까지 올립니다. 공유 잠금(`work/remote-build/.cargo-build.lock`)이 Linux 묶음 빌드와 Windows 교차 빌드가 동시에 돌지 않게 막습니다. `--jobs`와 `--cpus`로 바꿀 수 있습니다.
+
+## Windows 런타임 교차 빌드(빌드 서버)
+
+관리창의 Windows 런타임 다섯 파일(`codex`, `codex-code-mode-host`, `codex-windows-sandbox-setup`, `codex-command-runner`, `codex-app-server`)을 Linux 빌드 서버에서 `x86_64-pc-windows-msvc`로 교차 빌드합니다.
+
+한 번만 하는 준비(사용자가 Microsoft Visual Studio Build Tools 라이선스에 동의해야 합니다):
+- `sudo apt-get install -y --no-install-recommends clang-20 clang-tools-20 lld-20 llvm-20`. Ubuntu의 `lld-link`는 libxml2로 `codex-windows-sandbox-setup`의 매니페스트를 직접 병합합니다. Rust에 들어 있는 rust-lld는 `mt.exe`를 찾다가 실패합니다.
+- 체크섬을 확인한 xwin 0.10.0 바이너리를 `~/.local/bin`에 둡니다.
+- `XWIN_ACCEPT_LICENSE=true xwin --manifest-version 17 --arch x86_64 --variant desktop --crt-version 14.44.17.14 --sdk-version 10.0.26100 --cache-dir work/xwin/cache splat --output work/xwin/msvc-14.44.17.14_sdk-10.0.26100`. 로컬 Windows 빌드와 같은 MSVC 14.44 / SDK 10.0.26100 계열입니다.
+- Windows용 V8 파일은 `prepare_v8(..., target="x86_64-pc-windows-msvc")`가 공식 체크섬으로 확인해 `work/remote-build/v8/x86_64-pc-windows-msvc/<버전>/`에 둡니다.
+
+빌드:
+
+```sh
+python3 scripts/remote_helpers/package_windows_runtime.py --build
+```
+
+- `runtime/`이 `patches/runtime-source.json`의 `result_tree`와 같을 때만 빌드합니다. 대상 폴더는 `work/remote-build/windows-x86_64`입니다.
+- `RUSTFLAGS`를 지웁니다. 지우지 않으면 `.cargo/config.toml`의 `/STACK:8388608`과 `+crt-static`이 사라집니다.
+- C 컴파일러(`clang-cl`), 아카이버(`llvm-lib`), 헤더 경로는 Windows 대상에만 지정합니다.
+- 결과 PE를 검사합니다. x64, 콘솔, 8 MiB 스택, 동적 CRT 가져오기 없음을 확인하고, `codex-windows-sandbox-setup`에만 asInvoker 매니페스트가 하나 있는지 봅니다.
+- 마지막 줄 JSON의 `package_directory`에 exe 다섯 개, `windows-build.json`, `symbols/`(PDB, 서버에 보관)를 남깁니다.
+
+Windows에서는 exe와 `windows-build.json`만 `work/cross-windows/<id>/`로 가져온 뒤 `python scripts/stage_manager_runtime.py --source work/cross-windows/<id>`로 후보를 만듭니다. 스테이징은 패치 트리와 파일 해시를 다시 확인합니다. 활성화하려면 로컬 빌드와 똑같이 공유 편집·공통 저장소 무인 검증이 필요합니다. 교차 빌드는 내장 텍스트를 LF로 넣습니다(로컬 체크아웃은 CRLF).
+
 Ubuntu 24.04의 사용자 네임스페이스 정책 때문에 실행이 거절될 수 있습니다. 이 경우 샌드박스를 끄지 않고 원인을 표시합니다. 호스트별 관리자 정책 변경 도우미는 배포 소스에 포함하지 않으며 일반 원격 준비 과정에서도 실행하지 않습니다.
 
 ## 남은 실제 연결 검증

@@ -315,6 +315,8 @@ DRAIN_MARKERS = (
 #   Evidence: work/validation/release-113/drain-audit.json.
 #   version 0.153.4-managed-e0436ba1928a0e59 (codex ddfbc527..., revision 117: model
 #   catalog version only) passed the same audit. Evidence: work/validation/release-117.
+#   version 0.153.4-managed-485cb97bd8e33789 (codex 02b5eda3..., revision 118: SQLite pools
+#   without the sqlx reaper task) passed the same audit. Evidence: work/validation/release-118.
 # The manager may pass the digest from its own verified manifest; that digest
 # must still be in this allowlist, so an unknown bundle always refuses.
 DRAIN_AUDITED_SHA256 = frozenset({
@@ -327,6 +329,7 @@ DRAIN_AUDITED_SHA256 = frozenset({
     "26715edad0e99f54d3c3c87cade7e2f0e5148aff01fcdacc5c4a5e89c1207aad",
     "1148581b96c5c772193b14dad0ba390bca89922fc118b0b899d23dc9d196a33d",
     "ddfbc527c820cc5abad3e38f19bc296675982bb404d7689303006784da6a6643",
+    "02b5eda30561e2673a8f393f86205fa220d6b7863888103483d93614783901e6",
 })
 # Unstripped revision 94-96 builds are ~1.3 GB; a smaller bound refused them.
 DRAIN_HASH_BYTES = 2 * 1024 * 1024 * 1024

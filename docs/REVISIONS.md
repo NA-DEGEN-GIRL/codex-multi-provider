@@ -35,6 +35,18 @@
 
 ## 최근 수정
 
+### 수정 118 — 원격 Codex 종료 멈춤 수정, 완전 종료 대기 선택지, Windows 교차 빌드
+
+- 완전 종료가 한 서버의 원격 Codex 종료 확인을 기다리며 멈췄다. 원인은 sqlx-core 0.9.0 풀 정리 작업의 무한 루프였다
+  (유휴 연결 수가 `usize::MAX`로 넘어가 양보 없이 돎, launchbadge/sqlx#3645). 이 루프가 작업 스레드를 점유해 종료가 끝나지 않고, 평소에도 CPU 한 코어를 쓴다.
+  `codex-state` 풀에서 유휴·수명 제한을 꺼 정리 작업을 만들지 않는다. Windows·Linux 런타임을 다시 빌드한다.
+- 원격 종료 확인이 제한 시간을 넘기면 오류 대신 "원격 실행을 서버에 남겨 두고 완전 종료" 선택 창을 띄운다.
+  대기 중에는 대상 프로필과 경과 시간을 보여 준다.
+- 빌드 서버 빌드를 64스레드(CPU 0-31·64-95, nice 10)로 제한하고, Windows 런타임을 서버에서 교차 빌드한다
+  (`package_windows_runtime.py`, clang-cl·lld-link·xwin MSVC 14.44/SDK 10.0.26100, 약 8분). 받은 패키지는 `stage_manager_runtime.py --source`로
+  해시·패치 트리를 다시 확인해 후보로 만든다. LLVM 매니페스트 병합이 Windows가 거부하는 매니페스트를 만드는 문제를 `/MANIFESTUAC:NO`로 막았다.
+- [원인·변경·검증](design/remote-exit-hang-118.md).
+
 ### 수정 117 — Claude 토큰 자동 갱신, GPT 새 모델 목록, 작업 바로가기 순서 바꾸기
 
 - 원격·위임 Claude 작업은 Windows 공식 Claude 로그인의 접근 토큰을 빌려 쓰는데, 로컬 CLI가 실행되지 않아 토큰이 만료된 채로 남았다
@@ -337,3 +349,4 @@
 | 115 | [desktop-930-update-ui-115](design/desktop-930-update-ui-115.md) | 프로필의 공식 Codex 26.930 사용, 공식 앱 업데이트 적용, 관리창 화면 개편 |
 | 116 | [update-flow-ui-polish-116](design/update-flow-ui-polish-116.md) | 작업 중 공식 앱 업데이트 적용, 26.930.4958 지원, 관리창 정보 정리 |
 | 117 | [token-models-shortcut-order-117](design/token-models-shortcut-order-117.md) | Claude 토큰 자동 갱신, GPT 새 모델 목록, 작업 바로가기 순서 |
+| 118 | [remote-exit-hang-118](design/remote-exit-hang-118.md) | 원격 Codex 종료 멈춤(sqlx 정리 작업), 완전 종료 대기 선택지, 서버 64스레드 제한·Windows 교차 빌드 |

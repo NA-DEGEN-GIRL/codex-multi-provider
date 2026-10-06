@@ -1487,6 +1487,7 @@ public sealed partial class MainWindow : Window
         // not resolve by waiting. Collect them and let the user leave those
         // listeners on the server, exactly like closing only the window.
         var aliases = _state.Arr("profiles").ToDictionary(p => p.S("id"), p => p.S("alias", p.S("id")));
+        var waitStarted = DateTime.UtcNow;
         try
         {
             while (jobs.Count > 0)
@@ -1513,13 +1514,21 @@ public sealed partial class MainWindow : Window
                     }
                 }
                 if (jobs.Count == 0) break;
-                SetStatus("SSH 작업 종료를 기다립니다. 현재 답변이 끝나면 원격 실행을 종료합니다.");
+                SetStatus($"원격 Codex 종료를 확인하고 있습니다 · {string.Join(", ", jobs.Keys.Select(id => aliases.GetValueOrDefault(id, id)))} · {(int)(DateTime.UtcNow - waitStarted).TotalSeconds}초");
                 await Task.Delay(1000, deadline.Token);
             }
         }
         catch (OperationCanceledException) when (deadline.IsCancellationRequested)
         {
-            throw new InvalidOperationException("SSH 작업이 아직 진행 중이거나 종료를 확인하고 있습니다. 종료 요청은 유지됩니다. 작업이 끝난 뒤 완전 종료를 다시 눌러 주세요.");
+            // A remote that neither exits nor reports a running answer does not
+            // resolve by waiting longer. Offer the same choice as a refused stop
+            // instead of making the user press 완전 종료 again; the stop request
+            // stays on the service either way.
+            foreach (var id in jobs.Keys)
+            {
+                refused.Add($"{aliases.GetValueOrDefault(id, id)} · {(int)(DateTime.UtcNow - waitStarted).TotalSeconds}초 동안 종료 확인이 오지 않았습니다.");
+                Log($"프로필 원격 종료 확인 시간 초과 · {aliases.GetValueOrDefault(id, id)}");
+            }
         }
         if (refused.Count > 0 && MessageBox.Show(this,
                 "다음 SSH 원격 실행은 자동으로 종료하지 못했습니다.\n\n" + string.Join("\n", refused) +

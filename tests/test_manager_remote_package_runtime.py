@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import struct
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -67,16 +68,23 @@ class PackageRuntimeTests(unittest.TestCase):
             self.fail('Unexpected tool invocation: ' + repr(command))
         return subprocess.CompletedProcess(command, 0, '', '')
 
-    def run_build(self, cache=None):
+    def run_build(self, cache=None, **options):
+        start = len(self.calls)
         with ExitStack() as stack:
             stack.enter_context(patch.object(PACKAGE.platform, 'system', return_value='Linux'))
             stack.enter_context(patch.object(PACKAGE.platform, 'machine', return_value='x86_64'))
             stack.enter_context(patch.object(PACKAGE.shutil, 'which', return_value='cargo'))
             v8 = stack.enter_context(patch.object(PACKAGE, 'prepare_v8', return_value={'RUSTY_V8_ARCHIVE': 'fixture-v8'}))
             stack.enter_context(patch.object(PACKAGE.subprocess, 'run', side_effect=self.tool))
-            result = PACKAGE.build(self.root, build_cache=cache)
+            result = PACKAGE.build(self.root, build_cache=cache, **options)
         expected_cache = cache.resolve() if cache is not None else self.root / 'work/remote-build'
         v8.assert_called_once_with(self.root.resolve(), 'x86_64', build_cache=expected_cache)
+        # Both cargo builds (bwrap, then codex) share the server job limit.
+        cargo = [command for command, _ in self.calls[start:] if command[0] == 'cargo']
+        self.assertEqual(len(cargo), 2)
+        for command in cargo:
+            self.assertEqual(command.count('-j'), 1)
+            self.assertEqual(command[command.index('-j') + 1], str(options.get('jobs', 64)))
         manifest = json.loads((Path(result['bundle_directory']) / 'manifest.json').read_text())
         self.assertEqual(manifest['bwrap_sha256'], self.pinned[-1])
         self.assertEqual(manifest['build_source_sha256'], 'a' * 64)
@@ -112,6 +120,36 @@ class PackageRuntimeTests(unittest.TestCase):
         result = self.run_build()
         self.assertEqual(Path(result['staging_directory']), self.root / 'work/remote-build/linux-x86_64/package')
 
+    def test_explicit_jobs_reach_every_cargo_build(self):
+        self.run_build(jobs=12)
+
+    def test_cpu_list_parses_server_ranges_and_rejects_malformed_lists(self):
+        self.assertEqual(PACKAGE.parse_cpus('0-31,64-95'), set(range(32)) | set(range(64, 96)))
+        self.assertEqual(PACKAGE.parse_cpus('7, 3-3'), {3, 7})
+        for text in ('a-b', '', '3-', '5-3', '-3', '1,,2'):
+            with self.subTest(text=text), self.assertRaisesRegex(ValueError, '^Invalid CPU list'):
+                PACKAGE.parse_cpus(text)
+
+    def test_server_limits_refuse_other_hosts_before_posix_imports(self):
+        # A None entry makes `import fcntl` fail, so only the platform check may raise.
+        with patch.object(PACKAGE.platform, 'system', return_value='Windows'), \
+                patch.dict(sys.modules, {'fcntl': None, 'resource': None}), \
+                patch.object(PACKAGE.os, 'sched_setaffinity', create=True) as affinity, \
+                self.assertRaisesRegex(RuntimeError, 'Linux build server only'):
+            PACKAGE.limit_server_build(PACKAGE.SERVER_BUILD_CPUS, 4)
+        affinity.assert_not_called()
+
+    def test_module_imports_without_posix_only_modules(self):
+        # The manager imports this module on Windows, where fcntl and resource
+        # do not exist; a None entry makes any module-level import of them fail.
+        isolated = importlib.util.spec_from_file_location(
+            'package_runtime_posix_free', ROOT / 'scripts/remote_helpers/package_runtime.py')
+        module = importlib.util.module_from_spec(isolated)
+        with patch.dict(sys.modules, {'fcntl': None, 'resource': None}), patch.object(sys, 'path', list(sys.path)):
+            isolated.loader.exec_module(module)
+        self.assertNotIn('fcntl', vars(module))
+        self.assertNotIn('resource', vars(module))
+
     def test_explicit_v8_cache_verifies_and_reuses_both_pinned_files(self):
         (self.root / 'runtime/codex-rs/Cargo.lock').write_text('[[package]]\nname="v8"\nversion="150.4.0"\n')
         cache = self.base / 'shared-cache'
@@ -130,6 +168,30 @@ class PackageRuntimeTests(unittest.TestCase):
         self.assertTrue(request.call_args.args[0].startswith('https://github.com/openai/codex/releases/download/rusty-v8-v150.4.0/'))
         self.assertEqual(result, {'RUSTY_V8_ARCHIVE': str(directory / names[0]),
                                   'RUSTY_V8_SRC_BINDING_PATH': str(directory / names[1])})
+        self.assertFalse((self.root / 'work').exists())
+
+    def test_windows_v8_target_verifies_and_reuses_files_from_crlf_manifest(self):
+        (self.root / 'runtime/codex-rs/Cargo.lock').write_text('[[package]]\nname="v8"\nversion="150.4.0"\n')
+        cache = self.base / 'shared-cache'
+        directory = cache / 'v8/x86_64-pc-windows-msvc/150.4.0'
+        directory.mkdir(parents=True)
+        names = ('rusty_v8_ptrcomp_sandbox_release_x86_64-pc-windows-msvc.lib.gz',
+                 'src_binding_ptrcomp_sandbox_release_x86_64-pc-windows-msvc.rs')
+        manifest = ''
+        for name in names:
+            data = ('pinned fixture: ' + name).encode()
+            (directory / name).write_bytes(data)
+            # The official Windows manifest is CRLF with binary-mode '*' names.
+            manifest += hashlib.sha256(data).hexdigest() + ' *' + name + '\r\n'
+        with patch.object(PACKAGE.urllib.request, 'urlopen', return_value=io.BytesIO(manifest.encode())) as request:
+            result = PACKAGE.prepare_v8(self.root, 'x86_64', build_cache=cache, target='x86_64-pc-windows-msvc')
+        request.assert_called_once()
+        self.assertEqual(request.call_args.args[0],
+                         'https://github.com/openai/codex/releases/download/rusty-v8-v150.4.0/'
+                         'rusty_v8_ptrcomp_sandbox_release_x86_64-pc-windows-msvc.sha256')
+        self.assertEqual(result, {'RUSTY_V8_ARCHIVE': str(directory / names[0]),
+                                  'RUSTY_V8_SRC_BINDING_PATH': str(directory / names[1])})
+        self.assertFalse((cache / 'v8/x86_64-unknown-linux-gnu').exists())
         self.assertFalse((self.root / 'work').exists())
 
 

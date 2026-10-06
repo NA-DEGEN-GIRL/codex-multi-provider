@@ -73363,7 +73363,7 @@ index a18c051d8..02412d362 100644
          r#"
  SELECT
 diff --git a/codex-rs/state/src/sqlite.rs b/codex-rs/state/src/sqlite.rs
-index 536d56bef..b62ef368d 100644
+index 536d56bef..197b6a0a7 100644
 --- a/codex-rs/state/src/sqlite.rs
 +++ b/codex-rs/state/src/sqlite.rs
 @@ -5,6 +5,10 @@
@@ -73377,6 +73377,34 @@ index 536d56bef..b62ef368d 100644
  use crate::DbTelemetry;
  use crate::migrations::repair_legacy_recency_migration_version;
  use crate::runtime::RuntimeDbInitError;
+@@ -284,8 +288,15 @@ impl SqliteConfig {
+             .auto_vacuum(SqliteAutoVacuum::Incremental)
+             .busy_timeout(Duration::from_secs(5))
+             .log_statements(LevelFilter::Off);
++        // No idle reaping: sqlx 0.9.0 can wrap its idle counter to usize::MAX
++        // under concurrent release/acquire, and the reaper task then never
++        // yields, which spins a runtime worker and blocks process exit
++        // (launchbadge/sqlx#3645). Without both limits no reaper is spawned;
++        // local SQLite connections need no recycling.
+         SqlitePoolOptions::new()
+             .max_connections(5)
++            .idle_timeout(None)
++            .max_lifetime(None)
+             .connect_with(options)
+             .await
+     }
+@@ -304,8 +315,11 @@ impl SqliteConfig {
+         if let Some(busy_timeout) = busy_timeout {
+             options = options.busy_timeout(busy_timeout);
+         }
++        // See `open_read_write_pool`: no reaper task (launchbadge/sqlx#3645).
+         SqlitePoolOptions::new()
+             .max_connections(1)
++            .idle_timeout(None)
++            .max_lifetime(None)
+             .connect_with(options)
+             .await
+     }
 diff --git a/codex-rs/state/src/temporary_history.rs b/codex-rs/state/src/temporary_history.rs
 new file mode 100644
 index 000000000..4af37baee
