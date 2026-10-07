@@ -1,6 +1,5 @@
 """Codex Control Center backend. JSON RPC plus an opt-in loopback skill worker."""
 import argparse
-from copy import deepcopy
 import json
 import os
 from pathlib import Path
@@ -8,7 +7,7 @@ import sys
 import threading
 import time
 
-from manager_core.store import Store, identifier, label, now
+from manager_core.store import Store, identifier, json_copy, label, now
 from manager_core.accounts import Accounts
 from manager_core.catalog import list_catalog, sort_conversations
 from manager_core.catalog_pages import page as catalog_page, legacy_view as catalog_legacy_view
@@ -40,6 +39,9 @@ class ControlCenter:
     # Completed non-state requests. A poll joins only a computation that
     # started after the latest one finished, so it sees that request's writes.
     _request_epoch=0
+    # Polls rescan every home for task forks at most this often. Opening a
+    # task's notes still refreshes that task at once (notes.refresh_forks).
+    NOTE_FORKS_SECONDS=30.0
 
     def __init__(self,root=ROOT,*,supervisor_protocol=None):
         self.root=Path(root).resolve(); self.store=Store(self.root)
@@ -78,6 +80,7 @@ class ControlCenter:
         self.claude_usage=ClaudeUsage(self.root,self.store)
         self.profile_lifecycle=ProfileLifecycle(self.store,self.instances)
         self._sync_at=0
+        self._due_at={}
         self._mutex=threading.RLock()
         self._request_gates={}
         self._request_gate_lock=threading.Lock()
@@ -209,6 +212,13 @@ class ControlCenter:
                 except (ValueError, RuntimeError, OSError, KeyError):
                     continue
 
+    def _due(self,name,seconds):
+        """True on the first call and then at most once every `seconds`."""
+        moment=time.monotonic()
+        last=self._due_at.get(name)
+        if last is not None and moment-last<seconds:return False
+        self._due_at[name]=moment;return True
+
     def state(self):
         notices=[]
         if time.monotonic()-self._sync_at>30:
@@ -220,20 +230,27 @@ class ControlCenter:
             self._remote_reconcile_started = True
             threading.Thread(target=self._reconcile_remote_hosts, daemon=True,
                              name='codex-remote-reconcile').start()
-        if not any(Path(s['home']).resolve()==(Path.home()/'.codex').resolve() for s in state['sources']):
+        original_home=(Path.home()/'.codex').resolve()
+        # Saved homes are already resolved; resolving each one costs a file
+        # open per source, so do it only when no saved home matches as is.
+        if (not any(Path(s['home'])==original_home for s in state['sources'])
+                and not any(Path(s['home']).resolve()==original_home for s in state['sources'])):
             def register(data):
                 Store._source(data,Path.home()/'.codex','original:local','기존 Codex')
             self.store.mutate(register);state=self.store.read()
         # This one snapshot serves the whole poll. Quota refresh gets the saved
         # profiles before this view adds observations to them below.
-        saved_profiles=deepcopy(state['profiles'])
+        saved_profiles=json_copy(state['profiles'])
         # Forked tasks (local and SSH) share their parent's notes until split; the
         # note service reads this mapping instead of opening state databases.
-        try:
-            from manager_core.note_forks import refresh as refresh_note_forks
-            refresh_note_forks(self.root,state)
-        except (ValueError,RuntimeError,OSError):
-            pass
+        if self._due('note_forks',self.NOTE_FORKS_SECONDS):
+            try:
+                from manager_core.note_forks import refresh as refresh_note_forks
+                refresh_note_forks(self.root,state)
+            except (ValueError,RuntimeError,OSError):
+                # A transient failure (a locked state database) retries on the
+                # next poll instead of waiting out the whole interval.
+                self._due_at.pop('note_forks',None)
         state['profile_restarts']=self.restarts.status(state=state)
         state['startup_updates']=self.startup_updates.status(state=state,jobs=state['profile_restarts'])
         state['remote_updates']=self.remote_updates.status_all(state=state)
@@ -298,7 +315,7 @@ class ControlCenter:
         state['view_instances']=[p for p in state['profiles'] if p.get('view_only')]
         state['profiles']=[p for p in state['profiles'] if not p.get('view_only')]
         state['cache_warmth']=self._cache_warmth_summary(state['profiles'],registry)
-        built=runtime_build(self.root).get('capabilities',{})
+        built=selected_runtime.get('capabilities',{})  # One verified release read per poll.
         shared_running=built.get('shared_record_catalog') and any(p['status']=='running' and p.get('runtime_channel')!='packaged' for p in state['profiles'])
         catalog_refresh=self.current_catalog_refresh(built)
         if (state['view_instances'] and built.get('native_record_catalog')) or shared_running:

@@ -2,12 +2,75 @@
 from copy import deepcopy
 from contextlib import closing
 import hashlib
+import marshal
 import os
 import ntpath
 from pathlib import Path
 import sqlite3
 
 from .source_catalog import projection_id
+from .store import file_stamp
+
+# Profiles prepared one after another read the same source store. Per kind and
+# source: (database stamps, input token, value). A hit needs the same inputs
+# too; the caller's donor document is compared, not its file's stamp. Only
+# database reads are kept: folder links are resolved again on every call.
+_SNAPSHOTS = {}
+_SNAPSHOT_LIMIT = 16
+_NO_INPUTS = b''
+
+
+def _database_stamp(database):
+    """Stamps of a SQLite database and its WAL; None while either may still change."""
+    stamps = (file_stamp(database), file_stamp(database.with_name(database.name + '-wal')))
+    return None if None in stamps else stamps
+
+
+def _inputs_token(*inputs):
+    """Type-exact bytes of the inputs, or None when they cannot be compared.
+
+    `==` treats 1, 1.0 and True as equal; marshal keeps their types apart.
+    Version 2 writes no object references or interning marks, so equal
+    values give equal bytes whatever their identity or reference counts.
+    Callers pass sets sorted: equal sets may iterate in different orders.
+    """
+    try:
+        return marshal.dumps(inputs, 2)
+    except ValueError:
+        return None  # Not a plain JSON/SQLite value; never cached.
+
+
+def _cached(key, stamp, token):
+    entry = _SNAPSHOTS.get(key)
+    if stamp is None or token is None or entry is None or entry[0] != stamp or entry[1] != token:
+        return None
+    return entry[2]
+
+
+def _remember(key, stamp, token, value):
+    if stamp is None or token is None or value is None:
+        return
+    if len(_SNAPSHOTS) >= _SNAPSHOT_LIMIT:
+        _SNAPSHOTS.clear()
+    _SNAPSHOTS[key] = (stamp, token, value)
+
+
+def _task_folders(database, key):
+    """(id, cwd) of every task, reused while the database and its WAL keep their stamps."""
+    stamp = _database_stamp(database)
+    rows = _cached(key, stamp, _NO_INPUTS)
+    if rows is not None:
+        return rows  # A tuple of tuples of SQLite scalars: callers cannot modify it.
+    connection = sqlite3.connect(database.as_uri() + '?mode=ro', uri=True, timeout=5)
+    try:
+        connection.execute('PRAGMA query_only=ON')
+        rows = tuple(connection.execute('SELECT id,cwd FROM threads LIMIT 100001'))
+    finally:
+        connection.close()
+    if len(rows) > 100000:
+        raise ValueError('공유 프로젝트의 대화 분류 범위를 초과했습니다.')
+    _remember(key, stamp, _NO_INPUTS, rows)
+    return rows
 
 
 def _confirmed_threads(signals):
@@ -35,6 +98,17 @@ def workspace_path(value):
     return path[4:] if path.startswith('\\\\?\\') else path
 
 
+def _folder_project(path, roots):
+    """The one project with the deepest root containing path, else None."""
+    matches = [(len(root), legacy) for root, legacy in roots
+               if path == root or path.startswith(root.rstrip('\\/') + os.sep)]
+    if not matches:
+        return None
+    deepest = max(length for length, _ in matches)
+    ids = {legacy for length, legacy in matches if length == deepest}
+    return ids.pop() if len(ids) == 1 else None
+
+
 def inferred_assignments(source, original, projects):
     """Reproduce legacy folder grouping from metadata, without reading bodies."""
     database = source / 'state_5.sqlite'
@@ -45,27 +119,19 @@ def inferred_assignments(source, original, projects):
     projectless = set(original.get('projectless-thread-ids', []))
     hints = original.get('thread-workspace-root-hints', {})
     result = {}
-    connection = sqlite3.connect(database.as_uri() + '?mode=ro', uri=True, timeout=5)
-    try:
-        connection.execute('PRAGMA query_only=ON')
-        for index, (thread, cwd) in enumerate(connection.execute('SELECT id,cwd FROM threads LIMIT 100001')):
-            if index >= 100000:
-                raise ValueError('공유 프로젝트의 대화 분류 범위를 초과했습니다.')
-            if thread in projectless:
-                continue
-            candidate = hints.get(thread) or cwd
-            if not isinstance(candidate, str):
-                continue
-            path = workspace_path(candidate)
-            matches = [(len(root), legacy) for root, legacy in roots
-                       if path == root or path.startswith(root.rstrip('\\/') + os.sep)]
-            if matches:
-                deepest = max(length for length, _ in matches)
-                ids = {legacy for length, legacy in matches if length == deepest}
-                if len(ids) == 1:
-                    result[thread] = ids.pop()
-    finally:
-        connection.close()
+    # Many tasks share a working folder; resolve and match each string once
+    # per call, so a changed junction or mapped drive is seen at once.
+    folders = {}
+    for thread, cwd in _task_folders(database, ('tasks', str(source))):
+        if thread in projectless:
+            continue
+        candidate = hints.get(thread) or cwd
+        if not isinstance(candidate, str):
+            continue
+        if candidate not in folders:
+            folders[candidate] = _folder_project(workspace_path(candidate), roots)
+        if folders[candidate] is not None:
+            result[thread] = folders[candidate]
     return result
 
 
@@ -99,6 +165,11 @@ def current_workspace(source, original, *, signals=None):
     database = source / 'state_5.sqlite'
     if not migration.get('projectsMigrated') or not database.is_file():
         return original
+    key, stamp = ('current', str(source)), _database_stamp(database)
+    token = None if stamp is None else _inputs_token(original, sorted(confirmed))
+    cached = _cached(key, stamp, token)
+    if cached is not None:
+        return marshal.loads(cached)  # A fresh copy: callers modify results.
     with closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True, timeout=5)) as connection:
         connection.execute('PRAGMA query_only=ON')
         connection.execute('BEGIN')
@@ -143,13 +214,19 @@ def current_workspace(source, original, *, signals=None):
                     assignments.pop(thread, None)
                     projectless.add(thread)
         result['projectless-thread-ids'] = list(projectless)
-        return result
+    try:
+        packed = marshal.dumps(result)
+    except ValueError:
+        packed = None
+    _remember(key, stamp, token, packed)
+    return result
 
 
 def merge_workspace(current, original, owned, source, *, ssh_ready_aliases=None, signals=None,
-                    allow_remote_connections=True):
+                    allow_remote_connections=True, workspace=None):
+    """workspace: the caller's current_workspace(source, original) result, if read."""
     source = Path(source).resolve()
-    original = current_workspace(source, original, signals=signals)
+    original = current_workspace(source, original, signals=signals) if workspace is None else workspace
     if not allow_remote_connections:
         # Local-only agents must not inherit Electron's automatic SSH startup.
         # These dictionaries belong to this isolated profile; never change the donor.

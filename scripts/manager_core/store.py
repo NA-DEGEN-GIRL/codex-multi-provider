@@ -3,6 +3,7 @@ from contextlib import contextmanager
 from copy import deepcopy
 from datetime import datetime, timezone
 import json
+import marshal
 import os
 from pathlib import Path
 import tempfile
@@ -11,8 +12,43 @@ import time
 from uuid import UUID, uuid4
 
 
+# Last parsed state document per path: (file stamp, marshal bytes). Every
+# read gets its own copy; marshal.loads builds one several times faster than
+# json.loads, and deepcopy is slower than both.
+_PARSED = {}
+_PARSED_LIMIT = 16
+# A file younger than this may still change within one timestamp tick while
+# keeping its size and mtime (Git's "racily clean" case).
+SETTLED_NS = 2_000_000_000
+
+
 def now():
     return datetime.now(timezone.utc).isoformat()
+
+
+def json_copy(value):
+    """An independent copy of a JSON-typed document, faster than deepcopy."""
+    try:
+        return marshal.loads(marshal.dumps(value))
+    except ValueError:  # Holds a value marshal cannot represent.
+        return deepcopy(value)
+
+
+def file_stamp(path, *, replaced=False):
+    """Content identity of a file: () when missing, None when it cannot be trusted.
+
+    replaced: every writer swaps in a new file (atomic_json), so a new file
+    identity marks each write and even a fresh file can be trusted.
+    """
+    try:
+        stat = os.stat(path)
+    except FileNotFoundError:
+        return ()
+    except OSError:
+        return None
+    if not (replaced and stat.st_ino) and time.time_ns() - stat.st_mtime_ns < SETTLED_NS:
+        return None
+    return (stat.st_ino, stat.st_size, stat.st_mtime_ns)
 
 
 def identifier(value):
@@ -123,6 +159,16 @@ class Store:
                     fcntl.flock(file, fcntl.LOCK_UN)
 
     def read(self):
+        # An unchanged file is served from its last parse with only a stat:
+        # no open handle, so no lock is needed and a long writer is not waited
+        # for. Writers still replace the file under the lock below.
+        # A holder of the lock is about to decide or write from what it reads,
+        # so it always parses the file: a stamp can repeat off NTFS (a reused
+        # inode in one mtime tick), and that would turn into a lost update.
+        if not getattr(self._local, 'held', False):
+            cached = _PARSED.get(str(self.path))
+            if cached and cached[0] == file_stamp(self.path, replaced=True):
+                return marshal.loads(cached[1])
         # Readers and writers use the same interprocess lock. On Windows even
         # a complete atomic replace may temporarily deny another open handle.
         with self.locked():
@@ -132,14 +178,19 @@ class Store:
         if not self.path.exists():
             return dict(version=1, revision=0, profiles=[], shortcuts=[], deleted_shortcuts=[],
                         sources=[], representative_profile_id=None, notices=[])
+        stamp = file_stamp(self.path, replaced=True)  # No writer replaces it while locked.
         data = json.loads(self.path.read_text(encoding='utf-8-sig'))
         if data.get('version') != 1:
             raise RuntimeError('지원하지 않는 관리 데이터 버전입니다. 기존 파일을 보존했습니다.')
+        if stamp:
+            if len(_PARSED) >= _PARSED_LIMIT:
+                _PARSED.clear()
+            _PARSED[str(self.path)] = (stamp, marshal.dumps(data))
         return data
 
     def mutate(self, operation):
         with self.locked():
-            data = self.read()
+            data = self._read_unlocked()  # Never builds on the unlocked cache.
             result = operation(data)
             if isinstance(result, Unchanged):
                 return deepcopy(result.value)

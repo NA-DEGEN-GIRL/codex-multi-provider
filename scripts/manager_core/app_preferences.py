@@ -98,15 +98,15 @@ def prepare(home, source, *, account_id=None, ssh_ready_aliases=None, canonical=
     membership_baseline = deepcopy(current)
     from .ssh_connection_recovery import apply_pending, finish as finish_ssh_recovery
     ssh_recovery = apply_pending(home, current) if allow_remote_connections else None
-    from .app_workspace import merge_workspace, remove_imported_projects
+    from .app_workspace import current_workspace, merge_workspace, remove_imported_projects
+    # One read of the source store serves both the merge and canonical membership.
+    workspace = current_workspace(source, original, signals=signals)
     project_aliases, result['workspace'] = merge_workspace(current, original, owned, source,
         ssh_ready_aliases=ssh_ready_aliases, signals=signals,
-        allow_remote_connections=allow_remote_connections)
+        allow_remote_connections=allow_remote_connections, workspace=workspace)
     if canonical:
         # Project IDs now belong to the shared store. Never run each profile's
         # legacy importer against it or resurrect removed project declarations.
-        from .app_workspace import current_workspace
-        workspace = current_workspace(source, original, signals=signals)
         host = 'local:' + str(home)
         donor_host = 'local:' + str(source)
         current.setdefault('app-server-project-id-by-legacy-project-id-by-host', {})[host] = deepcopy(
