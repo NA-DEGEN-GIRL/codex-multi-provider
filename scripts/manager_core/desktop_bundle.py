@@ -214,8 +214,8 @@ def read_header(stream):
 def patch_archive(source, destination):
     """Patch exact native entry points and preserve unrelated archive assets."""
     from .original_sync_bundle import (main_sync_plan, renderer_patches_for, renderer_plugin_patches,
-        renderer_host_identity_patches, renderer_remote_root_patches, renderer_summary_dir_patches,
-        require_project_grouping, archive_version)
+        renderer_host_identity_patches, renderer_remote_root_patches, renderer_remote_order_patches,
+        renderer_summary_dir_patches, require_project_grouping, archive_version)
     from .desktop_reasoning_ui import PICKER_MARKER, patch as patch_reasoning
     from .desktop_chrome_host import Plan as ChromeHostPlan
     with Path(source).open('rb') as src:
@@ -233,6 +233,7 @@ def patch_archive(source, destination):
         reasoning_settings = False
         host_filters = []
         remote_roots = []
+        remote_orders = []
         summary_dirs = []
         grouping_chunks = []
         chrome_host = ChromeHostPlan()
@@ -258,6 +259,8 @@ def patch_archive(source, destination):
                     host_filters.append(name)
                 if renderer_remote_root_patches(data):
                     remote_roots.append(name)
+                if renderer_remote_order_patches(data):
+                    remote_orders.append(name)
                 if renderer_summary_dir_patches(data):
                     summary_dirs.append(name)
                 if PICKER_MARKER in data:
@@ -277,6 +280,8 @@ def patch_archive(source, destination):
                         host_filters.append(name)
                     if renderer_remote_root_patches(data):
                         remote_roots.append(name)
+                    if renderer_remote_order_patches(data):
+                        remote_orders.append(name)
                     if renderer_summary_dir_patches(data):
                         summary_dirs.append(name)
                     if PICKER_MARKER in data:
@@ -340,7 +345,8 @@ def patch_archive(source, destination):
             changed[renderer_name] = (renderer_target, renderer_data)
         # The host filter and the remote project grouping live in app-initial
         # (26.917) or app-shared (26.930); each exists in at most one chunk.
-        # The remote worktree folder lookup follows the guard of its chunk.
+        # The remote worktree project order and folder lookup follow the guard
+        # of their chunk; the guard goes first (its section holds the call).
         entries_by_name = dict(entries)
         def webview_data(name):
             if name in changed:
@@ -350,6 +356,7 @@ def patch_archive(source, destination):
             return src.read(item['size'])
         for found, patches_of, label in ((host_filters, renderer_host_identity_patches, 'host-specific archive filter'),
                                          (remote_roots, renderer_remote_root_patches, 'remote project grouping'),
+                                         (remote_orders, renderer_remote_order_patches, 'remote worktree project order'),
                                          (summary_dirs, renderer_summary_dir_patches, 'remote worktree folder lookup')):
             if len(found) > 1:
                 raise ValueError('Ambiguous desktop ' + label + '.')
@@ -358,7 +365,7 @@ def patch_archive(source, destination):
                 for before, after in patches_of(filter_data).items():
                     filter_data = filter_data.replace(before, after)
                 changed[filter_name] = (entries_by_name[filter_name], filter_data)
-        # 26.930 refuses to publish without both grouping patches (see
+        # 26.930 refuses to publish without all three grouping patches (see
         # require_project_grouping); other versions keep the native fallback.
         require_project_grouping(archive_version(src, base, entries),
                                  [webview_data(chunk) for chunk in grouping_chunks])
