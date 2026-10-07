@@ -143,6 +143,105 @@ class PluginSyncTests(unittest.TestCase):
         self.assertEqual(0, self.sync.reconcile(force=True)['applied'])
         self.assertEqual(second, self.signal()['revision'])
 
+    def test_marker_rewrite_with_same_content_keeps_the_generation(self):
+        base = self.install_native(self.homes['02'])
+        self.sync.reconcile(force=True)
+        first = self.signal()['revision']
+        generation = self.sync.status()['shared']['github']['source_generation']
+        marker = base / '.codex-remote-plugin-install.json'
+        # A desktop rewrite: same install identity, other formatting, newer time.
+        marker.write_text(json.dumps({'remote_plugin_id': 'plugin_synthetic', 'schema_version': 1},
+                                     indent=2) + '\n', encoding='utf-8')
+        later = time.time() + 30
+        os.utime(marker, (later, later))
+        self.assertEqual(0, self.sync.reconcile(force=True)['applied'])
+        self.assertEqual(first, self.signal()['revision'])
+        record = self.sync.status()['shared']['github']
+        self.assertEqual(generation, record['source_generation'])
+        self.assertNotIn('previous_generation', record)
+        # A reinstall changes the identity; the registry names the plugin that moved.
+        marker.write_text(json.dumps({'schema_version': 1, 'remote_plugin_id': 'plugin_reinstalled'}),
+                          encoding='utf-8')
+        self.assertGreaterEqual(self.sync.reconcile(force=True)['applied'], 1)
+        self.assertNotEqual(first, self.signal()['revision'])
+        record = self.sync.status()['shared']['github']
+        self.assertNotEqual(generation, record['source_generation'])
+        self.assertEqual(generation, record['previous_generation'])
+        self.assertIs(int, type(record['generation_changed_at_ns']))
+        registry = json.loads((self.store.directory / 'plugin-sync.json').read_text(encoding='utf-8'))
+        self.assertEqual(generation, registry['shared']['github']['previous_generation'])
+        applied = json.loads((self.mirror(self.original) / plugin_sync._GENERATION_FILE)
+                             .read_text(encoding='utf-8'))
+        self.assertEqual(record['source_generation'], applied['generation'])
+
+    def test_marker_identity_ignores_formatting_and_counts_unreadable_bytes(self):
+        marker = self.root / 'marker.json'
+        self.assertEqual('0', plugin_sync._marker_identity(marker))
+        marker.write_text('{"schema_version": 1, "remote_plugin_id": "plugin_a"}', encoding='utf-8')
+        first = plugin_sync._marker_identity(marker)
+        marker.write_text('{\n  "remote_plugin_id": "plugin_a",\n  "schema_version": 1\n}\n',
+                          encoding='utf-8')
+        self.assertEqual(first, plugin_sync._marker_identity(marker))
+        marker.write_text('{"schema_version": 1, "remote_plugin_id": "plugin_b"}', encoding='utf-8')
+        self.assertNotEqual(first, plugin_sync._marker_identity(marker))
+        marker.write_text('{damaged', encoding='utf-8')
+        damaged = plugin_sync._marker_identity(marker)
+        marker.write_text('{damaged!', encoding='utf-8')
+        self.assertNotEqual(damaged, plugin_sync._marker_identity(marker))
+
+    def test_config_state_is_parsed_once_per_config_revision(self):
+        home = self.homes['03']
+        config = home / 'config.toml'
+        plugin_sync._config_cache.clear()
+        config.write_text('[plugins."github@openai-curated-remote"]\nenabled = true\n', encoding='utf-8')
+        settled = time.time() - 60
+        os.utime(config, (settled, settled))
+        with mock.patch.object(plugin_sync.tomllib, 'loads', wraps=tomllib.loads) as parse:
+            states, names = plugin_sync._config_state(home)
+            states['github@openai-curated-remote'] = False
+            names.append('mutated')
+            self.assertEqual(({'github@openai-curated-remote': True}, []),
+                             plugin_sync._config_state(home))
+            self.assertEqual(1, parse.call_count)
+            config.write_text('[plugins."github@openai-curated-remote"]\nenabled = false\n',
+                              encoding='utf-8')
+            os.utime(config, (settled + 1, settled + 1))
+            self.assertEqual({'github@openai-curated-remote': False},
+                             plugin_sync._config_state(home)[0])
+            self.assertEqual(2, parse.call_count)
+            # A file written moments ago is parsed again on every call.
+            config.write_text('model = "synthetic"\n', encoding='utf-8')
+            plugin_sync._config_state(home)
+            plugin_sync._config_state(home)
+            self.assertEqual(4, parse.call_count)
+
+    def test_in_process_pass_returns_busy_without_waiting(self):
+        self.install_native(self.homes['02'])
+        held, release = threading.Event(), threading.Event()
+
+        def hold():
+            with self.sync.lock:
+                held.set()
+                release.wait(10)
+
+        worker = threading.Thread(target=hold, daemon=True)
+        worker.start()
+        self.assertTrue(held.wait(5))
+        try:
+            started = time.monotonic()
+            result = self.sync.reconcile(force=True)
+            elapsed = time.monotonic() - started
+        finally:
+            release.set()
+            worker.join(timeout=5)
+        self.assertTrue(result.get('busy'))
+        self.assertEqual(0, result['applied'])
+        self.assertLess(elapsed, 2)
+        self.assertFalse((self.store.directory / 'shared-plugins').exists())
+        self.assertFalse(self.mirror(self.original).exists())
+        self.assertFalse(self.sync.reconcile(force=True).get('busy'))
+        self.assertTrue((self.mirror(self.original) / '1.0.0').is_dir())
+
     def test_peer_disable_is_preserved_and_native_peer_drops_the_mirror(self):
         self.install_native(self.homes['02'])
         self.sync.reconcile(force=True)

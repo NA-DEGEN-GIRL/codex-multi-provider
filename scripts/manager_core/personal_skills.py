@@ -223,53 +223,62 @@ class PersonalSkills:
         if self.worker:
             self.worker.join(timeout=3)
 
+    def _stamp(self, homes):
+        paths = [self.registry, *_roots(self.source), *(h / 'config.toml' for _, h in homes)]
+        return tuple((str(p), p.stat().st_mtime_ns, p.stat().st_size) if p.exists() else (str(p), None) for p in paths)
+
     def reconcile(self, force=False):
-        with self.lock, self.store.locked(), _resolved_once():
-            homes = self._homes()
-            paths = [self.registry, *_roots(self.source), *(h / 'config.toml' for _, h in homes)]
-            stamp = tuple((str(p), p.stat().st_mtime_ns, p.stat().st_size) if p.exists() else (str(p), None) for p in paths)
-            if not force and stamp == self.stamp:
+        with self.lock, _resolved_once():
+            # The idle check needs only a state snapshot. The state lock is
+            # held just for a pass that rewrites homes (state before config).
+            if not force and self._stamp(self._homes()) == self.stamp:
                 return self.result
-            rows = inventory(self.source)
-            registry = self._load()
-            previous = deepcopy(registry)
-            for row in rows:
-                # Bootstrap new installations once. Afterwards the manager's
-                # registry owns the setting; no app/profile has priority.
-                registry['skills'].setdefault(row['id'], dict(enabled=row['enabled'], name=row['name']))
-            changes = []
-            for alias, home in homes:
-                try:
-                    current = self._observation(home, rows)
-                except (OSError, ValueError):
-                    continue
-                old = registry['observations'].get(_key(home))
-                if old:
-                    for sid, enabled in current['values'].items():
-                        if sid in old['values'] and enabled != old['values'][sid]:
-                            changes.append((current['changed_at'], _key(home), sid, enabled))
-            # A real change in any client is promoted to the common registry.
-            # New profiles' empty configs never reset existing shared choices.
-            for _, _, sid, enabled in sorted(changes):
-                registry['skills'][sid]['enabled'] = enabled
-            for row in rows:
-                row['enabled'] = registry['skills'][row['id']]['enabled']
-            applied, errors = 0, []
-            for alias, home in homes:
-                try:
-                    sync_home(home, self.source, rows)
-                    registry['observations'][_key(home)] = self._observation(home, rows)
-                    applied += 1
-                except (OSError, ValueError) as error:
-                    errors.append(dict(profile=alias, message=str(error)))
-            self.result = dict(applied=applied, errors=errors)
-            if registry != previous or not self.registry.exists():
-                atomic_json(self.registry, registry)
-            # Store the post-write signature to avoid rewriting every state poll.
-            self.stamp = tuple((str(p), p.stat().st_mtime_ns, p.stat().st_size) if p.exists() else (str(p), None) for p in paths)
-            if errors:
-                self.stamp = None
-            return self.result
+            with self.store.locked():
+                return self._reconcile()
+
+    def _reconcile(self):
+        # Caller holds self.lock and the state lock; homes come from that snapshot.
+        homes = self._homes()
+        rows = inventory(self.source)
+        registry = self._load()
+        previous = deepcopy(registry)
+        for row in rows:
+            # Bootstrap new installations once. Afterwards the manager's
+            # registry owns the setting; no app/profile has priority.
+            registry['skills'].setdefault(row['id'], dict(enabled=row['enabled'], name=row['name']))
+        changes = []
+        for alias, home in homes:
+            try:
+                current = self._observation(home, rows)
+            except (OSError, ValueError):
+                continue
+            old = registry['observations'].get(_key(home))
+            if old:
+                for sid, enabled in current['values'].items():
+                    if sid in old['values'] and enabled != old['values'][sid]:
+                        changes.append((current['changed_at'], _key(home), sid, enabled))
+        # A real change in any client is promoted to the common registry.
+        # New profiles' empty configs never reset existing shared choices.
+        for _, _, sid, enabled in sorted(changes):
+            registry['skills'][sid]['enabled'] = enabled
+        for row in rows:
+            row['enabled'] = registry['skills'][row['id']]['enabled']
+        applied, errors = 0, []
+        for alias, home in homes:
+            try:
+                sync_home(home, self.source, rows)
+                registry['observations'][_key(home)] = self._observation(home, rows)
+                applied += 1
+            except (OSError, ValueError) as error:
+                errors.append(dict(profile=alias, message=str(error)))
+        self.result = dict(applied=applied, errors=errors)
+        if registry != previous or not self.registry.exists():
+            atomic_json(self.registry, registry)
+        # Store the post-write signature to avoid rewriting every state poll.
+        self.stamp = self._stamp(homes)
+        if errors:
+            self.stamp = None
+        return self.result
 
     def list(self):
         with self.lock:

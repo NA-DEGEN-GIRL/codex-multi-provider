@@ -3,8 +3,9 @@
 Installed bundles are mirrored faithfully, including the ``.codex-plugin``
 manifest, capabilities, app/connector declarations, skills, MCP declarations
 and hooks. The receiving runtime keeps its own per-account authorization and
-hook trust checks. Credentials, OAuth grants, remote installation markers,
-``plugins/data`` and symlinks/junctions are never read or copied.
+hook trust checks. Credentials, OAuth grants, ``plugins/data`` and
+symlinks/junctions are never read or copied. A remote installation marker is
+never copied; only its install identity stamps the plugin's generation.
 
 The mirror lives in its own marketplace name. The runtime's account-scoped
 remote cleanup only removes entries under the six remote marketplace names
@@ -63,6 +64,10 @@ _MAX_BUNDLE_ENTRIES = 20000
 _MAX_BUNDLE_BYTES = 512 * 1024 * 1024
 _MAX_TOMBSTONES = 256
 _GENERATION_FILE = '.codex-manager-generation.json'
+_CONFIG_SETTLE_NS = 2_000_000_000
+_MAX_CONFIG_CACHE = 256
+# Parsed ``config.toml`` state per home: key -> ((mtime_ns, size), states, names).
+_config_cache = {}
 
 
 def _read(path):
@@ -159,9 +164,25 @@ def _version(value, fallback='local'):
 
 
 def _config_state(home):
-    """Explicit plugin enablement plus declared marketplace names."""
+    """Explicit plugin enablement plus declared marketplace names.
+
+    The watcher stamps every home on each pass, so a parse is reused while
+    ``config.toml`` keeps its (mtime, size). A file younger than
+    ``_CONFIG_SETTLE_NS`` is not cached: a same-size rewrite within one
+    filesystem clock tick would keep that stamp.
+    """
+    path = Path(home) / 'config.toml'
+    key = os.path.normcase(os.path.abspath(path))
     try:
-        data = tomllib.loads(_read(Path(home) / 'config.toml'))
+        info = path.stat()
+        stamp = (info.st_mtime_ns, info.st_size)
+    except OSError:
+        stamp = None
+    cached = _config_cache.get(key)
+    if stamp is not None and cached is not None and cached[0] == stamp:
+        return dict(cached[1]), list(cached[2])
+    try:
+        data = tomllib.loads(_read(path))
     except (OSError, ValueError):
         return {}, {}
     plugins, marketplaces = data.get('plugins'), data.get('marketplaces')
@@ -171,7 +192,33 @@ def _config_state(home):
               for name, value in plugins.items()
               if isinstance(name, str) and isinstance(value, dict) and _PLUGIN_ID.fullmatch(name)}
     names = [name for name in marketplaces if isinstance(name, str) and _NAME.fullmatch(name)]
+    if stamp is not None and time.time_ns() - stamp[0] > _CONFIG_SETTLE_NS:
+        if len(_config_cache) >= _MAX_CONFIG_CACHE:
+            _config_cache.clear()
+        _config_cache[key] = (stamp, dict(states), list(names))
     return states, names
+
+
+def _marker_identity(path):
+    """Content stamp of a remote install marker for a plugin generation.
+
+    Desktops rewrite ``.codex-remote-plugin-install.json`` with unchanged
+    content; that must not republish the plugin into every home. Only the
+    remote install identity counts, and a marker that is not valid JSON
+    counts by its bytes. The marker is never copied; a linked one is not read.
+    """
+    if not path.is_file() or _linked(path):
+        return '0'
+    with path.open('rb') as stream:
+        data = stream.read(_MAX_MANIFEST_BYTES + 1)
+    try:
+        value = json.loads(data.decode('utf-8-sig')) if len(data) <= _MAX_MANIFEST_BYTES else None
+    except ValueError:
+        value = None
+    if isinstance(value, dict):
+        data = json.dumps([value.get('remote_plugin_id'), value.get('schema_version')],
+                          sort_keys=True).encode('utf-8')
+    return hashlib.sha256(data).hexdigest()[:32]
 
 
 def _marketplace_names(home, configured):
@@ -232,8 +279,7 @@ def inventory(home, marketplaces=None):
                 if manifest_path.is_file() and not manifest_path.is_symlink():
                     manifest_time = manifest_path.stat().st_mtime_ns
             generation = hashlib.sha256('|'.join((
-                versions[-1], str(newest),
-                str(marker.stat().st_mtime_ns) if marker.is_file() else '0',
+                versions[-1], str(newest), _marker_identity(marker),
                 str(manifest_time))).encode('utf-8')).hexdigest()[:32]
             found[name] = dict(
                 name=name, marketplace=marketplace, versions=versions,
@@ -432,6 +478,16 @@ def _remove_directory(base, target, label):
     _confined(base, target, label)
     if os.path.lexists(target):
         shutil.rmtree(_long(target), ignore_errors=True)
+
+
+def _note_generation(record, generation, now):
+    """Keep in the registry which shared plugin's source generation moved, and when.
+
+    Each move republishes that plugin and re-mirrors it into every home.
+    """
+    previous = record.get('source_generation')
+    if previous is not None and previous != generation:
+        record.update(previous_generation=previous, generation_changed_at_ns=now)
 
 
 class PluginSync:
@@ -649,20 +705,26 @@ class PluginSync:
         The manager state lock is never held while bundles are copied: homes
         come from one short snapshot and every write happens under
         ``plugin-sync.lock``, so a slow pass cannot stall profile RPCs.
+        A pass already running in this process or another one is a skip.
         """
-        with self.lock:
+        # Busy is a skip, not a result: the watcher retries and a profile
+        # open must never fail or wait on propagation.
+        busy = dict(applied=0, shared=0, removed=0, busy=True,
+                    errors=[dict(profile='shared plugins', code='busy',
+                                 message='Another shared plugin pass is running.')])
+        if not self.lock.acquire(blocking=False):
+            return busy
+        try:
             try:
                 handle = _lock_file(self.lock_path)
             except UpdateError:
-                # Busy is a skip, not a result: the watcher retries and a
-                # profile open must never fail or wait on propagation.
-                return dict(applied=0, shared=0, removed=0, busy=True,
-                            errors=[dict(profile='shared plugins', code='busy',
-                                         message='Another shared plugin pass is running.')])
+                return busy
             try:
                 return self._reconcile(force)
             finally:
                 _unlock_file(handle)
+        finally:
+            self.lock.release()
 
     def _reconcile(self, force=False):
         state = self.store.read()
@@ -713,6 +775,7 @@ class PluginSync:
                 elif (record.get('origin') == key
                       and (found['modified_ns'] > record.get('installed_at_ns', 0)
                            or record.get('source_generation') != found['generation'])):
+                    _note_generation(record, found['generation'], now)
                     record.update(marketplace=found['marketplace'], version=found['version'],
                                   installed_at_ns=found['modified_ns'],
                                   source_generation=found['generation'],
@@ -733,6 +796,7 @@ class PluginSync:
                            if inventories[_key(home)].get(name, {}).get('promotable')]
                 if natives:
                     found = inventories[_key(natives[0])][name]
+                    _note_generation(record, found['generation'], now)
                     record.update(origin=_key(natives[0]), marketplace=found['marketplace'],
                                   version=found['version'], installed_at_ns=found['modified_ns'],
                                   source_generation=found['generation'])

@@ -121,6 +121,25 @@ class PersonalSkillsTests(unittest.TestCase):
         self.assertEqual(before, [(home / 'config.toml').stat().st_mtime_ns for home in self.homes])
         self.assertEqual(registry_time, self.manager.registry.stat().st_mtime_ns)
 
+    def test_state_lock_is_taken_only_when_a_pass_is_needed(self):
+        from unittest.mock import patch
+        self.manager.list()
+        homes = self.manager._homes()
+        with patch.object(self.manager, '_homes', return_value=homes), \
+                patch.object(self.store, 'locked', side_effect=AssertionError('state lock taken')):
+            self.assertIs(self.manager.result, self.manager.reconcile())
+        self.change(self.homes[1], 'old-skill', False)
+        real, calls = self.store.locked, []
+
+        def counting():
+            calls.append(1)
+            return real()
+        with patch.object(self.manager, '_homes', return_value=homes), \
+                patch.object(self.store, 'locked', counting):
+            self.assertEqual([], self.manager.reconcile()['errors'])
+        self.assertEqual([1], calls)
+        self.assert_enabled('old-skill', False)
+
     def test_physical_deletion_from_shared_profile_is_not_resurrected(self):
         self.manager.list()
         path = self.homes[1] / 'skills/old-skill'
