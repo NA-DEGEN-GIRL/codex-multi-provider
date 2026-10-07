@@ -9,12 +9,14 @@ import tempfile
 import time
 import unittest
 from unittest.mock import patch
+import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 from manager_core import app_workspace, membership_proofs
 from manager_core.app_preferences import prepare
 from manager_core.app_workspace import current_workspace
 from manager_core.source_catalog import projection_id
+from manager_core.store import file_stamp
 
 
 class WorkspaceTests(unittest.TestCase):
@@ -429,7 +431,7 @@ class WorkspaceTests(unittest.TestCase):
                 current_workspace(source, original, signals=signals)
                 self.assertEqual(connect.call_count, 6)
 
-    def test_folder_grouping_resolves_each_folder_once_and_reuses_a_settled_database(self):
+    def test_folder_grouping_reuses_task_rows_but_resolves_folders_on_every_call(self):
         with tempfile.TemporaryDirectory() as temp:
             source = Path(temp) / 'source'
             source.mkdir()
@@ -442,17 +444,92 @@ class WorkspaceTests(unittest.TestCase):
                                  [(thread, str(source / folder)) for thread, folder in zip(threads, folders)])
             projects = {name: dict(rootPaths=[str(source / name)]) for name in ('alpha', 'beta')}
             expected = {thread: folder for thread, folder in zip(threads, folders) if folder != 'other'}
+            inferred = app_workspace.inferred_assignments
             with patch('manager_core.app_workspace.workspace_path', wraps=app_workspace.workspace_path) as resolve:
-                self.assertEqual(app_workspace.inferred_assignments(source, {}, projects), expected)
+                self.assertEqual(inferred(source, {}, projects), expected)
             self.assertEqual(resolve.call_count, 2 + 3)  # Two roots, three distinct working folders.
             self.settle(database)
-            app_workspace.inferred_assignments(source, {}, projects).clear()
-            with patch('manager_core.app_workspace.sqlite3.connect', wraps=sqlite3.connect) as connect:
-                self.assertEqual(app_workspace.inferred_assignments(source, {}, projects), expected)
+            inferred(source, {}, projects).clear()  # Callers modify results.
+            with patch('manager_core.app_workspace.sqlite3.connect', wraps=sqlite3.connect) as connect, \
+                    patch('manager_core.app_workspace.workspace_path', wraps=app_workspace.workspace_path) as resolve:
+                self.assertEqual(inferred(source, {}, projects), expected)
                 self.assertEqual(connect.call_count, 0)
+                self.assertEqual(resolve.call_count, 2 + 3)  # Folder links are resolved again.
                 hidden = {'projectless-thread-ids': [threads[0]]}
-                self.assertNotIn(threads[0], app_workspace.inferred_assignments(source, hidden, projects))
-                self.assertEqual(connect.call_count, 1)
+                self.assertNotIn(threads[0], inferred(source, hidden, projects))
+                self.assertEqual(connect.call_count, 0)  # Only the database rows are kept.
+            # The 'other' folder becomes a junction to 'alpha'; the database is unchanged.
+            real = app_workspace.workspace_path
+            alpha = real(source / 'alpha')
+            def linked(value):
+                return alpha if Path(value).name == 'other' else real(value)
+            with patch('manager_core.app_workspace.sqlite3.connect', wraps=sqlite3.connect) as connect, \
+                    patch('manager_core.app_workspace.workspace_path', side_effect=linked):
+                self.assertEqual(inferred(source, {}, projects), {**expected, threads[5]: 'alpha'})
+                self.assertEqual(connect.call_count, 0)
+
+    def test_cached_snapshot_tells_one_from_true(self):
+        # `==` treats 1 and True alike, but only `true` confirms the native read migration.
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / 'source'
+            thread = '00000000-0000-4000-9000-000000000013'
+            original = self.membership_fixture(source, thread, native=None,
+                threadAssignmentsMigrated=True, threadAssignmentsReadMigrated=1)
+            self.settle(source / 'state_5.sqlite')
+            migration = original['app-server-projects-migration-by-host']['local:' + str(source)]
+            self.assertIn(thread, current_workspace(source, original)['thread-project-assignments'])
+            migration['threadAssignmentsReadMigrated'] = True
+            self.assertNotIn(thread, current_workspace(source, original)['thread-project-assignments'])
+            migration['threadAssignmentsReadMigrated'] = 1.0
+            self.assertIn(thread, current_workspace(source, original)['thread-project-assignments'])
+
+    def test_cached_snapshot_ignores_the_order_of_equal_membership_proofs(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / 'source'
+            thread = '00000000-0000-4000-9000-000000000014'
+            original = self.membership_fixture(source, thread, native=None, threadAssignmentsMigrated=True)
+            self.settle(source / 'state_5.sqlite')
+            proofs = [str(uuid.UUID(int=index)) for index in range(40)] + [thread]
+            with patch('manager_core.app_workspace._confirmed_threads', return_value=set(proofs)), \
+                    patch('manager_core.app_workspace.sqlite3.connect', wraps=sqlite3.connect) as connect:
+                self.assertNotIn(thread, current_workspace(source, original)['thread-project-assignments'])
+            with patch('manager_core.app_workspace._confirmed_threads', return_value=set(reversed(proofs))), \
+                    patch('manager_core.app_workspace.sqlite3.connect', wraps=sqlite3.connect) as again:
+                self.assertNotIn(thread, current_workspace(source, original)['thread-project-assignments'])
+            self.assertEqual((connect.call_count, again.call_count), (1, 0))
+
+    def test_a_commit_that_only_reaches_the_wal_invalidates_both_snapshots(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / 'source'
+            thread = '00000000-0000-4000-9000-000000000015'
+            original = self.membership_fixture(source, thread, native='native-audio',
+                threadAssignmentsMigrated=True, threadAssignmentsReadMigrated=True)
+            database, wal = source / 'state_5.sqlite', source / 'state_5.sqlite-wal'
+            projects = original['local-projects']
+            # The desktop keeps one WAL connection open; until a checkpoint
+            # its commits reach only the -wal file.
+            with closing(sqlite3.connect(database, isolation_level=None)) as desktop:
+                self.assertEqual(desktop.execute('PRAGMA journal_mode=WAL').fetchone()[0], 'wal')
+                desktop.execute('PRAGMA wal_autocheckpoint=0')
+                desktop.execute("UPDATE threads SET title='Renamed task'")
+                self.assertGreater(wal.stat().st_size, 0)
+                self.settle(database, wal)
+                stamps = file_stamp(database), file_stamp(wal)
+                with patch('manager_core.app_workspace.sqlite3.connect', wraps=sqlite3.connect) as connect:
+                    for _ in range(2):
+                        self.assertIn(thread, current_workspace(source, original)['thread-project-assignments'])
+                        self.assertEqual(app_workspace.inferred_assignments(source, original, projects),
+                                         {thread: 'audio'})
+                    self.assertEqual(connect.call_count, 2)  # The second pair came from memory.
+                    desktop.execute('UPDATE threads SET project_id=NULL,cwd=?', (str(Path(temp) / 'elsewhere'),))
+                    self.settle(wal, age=10)
+                    self.assertEqual(file_stamp(database), stamps[0])  # Only the WAL changed.
+                    self.assertNotEqual(file_stamp(wal), stamps[1])
+                    removed = current_workspace(source, original)
+                    self.assertNotIn(thread, removed['thread-project-assignments'])
+                    self.assertIn(thread, removed['projectless-thread-ids'])
+                    self.assertEqual(app_workspace.inferred_assignments(source, original, projects), {})
+                    self.assertEqual(connect.call_count, 4)
 
     def test_prepare_reads_the_source_workspace_once(self):
         with tempfile.TemporaryDirectory() as temp:

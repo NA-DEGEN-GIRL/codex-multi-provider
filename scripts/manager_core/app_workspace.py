@@ -12,10 +12,12 @@ from .source_catalog import projection_id
 from .store import file_stamp
 
 # Profiles prepared one after another read the same source store. Per kind and
-# source: (database stamps, the inputs, marshalled result). A hit needs equal
-# inputs too; the caller's donor document is compared, not its file's stamp.
+# source: (database stamps, input token, value). A hit needs the same inputs
+# too; the caller's donor document is compared, not its file's stamp. Only
+# database reads are kept: folder links are resolved again on every call.
 _SNAPSHOTS = {}
 _SNAPSHOT_LIMIT = 16
+_NO_INPUTS = b''
 
 
 def _database_stamp(database):
@@ -24,24 +26,51 @@ def _database_stamp(database):
     return None if None in stamps else stamps
 
 
-def _cached(key, stamp, *inputs):
-    entry = _SNAPSHOTS.get(key)
-    if stamp is None or entry is None or entry[0] != stamp or entry[1] != inputs:
-        return None
-    return marshal.loads(entry[2])  # A fresh copy: callers modify results.
+def _inputs_token(*inputs):
+    """Type-exact bytes of the inputs, or None when they cannot be compared.
 
-
-def _remember(key, stamp, result, *inputs):
-    if stamp is None:
-        return
+    `==` treats 1, 1.0 and True as equal; marshal keeps their types apart.
+    Version 2 writes no object references or interning marks, so equal
+    values give equal bytes whatever their identity or reference counts.
+    Callers pass sets sorted: equal sets may iterate in different orders.
+    """
     try:
-        # Copies, so a caller changing its donor document cannot alter the entry.
-        entry = (stamp, marshal.loads(marshal.dumps(inputs)), marshal.dumps(result))
+        return marshal.dumps(inputs, 2)
     except ValueError:
-        return  # Not a plain JSON/SQLite value; recompute next time.
+        return None  # Not a plain JSON/SQLite value; never cached.
+
+
+def _cached(key, stamp, token):
+    entry = _SNAPSHOTS.get(key)
+    if stamp is None or token is None or entry is None or entry[0] != stamp or entry[1] != token:
+        return None
+    return entry[2]
+
+
+def _remember(key, stamp, token, value):
+    if stamp is None or token is None or value is None:
+        return
     if len(_SNAPSHOTS) >= _SNAPSHOT_LIMIT:
         _SNAPSHOTS.clear()
-    _SNAPSHOTS[key] = entry
+    _SNAPSHOTS[key] = (stamp, token, value)
+
+
+def _task_folders(database, key):
+    """(id, cwd) of every task, reused while the database and its WAL keep their stamps."""
+    stamp = _database_stamp(database)
+    rows = _cached(key, stamp, _NO_INPUTS)
+    if rows is not None:
+        return rows  # A tuple of tuples of SQLite scalars: callers cannot modify it.
+    connection = sqlite3.connect(database.as_uri() + '?mode=ro', uri=True, timeout=5)
+    try:
+        connection.execute('PRAGMA query_only=ON')
+        rows = tuple(connection.execute('SELECT id,cwd FROM threads LIMIT 100001'))
+    finally:
+        connection.close()
+    if len(rows) > 100000:
+        raise ValueError('공유 프로젝트의 대화 분류 범위를 초과했습니다.')
+    _remember(key, stamp, _NO_INPUTS, rows)
+    return rows
 
 
 def _confirmed_threads(signals):
@@ -89,31 +118,20 @@ def inferred_assignments(source, original, projects):
              for legacy, project in projects.items() for root in project['rootPaths']]
     projectless = set(original.get('projectless-thread-ids', []))
     hints = original.get('thread-workspace-root-hints', {})
-    key, stamp = ('inferred', str(source)), _database_stamp(database)
-    cached = _cached(key, stamp, roots, projectless, hints)
-    if cached is not None:
-        return cached
     result = {}
-    # Many tasks share a working folder; resolve and match each string once.
+    # Many tasks share a working folder; resolve and match each string once
+    # per call, so a changed junction or mapped drive is seen at once.
     folders = {}
-    connection = sqlite3.connect(database.as_uri() + '?mode=ro', uri=True, timeout=5)
-    try:
-        connection.execute('PRAGMA query_only=ON')
-        for index, (thread, cwd) in enumerate(connection.execute('SELECT id,cwd FROM threads LIMIT 100001')):
-            if index >= 100000:
-                raise ValueError('공유 프로젝트의 대화 분류 범위를 초과했습니다.')
-            if thread in projectless:
-                continue
-            candidate = hints.get(thread) or cwd
-            if not isinstance(candidate, str):
-                continue
-            if candidate not in folders:
-                folders[candidate] = _folder_project(workspace_path(candidate), roots)
-            if folders[candidate] is not None:
-                result[thread] = folders[candidate]
-    finally:
-        connection.close()
-    _remember(key, stamp, result, roots, projectless, hints)
+    for thread, cwd in _task_folders(database, ('tasks', str(source))):
+        if thread in projectless:
+            continue
+        candidate = hints.get(thread) or cwd
+        if not isinstance(candidate, str):
+            continue
+        if candidate not in folders:
+            folders[candidate] = _folder_project(workspace_path(candidate), roots)
+        if folders[candidate] is not None:
+            result[thread] = folders[candidate]
     return result
 
 
@@ -148,9 +166,10 @@ def current_workspace(source, original, *, signals=None):
     if not migration.get('projectsMigrated') or not database.is_file():
         return original
     key, stamp = ('current', str(source)), _database_stamp(database)
-    cached = _cached(key, stamp, original, confirmed)
+    token = None if stamp is None else _inputs_token(original, sorted(confirmed))
+    cached = _cached(key, stamp, token)
     if cached is not None:
-        return cached
+        return marshal.loads(cached)  # A fresh copy: callers modify results.
     with closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True, timeout=5)) as connection:
         connection.execute('PRAGMA query_only=ON')
         connection.execute('BEGIN')
@@ -195,7 +214,11 @@ def current_workspace(source, original, *, signals=None):
                     assignments.pop(thread, None)
                     projectless.add(thread)
         result['projectless-thread-ids'] = list(projectless)
-    _remember(key, stamp, result, original, confirmed)
+    try:
+        packed = marshal.dumps(result)
+    except ValueError:
+        packed = None
+    _remember(key, stamp, token, packed)
     return result
 
 

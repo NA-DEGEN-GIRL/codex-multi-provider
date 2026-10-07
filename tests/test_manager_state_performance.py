@@ -156,6 +156,39 @@ class StoreReadCacheTests(unittest.TestCase):
         self.assertIsNot(copied['items'][0], document['items'][0])
         self.assertEqual(json_copy([Path('sample-repo')]), [Path('sample-repo')])  # Not marshallable.
 
+    def write_marker(self, value):
+        """Another process replaces the file."""
+        data = json.loads(self.store.path.read_text(encoding='utf-8'))
+        data['marker'] = value
+        atomic_json(self.store.path, data)
+
+    def test_lock_holders_and_mutate_never_build_on_a_repeated_stamp(self):
+        # Off NTFS a stamp can repeat: a reused inode, the same size, one mtime tick.
+        self.store.read()
+        stamp = file_stamp(self.store.path, replaced=True)
+        self.write_marker('second')
+        with patch('manager_core.store.file_stamp', return_value=stamp):
+            self.assertNotIn('marker', self.store.read())  # The repeat fools an unlocked read only.
+            self.assertEqual(self.store.mutate(lambda data: data.setdefault('seen', data.get('marker'))), 'second')
+            self.write_marker('third')
+            with self.store.locked():
+                self.assertEqual(self.store.read()['marker'], 'third')
+        saved = json.loads(self.store.path.read_text(encoding='utf-8'))
+        self.assertEqual((saved['marker'], saved['seen']), ('third', 'second'))
+
+    def test_a_failed_stat_falls_back_to_the_locked_read(self):
+        self.store.read()
+        real, failed = os.stat, []
+        def stat(path, *args, **kwargs):
+            if not failed:
+                failed.append(path)
+                raise PermissionError(13, 'fixture sharing violation')
+            return real(path, *args, **kwargs)
+        with patch('manager_core.store.os.stat', side_effect=stat), \
+                patch.object(Store, 'locked', wraps=self.store.locked) as locked:
+            self.assertEqual(self.store.read()['profiles'][0]['id'], self.profile['id'])
+        self.assertEqual((len(failed), locked.call_count), (1, 1))
+
 
 class StatePollTests(unittest.TestCase):
     def setUp(self):
@@ -230,7 +263,7 @@ class StatePollTests(unittest.TestCase):
             data['sources'] = [s for s in data['sources'] if s['id'] != 'original:local']
         self.store.mutate(forget)
         result, reads = self.poll()
-        self.assertEqual(reads, 3)  # read, the registering mutate, and one fresh read.
+        self.assertEqual(reads, 2)  # read, then one fresh read after the registering mutate.
         self.assertIn('original:local', {s['id'] for s in result['sources']})
         self.assertIn('original:local', {s['id'] for s in self.store.read()['sources']})
         self.assertEqual(self.center.usage_refresh.schedule.call_args.kwargs['profiles'], self.store.read()['profiles'])
@@ -249,6 +282,14 @@ class StatePollTests(unittest.TestCase):
         self.assertEqual(self.center.dispatch('notes.refresh_forks', dict(task=dict(thread_id=thread))),
                          dict(refreshed=True))
         self.assertEqual((self.forks.call_count, self.forks.call_args.kwargs), (3, dict(thread_id=thread)))
+
+    def test_a_failed_fork_rescan_is_retried_on_the_next_poll(self):
+        self.forks.side_effect = RuntimeError('fixture: database is locked')
+        self.center.state()
+        self.forks.side_effect = None
+        self.center.state()
+        self.center.state()
+        self.assertEqual(self.forks.call_count, 2)  # Retried once, then throttled again.
 
     def test_poll_reads_the_runtime_release_once_and_resolves_no_saved_home(self):
         homes = {os.path.normcase(s['home']) for s in self.store.read()['sources'] if s['id'] != 'original:local'}

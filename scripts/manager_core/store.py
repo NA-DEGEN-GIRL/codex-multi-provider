@@ -162,9 +162,13 @@ class Store:
         # An unchanged file is served from its last parse with only a stat:
         # no open handle, so no lock is needed and a long writer is not waited
         # for. Writers still replace the file under the lock below.
-        cached = _PARSED.get(str(self.path))
-        if cached and cached[0] == file_stamp(self.path, replaced=True):
-            return marshal.loads(cached[1])
+        # A holder of the lock is about to decide or write from what it reads,
+        # so it always parses the file: a stamp can repeat off NTFS (a reused
+        # inode in one mtime tick), and that would turn into a lost update.
+        if not getattr(self._local, 'held', False):
+            cached = _PARSED.get(str(self.path))
+            if cached and cached[0] == file_stamp(self.path, replaced=True):
+                return marshal.loads(cached[1])
         # Readers and writers use the same interprocess lock. On Windows even
         # a complete atomic replace may temporarily deny another open handle.
         with self.locked():
@@ -186,7 +190,7 @@ class Store:
 
     def mutate(self, operation):
         with self.locked():
-            data = self.read()
+            data = self._read_unlocked()  # Never builds on the unlocked cache.
             result = operation(data)
             if isinstance(result, Unchanged):
                 return deepcopy(result.value)

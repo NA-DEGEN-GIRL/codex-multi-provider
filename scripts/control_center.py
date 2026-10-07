@@ -246,7 +246,9 @@ class ControlCenter:
                 from manager_core.note_forks import refresh as refresh_note_forks
                 refresh_note_forks(self.root,state)
             except (ValueError,RuntimeError,OSError):
-                pass
+                # A transient failure (a locked state database) retries on the
+                # next poll instead of waiting out the whole interval.
+                self._due_at.pop('note_forks',None)
         state['profile_restarts']=self.restarts.status(state=state)
         state['startup_updates']=self.startup_updates.status(state=state,jobs=state['profile_restarts'])
         state['remote_updates']=self.remote_updates.status_all(state=state)
