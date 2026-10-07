@@ -169,7 +169,46 @@ class SharedCheck:
             batch['done'].set()
 
 
+def _desktop_evidence(installed, app):
+    """What a desktop_bundle.prepare result rests on, or None if unusable.
+
+    The installed package and its archive stamp, the manager's adapters, the
+    copy's marker bytes, and its hashed program files, which must still match
+    that marker's sizes, mtimes and digests. Not the copy's other files: those
+    are covered only by the recent full check this evidence lets a caller reuse.
+    """
+    import hashlib
+    import stat
+    from .desktop_bundle import adapter_identity
+    from .desktop_publication import _hash
+    try:
+        source = Path(installed['executable']).resolve().parent
+        archive = (source / 'resources/app.asar').stat()
+        directory = Path(app['executable']).parent
+        raw = (directory / 'manager-desktop.json').read_bytes()  # desktop_bundle.prepare's marker
+        marker = json.loads(raw.decode('utf8'))
+        if not marker['hashes']:
+            return None
+        hashed = []
+        for name, digest in sorted(marker['hashes'].items()):
+            path = directory / name
+            info = path.lstat()
+            if (not stat.S_ISREG(info.st_mode) or getattr(info, 'st_file_attributes', 0) & 0x400
+                    or marker['files'].get(name) != dict(size=info.st_size, modified=info.st_mtime_ns)
+                    or _hash(path) != digest):
+                return None
+            hashed.append((name, info.st_size, info.st_mtime_ns))
+        return (dict(installed), str(source), archive.st_size, archive.st_mtime_ns, adapter_identity(),
+                hashlib.sha256(raw).hexdigest(), hashed)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
 class Instances:
+    # A launch reuses a successful desktop copy check for this long while its
+    # evidence is unchanged; the next launch after it checks every file again.
+    DESKTOP_REUSE_SECONDS = 120
+
     def __init__(self, root, store, providers, *, embed_windows=False):
         self.root=Path(root).resolve(); self.store=store; self.providers=providers
         self.processes={};self.handles={}
@@ -182,6 +221,7 @@ class Instances:
         self._app_cache=None
         self._app_checked=0.0
         self._desktop_checks=SharedCheck()
+        self._desktop_results={}  # SharedCheck key -> (app, evidence, monotonic start)
         from .launch_metrics import LaunchMetrics
         self.metrics = LaunchMetrics(store.directory)
         from .personal_skills import PersonalSkills
@@ -206,6 +246,29 @@ class Instances:
             self._app_cache = dict(app)
             self._app_checked = time.monotonic()
             return dict(app)
+
+    def _prepare_desktop(self, installed):
+        """desktop_bundle.prepare, reusing a recent success for the same copy.
+
+        Launches of one wave would otherwise check every file of the same copy
+        again. SharedCheck runs this one at a time per (executable, version).
+        """
+        from .desktop_bundle import prepare as prepare_desktop
+        key = (installed.get('executable'), installed.get('Version'))
+        remembered = self._desktop_results.pop(key, None)
+        if remembered is not None:
+            app, evidence, started = remembered
+            if (time.monotonic() - started < self.DESKTOP_REUSE_SECONDS
+                    and _desktop_evidence(installed, app) == evidence):
+                self._desktop_results[key] = remembered
+                return dict(app)
+        started = time.monotonic()
+        app = prepare_desktop(self.root, installed)
+        # A fallback copy is reconsidered on every launch.
+        evidence = None if app.get('desktop_compatibility_notice') else _desktop_evidence(installed, app)
+        if evidence is not None:
+            self._desktop_results[key] = (dict(app), evidence, started)
+        return app
 
     def paths(self, profile):
         pid=identifier(profile['id'])
@@ -526,8 +589,11 @@ class Instances:
         from .login_health import require as require_login
         active=self.observe(profile)
         if active['status']=='running':
-            from .browser_bundle import ensure as ensure_browser
-            ensure_browser(profile['home'], active['executable_path'])
+            # A repair can rewrite hundreds of files: it runs off this request,
+            # which never waits for or fails on it. A launch prepares in place.
+            from .browser_bundle import ensure_later as ensure_browser_later
+            ensure_browser_later(profile['home'], active['executable_path'],
+                                 metrics=self.metrics, profile_id=profile['id'])
             if not reopen_existing:
                 return dict(profile_id=profile['id'],profile={**profile,**active},state='existing')
             # Ask Electron itself to restore/show the existing profile. Merely
@@ -561,13 +627,13 @@ class Instances:
                 raise RuntimeError('이 프로필의 로그인 계정을 먼저 확인하세요. 다른 계정으로 작업을 시작하지 않았습니다.')
         with self.metrics.phase(profile_id, 'profile_configuration'):
             preparation = self.prepare(profile)
-        from .desktop_bundle import prepare as prepare_desktop
         with self.metrics.phase(profile_id, 'desktop_bundle'):
             installed=self.installed_app()
             # Different profiles launch together; they share one validation of
-            # the same version-scoped copy that started after each one asked.
+            # the same version-scoped copy that started after each one asked,
+            # or reuse a recent one (_prepare_desktop).
             app=dict(self._desktop_checks((installed.get('executable'),installed.get('Version')),
-                                          lambda: prepare_desktop(self.root, installed)))
+                                          lambda: self._prepare_desktop(installed)))
         from .browser_bundle import ensure as ensure_browser
         with self.metrics.phase(profile_id, 'browser_bundle'):
             preparation['browser_plugin'] = ensure_browser(profile['home'], app['executable'])

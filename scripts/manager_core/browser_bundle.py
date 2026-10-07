@@ -19,7 +19,7 @@ import time
 from uuid import uuid4
 
 from . import desktop_publication
-from .desktop_publication import _cache_eligible, _content_stamp, _hash
+from .desktop_publication import _cache_eligible, _change_time_ns, _content_stamp, _hash
 from .updates import UpdateError, _lock_file, _unlock_file
 
 _REQUIRED = ('.codex-plugin/plugin.json', 'scripts/browser-client.mjs',
@@ -30,12 +30,16 @@ _MAX_BYTES = 256 * 1024 * 1024
 # They get their own digest cache instead of evicting the shared 64 entries.
 _digests = OrderedDict()
 _DIGEST_LIMIT = 8192
-# (home, desktop executable, manifest digest) -> version, settled content
-# stamps of the published files and (inode, mtime) of every target folder
-# after a verified 'ready' check. An added, removed or renamed entry changes
-# its folder's mtime, so a new link falls back to the full check.
+# (home, desktop executable, manifest digest) -> version, content stamps of
+# the published files and (inode, mtime) of every target folder after a
+# verified check, plus the files (with digests) and folders whose stamps were
+# still too recent to prove a later change. An added, removed or renamed entry
+# changes its folder's mtime, so a new link falls back to the full check.
 _verified = OrderedDict()
 _verified_lock = threading.Lock()
+# Normalized home -> the request queued behind its running background job.
+_jobs = {}
+_jobs_lock = threading.Lock()
 
 
 def _plain(path):
@@ -124,11 +128,13 @@ def _locked(parent):
         _unlock_file(lock)
 
 
-def _stamps(target, names):
+def _stamps(target, names, fresh=None):
     """Settled content stamps of the published files, or None if any is unusable.
 
     Size, mtime and NTFS ChangeTime of every file, not the directory mtime:
     an in-place edit deep in the tree does not change its parent's mtime.
+    With `fresh`, a valid stamp too recent to prove a later edit is accepted
+    and its name added there; the caller must prove that file by content.
     """
     stamps = {}
     try:
@@ -144,7 +150,9 @@ def _stamps(target, names):
             with path.open('rb') as stream:
                 stamp = _content_stamp(stream)
             if not _cache_eligible(stamp):
-                return None  # Unavailable or too recent to prove a later edit.
+                if fresh is None or _change_time_ns(stamp) is None:
+                    return None  # Unavailable or too recent to prove a later edit.
+                fresh.add(name)
             stamps[name] = stamp
     except OSError:
         return None
@@ -160,6 +168,21 @@ def _same_folders(target, folders):
                 return False
     except OSError:
         return False
+    return True
+
+
+def _listed(target, name, folders):
+    """A folder holds only regular files and folders the remembered check walked."""
+    for count, path in enumerate((target / name).iterdir()):
+        info = path.lstat()
+        if (count >= _MAX_FILES or stat.S_ISLNK(info.st_mode)
+                or getattr(info, 'st_file_attributes', 0) & 0x400):
+            return False
+        if stat.S_ISDIR(info.st_mode):
+            if path.relative_to(target) not in folders:
+                return False
+        elif not stat.S_ISREG(info.st_mode):
+            return False
     return True
 
 
@@ -183,36 +206,59 @@ def _remembered(key, target):
         entry = _verified.get(key)
     if entry is None:
         return None
-    version, stamps, folders = entry
-    if not _same_folders(target, folders) or _stamps(target, stamps) != stamps:
+    version, stamps, folders, files, listed = entry
+    now, fresh = desktop_publication._now_ns(), set()
+    try:
+        # A file or folder changed just before it was remembered is proven by
+        # its content or listing again, until its stamp is old enough that a
+        # later change would alter it. Read first, then compare the stamps.
+        rechecked = (all(_listed(target, name, folders) for name in listed)
+                     and all(_hash(target / name, _digests, _DIGEST_LIMIT) == digest
+                             for name, digest in files.items()))
+    except (OSError, ValueError):
+        rechecked = False
+    if (not rechecked or not _same_folders(target, folders)
+            or _stamps(target, stamps, fresh) != stamps or not fresh <= files.keys()):
         with _verified_lock:
             if _verified.get(key) is entry:
                 del _verified[key]
         return None
+    if files or listed:
+        limit = now - desktop_publication._HASH_MIN_AGE_NS
+        files = {name: digest for name, digest in files.items()
+                 if not _cache_eligible(stamps[name], now_ns=now)}
+        listed = frozenset(name for name in listed if folders[name][1] > limit)
+        with _verified_lock:
+            if _verified.get(key) is entry:
+                _verified[key] = (version, stamps, folders, files, listed)
     return dict(state='ready', version=version, files=len(stamps), changed_files=0)
 
 
-def _remember(key, version, stamps, folders):
+def _remember(key, version, stamps, folders, files=None, listed=frozenset()):
     if key is None:
         return
     with _verified_lock:
-        _verified[key] = (version, stamps, folders)
+        _verified[key] = (version, stamps, folders, files or {}, listed)
         _verified.move_to_end(key)
         while len(_verified) > 64:
             _verified.popitem(last=False)
+
+
+def _source(executable):
+    return _plain(Path(executable).absolute().parent / 'resources/plugins/openai-bundled/plugins/browser')
 
 
 def ensure(home, executable):
     """Verify/publish one exact Browser version; no process or config changes.
 
     New versions appear only after complete staging and hash verification.
-    An incomplete existing version is repaired with atomic file replacements,
-    so its good files remain readable even if preparation fails or is interrupted.
-    A verified version is remembered for this service while the desktop
-    executable, the manifest, every published file's stamp and every folder's
-    entries are unchanged.
+    An incomplete existing version is repaired with atomic replacements of the
+    staged changed files, so its good files remain readable even if
+    preparation fails or is interrupted. A verified version is remembered for
+    this service while the desktop executable, the manifest, every published
+    file's stamp and every folder's entries are unchanged.
     """
-    source = _plain(Path(executable).absolute().parent / 'resources/plugins/openai-bundled/plugins/browser')
+    source = _source(executable)
     if not source.exists():
         return dict(state='not_bundled')  # Desktop editions without Browser.
     manifest = source / '.codex-plugin/plugin.json'
@@ -241,29 +287,45 @@ def ensure(home, executable):
     target = _inside(parent, parent / version)
     with _locked(parent):
         # Stamps taken before and after one verification prove that the
-        # verified bytes are the stamped ones; a repair is remembered next time.
-        before, folders = _stamps(target, expected), {}
-        result = _publish(source, parent, target, version, expected, folders)
+        # verified bytes are the stamped ones.
+        before, folders, published = _stamps(target, expected), {}, {}
+        result = _publish(source, parent, target, version, expected, folders, published)
         if (result['state'] == 'ready' and before is not None and _settled(folders)
                 and _stamps(target, expected) == before):
             _remember(key, version, before, folders)
+        elif published:
+            # A repair is remembered with the stamps of its final check, so the
+            # next call does not repeat it. What it changed just now is proven
+            # again by content and listing until its stamps have settled.
+            limit = desktop_publication._now_ns() - desktop_publication._HASH_MIN_AGE_NS
+            _remember(key, version, published['stamps'], published['folders'],
+                      {name: expected[name] for name in published['fresh']},
+                      frozenset(name for name, (_, mtime) in published['folders'].items() if mtime > limit))
         return result
 
 
-def _publish(source, parent, target, version, expected, folders=None):
-    staging = _inside(parent, parent / ('.manager-stage-' + uuid4().hex))
+def _publish(source, parent, target, version, expected, folders=None, published=None):
+    # Staged in the profile's plugin cache (same volume), never inside the
+    # Browser plugin folder: every folder there is listed as a version.
+    cache = parent.parent.parent
+    staging = _inside(cache, cache / ('.manager-stage-' + uuid4().hex))
     try:
         changed = _changed(target, expected, folders)
         if not changed:
             return dict(state='ready', version=version, files=len(expected), changed_files=0)
+        # A new version is staged complete; a repair stages only what it replaces.
         staging.mkdir()
-        for name in expected:
+        for name in changed:
             destination = staging / name
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(source / name, destination)
-        if _inventory(staging) != expected or _inventory(source) != expected:
+        staged = set(changed)
+        if (_inventory(staging) != {name: expected[name] for name in changed}
+                or _inventory(source) != expected):
             raise OSError('브라우저 구성요소가 복사 중 변경되어 적용하지 않았습니다.')
         if not target.exists():
+            if len(staged) != len(expected):
+                raise OSError('브라우저 구성요소가 준비 중 변경되었습니다. 다시 시도하세요.')
             _inside(parent, target)
             staging.rename(target)
             state = 'prepared'
@@ -271,17 +333,85 @@ def _publish(source, parent, target, version, expected, folders=None):
             # Validate all destinations before the first change. Leave unowned
             # extra files alone; only package-declared assets may be replaced.
             changed = _changed(target, expected)
+            if not staged.issuperset(changed):
+                raise OSError('브라우저 구성요소가 준비 중 변경되었습니다. 다시 시도하세요.')
             for name in changed:
                 destination = _inside(parent, target / name)
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 os.replace(staging / name, destination)
             state = 'repaired'
-        if _changed(target, expected):
+        # A new version's files are all fresh, so only a repair hands back the
+        # stamps taken around this final check to be remembered.
+        fresh = set()
+        stamps = _stamps(target, expected, fresh) if published is not None and state == 'repaired' else None
+        checked = {}
+        if _changed(target, expected, checked):
             raise OSError('브라우저 구성요소의 복사 결과를 확인하지 못했습니다.')
+        if stamps is not None and _stamps(target, expected, set()) == stamps:
+            published.update(stamps=stamps, folders=checked, fresh=fresh)
         return dict(state=state, version=version, files=len(expected), changed_files=len(changed))
     finally:
         if staging.exists():
             # Only this call's uniquely named staging directory is removed.
-            _inside(parent, staging)
+            _inside(cache, staging)
             _inventory(staging)
             shutil.rmtree(staging)
+
+
+def ensure_later(home, executable, *, metrics=None, profile_id=None):
+    """Run ensure() for an already running desktop on a background thread.
+
+    Selecting a running profile or opening its task never waits for, or fails
+    on, a Browser repair. One job runs per home; a request while it runs
+    queues one more pass with its own arguments, so a change after the running
+    pass's check is still seen. Each pass is recorded in the launch metrics,
+    a failure by its exception class only. Returns the started thread, or None
+    when the request was queued behind a running job, or there is nothing to
+    prepare or no thread to prepare it now.
+    """
+    try:
+        bundled = _source(executable).exists()
+    except (OSError, ValueError):
+        bundled = True  # The job records why it cannot check.
+    if not bundled:
+        return None  # Desktop editions without Browser.
+    key = os.path.normcase(os.path.abspath(home))
+    request = (home, executable, metrics, profile_id)
+    with _jobs_lock:
+        if key in _jobs:
+            _jobs[key] = request
+            return None
+        _jobs[key] = None
+    thread = threading.Thread(target=_run_later, args=(key, request),
+                              name='browser-bundle-repair', daemon=True)
+    try:
+        thread.start()
+    except RuntimeError:
+        # No thread is available now; the next selection asks again.
+        with _jobs_lock:
+            _jobs.pop(key, None)
+        return None
+    return thread
+
+
+def _run_later(key, request):
+    try:
+        while request is not None:
+            home, executable, metrics, profile_id = request
+            started, error = time.perf_counter(), None
+            try:
+                ensure(home, executable)
+            except Exception as failure:
+                error = type(failure).__name__  # The message can carry paths.
+            if metrics is not None:
+                metrics.record(profile_id, 'browser_bundle_background', started, error is None, error=error)
+            with _jobs_lock:
+                request = _jobs[key]
+                if request is None:
+                    del _jobs[key]
+                else:
+                    _jobs[key] = None
+    except BaseException:
+        with _jobs_lock:
+            _jobs.pop(key, None)
+        raise
