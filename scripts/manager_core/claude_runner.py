@@ -780,12 +780,13 @@ def execute(command, cwd, environment, incoming, emit, bridge, stopped, observed
                 background_seen = background_seen or bool(background)
             if settle_deadline is not None and message.get('type') in ('assistant', 'stream_event', 'user'):
                 settle_deadline = None  # A background report started the next turn.
-            if message.get('type') == 'rate_limit_event':
+            # Remote (SSH) runs have no manager store; their usage is read on Windows.
+            if message.get('type') == 'rate_limit_event' and usage_store is not None:
                 from manager_core.claude_usage import record_event
                 try:
                     record_event(usage_store, hello['claude_profile_id'],
                                  record['settings'].get('account_identity'), message)
-                except (OSError, ValueError, KeyError):
+                except (OSError, ValueError, KeyError, TypeError, AttributeError):
                     # A local usage-cache failure must not interrupt this answer.
                     pass
             if message.get('type') == 'system' and message.get('subtype') == 'init':

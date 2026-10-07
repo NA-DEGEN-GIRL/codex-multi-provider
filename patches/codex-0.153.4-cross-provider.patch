@@ -53698,10 +53698,10 @@ index 000000000..64333cba1
 +}
 diff --git a/codex-rs/core/src/tasks/claude_code/context.rs b/codex-rs/core/src/tasks/claude_code/context.rs
 new file mode 100644
-index 000000000..09aa3ed10
+index 000000000..debaa7893
 --- /dev/null
 +++ b/codex-rs/core/src/tasks/claude_code/context.rs
-@@ -0,0 +1,245 @@
+@@ -0,0 +1,267 @@
 +//! Claude sessions receive only portable history, with exact committed-turn fingerprints.
 +use std::collections::BTreeMap;
 +use std::collections::HashSet;
@@ -53807,26 +53807,30 @@ index 000000000..09aa3ed10
 +}
 +
 +/// Keeps completed items Claude has not seen, with checkpoint offsets recounted to match.
-+fn unseen_completed(transcript: &mut ModelTranscript, covered: &HashSet<String>) {
++fn unseen_completed(transcript: &mut ModelTranscript, covered: &HashSet<String>, budget_tokens: i64) {
 +    // Checkpoint offsets are relative to item positions. A checkpoint after a turn this Claude
-+    // session already holds would repeat covered context, so only checkpoints before the first
-+    // covered item are kept. Incomplete items (an interrupted turn long ago, or a concurrent
-+    // in-flight turn) are dropped too, but they must not discard every later checkpoint: one
-+    // interrupted turn early in a long task used to remove all of its portable summaries and
-+    // leave nothing but a refusal. Their checkpoints keep their place by recounting offsets.
++    // session already holds repeats covered context, so it is set aside and used only when what
++    // Claude has not seen does not fit: a resumed session that missed a long stretch of
++    // other-provider work otherwise lost the summaries written for it (including one made by
++    // /compact for this very handoff) and was refused. Incomplete items (an interrupted turn
++    // long ago, or a concurrent in-flight turn) are dropped too, but they must not discard
++    // every later checkpoint: their checkpoints keep their place by recounting offsets.
 +    let id_of = |item: &codex_rollout::TranscriptItem| {
 +        item.turn_id
 +            .clone()
 +            .unwrap_or_else(|| format!("legacy-{}", item.position))
 +    };
++    let mut after_covered = Vec::new();
 +    if let Some(first_covered) = transcript
 +        .items
 +        .iter()
 +        .position(|item| covered.contains(&id_of(item)))
 +    {
-+        transcript
-+            .checkpoints
-+            .retain(|checkpoint| checkpoint.items_before <= first_covered);
++        let (before, after) = std::mem::take(&mut transcript.checkpoints)
++            .into_iter()
++            .partition(|checkpoint| checkpoint.items_before <= first_covered);
++        transcript.checkpoints = before;
++        after_covered = after;
 +    }
 +    let keep: Vec<bool> = transcript
 +        .items
@@ -53838,7 +53842,11 @@ index 000000000..09aa3ed10
 +    for kept in &keep {
 +        kept_before.push(kept_before[kept_before.len() - 1] + usize::from(*kept));
 +    }
-+    for checkpoint in &mut transcript.checkpoints {
++    for checkpoint in transcript
++        .checkpoints
++        .iter_mut()
++        .chain(after_covered.iter_mut())
++    {
 +        checkpoint.items_before = kept_before[checkpoint.items_before.min(keep.len())];
 +    }
 +    let mut index = 0;
@@ -53846,6 +53854,16 @@ index 000000000..09aa3ed10
 +        index += 1;
 +        keep[index - 1]
 +    });
++    if !after_covered.is_empty()
++        && transcript
++            .items
++            .iter()
++            .map(|item| crate::portable_context::rebuild_token_count(&item.item.item))
++            .sum::<i64>()
++            > budget_tokens
++    {
++        transcript.checkpoints.extend(after_covered);
++    }
 +}
 +
 +pub(super) fn handoff(
@@ -53854,13 +53872,17 @@ index 000000000..09aa3ed10
 +    covered: &HashSet<String>,
 +    images: &mut super::images::Images<'_>,
 +) -> Result<String> {
-+    unseen_completed(&mut transcript, covered);
 +    let agent = ctx
 +        .provider
 +        .info()
 +        .agent
 +        .as_ref()
 +        .ok_or_else(|| failure("agent configuration missing"))?;
++    unseen_completed(
++        &mut transcript,
++        covered,
++        i64::try_from(agent.handoff_budget_tokens).unwrap_or(i64::MAX),
++    );
 +    // Validate summary coverage against canonical bytes before replacing images in this
 +    // private handoff view. Snapshot fingerprints and stored history remain unchanged.
 +    if crate::portable_context::has_agent_summary(&transcript)
@@ -53949,10 +53971,10 @@ index 000000000..09aa3ed10
 +}
 diff --git a/codex-rs/core/src/tasks/claude_code/context_tests.rs b/codex-rs/core/src/tasks/claude_code/context_tests.rs
 new file mode 100644
-index 000000000..cd70b99fc
+index 000000000..b6f3ca8ce
 --- /dev/null
 +++ b/codex-rs/core/src/tasks/claude_code/context_tests.rs
-@@ -0,0 +1,142 @@
+@@ -0,0 +1,178 @@
 +use super::*;
 +use codex_history::ResponseItemEnvelope;
 +use codex_rollout::TranscriptCompleteness;
@@ -54063,7 +54085,7 @@ index 000000000..cd70b99fc
 +        rejected_checkpoints: 0,
 +        producers: Vec::new(),
 +    };
-+    unseen_completed(&mut transcript, &HashSet::new());
++    unseen_completed(&mut transcript, &HashSet::new(), /*budget_tokens*/ i64::MAX);
 +    let texts: Vec<_> = transcript
 +        .items
 +        .iter()
@@ -54090,10 +54112,46 @@ index 000000000..cd70b99fc
 +        rejected_checkpoints: 0,
 +        producers: Vec::new(),
 +    };
-+    unseen_completed(&mut transcript, &HashSet::from(["seen".to_string()]));
++    unseen_completed(
++        &mut transcript,
++        &HashSet::from(["seen".to_string()]),
++        /*budget_tokens*/ i64::MAX,
++    );
 +    assert_eq!(transcript.items.len(), 1);
 +    assert_eq!(transcript.checkpoints.len(), 1);
 +    assert_eq!(transcript.checkpoints[0].items_before, 0);
++}
++
++#[test]
++fn summaries_after_a_covered_turn_are_used_when_unseen_work_does_not_fit() {
++    // A resumed Claude session saw one early turn; another provider then worked on, and /compact
++    // wrote a portable summary at the end. Without that summary the unseen work cannot be
++    // handed over at all, so it is kept even though it repeats the covered turn.
++    let mut transcript = ModelTranscript {
++        items: vec![
++            item("seen", true, "Claude already has this"),
++            item("gpt-1", true, "long other-provider work"),
++            item("gpt-2", true, "more other-provider work"),
++        ],
++        checkpoints: vec![checkpoint_before(0), checkpoint_before(3)],
++        completeness: TranscriptCompleteness::Complete,
++        rejected_checkpoints: 0,
++        producers: Vec::new(),
++    };
++    unseen_completed(
++        &mut transcript,
++        &HashSet::from(["seen".to_string()]),
++        /*budget_tokens*/ 1,
++    );
++    assert_eq!(transcript.items.len(), 2);
++    assert_eq!(
++        transcript
++            .checkpoints
++            .iter()
++            .map(|checkpoint| checkpoint.items_before)
++            .collect::<Vec<_>>(),
++        vec![0, 2]
++    );
 +}
 diff --git a/codex-rs/core/src/tasks/claude_code/delegation.rs b/codex-rs/core/src/tasks/claude_code/delegation.rs
 new file mode 100644
