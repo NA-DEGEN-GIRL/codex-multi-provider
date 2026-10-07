@@ -12,14 +12,27 @@ internal static class RemoteUpdatesPresentation
         return managed.Success ? managed.Groups[1].Value : value;
     }
 
-    // Current profiles' SSH hosts still running an older managed runtime and
-    // not yet scheduled (the settings badge points to ‘SSH 업데이트’).
+    // Current profiles' connected SSH hosts still running an older managed
+    // runtime that ‘SSH 업데이트’ can schedule now (the settings badge).
+    // It mirrors the service: one profile job covers every host of the profile
+    // but is stored on the scheduling host only (status() shares it, schedule()
+    // returns it); schedule() refuses while a remote update holds the profile's
+    // SSH gate; a job needing review is not re-run; entries of hosts no longer
+    // prepared for the profile are kept by the service but cannot be applied.
     internal static int PendingManaged(JsonElement state)
     {
-        var profiles = state.Arr("profiles").Select(p => p.S("id")).ToHashSet();
-        return state.Get("remote_updates").Arr("items").Count(item => profiles.Contains(item.S("profile_id"))
+        var hosts = state.Arr("profiles").SelectMany(profile => profile.Arr("remote_bindings")
+            .Where(binding => binding.B("prepared")).Select(binding => (profile.S("id"), binding.S("alias")))).ToHashSet();
+        var items = state.Get("remote_updates").Arr("items").ToArray();
+        var scheduled = items.Where(item => item.Get("job").S("state") is "queued" or "waiting" or "applying" or "recovering")
+            .Select(item => item.S("profile_id")).ToHashSet();
+        var maintenance = state.Get("ssh_maintenance");
+        bool Held(string profileId) => maintenance.Get(profileId) is var gate
+            && gate.B("remote_update") && gate.S("state") is not ("" or "released");
+        return items.Count(item => hosts.Contains((item.S("profile_id"), item.S("alias")))
             && item.Get("managed").S("state") == "update_available"
-            && item.Get("job").S("state") is not ("queued" or "waiting" or "applying" or "recovering"));
+            && item.Get("job").S("state") is not ("attention" or "unknown")
+            && !scheduled.Contains(item.S("profile_id")) && !Held(item.S("profile_id")));
     }
 
     internal static string Managed(JsonElement value) => value.S("observation_code") is { Length: > 0 } observation

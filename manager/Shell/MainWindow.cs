@@ -2488,10 +2488,21 @@ public sealed partial class MainWindow : Window
         {
             PresentShortcutResult(result, item, profileId);
             SetStatus(result.Message("Codex가 준비되면 선택한 대화로 자동 이동합니다."));
-            var completed = await ConversationReadyWait.CompleteAsync(result,
-                () => ticket == _navigation && _selectedProfile == profileId && !_closing,
-                token => Request("conversation.navigate", new { navigation_id = token }),
-                () => Task.Delay(750));
+            JsonElement? completed;
+            try
+            {
+                completed = await ConversationReadyWait.CompleteAsync(result,
+                    () => ticket == _navigation && _selectedProfile == profileId && !_closing,
+                    token => Request("conversation.navigate", new { navigation_id = token }),
+                    () => Task.Delay(750));
+            }
+            // The ready wait of a replaced or abandoned open fails silently too.
+            // Request does not log this untracked command, so it is logged here.
+            catch (Exception error) when (ticket != _navigation || _closing)
+            {
+                Log($"대화 이동 대기 정리 · {error.Message}");
+                return;
+            }
             if (completed is null) return;
             result = completed.Value;
             Log($"{Profile().S("alias")} · 준비 후 대화 이동 · {result.S("state")}");

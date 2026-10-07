@@ -134,6 +134,38 @@ internal static class ShortcutNavigationSelfTest
             checks.Add("A re-click of a task being opened joins it; another task of the account replaces it after the open in flight, with one open each and no rejection.");
         }
         finally { foreach (var open in opens) open.Reply.TrySetResult(ready); mergeWindow.Close(); }
+
+        // A replaced open still waiting for Codex readiness fails silently too.
+        var steps = new List<(string Command, string Id, TaskCompletionSource<JsonElement> Reply)>();
+        var abandonWindow = new MainWindow(root, fixture: true, fixtureRequest: (command, args) =>
+        {
+            if (command is not ("conversation.open" or "conversation.navigate")) throw new InvalidOperationException("Unexpected request: " + command);
+            steps.Add((command, JsonSerializer.SerializeToElement(args).S("shortcut_id"), new(TaskCreationOptions.RunContinuationsAsynchronously)));
+            return steps[^1].Reply.Task;
+        }) { FixtureRefreshesState = true };
+        try
+        {
+            abandonWindow.UseFixture(pair);
+            var first = Invoke(abandonWindow, "OpenShortcutAsync", "shortcut");
+            steps[0].Reply.SetResult(waiting);
+            for (var started = Environment.TickCount64; steps.Count < 2; await Task.Delay(10))
+                Require(Environment.TickCount64 - started < 3000, "The cold open did not send its readiness continuation.");
+            var replacement = Invoke(abandonWindow, "OpenShortcutAsync", "other");
+            Require(steps[1].Command == "conversation.navigate" && !replacement.IsCompleted,
+                "The replacing task did not wait for the open in flight.");
+            steps[1].Reply.SetException(new InvalidOperationException("fixture readiness failure"));
+            // Unsilenced, the replaced open faults here and Safe reports it as an error.
+            await first.WaitAsync(TimeSpan.FromSeconds(3));
+            for (var started = Environment.TickCount64; steps.Count < 3; await Task.Delay(10))
+                Require(Environment.TickCount64 - started < 3000, "The replacing task was not opened after the replaced open ended.");
+            Require(steps[2].Command == "conversation.open" && steps[2].Id == "other",
+                "The replacement opened the wrong task after a replaced readiness failure.");
+            steps[2].Reply.SetResult(ready);
+            await replacement.WaitAsync(TimeSpan.FromSeconds(3));
+            using (Field<ProfileActionGate>(abandonWindow, "_profileActions").Enter("profile", "fixture")) { }
+            checks.Add("A replaced open's failed readiness continuation is not reported, and the replacing task still opens.");
+        }
+        finally { foreach (var step in steps) step.Reply.TrySetResult(ready); abandonWindow.Close(); }
         checks.AddRange(DesktopCompatibilitySelfTest.Run(root));
         checks.AddRange(LocalModelSelfTest.Run());
         checks.AddRange(await ProfileOpenStatusSelfTest.RunAsync(root));
