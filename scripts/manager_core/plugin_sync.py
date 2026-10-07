@@ -68,6 +68,9 @@ _CONFIG_SETTLE_NS = 2_000_000_000
 _MAX_CONFIG_CACHE = 256
 # Parsed ``config.toml`` state per home: key -> ((mtime_ns, size), states, names).
 _config_cache = {}
+_MAX_MARKER_CACHE = 2048
+# Remote install marker identity per marker: key -> ((mtime_ns, size), identity).
+_marker_cache = {}
 
 
 def _read(path):
@@ -144,7 +147,9 @@ def _json_file(path, limit):
         return None
     try:
         value = json.loads(path.read_text(encoding='utf-8-sig'))
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
+        # A deeply nested document exhausts the decoder's recursion limit;
+        # it is unreadable like any other malformed file.
         return None
     return value if isinstance(value, dict) else None
 
@@ -206,19 +211,41 @@ def _marker_identity(path):
     content; that must not republish the plugin into every home. Only the
     remote install identity counts, and a marker that is not valid JSON
     counts by its bytes. The marker is never copied; a linked one is not read.
+
+    The runtime replaces the marker by renaming a temporary file over it, and
+    on Windows that rename fails while any reader holds the marker open. The
+    identity is therefore cached per marker while its (mtime, size) stays the
+    same, so a settled marker is only stat'd. A marker younger than
+    ``_CONFIG_SETTLE_NS`` (or dated in the future) is read every time: a
+    same-size rewrite within one filesystem clock tick would keep the stamp.
     """
     if not path.is_file() or _linked(path):
         return '0'
+    key = os.path.normcase(os.path.abspath(path))
+    info = path.stat()
+    cached = _marker_cache.get(key)
+    if cached is not None and cached[0] == (info.st_mtime_ns, info.st_size):
+        return cached[1]
     with path.open('rb') as stream:
         data = stream.read(_MAX_MANIFEST_BYTES + 1)
+        # The stamp of the file actually read; a replacement that landed
+        # after the stat above is keyed by its own stamp.
+        info = os.fstat(stream.fileno())
     try:
         value = json.loads(data.decode('utf-8-sig')) if len(data) <= _MAX_MANIFEST_BYTES else None
-    except ValueError:
+    except (ValueError, RecursionError):
         value = None
     if isinstance(value, dict):
         data = json.dumps([value.get('remote_plugin_id'), value.get('schema_version')],
                           sort_keys=True).encode('utf-8')
-    return hashlib.sha256(data).hexdigest()[:32]
+    identity = hashlib.sha256(data).hexdigest()[:32]
+    if time.time_ns() - info.st_mtime_ns > _CONFIG_SETTLE_NS:
+        if len(_marker_cache) >= _MAX_MARKER_CACHE:
+            _marker_cache.clear()
+        _marker_cache[key] = ((info.st_mtime_ns, info.st_size), identity)
+    else:
+        _marker_cache.pop(key, None)
+    return identity
 
 
 def _marketplace_names(home, configured):
