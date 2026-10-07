@@ -20,6 +20,47 @@ internal static class RemoteUpdatesSelfTest
             checks++;
         }
 
+        object Binding(string alias, bool prepared = true) => new { alias, prepared };
+        object Profile(string id, params object[] bindings) => new { id, remote_bindings = bindings };
+        object Entry(string profile, string alias, string managed = "update_available", string? job = null) =>
+            new { profile_id = profile, alias, managed = new { state = managed }, job = job is null ? null : (object)new { state = job } };
+        int Pending(object[] profiles, object[] items, Dictionary<string, object>? gates = null) =>
+            RemoteUpdatesPresentation.PendingManaged(JsonSerializer.SerializeToElement(new
+            {
+                profiles,
+                ssh_maintenance = gates ?? [],
+                remote_updates = new { worker_active = false, items }
+            }));
+        var counted = Pending(
+            [Profile("p1", Binding("remote-a"), Binding("remote-b"), Binding("remote-c", prepared: false)),
+             Profile("p2", Binding("remote-a"), Binding("remote-b"), Binding("remote-c")),
+             Profile("p3", Binding("remote-a")),
+             Profile("p4", Binding("remote-a"), Binding("remote-b"))],
+            [Entry("p1", "remote-a"), Entry("p1", "remote-b", job: "complete"),
+             Entry("p1", "remote-c"), Entry("p1", "remote-gone"),
+             Entry("p2", "remote-a", job: "queued"), Entry("p2", "remote-b", "current"), Entry("p2", "remote-c"),
+             Entry("p3", "remote-a"),
+             Entry("p4", "remote-a", job: "attention"), Entry("p4", "remote-b"),
+             Entry("removed", "remote-a")],
+            new() { ["p3"] = new { state = "held", remote_update = true }, ["p4"] = new { state = "released", remote_update = true } });
+        Require(counted == 3,
+            "the settings badge counts current profiles' connected, unscheduled and applicable managed SSH updates only");
+        // One profile job covers every host of the profile although only the
+        // scheduling host's entry carries it (as status() reports to the window).
+        Require(Pending([Profile("p2", Binding("remote-a"), Binding("remote-b"))],
+                [Entry("p2", "remote-a", job: "waiting"), Entry("p2", "remote-b")]) == 0
+            && Pending([Profile("p2", Binding("remote-a"), Binding("remote-b"))],
+                [Entry("p2", "remote-a", job: "complete"), Entry("p2", "remote-b")]) == 2,
+            "a profile's scheduled SSH update covers its other hosts until that job ends");
+        // schedule() refuses while a remote update holds the profile's gate; other gate holders only make the job wait.
+        Require(Pending([Profile("p1", Binding("remote-a"))], [Entry("p1", "remote-a")],
+                new() { ["p1"] = new { state = "attention", remote_update = true } }) == 0
+            && Pending([Profile("p1", Binding("remote-a"))], [Entry("p1", "remote-a")],
+                new() { ["p1"] = new { state = "held", remote_update = false } }) == 1,
+            "an SSH update that schedule() would refuse is not offered");
+        Require(RemoteUpdatesPresentation.PendingManaged(JsonSerializer.SerializeToElement(new { profiles = new[] { new { id = "p1" } } })) == 0,
+            "a state without remote_updates needs no SSH update attention");
+
         const string profileId = "fixture-profile";
         const string firstHost = "fixture-a";
         const string secondHost = "fixture-b";

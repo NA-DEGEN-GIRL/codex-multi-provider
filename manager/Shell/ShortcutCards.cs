@@ -29,6 +29,10 @@ internal static class ShortcutCards
             await click(choice, action, button);
         }));
 
+    // Working dots animate only while the list's Tag says so. The window turns
+    // it off while the list is not on screen or the window is minimized.
+    internal static void SetPulse(ListBox list, bool on) => list.Tag = on ? "pulse" : null;
+
     private const string CardMarkup = """
         <DataTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
                       xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
@@ -122,20 +126,27 @@ internal static class ShortcutCards
             </Button>
           </Grid>
           <DataTemplate.Triggers>
-            <!-- A working task's dot breathes; waiting and idle dots stay still. -->
-            <DataTrigger Binding="{Binding Shortcut.State}" Value="working">
-              <DataTrigger.EnterActions>
+            <!-- A working task's dot breathes; waiting and idle dots stay still. It
+                 breathes at a few frames a second and only while the list is seen
+                 (SetPulse): a forever animation otherwise ticks every card's clock
+                 at full frame rate in a closed overlay or a minimized window. -->
+            <MultiDataTrigger>
+              <MultiDataTrigger.Conditions>
+                <Condition Binding="{Binding Shortcut.State}" Value="working"/>
+                <Condition Binding="{Binding Tag, RelativeSource={RelativeSource AncestorType=ListBox}}" Value="pulse"/>
+              </MultiDataTrigger.Conditions>
+              <MultiDataTrigger.EnterActions>
                 <BeginStoryboard x:Name="Pulse">
-                  <Storyboard>
+                  <Storyboard Timeline.DesiredFrameRate="8">
                     <DoubleAnimation Storyboard.TargetName="Dot" Storyboard.TargetProperty="Opacity"
                                      From="1" To="0.25" Duration="0:0:0.9" AutoReverse="True" RepeatBehavior="Forever"/>
                   </Storyboard>
                 </BeginStoryboard>
-              </DataTrigger.EnterActions>
-              <DataTrigger.ExitActions>
+              </MultiDataTrigger.EnterActions>
+              <MultiDataTrigger.ExitActions>
                 <StopStoryboard BeginStoryboardName="Pulse"/>
-              </DataTrigger.ExitActions>
-            </DataTrigger>
+              </MultiDataTrigger.ExitActions>
+            </MultiDataTrigger>
           </DataTemplate.Triggers>
         </DataTemplate>
         """;

@@ -98,6 +98,74 @@ internal static class ShortcutNavigationSelfTest
             checks.Add("Mismatched returned profiles are rejected and the action gate is released on failure.");
         }
         finally { invalidWindow.Close(); }
+
+        // Task opens of one account merge instead of rejecting each other.
+        var other = new { id = "other", profile_id = "profile", alias = "다른 작업", thread_id = "thread-2", host_id = "local" };
+        var pair = JsonSerializer.SerializeToElement(new { profiles = new[] { profile }, shortcuts = new[] { shortcut, other } });
+        var opens = new List<(string Id, TaskCompletionSource<JsonElement> Reply)>();
+        var mergeWindow = new MainWindow(root, fixture: true, fixtureRequest: (command, args) =>
+        {
+            if (command != "conversation.open") throw new InvalidOperationException("Unexpected request: " + command);
+            opens.Add((JsonSerializer.SerializeToElement(args).S("shortcut_id"), new(TaskCreationOptions.RunContinuationsAsynchronously)));
+            return opens[^1].Reply.Task;
+        }) { FixtureRefreshesState = true };
+        try
+        {
+            mergeWindow.UseFixture(pair);
+            var first = Invoke(mergeWindow, "OpenShortcutAsync", "shortcut");
+            var again = Invoke(mergeWindow, "OpenShortcutAsync", "shortcut");
+            Require(again.IsCompletedSuccessfully && opens.Count == 1,
+                "A re-click of the task being opened was rejected or sent a second open.");
+            var replacement = Invoke(mergeWindow, "OpenShortcutAsync", "other");
+            var repeat = Invoke(mergeWindow, "OpenShortcutAsync", "other");
+            Require(!replacement.IsCompleted && repeat.IsCompletedSuccessfully && opens.Count == 1,
+                "Another task of the account was rejected, or sent before the open in flight ended.");
+            opens[0].Reply.SetResult(ready);
+            await first.WaitAsync(TimeSpan.FromSeconds(3));
+            for (var started = Environment.TickCount64; opens.Count < 2; await Task.Delay(10))
+                Require(Environment.TickCount64 - started < 3000, "The replacing task was not opened after the open in flight ended.");
+            Require(opens[1].Id == "other" && Field<Dictionary<string, JsonElement>>(mergeWindow, "_shownProfiles").Count == 0,
+                "The replaced open presented its result, or the replacement opened the wrong task.");
+            opens[1].Reply.SetResult(ready);
+            await replacement.WaitAsync(TimeSpan.FromSeconds(3));
+            Require(opens.Count == 2 && Field<Dictionary<string, JsonElement>>(mergeWindow, "_shownProfiles")["profile"].S("generation") == "new",
+                "The replacing open did not present its returned launch.");
+            using (Field<ProfileActionGate>(mergeWindow, "_profileActions").Enter("profile", "fixture")) { }
+            checks.Add("A re-click of a task being opened joins it; another task of the account replaces it after the open in flight, with one open each and no rejection.");
+        }
+        finally { foreach (var open in opens) open.Reply.TrySetResult(ready); mergeWindow.Close(); }
+
+        // A replaced open still waiting for Codex readiness fails silently too.
+        var steps = new List<(string Command, string Id, TaskCompletionSource<JsonElement> Reply)>();
+        var abandonWindow = new MainWindow(root, fixture: true, fixtureRequest: (command, args) =>
+        {
+            if (command is not ("conversation.open" or "conversation.navigate")) throw new InvalidOperationException("Unexpected request: " + command);
+            steps.Add((command, JsonSerializer.SerializeToElement(args).S("shortcut_id"), new(TaskCreationOptions.RunContinuationsAsynchronously)));
+            return steps[^1].Reply.Task;
+        }) { FixtureRefreshesState = true };
+        try
+        {
+            abandonWindow.UseFixture(pair);
+            var first = Invoke(abandonWindow, "OpenShortcutAsync", "shortcut");
+            steps[0].Reply.SetResult(waiting);
+            for (var started = Environment.TickCount64; steps.Count < 2; await Task.Delay(10))
+                Require(Environment.TickCount64 - started < 3000, "The cold open did not send its readiness continuation.");
+            var replacement = Invoke(abandonWindow, "OpenShortcutAsync", "other");
+            Require(steps[1].Command == "conversation.navigate" && !replacement.IsCompleted,
+                "The replacing task did not wait for the open in flight.");
+            steps[1].Reply.SetException(new InvalidOperationException("fixture readiness failure"));
+            // Unsilenced, the replaced open faults here and Safe reports it as an error.
+            await first.WaitAsync(TimeSpan.FromSeconds(3));
+            for (var started = Environment.TickCount64; steps.Count < 3; await Task.Delay(10))
+                Require(Environment.TickCount64 - started < 3000, "The replacing task was not opened after the replaced open ended.");
+            Require(steps[2].Command == "conversation.open" && steps[2].Id == "other",
+                "The replacement opened the wrong task after a replaced readiness failure.");
+            steps[2].Reply.SetResult(ready);
+            await replacement.WaitAsync(TimeSpan.FromSeconds(3));
+            using (Field<ProfileActionGate>(abandonWindow, "_profileActions").Enter("profile", "fixture")) { }
+            checks.Add("A replaced open's failed readiness continuation is not reported, and the replacing task still opens.");
+        }
+        finally { foreach (var step in steps) step.Reply.TrySetResult(ready); abandonWindow.Close(); }
         checks.AddRange(DesktopCompatibilitySelfTest.Run(root));
         checks.AddRange(LocalModelSelfTest.Run());
         checks.AddRange(await ProfileOpenStatusSelfTest.RunAsync(root));
