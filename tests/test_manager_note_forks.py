@@ -1,3 +1,4 @@
+import copy
 import json
 import sqlite3
 import sys
@@ -6,9 +7,14 @@ import unittest
 from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
+from uuid import uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
+from control_center import ControlCenter
 from manager_core import note_forks
+from manager_core.remote_catalog import RemoteCatalog, groups
+from manager_core.store import Store
+from test_manager_remote_catalog import register
 
 
 class NoteForkTests(unittest.TestCase):
@@ -158,6 +164,105 @@ class NoteForkTests(unittest.TestCase):
             document = note_forks.refresh(root, {'sources': [], 'profiles': []})
             self.assertIsNone(document)
             self.assertFalse((root / 'work/control-center/note-forks.json').exists())
+
+
+class SshNoteForkTests(unittest.TestCase):
+    parent = '00000000-0000-4000-8000-000000000011'
+    child = '00000000-0000-4000-8000-000000000012'
+    grandchild = '00000000-0000-4000-8000-000000000013'
+    pending = '00000000-0000-4000-8000-000000000014'
+    host = 'remote-ssh-discovered:remote-dev'
+
+    def setUp(self):
+        note_forks._SEEN.clear()
+        note_forks._META.clear()
+        note_forks._CATALOGS.clear()
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.store = Store(self.root)
+        self.profile = self.store.add_profile('04')
+        register(self.store, self.profile)
+        self.target = self.root / 'work/control-center/note-forks.json'
+        self.rows = [self._row(self.parent, None), self._row(self.child, self.parent),
+                     self._row(self.grandchild, self.child), self._row(self.pending)]
+
+    def _row(self, thread_id, *parent):
+        row = dict(thread_id=thread_id, source_store_id='manager:' + self.profile['id'], title='SSH task',
+                   cwd='/srv/projects/sample-repo', updated_at=1789300000, archived=False)
+        if parent:
+            row['forked_from_id'] = parent[0]
+        return row
+
+    def _catalog(self):
+        # The manager's real cache writer, fed by a fixture SSH reader.
+        cache = RemoteCatalog(self.root, self.store, object(), reader=lambda _: dict(conversations=copy.deepcopy(self.rows), errors=[]))
+        cache._refresh_host(groups(self.store.read())['remote-dev'])
+        return cache._path('remote-dev')
+
+    def _key(self, thread_id):
+        return 'ssh:remote-dev\0' + thread_id
+
+    def test_catalog_forks_are_published_per_host_alongside_local_forks(self):
+        home = self.root / 'codex-home'
+        home.mkdir()
+        local_parent, local_child = str(uuid4()), str(uuid4())
+        with closing(sqlite3.connect(home / 'state_5.sqlite')) as db, db:
+            db.execute('CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT, source TEXT)')
+            # The local thread that shares an SSH fork's id is not a fork.
+            for thread_id, parent in ((local_child, local_parent), (self.child, None)):
+                rollout = home / (thread_id + '.jsonl')
+                rollout.write_text(json.dumps({'type': 'session_meta', 'payload': {
+                    'id': thread_id, 'forked_from_id': parent, 'source': 'vscode'}}) + '\n', encoding='utf-8')
+                db.execute('INSERT INTO threads VALUES(?,?,?)', (thread_id, str(rollout), 'vscode'))
+        state = self.store.read()
+        state['sources'].append({'host_id': 'local', 'home': str(home)})
+        self._catalog()
+        expected = {local_child: local_parent, self._key(self.child): self.parent,
+                    self._key(self.grandchild): self.child}
+        self.assertEqual(note_forks.refresh(self.root, state), expected)
+        self.assertEqual(json.loads(self.target.read_text(encoding='utf-8')), expected)
+        # A targeted local read keeps the published SSH forks.
+        self.assertEqual(note_forks.refresh(self.root, state, local_child), expected)
+
+    def test_first_note_read_publishes_one_ssh_ancestry_chain(self):
+        self._catalog()
+        for host in (self.host, 'ssh:remote-dev'):
+            with self.subTest(host=host):
+                self.target.unlink(missing_ok=True)
+                self.assertEqual(note_forks.refresh(self.root, self.store.read(), self.grandchild, host),
+                                 {self._key(self.grandchild): self.child, self._key(self.child): self.parent})
+
+    def test_unresolved_or_unknown_ssh_task_waits_without_error_or_file(self):
+        self._catalog()
+        for thread_id, host in ((self.pending, self.host), (str(uuid4()), self.host),
+                                (self.child, 'remote-ssh-discovered:other-host')):
+            with self.subTest(thread_id=thread_id, host=host):
+                self.assertIsNone(note_forks.refresh(self.root, self.store.read(), thread_id, host))
+        self.assertFalse(self.target.exists())
+        for host in ('remote-ssh-discovered:', 'cloud:remote-dev'):
+            with self.subTest(host=host), self.assertRaises(ValueError):
+                note_forks.refresh(self.root, self.store.read(), self.child, host)
+
+    def test_unavailable_catalog_keeps_published_forks_until_host_is_removed(self):
+        path = self._catalog()
+        published = note_forks.refresh(self.root, self.store.read())
+        path.unlink()
+        self.assertEqual(note_forks.refresh(self.root, self.store.read()), published)
+        # A cache from another source scope is not trusted for new edges.
+        self.rows.append(self._row(self.pending, self.grandchild))
+        self._catalog()
+        register(self.store, self.store.add_profile('05'))
+        self.assertEqual(note_forks.refresh(self.root, self.store.read()), published)
+        self.store.mutate(lambda data: [p.update(remote_bindings=[]) for p in data['profiles']])
+        self.assertEqual(note_forks.refresh(self.root, self.store.read()), {})
+
+    def test_control_center_note_preflight_reads_ssh_fork_metadata(self):
+        self._catalog()
+        center = ControlCenter(self.root)
+        result = center.dispatch('notes.refresh_forks', dict(task=dict(host_id=self.host, thread_id=self.child)))
+        self.assertEqual(result, dict(refreshed=True))
+        self.assertEqual(json.loads(self.target.read_text(encoding='utf-8')), {self._key(self.child): self.parent})
 
 
 if __name__ == '__main__':

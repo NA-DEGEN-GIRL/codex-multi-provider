@@ -85,19 +85,29 @@ fn group_path(root: &Path, group_id: &str) -> PathBuf {
         .join(format!("{group_id}.json"))
 }
 
-/// Local native forks share their parent's note group; remote task identities
-/// stay isolated.
-fn fork_parent(root: &Path, task: &TaskKey) -> Option<String> {
-    if task.host_id != "local" {
-        return None;
+/// Native forks share their parent's note group. Local forks are keyed by
+/// thread id; SSH forks by `ssh:<host alias>\0<thread id>`, so a fork never
+/// inherits a relationship from another host or from a local task.
+fn fork_key(task: &TaskKey) -> Option<String> {
+    if task.host_id == "local" {
+        return Some(task.thread_id.clone());
     }
+    let alias = ["ssh:", "remote-ssh-discovered:"]
+        .iter()
+        .find_map(|prefix| task.host_id.strip_prefix(prefix))
+        .filter(|alias| !alias.is_empty())?;
+    Some(format!("ssh:{alias}\0{}", task.thread_id))
+}
+
+fn fork_parent(root: &Path, task: &TaskKey) -> Option<String> {
+    let key = fork_key(task)?;
     let path = root.join("work/control-center/note-forks.json");
     let metadata = std::fs::metadata(&path).ok()?;
     if metadata.len() > 4 * 1024 * 1024 {
         return None;
     }
     let value: Value = serde_json::from_str(&std::fs::read_to_string(&path).ok()?).ok()?;
-    let entry = value.get(&task.thread_id)?;
+    let entry = value.get(&key)?;
     let parent = entry.as_str().map(str::to_string).or_else(|| {
         entry
             .get("parent_thread_id")
@@ -263,14 +273,15 @@ fn load_task(
         notes: vec![],
     };
     if let Some(parent) = fork_parent(root, &task) {
-        let mut source = load_task(
+        // An SSH parent may still keep its notes under an older catalog link.
+        let parent = crate::note_aliases::resolve(
             root,
             TaskKey {
                 host_id: task.host_id.clone(),
                 thread_id: parent,
             },
-            visited,
         )?;
+        let mut source = load_task(root, parent, visited)?;
         // A native fork shares the parent's mutable note group instead of
         // copying a snapshot. Documents that already exist are never
         // rewritten by this path, so old independent notes stay untouched.

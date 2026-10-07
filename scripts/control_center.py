@@ -225,7 +225,7 @@ class ControlCenter:
         # This one snapshot serves the whole poll. Quota refresh gets the saved
         # profiles before this view adds observations to them below.
         saved_profiles=deepcopy(state['profiles'])
-        # Forked tasks copy their source memo into an independent document; the
+        # Forked tasks (local and SSH) share their parent's notes until split; the
         # note service reads this mapping instead of opening state databases.
         try:
             from manager_core.note_forks import refresh as refresh_note_forks
@@ -364,9 +364,13 @@ class ControlCenter:
     def dispatch(self,command,args):
         if not isinstance(args,dict):raise ValueError('명령 인수가 올바르지 않습니다.')
         if command=='notes.refresh_forks':
-            if args['task'].get('host_id', 'local').startswith(('ssh:', 'remote-ssh-discovered:')):
+            host=args['task'].get('host_id', 'local')
+            if host.startswith(('ssh:', 'remote-ssh-discovered:')):
                 from manager_core.note_aliases import refresh
                 refresh(self.root, args['task'])
+                # SSH forks share notes from the cached catalog's fork metadata.
+                from manager_core.note_forks import refresh as refresh_forks
+                refresh_forks(self.root, self.store.read(), thread_id=args['task']['thread_id'], host_id=host)
                 return dict(refreshed=True)
             from manager_core.note_forks import refresh
             refresh(self.root, self.store.read(), thread_id=args['task']['thread_id'])

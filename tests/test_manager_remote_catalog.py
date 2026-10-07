@@ -194,6 +194,43 @@ class RemoteCatalogTests(unittest.TestCase):
         self.assertEqual(self.cache.snapshot()['conversations'], [])
         self.assertIn('등록 정보', self.cache.snapshot()['hosts'][0]['message'])
 
+    def test_request_lists_known_forks_but_never_exceeds_its_size_limit(self):
+        payloads = []
+        class Remote:
+            def _alias(self, alias): return alias
+            def _run(self, alias, command, **kwargs):
+                payloads.append(json.loads(kwargs['input']))
+                catalog_frames.write(kwargs['stdout'], dict(conversations=[], errors=[]))
+                return subprocess.CompletedProcess([], 0)
+        query = RemoteCatalog(ROOT, self.store, Remote())
+        group = groups(self.store.read())['remote-dev']
+        known = [str(uuid4()) for _ in range(5000)]
+        query._read({**group, 'fork_known': known})
+        self.assertEqual(payloads[-1]['request']['fork_known'], known[:4096])
+        with patch('manager_core.remote_catalog.MAX_FORK_KNOWN', 10000):
+            query._read({**group, 'fork_known': known * 2})
+        self.assertEqual(payloads[-1]['request']['fork_known'], [])
+
+    def test_fork_parents_are_carried_forward_and_kept_out_of_catalog_rows(self):
+        parent = self.rows[0]['thread_id']
+        self.rows[0]['forked_from_id'] = None
+        self.rows[1]['forked_from_id'] = parent
+        self.refresh()
+        self.assertEqual(self.calls[0]['fork_known'], [])
+        # Resolved headers are not read again; their parents stay cached.
+        for row in self.rows:
+            row.pop('forked_from_id')
+        self.refresh()
+        self.assertEqual(sorted(self.calls[1]['fork_known']), sorted(r['thread_id'] for r in self.rows))
+        with self.cache._path('remote-dev').open('rb') as stream:
+            cached = {r['thread_id']: r for r in catalog_frames.read(stream)['conversations']}
+        self.assertEqual(cached[self.rows[1]['thread_id']]['forked_from_id'], parent)
+        self.assertIsNone(cached[parent]['forked_from_id'])
+        self.assertTrue(all('forked_from_id' not in r for r in self.cache.snapshot()['conversations']))
+        self.rows[1]['forked_from_id'] = self.rows[1]['thread_id']
+        self.refresh()
+        self.assertTrue(self.cache.snapshot()['hosts'][0]['stale'])
+
     def test_foreign_source_response_is_rejected_and_old_records_survive(self):
         self.refresh()
         self.rows[0]['source_store_id'] = 'manager:' + str(uuid4())
@@ -318,6 +355,51 @@ class RemoteCatalogReaderTests(unittest.TestCase):
         path.write_bytes(b'Invalid database fixture')
         result = self.read()
         self.assertIn(self.sources[0]['id'], result['errors'])
+
+    def _thread(self, header, *, complete=True, updated_at=1789300100):
+        tid = str(uuid4())
+        rollout = Path(self.sources[0]['home']) / 'sessions' / f'rollout-{tid}.jsonl'
+        line = json.dumps(dict(type='session_meta', payload=dict(id=tid, **header)))
+        rollout.write_text(line + ('\nconversation text is never parsed\n' if complete else ''), encoding='utf-8')
+        with closing(sqlite3.connect(Path(self.sources[0]['home']) / 'state_5.sqlite')) as db, db:
+            db.execute('INSERT INTO threads VALUES(?,?,?,?,?)', (tid, 'Fork', '/work/project', updated_at, str(rollout)))
+        return tid
+
+    def test_fork_parent_is_reported_from_first_session_metadata_line_only(self):
+        parent = self.tid
+        fork = self._thread(dict(forked_from_id=parent, source='vscode'))
+        plain = self._thread(dict(source='vscode'))
+        agent = self._thread(dict(forked_from_id=parent, source={'subagent': {'thread_spawn': {}}}))
+        writing = self._thread(dict(forked_from_id=parent), complete=False)
+        invalid = self._thread(dict(forked_from_id='../outside'))
+        before = {str(p): p.read_bytes() for p in self.root.rglob('*') if p.is_file()}
+        rows = {r['thread_id']: r for r in self.read()['conversations']}
+        self.assertEqual(rows[fork]['forked_from_id'], parent)
+        for tid in (plain, agent, invalid):
+            self.assertIsNone(rows[tid]['forked_from_id'])
+        # A header still being written, or a non-JSON history, is read again later.
+        self.assertNotIn('forked_from_id', rows[writing])
+        self.assertNotIn('forked_from_id', rows[self.tid])
+        self.assertEqual(before, {str(p): p.read_bytes() for p in self.root.rglob('*') if p.is_file()})
+
+    def test_known_fork_headers_are_skipped_and_reads_are_bounded_newest_first(self):
+        fork = self._thread(dict(forked_from_id=self.tid), updated_at=1789300200)
+        older = self._thread(dict(forked_from_id=self.tid), updated_at=1789300150)
+        self.request['fork_known'] = [fork]
+        with patch.object(helper, 'fork_parent', wraps=helper.fork_parent) as read:
+            rows = {r['thread_id']: r for r in self.read()['conversations']}
+        self.assertNotIn(fork, [call.args[0] for call in read.call_args_list])
+        self.assertNotIn('forked_from_id', rows[fork])
+        self.assertEqual(rows[older]['forked_from_id'], self.tid)
+        self.request['fork_known'] = []
+        with patch.object(helper, 'MAX_FORK_READS', 1), \
+                patch.object(helper, 'fork_parent', wraps=helper.fork_parent) as read:
+            rows = {r['thread_id']: r for r in self.read()['conversations']}
+        self.assertEqual([call.args[0] for call in read.call_args_list], [fork])
+        self.assertNotIn('forked_from_id', rows[older])
+        self.request['fork_known'] = 'not a list'
+        with self.assertRaises(ValueError):
+            self.read()
 
 
 if __name__ == '__main__':

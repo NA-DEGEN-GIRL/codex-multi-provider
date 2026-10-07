@@ -15,6 +15,9 @@ from .ssh_shim import validate_binding
 from .store import identifier, now
 from . import catalog_frames
 
+# Thread ids whose rollout header is already resolved; the helper skips them.
+# 4096 ids keep the request well below its 256 KiB limit.
+MAX_FORK_KNOWN = 4096
 
 BOOTSTRAP = '''import json,sys,types
 value=json.load(sys.stdin)
@@ -80,7 +83,12 @@ class RemoteCatalog:
             ('catalog_frames', 'scripts/manager_core/catalog_frames.py'))}
         request = {k: group[k] for k in ('host_identity', 'sources')}
         request['discover_legacy'] = True
+        request['fork_known'] = list(group.get('fork_known', ()))[:MAX_FORK_KNOWN]
         payload = json.dumps(dict(modules=modules, request=request), ensure_ascii=False).encode('utf-8')
+        if len(payload) > 262144 and request['fork_known']:
+            # Known fork metadata only saves header reads; never fail for it.
+            request['fork_known'] = []
+            payload = json.dumps(dict(modules=modules, request=request), ensure_ascii=False).encode('utf-8')
         if len(payload) > 262144:
             raise ValueError('SSH catalog request limit')
         with tempfile.TemporaryFile() as output:
@@ -130,8 +138,16 @@ class RemoteCatalog:
                     and (not isinstance(item['cwd'], str) or len(item['cwd']) > 4096)
                     or not isinstance(item.get('updated_at'), (str, int, float, type(None)))):
                 raise ValueError('Invalid SSH catalog entry')
-            rows.append(dict(thread_id=identifier(item['thread_id']), source_store_id=item['source_store_id'],
-                title=item['title'], cwd=item.get('cwd'), updated_at=item.get('updated_at'), archived=bool(item.get('archived'))))
+            row = dict(thread_id=identifier(item['thread_id']), source_store_id=item['source_store_id'],
+                title=item['title'], cwd=item.get('cwd'), updated_at=item.get('updated_at'), archived=bool(item.get('archived')))
+            # Native fork parent for shared notes: a UUID, None for no fork,
+            # or absent while the rollout header is unresolved.
+            if 'forked_from_id' in item:
+                parent = item['forked_from_id']
+                if parent is not None and (identifier(parent) != parent or parent == row['thread_id']):
+                    raise ValueError('Invalid SSH catalog entry')
+                row['forked_from_id'] = parent
+            rows.append(row)
         return dict(conversations=rows, errors=value['errors'], discovered_sources=inventory,
                     discovery_errors=discovery_errors, possibly_truncated=value.get('possibly_truncated') is True)
 
@@ -173,9 +189,16 @@ class RemoteCatalog:
         alias = group['alias']
         failed = False
         try:
-            result = self._validate(self.reader(group), group)
             with self._lock:
                 previous = self._cached(group) or {}
+            # Rollout headers never change: carry resolved fork parents forward
+            # so a refresh reads only new or still unresolved task headers.
+            forks = {r['thread_id']: r['forked_from_id'] for r in previous.get('conversations', [])
+                     if 'forked_from_id' in r}
+            result = self._validate(self.reader({**group, 'fork_known': list(forks)[:MAX_FORK_KNOWN]}), group)
+            for row in result['conversations']:
+                if 'forked_from_id' not in row and row['thread_id'] in forks:
+                    row['forked_from_id'] = forks[row['thread_id']]
             # Retain unavailable sources; a failed read must not erase their tasks.
             unavailable = set(result['errors'])
             if result['discovery_errors']:
@@ -220,6 +243,7 @@ class RemoteCatalog:
                 if not group['conflicted']:
                     for row in cached.get('conversations', []):
                         source = source_map[row['source_store_id']]
+                        row = {k: v for k, v in row.items() if k != 'forked_from_id'}
                         rows.append({**row, 'host_id': 'ssh:' + alias, 'source_alias': source['alias'],
                             'source_home': source['home'], 'catalog_stale': stale})
                 hosts.append(dict(host_id='ssh:' + alias, refreshing=alias in self._workers,

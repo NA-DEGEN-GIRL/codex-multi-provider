@@ -708,6 +708,59 @@ fn remote_hosts_do_not_inherit_local_fork_relationships() {
 }
 
 #[test]
+fn ssh_forks_share_notes_only_on_their_own_host() {
+    let root = tempdir().unwrap();
+    let mut parent = note_args();
+    parent["task"]["host_id"] = json!("remote-ssh-discovered:fixture");
+    let mut child = note_args();
+    child["task"]["host_id"] = parent["task"]["host_id"].clone();
+    let child_id = child["task"]["thread_id"].as_str().unwrap().to_string();
+    note_fork_map(
+        root.path(),
+        json!({format!("ssh:fixture\0{child_id}"): parent["task"]["thread_id"]}),
+    );
+    notes::execute(root.path(), "notes.save", &parent).unwrap();
+    let shared = note_list(root.path(), &child);
+    assert_eq!(shared["shared"], true);
+    assert_eq!(shared["notes"][0]["id"], parent["note_id"]);
+    assert_eq!(note_list(root.path(), &parent)["shared"], true);
+    for host in ["remote-ssh-discovered:other", "ssh:other", "local"] {
+        let mut isolated = child.clone();
+        isolated["task"]["host_id"] = json!(host);
+        assert_eq!(note_list(root.path(), &isolated)["notes"], json!([]));
+        assert_eq!(note_list(root.path(), &isolated)["shared"], false);
+    }
+    // A parent whose notes live under an older catalog link keeps them visible
+    // to itself and shares them with the fork.
+    let mut old = note_args();
+    old["task"]["host_id"] = json!("ssh:fixture");
+    let saved = notes::execute(root.path(), "notes.save", &old).unwrap();
+    let canonical_parent = uuid::Uuid::new_v4().to_string();
+    let mut fork = note_args();
+    fork["task"]["host_id"] = old["task"]["host_id"].clone();
+    let fork_id = fork["task"]["thread_id"].as_str().unwrap().to_string();
+    std::fs::write(
+        root.path().join("work/control-center/note-aliases.json"),
+        serde_json::to_vec(
+            &json!({format!("ssh:fixture\0{canonical_parent}"): old["task"]["thread_id"]}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    note_fork_map(
+        root.path(),
+        json!({format!("ssh:fixture\0{child_id}"): parent["task"]["thread_id"],
+        format!("ssh:fixture\0{fork_id}"): canonical_parent}),
+    );
+    let inherited = note_list(root.path(), &fork);
+    assert_eq!(inherited["shared"], true);
+    assert_eq!(inherited["notes"][0], saved["note"]);
+    let mut parent_view = old.clone();
+    parent_view["task"]["thread_id"] = json!(canonical_parent);
+    assert_eq!(note_list(root.path(), &parent_view)["notes"][0], saved["note"]);
+}
+
+#[test]
 fn fork_cycles_fail_without_creating_documents_or_groups() {
     let root = tempdir().unwrap();
     let a = note_args();
