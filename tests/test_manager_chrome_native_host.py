@@ -29,6 +29,22 @@ SRC_917 = (PATH_917 + b's=e.a(s);var U0=`chrome-native-hosts-v2.json`;' + G2_917
            b'async function y2(e){let r=await x2(e),a=b2(e.resource);await B2({' + Y2_917 + b'})}')
 REF_ERROR = '--ref is only supported for git marketplace sources'
 
+# 26.930 moved the native-host code to the bootstrap module. Exact 26.930.7945
+# anchors: its node:path binding, the sync entry AF and the v2 writer's entry
+# list. RF is now the same-install test; the LF beside it compares fields (it
+# was IF in 4958) and is no anchor. The connecting text is shortened.
+PATH_930 = b'let g=require("node:path");'
+AF_7945 = b'async function AF(e){let t=[...new Set([...e.extensionIds,...r.Wr(e.nativeHostName)])]'
+RF_7945 = b'entries:[...r.entries.filter(t=>!RF(t,e.resource)),a]'
+BOOT_7945 = (PATH_930 + b'g=e.a(g);var rF=`chrome-native-hosts-v2.json`,iF=[0,100,200,400,800];' + AF_7945 +
+             b',n=$F()}async function write(t,e,r,i){let a=PF(i!=null&&LF(i,e.resource)?i:e.resource);'
+             b'await eI(t,Buffer.from(`${JSON.stringify({schemaVersion:aF,' + RF_7945 +
+             b'.sort((e,t)=>VF(e).localeCompare(VF(t)))},null,2)}\\n`),n)}')
+# The same module in 26.930.4958, which named these helpers kF, LF and IF.
+KF_4958 = AF_7945.replace(b'AF(', b'kF(')
+LF_4958 = RF_7945.replace(b'RF(', b'LF(')
+BOOT_4958 = BOOT_7945.replace(b'LF(i,', b'IF(i,').replace(AF_7945, KF_4958).replace(RF_7945, LF_4958)
+
 
 def after(before):
     replacement, = [patched for _, anchor, patched in chrome._PATCHES if anchor == before]
@@ -78,6 +94,35 @@ class PatchTableTests(unittest.TestCase):
         self.assertEqual(set(found), {RA_917, G2_917, Y2_917})
         for before, (_, replacement) in found.items():
             self.assertNotIn(before, replacement)
+
+    def test_each_930_bootstrap_is_patched_with_its_own_names(self):
+        for label, data, gate, exclusive in (('4958', BOOT_4958, KF_4958, LF_4958),
+                                             ('7945', BOOT_7945, AF_7945, RF_7945)):
+            with self.subTest(label):
+                found = chrome.patches_for(data)
+                self.assertEqual(found, {gate: ('native_host_gate', after(gate)),
+                                         exclusive: ('native_host_exclusive', after(exclusive))})
+                plan = chrome.Plan()
+                plan.scan('bootstrap.js', 'item', data)
+                changed = {}
+                self.assertEqual(plan.apply(changed), ['native_host_exclusive', 'native_host_gate'])
+                self.assertEqual(changed['bootstrap.js'],
+                                 ('item', data.replace(gate, after(gate)).replace(exclusive, after(exclusive))))
+                # The 26.930 filter calls the module's node:path binding g.
+                self.assertIn(b'(0,g.resolve)', after(exclusive))
+
+    def test_renamed_930_helpers_fail_closed(self):
+        # 7945 still calls LF beside the entry list, as its field comparison:
+        # the 4958 names must not match there.
+        self.assertIn(b'LF(i,e.resource)', BOOT_7945)
+        self.assertNotIn(LF_4958, BOOT_7945)
+        for label, data in (('gate', BOOT_7945.replace(b'function AF(', b'function xF(')),
+                            ('entry list', BOOT_7945.replace(b'!RF(t,', b'!xF(t,'))):
+            with self.subTest(label):
+                plan = chrome.Plan()
+                plan.scan('bootstrap.js', {}, data)
+                with self.assertRaisesRegex(ValueError, 'Chrome'):
+                    plan.apply({})
 
     def test_duplicate_anchor_is_ambiguous(self):
         with self.assertRaises(ValueError):
@@ -161,6 +206,15 @@ class ArchiveTests(unittest.TestCase):
         self.assertEqual(src, SRC_917.replace(G2_917, after(G2_917)).replace(Y2_917, after(Y2_917)))
         self.assertEqual(item['integrity']['hash'], hashlib.sha256(src).hexdigest())
 
+    def test_26_930_7945_bootstrap_gets_both_native_host_changes(self):
+        source, target = self.root / 'app.asar', self.root / 'patched.asar'
+        managed_archive(source, src=BOOT_7945)
+        result = bundle.patch_archive(source, target)
+        self.assertEqual(result['chrome_native_host'], ['marketplace_add', 'native_host_exclusive', 'native_host_gate'])
+        item, src = entries(target)['.vite/build/src-fixture.js']
+        self.assertEqual(src, BOOT_7945.replace(AF_7945, after(AF_7945)).replace(RF_7945, after(RF_7945)))
+        self.assertEqual(item['integrity']['hash'], hashlib.sha256(src).hexdigest())
+
     def test_unknown_native_host_shape_blocks_publication(self):
         source, target = self.root / 'app.asar', self.root / 'patched.asar'
         managed_archive(source, src=SRC_917.replace(b'WS(', b'XS('))
@@ -213,22 +267,31 @@ const cases = CASES, results = {};
             'hash-ref-twice': {'error': REF_ERROR, 'calls': [['D:\\#P\\m', 0], ['D:\\#P\\m#', 0]]}})
 
     def test_only_the_marked_desktop_syncs_its_native_host(self):
-        program = r'''
+        # 26.917 calls its extension-id helper WS; 26.930 calls r.Wr of a required module.
+        for label, gate, binding, helper in (('26.917', G2_917, 'WS', "() => ['store-id']"),
+                                             ('26.930.7945', AF_7945, 'r', "({Wr: () => ['store-id']})")):
+            program = r'''
 const log = [];
-const sync = new Function('WS', 'log', 'return ' + GATE + ';log.push(t)}')(() => ['store-id'], log);
+const sync = new Function(BINDING, 'log', 'return ' + GATE + ';log.push(t)}')(HELPER, log);
 (async () => {
   await sync({extensionIds: ['a', 'store-id'], nativeHostName: 'com.openai.codexextension'});
   console.log(JSON.stringify(log));
 })().catch(error => { console.error(error); process.exitCode = 1; });
-'''.replace('GATE', json.dumps(after(G2_917).decode()))
-        self.assertEqual(self.node(program), [])
-        self.assertEqual(self.node(program, **{chrome.ENV: '0'}), [])
-        self.assertEqual(self.node(program, **{chrome.ENV: '1'}), [['a', 'store-id']])
+'''.replace('GATE', json.dumps(after(gate).decode())).replace('BINDING', json.dumps(binding)).replace('HELPER', helper)
+            with self.subTest(label):
+                self.assertEqual(self.node(program), [])
+                self.assertEqual(self.node(program, **{chrome.ENV: '0'}), [])
+                self.assertEqual(self.node(program, **{chrome.ENV: '1'}), [['a', 'store-id']])
 
     def test_registration_replaces_entries_of_every_managed_copy_of_this_root(self):
+        for label, anchor, path, same_install in (('26.917', Y2_917, 's', 'w2'), ('26.930.7945', RF_7945, 'g', 'RF')):
+            with self.subTest(label):
+                self.check_registration(anchor, path, same_install)
+
+    def check_registration(self, anchor, path, same_install):
         program = r'''
 const s = require('path').win32, w2 = (t, e) => t?.entryId === e.entryId;
-const write = new Function('s', 'w2', 'return (r,e,a)=>({' + FILTER + '})')(s, w2);
+const write = new Function(PATH, SAME_INSTALL, 'return (r,e,a)=>({' + FILTER + '})')(s, w2);
 const at = resourcesPath => ({entryId: resourcesPath, paths: {resourcesPath}});
 const entries = [
   at('C:\\Program Files\\WindowsApps\\OpenAI.Codex_1_x64__id\\app\\resources'),
@@ -239,7 +302,8 @@ const entries = [
   {entryId: 'no-paths'}, 'not-an-object', {entryId: 'mine', paths: {resourcesPath: 'C:\\elsewhere'}}];
 const result = write({entries}, {resource: {entryId: 'mine'}}, {entryId: 'mine', current: true}).entries;
 console.log(JSON.stringify(result.map(entry => typeof entry === 'string' ? entry : entry.entryId + (entry.current ? '*' : ''))));
-'''.replace('FILTER', json.dumps(after(Y2_917).decode()))
+'''.replace('FILTER', json.dumps(after(anchor).decode())).replace('PATH', json.dumps(path)).replace(
+            'SAME_INSTALL', json.dumps(same_install))
         official = 'C:\\Program Files\\WindowsApps\\OpenAI.Codex_1_x64__id\\app\\resources'
         sibling = 'D:\\#Root\\mgr\\artifacts\\managed-desktop-old\\x\\resources'
         other_root = 'E:\\other\\artifacts\\managed-desktop\\26.917.1-cccc\\resources'

@@ -25,6 +25,8 @@ PROFILE = '00000000-0000-4000-9000-000000000007'
 OTHER = '00000000-0000-4000-9000-000000000008'
 FIXTURE = json.loads((Path(__file__).parent / 'fixtures/native_ssh_26_903_9818.json').read_text())
 NATIVE_917 = json.loads((Path(__file__).parent / 'fixtures/native_ssh_26_917_9434.json').read_text(encoding='utf-8-sig'))
+# Every native command of 26.930.7945, built by the bundle's own builders.
+NATIVE_7945 = json.loads((Path(__file__).parent / 'fixtures/native_ssh_26_930_7945.json').read_text(encoding='utf-8-sig'))
 OPERATIONS = {
     'codex_path_probe': 'native-probe', 'codex_version_probe': 'native-version',
     'app_server_bootstrap': 'native-start', 'remote_codex_kill': 'native-stop',
@@ -80,7 +82,7 @@ class NativeFixtureTests(unittest.TestCase):
             self.assertNotIn('a'*64,execute.call_args.args[1][-1])
 
     def test_updated_installed_app_routes_exact_captured_start_and_proxy(self):
-        for version in ('26_908_4834', '26_911_7940', '26_917_9434'):
+        for version in ('26_908_4834', '26_911_7940', '26_917_9434', '26_930_7945'):
             fixture=json.loads((Path(__file__).parent/f'fixtures/native_ssh_{version}.json').read_text(encoding='utf-8-sig'))
             for name,command in fixture['commands'].items():
                 rewritten,event=route_arguments(['-T','remote-dev',command],manifest())
@@ -170,6 +172,24 @@ class NativeFixtureTests(unittest.TestCase):
                 self.assertEqual(shlex.split(routed[-1])[2], shlex.split(NATIVE_917['commands']['start'])[2])
                 self.assertTrue(unwrap(routed[-1]).endswith('a' * 64 + ' native-start'))
                 self.assertNotIn('nohup', routed[-1])
+
+    def test_26_930_7945_routes_every_operation_without_a_verified_source(self):
+        # 7945 builds the 26.917 start and proxy byte for byte. Its source is not
+        # in VERIFIED_SOURCES, so every command is validated on its own.
+        self.assertEqual(NATIVE_7945['marker'], NATIVE_917['marker'])
+        self.assertEqual({name: NATIVE_7945['commands'][name] for name in NATIVE_917['commands']}, NATIVE_917['commands'])
+        unverified = {**manifest(), 'native_compatible': False, 'native_command_validation': 1}
+        prefix = ['-T', '-v', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15',
+                  '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=12', 'remote-dev']
+        for name, command in NATIVE_7945['commands'].items():
+            for data in (manifest(), unverified):
+                with self.subTest(name, native_compatible=data.get('native_compatible')):
+                    routed, event = route_arguments(prefix + [command], data)
+                    self.assertEqual(event['operation'], 'native-' + name)
+                    self.assertEqual(routed[:-1], prefix)
+                    self.assertTrue(unwrap(routed[-1]).startswith(decode_native(command)[1]))
+                    self.assertTrue(unwrap(routed[-1]).endswith(
+                        'exec /bin/uname -s' if name == 'platform' else 'a' * 64 + ' native-' + name))
 
     def test_26_917_installer_and_near_miss_starts_stay_blocked(self):
         body = unwrap(NATIVE_917['commands']['start']).split('; export PATH; ', 1)[1]

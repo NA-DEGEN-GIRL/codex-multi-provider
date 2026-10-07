@@ -18,8 +18,8 @@ The remap that places such threads falls back to the first project sharing the
 git common dir in each profile's sidebar order. The order patch ranks, for
 remote threads only, the declared worktree holding the cwd first and then the
 repository project, so the result no longer depends on the sidebar order.
-26.930 (3930 and 4958, the same code up to names) refuses to publish without
-all three grouping patches.
+26.930 (3930 and 4958, the same code up to names; 7945 keeps the 4958 names)
+refuses to publish without all three grouping patches.
 """
 import json
 import os
@@ -764,6 +764,8 @@ SKIP_4958 = b'n.summary!=null&&!Yu(n.cwd,i,a?.[e])||'
 REMOTE_SKIP_4958 = b'n.summary!=null&&e===t&&!Yu(n.cwd,i,a?.[e])||'
 CALL_4958, ORDERED_CALL_4958 = order_call(b'xIn', b'lFn', b'yh', b'bIn')
 VERSION_4958 = '26.930.41038'  # package.json version of the 26.930.4958 desktop
+# 26.930.7945 ships gIn, AIn and HELPERS_4958 byte for byte (ManagedRenderer7945Tests).
+VERSION_7945 = '26.930.61225'  # package.json version of the 26.930.7945 desktop
 SOURCE_4958 = (GIN_4958 + ';' + AIN_4958).encode()
 
 
@@ -911,6 +913,18 @@ class Grouping4958ArchiveTests(unittest.TestCase):
                     self.assertEqual(data.count(REMOTE_SKIP_4958), 1)
                     self.assertEqual(data.count(GUARDED_4958), 1)
                     self.assertEqual(data.count(ORDERED_CALL_4958), 1)
+
+    def test_26_930_7945_copies_are_patched_or_refused_like_4958(self):
+        # Same grouping code, new package version: the 26.930 requirement applies.
+        for label in COPIES:
+            with self.subTest(label):
+                data = patch_copy(label, SOURCE_4958, VERSION_7945)
+                self.assertEqual(data, patch_copy(label, SOURCE_4958, VERSION_4958))
+                self.assertEqual(data.count(REMOTE_SKIP_4958), 1)
+                self.assertEqual(data.count(GUARDED_4958), 1)
+                self.assertEqual(data.count(ORDERED_CALL_4958), 1)
+                with self.assertRaisesRegex(ValueError, 'SSH worktree'):
+                    patch_copy(label, AIN_4958.encode(), VERSION_7945)
 
 
 # 26.930.3930 (app-initial), verbatim apart from the guard (the managed copy
@@ -1221,6 +1235,16 @@ class ManagedRenderer4958Tests(ManagedRendererChecks, unittest.TestCase):
         renderers = renderers_4958()
         if not renderers:
             self.skipTest('No 26.930.4958 renderer on this machine (no managed copy; set CODEX_DESKTOP_RENDERER_4958 '
+                          'to an extracted app-initial chunk to check one).')
+        self.check(renderers, GIN_4958.encode(), SKIP_4958, REMOTE_SKIP_4958,
+                   grouping_forms(AIN_4958, CONDITION_4958, GUARDED_4958, CALL_4958, ORDERED_CALL_4958), HELPERS_4958)
+
+
+class ManagedRenderer7945Tests(ManagedRendererChecks, unittest.TestCase):
+    def test_26_930_7945_renderer_matches_the_4958_sources(self):
+        renderers = app_initial_chunks('26.930.7945.*', 'CODEX_DESKTOP_RENDERER_7945')
+        if not renderers:
+            self.skipTest('No 26.930.7945 renderer on this machine (no managed copy; set CODEX_DESKTOP_RENDERER_7945 '
                           'to an extracted app-initial chunk to check one).')
         self.check(renderers, GIN_4958.encode(), SKIP_4958, REMOTE_SKIP_4958,
                    grouping_forms(AIN_4958, CONDITION_4958, GUARDED_4958, CALL_4958, ORDERED_CALL_4958), HELPERS_4958)

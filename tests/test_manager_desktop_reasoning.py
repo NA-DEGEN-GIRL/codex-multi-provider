@@ -9,6 +9,31 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 from manager_core.desktop_reasoning_ui import patch, patch_composer, upgrade_managed
 
+# Verbatim 26.930.7945 shapes (the gate kve and validator Al are 4958's names):
+# the picker (Kti) and the dropdown rows (V9r) of app-initial, and the composer
+# choices, selection, labels (shortened) and icon map of app-primary.
+PICKER_930 = (b'function Kti({additionalAvailableModels:e,authMethod:t,availableModels:n,defaultModel:r,'
+              b'enabledReasoningEfforts:i,hasConfiguredModelCatalog:a,includeUltraReasoningEffort:o,'
+              b'isCustomModelProvider:s=!1,models:c,useHiddenModels:l}){let u=[],d=null,f=c.some(e=>e.supportedReasoningEfforts'
+              b'.some(({reasoningEffort:e})=>e===`max`)),p=o&&c.some(e=>e.supportedReasoningEfforts.some(({reasoningEffort:e})=>'
+              b'e===`ultra`));return c.forEach(r=>{if(qti({additionalAvailableModels:e,authMethod:t,availableModels:n,'
+              b'hasConfiguredModelCatalog:a,isCustomModelProvider:s,model:r,useHiddenModels:l})){let e=o?r.supportedReasoningEfforts:'
+              b'r.supportedReasoningEfforts.filter(({reasoningEffort:e})=>e!==`ultra`),n=(t===`copilot`?'
+              b'[e.find(e=>e.reasoningEffort===`medium`)??{reasoningEffort:`medium`,description:`medium effort`}]:e)'
+              b'.filter(({reasoningEffort:e})=>kve(e)&&i.has(e)),a={...r,supportedReasoningEfforts:n};u.push(a),'
+              b'r.isDefault&&(d=a)}}),d??=u.find(e=>e.model===r)??null,{models:u,defaultModel:d,'
+              b'hasModelSupportingMaxReasoningEffort:f,hasModelSupportingUltraReasoningEffort:p}}')
+DROPDOWN_930 = (b'function V9r(e,{stripGptPrefix:t=!0}={}){return e?.flatMap(({displayName:e,model:n,supportedReasoningEfforts:r})=>'
+                b'{let i=e==null?`Custom`:I9r(e,{stripGptPrefix:t}),a=r.flatMap(({reasoningEffort:e})=>kve(e)&&'
+                b'e!==`persistent`?[e]:[]);return(a.length>0?a:[`medium`]).map(e=>({id:`${n}:${e}`,model:n,modelLabel:i,'
+                b'reasoningEffort:e}))})??[]}')
+COMPOSER_930 = (b'function gF(e,t){let n=e?.find(e=>e.model===t);return n==null?me.map(e=>({description:``,reasoningEffort:e})):'
+                b'n.supportedReasoningEfforts.filter(e=>Al(e.reasoningEffort)&&e.reasoningEffort!==`persistent`)}'
+                b'function _F(e,t){return Al(e)&&t.some(t=>t.reasoningEffort===e)?e:Yde(e,t.map(e=>e.reasoningEffort))}'
+                b'const labels={ultra:{id:`composer.mode.local.reasoning.ultra.label`,defaultMessage:`Ultra`},'
+                b'persistent:{id:`composer.mode.local.reasoning.persistent.label`,defaultMessage:`Persistent`}};'
+                b'j2e={none:$U,minimal:$U,low:E2e,medium:O2e,high:w2e,xhigh:JU,max:JU,ultra:JU,persistent:JU};')
+
 
 class DesktopReasoningTests(unittest.TestCase):
     def fixture(self, binding):
@@ -23,7 +48,7 @@ class DesktopReasoningTests(unittest.TestCase):
                 b'return(a.length>0?a:[`medium`]).map(e=>n+`:`+e)})}')
 
     def test_verified_bindings_preserve_effort_validation_and_native_gating(self):
-        for binding in (b'gj', b'WXn', b'UXn', b'vw', b'pye'):
+        for binding in (b'gj', b'WXn', b'UXn', b'vw', b'pye', b'zve', b'kve'):
             with self.subTest(binding=binding):
                 result = patch(self.fixture(binding))
                 self.assertIn(b'let e=o||s?', result)
@@ -46,6 +71,19 @@ class DesktopReasoningTests(unittest.TestCase):
         result = patch(source)
         self.assertEqual(result.count(b'let e=o||s?r.supportedReasoningEfforts:'), 1)
         self.assertEqual(result.count(b'=>(vw(e)||s&&e===`ultracode`)&&(s||i.has(e))),a={...r,'), 1)
+
+    def test_26_930_picker_dropdown_and_composer_shapes_are_patched_once(self):
+        result = patch(PICKER_930 + DROPDOWN_930)
+        self.assertEqual(result.count(b'let e=o||s?r.supportedReasoningEfforts:'), 1)
+        self.assertEqual(result.count(b'=>(kve(e)||s&&e===`ultracode`)&&(s||i.has(e))),a={...r,'), 1)
+        self.assertEqual(result.count(b'a=r.flatMap(({reasoningEffort:e})=>(kve(e)||e===`ultracode`)&&'
+                                      b'e!==`persistent`?[e]:[])'), 1)
+        composer = patch_composer(COMPOSER_930)
+        self.assertEqual(composer.count(b'.filter(e=>(Al(e.reasoningEffort)||e.reasoningEffort===`ultracode`)&&'
+                                        b'e.reasoningEffort!==`persistent`)'), 1)
+        self.assertEqual(composer.count(b'return (Al(e)||e===`ultracode`)&&t.some(t=>t.reasoningEffort===e)?e:Yde('), 1)
+        self.assertEqual(composer.count(b'ultracode:{id:`composer.mode.local.reasoning.ultracode.label`'), 1)
+        self.assertEqual(composer.count(b'persistent:JU,ultracode:JU}'), 1)
 
     @unittest.skipUnless(shutil.which('node'), 'Node is needed to execute the desktop picker fixture')
     def test_ultracode_choice_is_executable_only_for_an_advertising_custom_provider(self):
