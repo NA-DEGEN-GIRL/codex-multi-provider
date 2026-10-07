@@ -10,13 +10,14 @@ import tempfile
 import threading
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, call, patch
 from uuid import uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 import control_center
 from control_center import ControlCenter, INTERNAL_ERROR
-from manager_core.store import Store, Unchanged, atomic_json
+from manager_core.store import Store, Unchanged, atomic_json, file_stamp, json_copy
 
 
 def streamed(data):
@@ -90,6 +91,70 @@ class StoreNoChangeTests(unittest.TestCase):
         self.assertEqual(again, added)
         self.assertEqual(self.store.path.read_bytes(), before)
         self.assertEqual(self.store.read()['revision'], revision)
+
+
+class StoreReadCacheTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.store = Store(Path(temp.name))
+        self.profile = self.store.add_profile('01')
+
+    def test_unchanged_file_is_served_without_the_lock_as_independent_copies(self):
+        first = self.store.read()
+        first['profiles'].clear()  # Callers modify what they read.
+        with patch.object(Store, 'locked', side_effect=AssertionError('read took the store lock')):
+            second, third = self.store.read(), Store(self.store.root).read()
+        self.assertEqual([p['id'] for p in second['profiles']], [self.profile['id']])
+        self.assertEqual(second, third)
+        self.assertIsNot(second['profiles'][0], third['profiles'][0])
+
+    def test_every_write_is_seen_by_the_next_read(self):
+        self.store.read()
+        self.store.mutate(lambda data: data.update(marker=1))
+        self.assertEqual(self.store.read()['marker'], 1)
+        Store(self.store.root).mutate(lambda data: data.update(marker=2))  # Another writer.
+        self.assertEqual(self.store.read()['marker'], 2)
+        self.store.path.write_text('{broken', encoding='utf-8')  # An in-place rewrite.
+        with self.assertRaises(ValueError):
+            self.store.read()
+
+    def test_reader_does_not_wait_for_a_writer_holding_the_lock(self):
+        self.store.read()
+        held, release = threading.Event(), threading.Event()
+        def writer():
+            with self.store.locked():
+                held.set()
+                release.wait(5)
+        thread = threading.Thread(target=writer)
+        thread.start()
+        self.addCleanup(thread.join)
+        self.addCleanup(release.set)
+        self.assertTrue(held.wait(3))
+        started = time.monotonic()
+        self.assertEqual(self.store.read()['profiles'][0]['id'], self.profile['id'])
+        self.assertLess(time.monotonic() - started, 1)
+
+    def test_file_stamp_trusts_a_new_file_identity_or_a_settled_file(self):
+        path = self.store.path
+        current = time.time_ns()
+        os.utime(path, ns=(current, current))
+        self.assertTrue(file_stamp(path, replaced=True))  # atomic_json gave it a new identity.
+        self.assertIsNone(file_stamp(path))  # An in-place rewrite within one tick looks the same.
+        old = current - 10 ** 10
+        os.utime(path, ns=(old, old))
+        self.assertEqual(file_stamp(path)[1:], (path.stat().st_size, old))
+        self.assertEqual(file_stamp(path.with_name('missing.json')), ())
+        anonymous = SimpleNamespace(st_ino=0, st_size=5, st_mtime_ns=current)
+        with patch('manager_core.store.os.stat', return_value=anonymous):
+            self.assertIsNone(file_stamp(path, replaced=True))
+
+    def test_json_copy_is_independent_and_falls_back_for_other_values(self):
+        document = dict(items=[dict(a=1)], text='프로필', flag=True, none=None, number=2.5)
+        copied = json_copy(document)
+        self.assertEqual(copied, document)
+        self.assertIsNot(copied['items'][0], document['items'][0])
+        self.assertEqual(json_copy([Path('sample-repo')]), [Path('sample-repo')])  # Not marshallable.
 
 
 class StatePollTests(unittest.TestCase):
@@ -171,6 +236,32 @@ class StatePollTests(unittest.TestCase):
         self.assertEqual(self.center.usage_refresh.schedule.call_args.kwargs['profiles'], self.store.read()['profiles'])
         _, reads = self.poll()
         self.assertEqual(reads, 1)
+
+    def test_polls_rescan_task_forks_at_most_every_30_seconds(self):
+        self.center.state()
+        self.center.state()
+        self.assertEqual(self.forks.call_count, 1)
+        self.center._due_at['note_forks'] -= self.center.NOTE_FORKS_SECONDS
+        self.center.state()
+        self.assertEqual(self.forks.call_count, 2)
+        # Opening a task's notes still refreshes that task immediately.
+        thread = str(uuid4())
+        self.assertEqual(self.center.dispatch('notes.refresh_forks', dict(task=dict(thread_id=thread))),
+                         dict(refreshed=True))
+        self.assertEqual((self.forks.call_count, self.forks.call_args.kwargs), (3, dict(thread_id=thread)))
+
+    def test_poll_reads_the_runtime_release_once_and_resolves_no_saved_home(self):
+        homes = {os.path.normcase(s['home']) for s in self.store.read()['sources'] if s['id'] != 'original:local'}
+        resolved, real = [], Path.resolve
+        def resolve(path, *args, **kwargs):
+            resolved.append(os.path.normcase(str(path)))
+            return real(path, *args, **kwargs)
+        with patch('control_center.runtime_build', wraps=control_center.runtime_build) as build, \
+                patch.object(Path, 'resolve', resolve):
+            self.center.state()
+        self.assertEqual(build.call_count, 1)
+        self.assertTrue(resolved)
+        self.assertFalse(homes & set(resolved))
 
     def test_periodic_account_sync_without_changes_never_rewrites_state(self):
         before = self.store.path.read_bytes()
