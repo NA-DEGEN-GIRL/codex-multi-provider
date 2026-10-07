@@ -87,3 +87,20 @@ Windows 릴리스 빌드는 이 PC(12코어, 사용자가 작업 중이라 8작�
 - `cargo test -p codex-state`: 190개 모두 통과했다. 기본 fd 한도(1024)에서 전체 병렬로 돌리면 95개가 "unable to open database file"로 실패한다.
   한도를 올리거나 `--test-threads=4`로 돌리면 모두 통과하므로, 테스트 환경의 fd 고갈이다.
 - `tests.test_remote_drain` 34개 통과(7개 건너뜀), 관리창 컴파일 경고 0개.
+
+## 실제 적용 뒤 발견: 교차 빌드본이 기존 기록 DB를 열지 못함(줄바꿈)
+- **증상:** 교차 빌드본을 활성화하고 관리창을 열자 모든 프로필이 "Codex를 준비하고 있습니다"에서 멈췄다.
+  - 각 프로필의 런타임이 initialize를 받은 직후 종료됐다.
+  - 같은 실행을 직접 재현하자 0.2초 만에 `failed to initialize sqlite state runtime under <기록 홈>`으로 끝났다.
+- **원인:**
+  - sqlx는 각 마이그레이션 SQL 파일 바이트의 SHA-384를 실행 파일에 넣고, 이미 적용된 마이그레이션의 체크섬이 다르면 시작을 거부한다.
+  - 이 PC의 기록 DB는 CRLF 체크아웃(`core.autocrlf=true`)으로 빌드된 런타임이 마이그레이션했다. 적용된 행 366개가 모두 CRLF 바이트와 일치했고, LF 바이트와 일치한 것은 0개였다.
+  - 서버 체크아웃은 LF였다.
+  - 무인 검증은 새 DB를 만들어 쓰므로 이 차이를 볼 수 없었다.
+- **즉시 조치:** 같은 소스를 이 PC에서 빌드한 런타임(검증 통과)으로 되돌렸다. 실제 프로필 설정과 기록 홈으로 initialize가 정상 응답하는 것을 확인했다.
+- **변경:**
+  - **교차 빌드 체크아웃:** 검증된 트리를 `core.autocrlf=true`, `core.symlinks=false`로 `work/remote-build/windows-source`에 다시 풀어(`windows_checkout`) 그 소스로 빌드한다. Windows 체크아웃과 같은 바이트가 되고, 마이그레이션 파일의 CRLF를 확인한다.
+  - **패키지 기록:** `windows-build.json`에 `line_endings: "crlf"`와 마이그레이션 목록(버전·설명·SHA-384)을 남긴다.
+  - **호환 검사(`manager_core/runtime_migrations.py`):** 후보가 넣은 마이그레이션 체크섬을 실제 기록 DB들(공통 기록 홈과 프로필 홈의 `*.sqlite`, 읽기 전용)의 `_sqlx_migrations`와 비교한다.
+    - 같은 버전·설명인데 체크섬이 다르면 스테이징을 거부한다.
+    - 활성화 직전에도 다시 확인한다(`activate_manager_runtime.py`).

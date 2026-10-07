@@ -1,10 +1,12 @@
 """Staging contracts for local and Linux cross-built runtime packages; synthetic .exe files only."""
-from contextlib import redirect_stdout
+from contextlib import closing, redirect_stdout
 import hashlib
 import io
 import json
 from pathlib import Path
+import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -14,6 +16,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 
 from manager_core import runtime_build
+from manager_core.runtime_migrations import source_migrations
 import stage_manager_runtime as STAGE
 
 
@@ -22,6 +25,19 @@ def sha256(path):
 
 
 MISSING = object()  # cross_package(field=MISSING) omits the field from windows-build.json
+THREADS_CRLF = b'CREATE TABLE threads (\r\n    id TEXT PRIMARY KEY\r\n);\r\n'
+
+
+def make_store(path, rows):
+    """A store as sqlx leaves it: _sqlx_migrations rows of (version, description, checksum bytes)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with closing(sqlite3.connect(path)) as connection:
+        connection.execute('CREATE TABLE _sqlx_migrations (version INTEGER PRIMARY KEY, description TEXT NOT NULL, '
+                           'installed_on TEXT NOT NULL, success BOOLEAN NOT NULL, checksum BLOB NOT NULL, '
+                           'execution_time INTEGER NOT NULL)')
+        connection.executemany("INSERT INTO _sqlx_migrations VALUES (?, ?, '2026-10-01 00:00:00', 1, ?, 1000)", rows)
+        connection.commit()
+    return path
 
 
 class StageRuntimeTests(unittest.TestCase):
@@ -37,6 +53,20 @@ class StageRuntimeTests(unittest.TestCase):
         self.git_head = None
         self.version_error = None
         self.calls = []
+        # What the package says its codex.exe embeds (a CRLF checkout's bytes).
+        self.migrations = [dict(directory='migrations', version=1, description='threads',
+                                sha384=hashlib.sha384(THREADS_CRLF).hexdigest())]
+
+    def live_store(self, checksum, *, profile=None):
+        """A record-home (or profile-home) store the live manager uses, migrated with `checksum`."""
+        if profile is None:
+            home = self.base / 'record-home'
+            canonical = self.root / 'work/control-center/canonical-storage.json'
+            canonical.parent.mkdir(parents=True, exist_ok=True)
+            canonical.write_text(json.dumps(dict(version=1, home=str(home))), encoding='utf-8')
+        else:
+            home = self.root / 'work/control-center/profiles' / profile / 'codex'
+        return make_store(home / 'state_5.sqlite', [(1, 'threads', checksum)])
 
     @staticmethod
     def binaries(directory, label):
@@ -57,7 +87,8 @@ class StageRuntimeTests(unittest.TestCase):
                      base_commit=self.recorded['base_commit'], result_tree=self.recorded['result_tree'],
                      build_source_sha256=self.recorded['patch_sha256'],
                      toolchain=dict(rustc='rustc 1.90.0', cargo='cargo 1.90.0'),
-                     xwin=dict(splat='xwin-fixture', libraries_sha256='e' * 64), files=files)
+                     xwin=dict(splat='xwin-fixture', libraries_sha256='e' * 64), files=files,
+                     line_endings='crlf', migrations=self.migrations)
         build.update(changes)
         build = {key: value for key, value in build.items() if value is not MISSING}
         (package / 'windows-build.json').write_text(json.dumps(build), encoding='utf-8')
@@ -115,11 +146,14 @@ class StageRuntimeTests(unittest.TestCase):
         self.assertEqual(manifest['build_xwin'], dict(splat='xwin-fixture', libraries_sha256='e' * 64))
         self.assertTrue(manifest['capabilities']['claude_code_agent'])
         self.assertFalse(manifest['capabilities']['managed_execution_presets'])
+        # Activation re-checks the live stores against these.
+        self.assertEqual(manifest['migrations'], self.migrations)
         # Only the staged copy is executed; the base commit comes from the package, not git.
         self.assertEqual(self.calls, [[str(release / 'codex.exe'), '--version']])
         loaded = runtime_build.load_release(self.root, candidate)
         self.assertEqual(loaded['runtime'], str((release / 'codex.exe').resolve()))
         self.assertEqual(loaded['files'], expected)
+        self.assertEqual(loaded['migrations'], self.migrations)
 
     def test_changed_or_missing_cross_companion_is_rejected(self):
         for change in ('tampered', 'missing'):
@@ -159,6 +193,60 @@ class StageRuntimeTests(unittest.TestCase):
             with self.subTest(field=field, value=value):
                 self.assertRejected(RuntimeError, '^Unsupported cross-build package',
                                     source=self.cross_package(**{field: value}))
+
+    def test_package_without_crlf_migration_digests_is_rejected(self):
+        # Packages from before the CRLF checkout were built from LF sources and cannot be checked.
+        for field, value in (('migrations', MISSING), ('migrations', None), ('migrations', {}),
+                             ('line_endings', MISSING), ('line_endings', 'lf'), ('line_endings', 'CRLF')):
+            with self.subTest(field=field, value=value):
+                self.assertRejected(RuntimeError, '^Unsupported cross-build package',
+                                    source=self.cross_package(**{field: value}))
+
+    def test_package_whose_migrations_differ_from_the_live_stores_is_not_staged(self):
+        lf_checksum = hashlib.sha384(THREADS_CRLF.replace(b'\r\n', b'\n')).digest()
+        for profile in (None, 'alpha'):
+            with self.subTest(home='profile' if profile else 'record home'):
+                store = self.live_store(lf_checksum, profile=profile)
+                before = store.read_bytes()
+                # Refused before a release directory exists or the staged codex.exe runs.
+                self.assertRejected(RuntimeError, '^This runtime would refuse existing records.*'
+                                    + re.escape('%s: 1 threads' % store), source=self.cross_package())
+                self.assertEqual(self.release_directories(), [])
+                self.assertEqual(store.read_bytes(), before)
+                store.unlink()
+
+    def test_package_matching_the_live_stores_is_staged(self):
+        store = self.live_store(bytes.fromhex(self.migrations[0]['sha384']))
+        # A migration the package does not embed (a newer runtime applied it) is not a conflict.
+        with closing(sqlite3.connect(store)) as connection:
+            connection.execute("INSERT INTO _sqlx_migrations VALUES (2, 'newer', 'now', 1, ?, 1)", (b'\x02' * 48,))
+            connection.commit()
+        candidate = self.stage(source=self.cross_package())
+        self.assertEqual(json.loads(candidate.read_text(encoding='utf-8'))['migrations'], self.migrations)
+
+    def test_local_build_records_the_runtime_source_migrations(self):
+        self.git_head = 'f' * 40
+        self.binaries(self.root / 'work/target-runtime/release', b'local')
+        codex_rs = self.root / 'runtime/codex-rs'
+        (codex_rs / 'state/migrations').mkdir(parents=True)
+        (codex_rs / 'state/migrations/0001_threads.sql').write_bytes(THREADS_CRLF)
+        (codex_rs / 'state/logs_migrations').mkdir(parents=True)
+        (codex_rs / 'state/logs_migrations/0001_logs.sql').write_bytes(b'CREATE TABLE logs (id INTEGER);\r\n')
+        expected = [dict(directory='migrations', version=1, description='threads',
+                         sha384=hashlib.sha384(THREADS_CRLF).hexdigest()),
+                    dict(directory='logs_migrations', version=1, description='logs',
+                         sha384=hashlib.sha384(b'CREATE TABLE logs (id INTEGER);\r\n').hexdigest())]
+        self.assertEqual(source_migrations(codex_rs), expected)
+        candidate = self.stage()
+        self.assertEqual(json.loads(candidate.read_text(encoding='utf-8'))['migrations'], expected)
+        # The same local sources against a store an LF build migrated: refused before anything is copied.
+        store = self.live_store(hashlib.sha384(THREADS_CRLF.replace(b'\r\n', b'\n')).digest(), profile='alpha')
+        releases = self.release_directories()
+        self.calls.clear()
+        with self.assertRaisesRegex(RuntimeError, re.escape('%s: 1 threads' % store)):
+            self.stage()
+        self.assertEqual(self.release_directories(), releases)
+        self.assertEqual(self.calls, [])
 
     def test_version_failure_removes_the_partial_release(self):
         for error in (subprocess.TimeoutExpired(['codex.exe', '--version'], 15),

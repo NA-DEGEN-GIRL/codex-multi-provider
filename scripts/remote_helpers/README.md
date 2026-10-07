@@ -64,7 +64,7 @@ python3 scripts/remote_helpers/package_windows_runtime.py --build
 - 결과 PE를 검사합니다. x64, 콘솔, 8 MiB 스택, 동적 CRT 가져오기 없음을 확인하고, `codex-windows-sandbox-setup`에만 asInvoker 매니페스트가 하나 있는지 봅니다.
 - 마지막 줄 JSON의 `package_directory`에 exe 다섯 개, `windows-build.json`, `symbols/`(PDB, 서버에 보관)를 남깁니다.
 
-Windows에서는 exe와 `windows-build.json`만 `work/cross-windows/<id>/`로 가져온 뒤 `python scripts/stage_manager_runtime.py --source work/cross-windows/<id>`로 후보를 만듭니다. 스테이징은 패치 트리와 파일 해시를 다시 확인합니다. 활성화하려면 로컬 빌드와 똑같이 공유 편집·공통 저장소 무인 검증이 필요합니다. 교차 빌드는 내장 텍스트를 LF로 넣습니다(로컬 체크아웃은 CRLF).
+Windows에서는 exe와 `windows-build.json`만 `work/cross-windows/<id>/`로 가져온 뒤 `python scripts/stage_manager_runtime.py --source work/cross-windows/<id>`로 후보를 만듭니다. 스테이징은 패치 트리와 파일 해시를 다시 확인합니다. 활성화하려면 로컬 빌드와 똑같이 공유 편집·공통 저장소 무인 검증이 필요합니다. 교차 빌드는 검증된 트리를 `core.autocrlf=true`로 `work/remote-build/windows-source`에 다시 풀어 Windows 체크아웃과 같은 CRLF 바이트로 빌드합니다. sqlx가 마이그레이션 파일 바이트의 체크섬을 넣기 때문에, LF로 빌드하면 이 PC의 기존 기록 DB를 열지 못하고 시작 직후 종료합니다. 스테이징과 활성화는 후보의 마이그레이션 체크섬을 실제 기록 DB와 비교해 다르면 거부합니다.
 
 Ubuntu 24.04의 사용자 네임스페이스 정책 때문에 실행이 거절될 수 있습니다. 이 경우 샌드박스를 끄지 않고 원인을 표시합니다. 호스트별 관리자 정책 변경 도우미는 배포 소스에 포함하지 않으며 일반 원격 준비 과정에서도 실행하지 않습니다.
 

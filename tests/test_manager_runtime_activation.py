@@ -1,6 +1,8 @@
+from contextlib import closing
 import hashlib
 import json
 from pathlib import Path
+import sqlite3
 import tempfile
 import unittest
 import sys
@@ -9,6 +11,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 
 from activate_manager_runtime import activate, SHARED_CHECKS
 from manager_core.store import atomic_json
+
+THREADS_CRLF = b'CREATE TABLE threads (\r\n    id TEXT PRIMARY KEY\r\n);\r\n'
+
+
+def migrated_store(path, checksum):
+    """A store sqlx migrated with `checksum` for (1, 'threads')."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.unlink(missing_ok=True)
+    with closing(sqlite3.connect(path)) as connection:
+        connection.execute('CREATE TABLE _sqlx_migrations (version INTEGER PRIMARY KEY, description TEXT NOT NULL, '
+                           'installed_on TEXT NOT NULL, success BOOLEAN NOT NULL, checksum BLOB NOT NULL, '
+                           'execution_time INTEGER NOT NULL)')
+        connection.execute("INSERT INTO _sqlx_migrations VALUES (1, 'threads', '2026-10-01 00:00:00', 1, ?, 1000)",
+                           (checksum,))
+        connection.commit()
+    return path
 
 
 class RuntimeActivationTests(unittest.TestCase):
@@ -67,3 +85,47 @@ class RuntimeActivationTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 activate(candidate, evidence, root)
             self.assertEqual(pointer.read_bytes(), original_pointer)
+
+    def test_release_whose_migrations_differ_from_the_live_stores_is_not_activated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            release = root / 'artifacts/manager-runtime/releases/cross'
+            release.mkdir(parents=True)
+            binary = release / 'codex.exe'
+            binary.write_bytes(b'cross-built fixture')
+            digest = hashlib.sha256(binary.read_bytes()).hexdigest()
+            migrations = [dict(directory='migrations', version=1, description='threads',
+                               sha384=hashlib.sha384(THREADS_CRLF).hexdigest())]
+            candidate = release / 'candidate.json'
+            atomic_json(candidate, dict(runtime=str(binary), sha256=digest, files={'codex.exe': digest},
+                                        migrations=migrations))
+            evidence = root / 'artifacts/results/fixture/report.json'
+            atomic_json(evidence, dict(status='PASS', finished_at='complete', runtime_sha256=digest,
+                                       checks={'proof': True}, parent_thread_id='root', transfers=[
+                                           dict(writer_release_verified=True, binding_reloaded=True,
+                                                root_thread_id='root') for _ in range(2)]))
+            home = root / 'record-home'
+            atomic_json(root / 'work/control-center/canonical-storage.json', dict(version=1, home=str(home)))
+            pointer = root / 'artifacts/manager-runtime/current.json'
+            previous = pointer.with_name('previous.json')
+            # The stores matched when it was staged and first activated.
+            store = migrated_store(home / 'state_5.sqlite', bytes.fromhex(migrations[0]['sha384']))
+            self.assertEqual(activate(candidate, evidence, root)['sha256'], digest)
+            active = pointer.read_bytes()
+            self.assertFalse(previous.exists())
+            # Since then a runtime built from LF sources migrated a store (here: a profile home).
+            lf = hashlib.sha384(THREADS_CRLF.replace(b'\r\n', b'\n')).digest()
+            for path in (store, root / 'work/control-center/profiles/alpha/codex/state_5.sqlite'):
+                with self.subTest(store=path.parent.name):
+                    migrated_store(path, lf)
+                    with self.assertRaisesRegex(ValueError, '^This runtime would refuse existing records') as raised:
+                        activate(candidate, evidence, root)
+                    self.assertIn('%s: 1 threads' % path, str(raised.exception))
+                    # Refused before anything is switched or backed up.
+                    self.assertEqual(pointer.read_bytes(), active)
+                    self.assertFalse(previous.exists())
+                    migrated_store(path, bytes.fromhex(migrations[0]['sha384']))
+            # Matching stores again: the switch proceeds.
+            self.assertEqual(activate(candidate, evidence, root)['sha256'], digest)
+            self.assertEqual(json.loads(previous.read_text(encoding='utf-8'))['sha256'], digest)
+            self.assertEqual(json.loads(pointer.read_text(encoding='utf-8'))['migrations'], migrations)

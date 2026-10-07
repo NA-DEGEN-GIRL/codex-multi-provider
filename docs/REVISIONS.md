@@ -45,6 +45,8 @@
 - 빌드 서버 빌드를 64스레드(CPU 0-31·64-95, nice 10)로 제한하고, Windows 런타임을 서버에서 교차 빌드한다
   (`package_windows_runtime.py`, clang-cl·lld-link·xwin MSVC 14.44/SDK 10.0.26100, 약 8분). 받은 패키지는 `stage_manager_runtime.py --source`로
   해시·패치 트리를 다시 확인해 후보로 만든다. LLVM 매니페스트 병합이 Windows가 거부하는 매니페스트를 만드는 문제를 `/MANIFESTUAC:NO`로 막았다.
+  처음 적용한 교차 빌드본은 LF 소스라 sqlx 마이그레이션 체크섬이 기존 기록 DB(CRLF로 마이그레이션됨)와 달라 시작하지 못했다(로컬 빌드로 되돌림).
+  교차 빌드를 CRLF 체크아웃으로 바꾸고, 스테이징·활성화가 후보의 마이그레이션 체크섬을 실제 기록 DB와 비교하게 했다(`runtime_migrations.py`).
 - [원인·변경·검증](design/remote-exit-hang-118.md).
 
 ### 수정 117 — Claude 토큰 자동 갱신, GPT 새 모델 목록, 작업 바로가기 순서 바꾸기

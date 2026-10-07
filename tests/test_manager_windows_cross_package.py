@@ -54,6 +54,12 @@ RT_VERSION, RT_MANIFEST = 16, 24
 VERSION_ONLY = {RT_VERSION: {1: {0x409: b'VS_VERSION_INFO fixture'}}}
 SETUP_RESOURCES = {**VERSION_ONLY, RT_MANIFEST: {1: {0x409: MANIFEST}}}
 BASE_COMMIT, PATCH_SHA256, RESULT_TREE = 'b' * 40, 'c' * 64, 'd' * 40
+# codex-rs/state files as the fake Windows export writes them (paths relative to state/).
+CHECKOUT_MIGRATIONS = {
+    'migrations/0001_threads.sql': b'CREATE TABLE threads (\r\n    id TEXT PRIMARY KEY\r\n);\r\n',
+    'migrations/0002_thread_titles.sql': b'ALTER TABLE threads ADD COLUMN title TEXT;\r\n',
+    'logs_migrations/0001_logs.sql': b'CREATE TABLE logs (id INTEGER);\r\n',
+}
 
 
 def import_section(rva, dlls):
@@ -285,11 +291,24 @@ class CrossBuildTests(unittest.TestCase):
         self.cache = self.base / 'cache'
         self.calls = []
         self.broken = {}
+        self.checkout_error = None
+
+    def checkout(self, runtime, tree, destination):
+        """Stands in for the core.autocrlf=true export of the recorded tree."""
+        if self.checkout_error is not None:
+            raise self.checkout_error
+        for name, body in CHECKOUT_MIGRATIONS.items():
+            path = destination / 'codex-rs/state' / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(body)
 
     def tool(self, command, **kwargs):
         self.calls.append((command, kwargs))
         executable = Path(command[0]).name
         if executable == 'cargo' and command[1] == 'build':
+            # cargo compiles the Windows (CRLF) export, not runtime/ as the server has it.
+            self.assertEqual(kwargs['cwd'], self.cache / 'windows-source/codex-rs')
+            self.assertTrue((kwargs['cwd'] / 'state/migrations/0001_threads.sql').is_file())
             release = Path(command[command.index('--target-dir') + 1]) / WINDOWS.TARGET / 'release'
             release.mkdir(parents=True, exist_ok=True)
             for name in (command[index + 1] for index, item in enumerate(command) if item == '--bin'):
@@ -314,6 +333,8 @@ class CrossBuildTests(unittest.TestCase):
             stack.enter_context(patch.dict(WINDOWS.os.environ, {'RUSTFLAGS': '-C link-arg=/STACK:1048576', 'CC': 'gcc'}))
             self.source_tree = stack.enter_context(patch.object(WINDOWS, 'source_tree', side_effect=trees))
             self.prepare_v8 = stack.enter_context(patch.object(WINDOWS, 'prepare_v8', return_value=self.v8_files))
+            self.windows_checkout = stack.enter_context(
+                patch.object(WINDOWS, 'windows_checkout', side_effect=self.checkout))
             stack.enter_context(patch.object(WINDOWS.subprocess, 'run', side_effect=self.tool))
             return WINDOWS.build(self.root, build_cache=self.cache, xwin=self.xwin)
 
@@ -343,7 +364,9 @@ class CrossBuildTests(unittest.TestCase):
         bins = [command[index + 1] for index, item in enumerate(command) if item == '--bin']
         self.assertEqual(len(bins), 5)
         self.assertEqual(sorted(bins), sorted(STAGE.BINARIES))
-        self.assertEqual(options['cwd'], self.root / 'runtime/codex-rs')
+        # The recorded tree is exported with Windows line endings to a stable path, then built there.
+        self.windows_checkout.assert_called_once_with(self.root / 'runtime', RESULT_TREE, self.cache / 'windows-source')
+        self.assertEqual(options['cwd'], self.cache / 'windows-source/codex-rs')
         self.assertIs(options['check'], True)
         environment = options['env']
         self.assertNotIn('RUSTFLAGS', environment)
@@ -381,6 +404,15 @@ class CrossBuildTests(unittest.TestCase):
         self.assertEqual(manifest['toolchain'], {'rustc': 'rustc fixture', 'cargo': 'cargo fixture',
                                                  'clang_cl': 'clang-cl fixture', 'lld_link': 'lld-link fixture'})
         self.assertEqual((manifest['environment']['jobs'], manifest['environment']['cpus']), (64, 64))
+        # The digests staging compares with the live stores: those of the exported (CRLF) sources.
+        self.assertEqual(manifest['line_endings'], 'crlf')
+        self.assertEqual(manifest['migrations'], [
+            dict(directory='migrations', version=1, description='threads',
+                 sha384=hashlib.sha384(CHECKOUT_MIGRATIONS['migrations/0001_threads.sql']).hexdigest()),
+            dict(directory='migrations', version=2, description='thread titles',
+                 sha384=hashlib.sha384(CHECKOUT_MIGRATIONS['migrations/0002_thread_titles.sql']).hexdigest()),
+            dict(directory='logs_migrations', version=1, description='logs',
+                 sha384=hashlib.sha384(CHECKOUT_MIGRATIONS['logs_migrations/0001_logs.sql']).hexdigest())])
         # The Windows staging side accepts exactly this package.
         self.assertEqual(STAGE._load_cross_build(self.root, package), manifest)
 
@@ -389,13 +421,24 @@ class CrossBuildTests(unittest.TestCase):
             self.run_build(tree='e' * 40)
         self.assertEqual(self.calls, [])
         self.prepare_v8.assert_not_called()
+        self.windows_checkout.assert_not_called()
         self.assertFalse((self.cache / 'windows-x86_64').exists())
+
+    def test_checkout_without_windows_line_endings_stops_before_cargo(self):
+        self.checkout_error = RuntimeError('The Windows source checkout did not convert line endings.')
+        with self.assertRaisesRegex(RuntimeError, 'did not convert line endings'):
+            self.run_build()
+        self.windows_checkout.assert_called_once_with(self.root / 'runtime', RESULT_TREE, self.cache / 'windows-source')
+        self.assertEqual([command for command, _ in self.calls if command[1] == 'build'], [])
+        self.assertFalse((self.cache / 'windows-x86_64/package').exists())
 
     def test_runtime_changed_during_the_build_writes_no_package(self):
         with self.assertRaisesRegex(RuntimeError, '^runtime/ changed during the build'):
             self.run_build(tree_after_build='e' * 40)
         self.assertEqual(len([command for command, _ in self.calls if command[1] == 'build']), 1)
         self.assertEqual(self.source_tree.call_count, 2)
+        # The export is of the tree recorded before the build.
+        self.windows_checkout.assert_called_once_with(self.root / 'runtime', RESULT_TREE, self.cache / 'windows-source')
         self.assertTrue((self.cache / 'windows-x86_64' / WINDOWS.TARGET / 'release/codex.exe').is_file())
         self.assertFalse((self.cache / 'windows-x86_64/package').exists())
 
@@ -448,6 +491,101 @@ class CrossBuildTests(unittest.TestCase):
         library = moved / 'sdk/lib/um/x86_64/kernel32.lib'
         library.write_bytes(library.read_bytes().upper())  # same size, other bytes
         self.assertNotEqual(WINDOWS.splat_digest(moved), original)
+
+
+class WindowsCheckoutTests(unittest.TestCase):
+    """windows_checkout against a real temporary git repository."""
+    SAMPLE = 'codex-rs/state/migrations/0001_threads.sql'
+    THREADS = b'CREATE TABLE threads (\n    id TEXT PRIMARY KEY\n);\n'
+
+    def setUp(self):
+        if shutil.which('git') is None:
+            self.skipTest('git is not installed')
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.base = Path(self.temporary.name).resolve()
+        # Only the function's own -c options may decide line endings, not this machine's git config
+        # (Git for Windows ships core.autocrlf=true in its system config).
+        (self.base / 'empty.gitconfig').write_bytes(b'')
+        self.enterContext(patch.dict(WINDOWS.os.environ, {'GIT_CONFIG_GLOBAL': str(self.base / 'empty.gitconfig'),
+                                                          'GIT_CONFIG_NOSYSTEM': '1'}))
+        self.runtime = self.base / 'runtime'
+        self.runtime.mkdir()
+        self.git('init', '-q')
+        self.destination = self.base / 'cache/windows-source'
+
+    def git(self, *arguments):
+        return subprocess.run(['git', '-C', str(self.runtime), '-c', 'core.autocrlf=false', *arguments],
+                              check=True, capture_output=True, text=True).stdout.strip()
+
+    def record(self, files):
+        """Write and stage `files` byte for byte (LF stays LF); return the tree id, like source_tree."""
+        for name, body in files.items():
+            path = self.runtime / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(body)
+        self.git('add', '-A')
+        return self.git('write-tree')
+
+    def test_recorded_tree_is_written_with_windows_line_endings(self):
+        binary = b'\x00\x01\n\x02 not text\n'
+        tree = self.record({self.SAMPLE: self.THREADS,
+                            'codex-rs/state/logs_migrations/0001_logs.sql': b'CREATE TABLE logs (id INTEGER);\n',
+                            'codex-rs/core/prompt.md': b'line one\nline two\n',
+                            'codex-rs/core/fixture.bin': binary})
+        stored = subprocess.run(['git', '-C', str(self.runtime), 'cat-file', 'blob', tree + ':' + self.SAMPLE],
+                                check=True, capture_output=True).stdout
+        self.assertEqual(stored, self.THREADS)  # the recorded blob is LF, as on the Linux server
+        # runtime/ moves on after the tree was recorded; the export is still of that tree.
+        moved = self.record({self.SAMPLE: b'-- edited\n', 'codex-rs/new.txt': b'new\n'})
+        self.assertNotEqual(moved, tree)
+        index = (self.runtime / '.git/index').read_bytes()
+        # A previous build's export is replaced, not merged into.
+        (self.destination / 'codex-rs').mkdir(parents=True)
+        (self.destination / 'codex-rs/stale.rs').write_bytes(b'old\n')
+
+        WINDOWS.windows_checkout(self.runtime, tree, self.destination)
+
+        exported = self.destination / 'codex-rs'
+        self.assertEqual((self.destination / self.SAMPLE).read_bytes(), self.THREADS.replace(b'\n', b'\r\n'))
+        self.assertEqual((exported / 'core/prompt.md').read_bytes(), b'line one\r\nline two\r\n')
+        self.assertEqual((exported / 'core/fixture.bin').read_bytes(), binary)
+        self.assertFalse((exported / 'stale.rs').exists())
+        self.assertFalse((exported / 'new.txt').exists())
+        self.assertEqual(WINDOWS.source_migrations(exported), [
+            dict(directory='migrations', version=1, description='threads',
+                 sha384=hashlib.sha384(self.THREADS.replace(b'\n', b'\r\n')).hexdigest()),
+            dict(directory='logs_migrations', version=1, description='logs',
+                 sha384=hashlib.sha384(b'CREATE TABLE logs (id INTEGER);\r\n').hexdigest())])
+        # The runtime checkout itself (its index and files) is untouched.
+        self.assertEqual((self.runtime / '.git/index').read_bytes(), index)
+        self.assertEqual((self.runtime / self.SAMPLE).read_bytes(), b'-- edited\n')
+
+    def test_second_export_rewrites_only_changed_files(self):
+        first = self.record({self.SAMPLE: self.THREADS, 'codex-rs/a.txt': b'one\n', 'codex-rs/b.txt': b'two\n'})
+        WINDOWS.windows_checkout(self.runtime, first, self.destination)
+        kept = self.destination / 'codex-rs/a.txt'
+        WINDOWS.os.utime(kept, (1_000_000_000, 1_000_000_000))
+        (self.runtime / 'codex-rs/b.txt').unlink()
+        second = self.record({'codex-rs/a.txt': b'one\n', 'codex-rs/c.txt': b'three\n'})
+        WINDOWS.windows_checkout(self.runtime, second, self.destination)
+        # Unchanged sources keep their timestamps, so cargo does not rebuild them.
+        self.assertEqual(kept.stat().st_mtime, 1_000_000_000)
+        self.assertFalse((self.destination / 'codex-rs/b.txt').exists())
+        self.assertEqual((self.destination / 'codex-rs/c.txt').read_bytes(), b'three\r\n')
+
+    def test_tree_that_keeps_lf_is_refused(self):
+        tree = self.record({'.gitattributes': b'* -text\n', self.SAMPLE: self.THREADS})
+        with self.assertRaisesRegex(RuntimeError, '^The Windows source checkout did not convert line endings'):
+            WINDOWS.windows_checkout(self.runtime, tree, self.destination)
+        # A refused export never reaches the build directory.
+        self.assertFalse((self.destination / self.SAMPLE).exists())
+
+    def test_tree_without_the_sample_migration_is_refused(self):
+        tree = self.record({'codex-rs/Cargo.toml': b'[workspace]\n'})
+        # Must not pass silently; the sample cannot prove the conversion.
+        with self.assertRaisesRegex(RuntimeError, '^The Windows source checkout did not convert line endings'):
+            WINDOWS.windows_checkout(self.runtime, tree, self.destination)
 
 
 if __name__ == '__main__':

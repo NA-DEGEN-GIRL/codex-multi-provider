@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from manager_core.runtime_build import load_release
+from manager_core.runtime_migrations import require_compatible
 from manager_core.store import atomic_json
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,6 +27,12 @@ def activate(candidate, evidence, root=ROOT, *, canonical_evidence=None):
     if not evidence.is_relative_to(root / 'artifacts/results'):
         raise ValueError('Evidence must belong to this workspace.')
     release = load_release(root, candidate)
+    if release.get('migrations') is not None:
+        # Stores may have been migrated since staging; re-check right before the switch.
+        try:
+            require_compatible(release['migrations'], root)
+        except RuntimeError as error:
+            raise ValueError(str(error)) from None
     report = json.loads(evidence.read_text(encoding='utf-8-sig'))
     transfers = report.get('transfers', [])
     checks = report.get('checks', {})

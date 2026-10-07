@@ -29,6 +29,7 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from package_runtime import (ROOT, SERVER_BUILD_CPUS, SERVER_BUILD_JOBS, contains_marker, digest,
                              limit_server_build, prepare_v8)
+from manager_core.runtime_migrations import source_migrations
 
 TARGET = "x86_64-pc-windows-msvc"
 # Same list (and therefore the same feature unification) as the Windows build.
@@ -70,6 +71,58 @@ def source_tree(runtime):
         git("read-tree", "HEAD")
         git("add", "-A", "--", ".", ":!*.snap.new", ":!*.pending-snap")
         return git("write-tree")
+
+
+def windows_checkout(runtime, tree, destination):
+    """Write `tree` exactly as a Windows checkout does (core.autocrlf=true).
+
+    sqlx embeds each migration's SHA-384 over its bytes, so CRLF matters: the
+    stores on the PC were migrated by CRLF-built runtimes and refuse an LF
+    build ("failed to initialize sqlite state runtime"). include_str! prompts
+    also keep the same bytes as the local build.
+    """
+    destination = Path(destination)
+    destination.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=destination.parent) as directory:
+        environment = dict(os.environ, GIT_INDEX_FILE=str(Path(directory) / "index"))
+        export = Path(directory) / "export"
+        subprocess.run(["git", "-C", str(runtime), "read-tree", tree], env=environment, check=True)
+        subprocess.run(["git", "-C", str(runtime), "-c", "core.autocrlf=true", "-c", "core.symlinks=false",
+                        "checkout-index", "-a", "-f", "--prefix=" + str(export) + "/"],
+                       env=environment, check=True)
+        sample = export / "codex-rs/state/migrations/0001_threads.sql"
+        if not sample.is_file() or b"\r\n" not in sample.read_bytes():
+            raise RuntimeError("The Windows source checkout did not convert line endings.")
+        _sync_tree(export, destination)
+
+
+def _sync_tree(source, destination):
+    """Make destination equal source, rewriting only changed files.
+
+    Unchanged files keep their timestamps, so cargo rebuilds only the crates
+    whose sources changed instead of the whole workspace.
+    """
+    wanted = set()
+    for path in sorted(source.rglob("*")):
+        relative = path.relative_to(source)
+        wanted.add(relative)
+        target = destination / relative
+        if path.is_dir():
+            if target.is_symlink() or (target.exists() and not target.is_dir()):
+                target.unlink()
+            target.mkdir(exist_ok=True)
+        elif target.is_symlink() or not target.is_file() or target.read_bytes() != path.read_bytes():
+            if target.is_dir() and not target.is_symlink():
+                shutil.rmtree(target)
+            elif target.exists() or target.is_symlink():
+                target.unlink()
+            shutil.copy2(path, target)
+    for path in sorted(destination.rglob("*"), reverse=True):
+        if path.relative_to(destination) not in wanted:
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                path.unlink(missing_ok=True)
 
 
 def _rva_reader(data, sections):
@@ -288,11 +341,14 @@ def build(root=ROOT, *, build_cache=None, xwin=None, jobs=SERVER_BUILD_JOBS):
     v8 = prepare_v8(root, "x86_64", build_cache=cache, target=TARGET)
     environment = cross_environment(xwin, v8)
     target_dir = cache / "windows-x86_64"
+    # A stable path keeps cargo's incremental state; refreshed for every build.
+    checkout = cache / "windows-source"
+    windows_checkout(root / "runtime", tree, checkout)
     command = [cargo, "build", "--locked", "--release", "--target", TARGET, "--target-dir", str(target_dir),
                "-j", str(jobs)]
     for name in BINARIES:
         command += ["--bin", name]
-    subprocess.run(command, cwd=root / "runtime/codex-rs", env=environment, check=True)
+    subprocess.run(command, cwd=checkout / "codex-rs", env=environment, check=True)
     if source_tree(root / "runtime") != tree:
         raise RuntimeError("runtime/ changed during the build; the package would not match its recorded tree.")
     output = target_dir / TARGET / "release"
@@ -301,14 +357,15 @@ def build(root=ROOT, *, build_cache=None, xwin=None, jobs=SERVER_BUILD_JOBS):
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     package = Path(tempfile.mkdtemp(prefix=stamp + "-" + source["patch_sha256"][:16] + "-", dir=package_root))
     try:
-        return _package(root, package, output, source, xwin, v8, environment, cargo, jobs, started)
+        return _package(root, package, output, source, xwin, v8, environment, cargo, jobs, started,
+                        source_migrations(checkout / "codex-rs"))
     except BaseException:
         # A package without windows-build.json is useless; do not leave ~650 MB behind.
         shutil.rmtree(package, ignore_errors=True)
         raise
 
 
-def _package(root, package, output, source, xwin, v8, environment, cargo, jobs, started):
+def _package(root, package, output, source, xwin, v8, environment, cargo, jobs, started, migrations):
     """Copy, then verify the copies that ship, and write windows-build.json last."""
     (package / "symbols").mkdir()
     files, symbols, checks = {}, {}, {}
@@ -327,6 +384,9 @@ def _package(root, package, output, source, xwin, v8, environment, cargo, jobs, 
         schema=1, platform="windows", target=TARGET, build_kind="linux-cross-xwin", profile="release",
         base_commit=source["base_commit"], result_tree=source["result_tree"],
         build_source_sha256=source["patch_sha256"],
+        # Built from a core.autocrlf=true checkout, like the local Windows build;
+        # staging compares these migration digests with the live stores.
+        line_endings="crlf", migrations=migrations,
         # rust-toolchain.toml in runtime/codex-rs selects the pinned toolchain.
         toolchain=dict(rustc=_version(["rustc", "-V"], cwd=root / "runtime/codex-rs"),
                        cargo=_version([cargo, "-V"], cwd=root / "runtime/codex-rs"),

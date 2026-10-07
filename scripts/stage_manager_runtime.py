@@ -7,6 +7,7 @@ import shutil
 import subprocess
 from uuid import uuid4
 
+from manager_core.runtime_migrations import require_compatible, source_migrations
 from manager_core.store import atomic_json
 from remote_helpers.package_runtime import contains_marker
 
@@ -28,7 +29,8 @@ def _load_cross_build(root, source):
     recorded = json.loads((root / 'patches/runtime-source.json').read_text(encoding='utf-8'))
     if (build.get('schema') != 1 or build.get('target') != CROSS_TARGET
             or build.get('profile') != 'release' or build.get('build_kind') != 'linux-cross-xwin'
-            or not isinstance(build.get('files'), dict)):
+            or not isinstance(build.get('files'), dict) or not isinstance(build.get('migrations'), list)
+            or build.get('line_endings') != 'crlf'):
         raise RuntimeError('Unsupported cross-build package: ' + str(source))
     if (build.get('result_tree') != recorded['result_tree']
             or build.get('build_source_sha256') != recorded['patch_sha256']
@@ -61,18 +63,22 @@ def stage(root=ROOT, profile='release', source=None):
     for name in BINARIES:
         if not (source / (name + '.exe')).is_file():
             raise RuntimeError('Missing built companion: ' + name)
+    # The compiled migrations must match the stores the runtime will open
+    # (a mismatch makes it exit at startup); fresh-store validations cannot see this.
+    migrations = cross['migrations'] if cross is not None else source_migrations(root / 'runtime/codex-rs')
+    require_compatible(migrations, root)
     release_id = datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S') + '-' + uuid4().hex[:6]
     destination = root / 'artifacts/manager-runtime/releases' / release_id
     destination.mkdir(parents=True)
     try:
-        return _stage_into(root, destination, source, profile, cross)
+        return _stage_into(root, destination, source, profile, cross, migrations)
     except BaseException:
         # Never leave a release folder without candidate.json behind.
         shutil.rmtree(destination, ignore_errors=True)
         raise
 
 
-def _stage_into(root, destination, source, profile, cross):
+def _stage_into(root, destination, source, profile, cross, migrations):
     files = {}
     for name in BINARIES:
         target = destination / (name + '.exe')
@@ -114,6 +120,7 @@ def _stage_into(root, destination, source, profile, cross):
         manifest.update(build_origin=cross['build_kind'], source_tree=cross['result_tree'],
                         build_source_sha256=cross['build_source_sha256'],
                         build_toolchain=cross.get('toolchain'), build_xwin=cross.get('xwin'))
+    manifest['migrations'] = migrations
     path = destination / 'candidate.json'
     atomic_json(path, manifest)
     print(json.dumps(dict(candidate_manifest=str(path), active_runtime_changed=False)))
