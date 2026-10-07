@@ -169,7 +169,56 @@ class SharedCheck:
             batch['done'].set()
 
 
+def _desktop_evidence(installed, app):
+    """What a desktop_bundle.prepare result rests on, or None if unusable.
+
+    The installed package and its archive stamp, the manager's adapters, the
+    copy's marker bytes, its hashed program files, which must still match that
+    marker's sizes, mtimes and digests, and its top-level files (the program's
+    executables and libraries, about 30 lstats), which must match its sizes and
+    mtimes. Not the copy's deeper files: those are covered only by the recent
+    full check this evidence lets a launch of the same wave reuse.
+    """
+    import hashlib
+    import stat
+    from .desktop_bundle import adapter_identity
+    from .desktop_publication import _hash
+    try:
+        source = Path(installed['executable']).resolve().parent
+        archive = (source / 'resources/app.asar').stat()
+        directory = Path(app['executable']).parent
+        raw = (directory / 'manager-desktop.json').read_bytes()  # desktop_bundle.prepare's marker
+        marker = json.loads(raw.decode('utf8'))
+        if not marker['hashes']:
+            return None
+        hashed = []
+        for name, digest in sorted(marker['hashes'].items()):
+            path = directory / name
+            info = path.lstat()
+            if (not stat.S_ISREG(info.st_mode) or getattr(info, 'st_file_attributes', 0) & 0x400
+                    or marker['files'].get(name) != dict(size=info.st_size, modified=info.st_mtime_ns)
+                    or _hash(path) != digest):
+                return None
+            hashed.append((name, info.st_size, info.st_mtime_ns))
+        for name, expected in marker['files'].items():
+            if '/' in name or name in marker['hashes']:
+                continue
+            info = (directory / name).lstat()
+            if (not stat.S_ISREG(info.st_mode) or getattr(info, 'st_file_attributes', 0) & 0x400
+                    or expected != dict(size=info.st_size, modified=info.st_mtime_ns)):
+                return None
+        return (dict(installed), str(source), archive.st_size, archive.st_mtime_ns, adapter_identity(),
+                hashlib.sha256(raw).hexdigest(), hashed)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
 class Instances:
+    # A launch wave reuses a successful desktop copy check for this long, from
+    # the start of that check, while its evidence is unchanged; see
+    # _prepare_desktop for which launches may reuse it.
+    DESKTOP_REUSE_SECONDS = 30
+
     def __init__(self, root, store, providers, *, embed_windows=False):
         self.root=Path(root).resolve(); self.store=store; self.providers=providers
         self.processes={};self.handles={}
@@ -182,6 +231,10 @@ class Instances:
         self._app_cache=None
         self._app_checked=0.0
         self._desktop_checks=SharedCheck()
+        self._desktop_results={}  # SharedCheck key -> (app, evidence, monotonic start, trust epoch)
+        self._desktop_lock=threading.Lock()
+        self._desktop_epoch=0  # Raised to stop reuse of every earlier check.
+        self._desktop_launched=set()  # Profiles that took a desktop copy in this process.
         from .launch_metrics import LaunchMetrics
         self.metrics = LaunchMetrics(store.directory)
         from .personal_skills import PersonalSkills
@@ -206,6 +259,52 @@ class Instances:
             self._app_cache = dict(app)
             self._app_checked = time.monotonic()
             return dict(app)
+
+    def _prepare_desktop(self, installed):
+        """desktop_bundle.prepare, reusing a recent success for the same copy.
+
+        Launches of one wave would otherwise check every file of the same copy
+        again. SharedCheck runs this one at a time per (executable, version).
+        A wave is the first launches of different profiles: a check is reused
+        only within DESKTOP_REUSE_SECONDS of its start, and only until a
+        launch fails, a launched desktop exits before its window or a profile
+        launches again (_join_desktop_wave, _distrust_desktop_checks). Those
+        get a check that started after they asked, as every launch did before.
+        """
+        from .desktop_bundle import prepare as prepare_desktop
+        key = (installed.get('executable'), installed.get('Version'))
+        remembered = self._desktop_results.pop(key, None)
+        with self._desktop_lock:
+            epoch = self._desktop_epoch
+        if remembered is not None:
+            app, evidence, started, trusted = remembered
+            if (trusted == epoch and time.monotonic() - started < self.DESKTOP_REUSE_SECONDS
+                    and _desktop_evidence(installed, app) == evidence):
+                self._desktop_results[key] = remembered
+                return dict(app)
+        started = time.monotonic()
+        app = prepare_desktop(self.root, installed)
+        # A fallback copy is reconsidered on every launch.
+        evidence = None if app.get('desktop_compatibility_notice') else _desktop_evidence(installed, app)
+        if evidence is not None:
+            self._desktop_results[key] = (dict(app), evidence, started, epoch)
+        return app
+
+    def _join_desktop_wave(self, profile_id):
+        """Only a profile's first launch in this process may reuse a wave's check.
+
+        A later launch follows an exit that a lost program file may have
+        caused, and the reuse evidence does not cover every file of the copy.
+        """
+        with self._desktop_lock:
+            if profile_id in self._desktop_launched:
+                self._desktop_epoch += 1
+            self._desktop_launched.add(profile_id)
+
+    def _distrust_desktop_checks(self):
+        """No earlier desktop copy check is reused; the next launch checks again."""
+        with self._desktop_lock:
+            self._desktop_epoch += 1
 
     def paths(self, profile):
         pid=identifier(profile['id'])
@@ -526,8 +625,11 @@ class Instances:
         from .login_health import require as require_login
         active=self.observe(profile)
         if active['status']=='running':
-            from .browser_bundle import ensure as ensure_browser
-            ensure_browser(profile['home'], active['executable_path'])
+            # A repair can rewrite hundreds of files: it runs off this request,
+            # which never waits for or fails on it. A launch prepares in place.
+            from .browser_bundle import ensure_later as ensure_browser_later
+            ensure_browser_later(profile['home'], active['executable_path'],
+                                 metrics=self.metrics, profile_id=profile['id'])
             if not reopen_existing:
                 return dict(profile_id=profile['id'],profile={**profile,**active},state='existing')
             # Ask Electron itself to restore/show the existing profile. Merely
@@ -561,15 +663,27 @@ class Instances:
                 raise RuntimeError('이 프로필의 로그인 계정을 먼저 확인하세요. 다른 계정으로 작업을 시작하지 않았습니다.')
         with self.metrics.phase(profile_id, 'profile_configuration'):
             preparation = self.prepare(profile)
-        from .desktop_bundle import prepare as prepare_desktop
         with self.metrics.phase(profile_id, 'desktop_bundle'):
             installed=self.installed_app()
             # Different profiles launch together; they share one validation of
-            # the same version-scoped copy that started after each one asked.
+            # the same version-scoped copy that started after each one asked,
+            # or reuse a recent one of their wave (_prepare_desktop).
+            self._join_desktop_wave(profile['id'])
             app=dict(self._desktop_checks((installed.get('executable'),installed.get('Version')),
-                                          lambda: prepare_desktop(self.root, installed)))
-        from .browser_bundle import ensure as ensure_browser
+                                          lambda: self._prepare_desktop(installed)))
+        try:
+            return self._launch_prepared(profile, profile_id, preparation, app)
+        except BaseException:
+            # Whatever failed, no later launch reuses the check this one used.
+            self._distrust_desktop_checks()
+            raise
+
+    def _launch_prepared(self, profile, profile_id, preparation, app):
+        from .browser_bundle import ensure as ensure_browser, settle as settle_browser
         with self.metrics.phase(profile_id, 'browser_bundle'):
+            # A background check from while this desktop was running may hold
+            # the Browser lock; this launch prepares the version itself.
+            settle_browser(profile['home'])
             preparation['browser_plugin'] = ensure_browser(profile['home'], app['executable'])
         profile['generation']=str(uuid4())
         profile['shared_catalog_path']=None
@@ -687,6 +801,10 @@ class Instances:
             if window or process.poll() is not None:
                 break
             time.sleep(.15)
+        if not window and process.poll() is not None:
+            # A desktop that exits before its window may have met a lost
+            # program file; no later launch reuses the check it started from.
+            self._distrust_desktop_checks()
         if profile.get('runtime_channel') == 'packaged' or profile.get('native_login_pending'):
             # A startup failure dialog can briefly look like a ready window.
             # Never report an already exited login process as awaiting input.

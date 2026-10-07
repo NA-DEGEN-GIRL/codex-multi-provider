@@ -116,13 +116,15 @@ class AppCatalogCacheTests(unittest.TestCase):
         from manager_core.instances import Instances
         instance = Instances.__new__(Instances)
         instance.store = SimpleNamespace(profile=lambda _: dict(id='profile', home=str(self.home)))
+        instance.metrics = object()
         instance.observe = lambda _: dict(status='running', window_handle=123,
                                           executable_path='test-desktop.exe')
         with patch('manager_core.app_catalog_cache.prepare') as migration, \
-                patch('manager_core.browser_bundle.ensure') as browser:
+                patch('manager_core.browser_bundle.ensure_later') as browser:
             self.assertEqual(instance._show('profile', reopen_existing=False)['state'], 'existing')
             migration.assert_not_called()
-            browser.assert_called_once_with(str(self.home), 'test-desktop.exe')
+            browser.assert_called_once_with(str(self.home), 'test-desktop.exe',
+                                            metrics=instance.metrics, profile_id='profile')
 
     def remote_rows(self, host):
         return [row for row in self.rows('local_thread_catalog') if row[0] == host]

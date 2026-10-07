@@ -95,8 +95,10 @@ class ControlCenter:
         profile=self.store.profile(profile_id)
         observed=self.instances.observe(profile)
         if observed.get('status') == 'running' and observed.get('executable_path'):
-            from manager_core.browser_bundle import ensure as ensure_browser
-            ensure_browser(profile['home'], observed['executable_path'])
+            # Repaired off this request; a launch still prepares it in place.
+            from manager_core.browser_bundle import ensure_later as ensure_browser_later
+            ensure_browser_later(profile['home'], observed['executable_path'],
+                                 metrics=getattr(self.instances, 'metrics', None), profile_id=profile_id)
         from manager_core.remote import supports_remote_claude
         local_only = profile.get('auth_mode') == 'claude_code' and not supports_remote_claude(self.root)
         ssh_gate={} if local_only else self.store.read().get('ssh_maintenance',{}).get(profile_id,{})
