@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from uuid import uuid4
 
 REPO = Path(__file__).resolve().parents[1]
@@ -18,6 +19,7 @@ sys.path.insert(0, str(REPO / 'scripts'))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from activate_manager_runtime import activate
+import health_report
 from health_report import report, summary
 from manager_core.store import atomic_json
 from test_manager_runtime_activation import THREADS_CRLF, handoff_evidence, migrated_store, stage_release
@@ -71,7 +73,7 @@ class HealthReportTests(unittest.TestCase):
             connection.execute("INSERT INTO _sqlx_migrations VALUES (2, 'thread titles', '2026-10-02', 1, ?, 1)",
                                (b'\x01' * 48,))
             connection.commit()
-        profile_id, claude_id, expired_id = str(uuid4()), str(uuid4()), str(uuid4())
+        profile_id, claude_id, expired_id, removed_id = str(uuid4()), str(uuid4()), str(uuid4()), str(uuid4())
         migrated_store(root / 'work/control-center/profiles' / profile_id / 'codex/state_5.sqlite',
                        hashlib.sha384(THREADS_CRLF.replace(b'\r\n', b'\n')).digest())
         # Manager state: SSH update backlog and Claude logins.
@@ -82,8 +84,10 @@ class HealthReportTests(unittest.TestCase):
             dict(id=claude_id, alias='claude-profile', auth_mode='claude_code'),
             dict(id=expired_id, alias='claude-expired', auth_mode='claude_code'),
             dict(id=str(uuid4()), alias='claude-missing', auth_mode='claude_code'),
-            dict(id=str(uuid4()), alias='claude-removed', auth_mode='claude_code', removed_at='2026-10-01')],
+            dict(id=removed_id, alias='claude-removed', auth_mode='claude_code', removed_at='2026-10-01')],
             remote_updates={
+                # Left behind by the removal of its profile: not a backlog.
+                removed_id + ':remote-host': dict(profile_id=removed_id, alias='remote-host', managed=managed),
                 profile_id + ':remote-host': dict(profile_id=profile_id, alias='remote-host', auto_apply=False,
                                                   managed=managed, job=None, checked_at='2026-10-07T11:00:00+00:00'),
                 profile_id + ':other-host': dict(profile_id=profile_id, alias='other-host',
@@ -140,7 +144,7 @@ class HealthReportTests(unittest.TestCase):
                                                        uptime_ms=420, initialize_completed=False,
                                                        exited_at='2026-10-07T11:59:00+00:00')])
         lines = summary(value)
-        self.assertEqual(lines[1], '관리 앱 릴리스: ' + release.name)
+        self.assertEqual(lines[1], '관리 앱 릴리스(다음 실행용): ' + release.name)
         self.assertIn('previous %s 파일 없음, 불량 목록' % old.parent.name, lines[2])
         self.assertIn('활성화 대기 후보: 2개 (20261003-000000-dddddd, 20261004-000000-eeeeee)', lines)
         self.assertIn('저장소 마이그레이션: 불일치 1건 - 현재 런타임이 시작하지 못합니다, 런타임에 없는 적용 1건', lines)
@@ -163,8 +167,52 @@ class HealthReportTests(unittest.TestCase):
         self.assertIn('error', value['manager_release'])
         self.assertIn('error', value['known_bad'])
         lines = summary(value)
-        self.assertIn('관리 앱 릴리스: 확인 실패', lines)
+        self.assertIn('관리 앱 릴리스(다음 실행용): 확인 실패', lines)
         self.assertIn('SSH 업데이트 대기: 확인 불가', lines)
+
+    def test_unreadable_known_bad_list_is_not_reported_as_listed(self):
+        root = self.root
+        names = ('20261001-000000-aaaaaa', '20261002-000000-bbbbbb', '20261003-000000-cccccc')
+        for name in names:
+            candidate, digest = stage_release(root, name)
+            activate(candidate, handoff_evidence(root, digest, name), root)
+            if name == names[1]:
+                shutil.rmtree(candidate.parent)  # Deleted while active.
+        (root / 'artifacts/manager-runtime/known-bad.json').write_text('{broken', encoding='utf-8')
+        value = report(root, now=NOW, environ={'LOCALAPPDATA': str(self.local)})
+        pointers = value['runtime_pointers']
+        self.assertIs(pointers['current']['known_bad_unreadable'], True)
+        self.assertNotIn('known_bad', pointers['current'])
+        # previous.json names the deleted runtime the last activation replaced.
+        self.assertEqual((pointers['previous']['release'], pointers['previous']['state'],
+                          pointers['previous']['verified']), (names[1], 'missing_on_disk', False))
+        runtimes = next(line for line in summary(value) if line.startswith('런타임: '))
+        self.assertIn('current %s 정상, 불량 목록 읽기 실패 /' % names[2], runtimes)
+        self.assertNotIn('불량 목록 /', runtimes)
+
+    def test_clean_exit_before_initialize_is_not_a_failed_start(self):
+        exits = dict(clean=dict(exit_code=0), failed=dict(exit_code=101), unknown=dict(exit_code=None))
+        for name, fields in exits.items():
+            atomic_json(self.root / 'work/control-center/instances' / name / 'runtime-state.json',
+                        dict(last_exit=dict(initialize_completed=False, uptime_ms=10, **fields)))
+        value = report(self.root, now=NOW, environ={'LOCALAPPDATA': str(self.local)})
+        self.assertEqual(sorted(item['profile_id'] for item in value['runtime_exits']), ['clean', 'failed', 'unknown'])
+        self.assertIn('초기화 전에 종료된 런타임: 1개 프로필 (failed 종료 코드 101)', summary(value))
+
+    def test_candidate_that_cannot_be_read_is_listed_as_incomplete(self):
+        stage_release(self.root, '20261001-000000-aaaaaa')
+        stage_release(self.root, '20261002-000000-bbbbbb')
+        read = health_report._json
+
+        def locked(path, *arguments):
+            if Path(path).parent.name == '20261001-000000-aaaaaa':
+                raise PermissionError('sharing violation')
+            return read(path, *arguments)
+
+        with patch.object(health_report, '_json', side_effect=locked):
+            value = report(self.root, now=NOW, environ={'LOCALAPPDATA': str(self.local)})
+        self.assertEqual(value['candidates']['incomplete'], ['20261001-000000-aaaaaa'])
+        self.assertEqual([item['release'] for item in value['candidates']['pending']], ['20261002-000000-bbbbbb'])
 
     def test_runs_as_a_script_from_the_repository_root(self):
         environment = {key: value for key, value in os.environ.items() if key != 'PYTHONPATH'}

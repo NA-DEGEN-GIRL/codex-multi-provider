@@ -56,11 +56,12 @@ def _relative(root, path):
 
 
 def _bad(root, release):
+    """known_bad (the entry's reason, or True), or known_bad_unreadable when the list cannot be read."""
     try:
         entry = known_bad_entry(root, release)
     except ValueError:
-        return 'unreadable'
-    return None if entry is None else (entry.get('reason') or True)
+        return dict(known_bad_unreadable=True)
+    return dict(known_bad=None if entry is None else (entry.get('reason') or True))
 
 
 def runtime_pointer(root, name):
@@ -73,7 +74,9 @@ def runtime_pointer(root, name):
     result = dict(release=Path(raw.get('runtime') or '').parent.name or None, sha256=raw.get('sha256'),
                   version=raw.get('version'), build_profile=raw.get('build_profile'),
                   build_origin=raw.get('build_origin'), activated_at=raw.get('activated_at'),
-                  marked_good_at=raw.get('marked_good_at'))
+                  marked_good_at=raw.get('marked_good_at'),
+                  # False: activation kept the record of a replaced runtime whose files no longer verified.
+                  verified=raw.get('verified'))
     try:
         load_release(root, path)
         result['state'] = 'valid'
@@ -81,7 +84,7 @@ def runtime_pointer(root, name):
         result.update(state='missing_on_disk', problem='The release files are no longer on disk.')
     except (OSError, ValueError, KeyError, TypeError, RuntimeError) as error:
         result.update(state='invalid', problem=str(error))
-    result.update(activation_problem=release_problem(raw), known_bad=_bad(root, raw))
+    result.update(activation_problem=release_problem(raw), **_bad(root, raw))
     return _compact(result)
 
 
@@ -99,7 +102,7 @@ def candidates(root, pointers):
             continue
         try:
             raw = _json(folder / 'candidate.json')
-        except ValueError:
+        except (OSError, ValueError):
             raw = None
         if not isinstance(raw, dict):
             incomplete.append(folder.name)
@@ -108,7 +111,7 @@ def candidates(root, pointers):
             release=folder.name, staged_at=raw.get('staged_at'), version=raw.get('version'),
             build_profile=raw.get('build_profile'), build_origin=raw.get('build_origin'),
             runtime_present=(folder / Path(raw.get('runtime') or 'codex.exe').name).is_file(),
-            activation_problem=release_problem(raw), known_bad=_bad(root, raw))))
+            activation_problem=release_problem(raw), **_bad(root, raw))))
     return dict(pending=pending, incomplete=incomplete, older_count=older)
 
 
@@ -156,7 +159,11 @@ def remote_updates(state):
     if state is None:
         return dict(state='missing')
     aliases, pending, states = _aliases(state), [], {}
+    removed = {item.get('id') for item in state.get('profiles', [])
+               if isinstance(item, dict) and item.get('removed_at')}
     for value in (state.get('remote_updates') or {}).values():
+        if not isinstance(value, dict) or value.get('profile_id') in removed:
+            continue  # An entry the removal of its profile left behind.
         managed = value.get('managed') or {}
         status = managed.get('state') or 'unknown'
         states[status] = states.get(status, 0) + 1
@@ -243,7 +250,8 @@ def report(root=ROOT, *, now=None, environ=None):
     pointers = {name: _section(runtime_pointer, root, name) for name in POINTERS}
     value = dict(generated_at=now.isoformat(), manager_release=_section(manager_release, root),
                  runtime_pointers=pointers,
-                 known_bad=_section(lambda: [entry.get('release') for entry in known_bad(root)]),
+                 known_bad=_section(lambda: [entry.get('release') or entry.get('sha256')
+                                             for entry in known_bad(root)]),
                  candidates=_section(candidates, root, pointers),
                  migrations=_section(migrations, root),
                  remote_updates=_section(remote_updates, state),
@@ -264,13 +272,15 @@ def _failed(section):
 def summary(value):
     lines = ['[상태 점검] ' + value['generated_at']]
     manager = value['manager_release']
+    # artifacts/manager/current.json selects the release for the next start, not the running one.
+    label = '관리 앱 릴리스(다음 실행용): '
     if _failed(manager):
-        lines.append('관리 앱 릴리스: 확인 실패')
+        lines.append(label + '확인 실패')
     elif manager.get('id'):
-        lines.append('관리 앱 릴리스: ' + manager['id'] + ('' if manager['state'] == 'valid'
-                                                     else ' (' + POINTER_STATES.get(manager['state'], '?') + ')'))
+        lines.append(label + manager['id'] + ('' if manager['state'] == 'valid'
+                                              else ' (' + POINTER_STATES.get(manager['state'], '?') + ')'))
     else:
-        lines.append('관리 앱 릴리스: ' + POINTER_STATES.get(manager.get('state'), '?'))
+        lines.append(label + POINTER_STATES.get(manager.get('state'), '?'))
     if value.get('state_error'):
         lines.append('관리 상태 파일(state.json)을 읽지 못했습니다.')
     parts = []
@@ -281,7 +291,9 @@ def summary(value):
             continue
         text = name + ' ' + (pointer.get('release') + ' ' if pointer.get('release') else '')
         text += POINTER_STATES.get(pointer.get('state'), '?')
-        if pointer.get('known_bad'):
+        if pointer.get('known_bad_unreadable'):
+            text += ', 불량 목록 읽기 실패'
+        elif pointer.get('known_bad'):
             text += ', 불량 목록'
         if pointer.get('activation_problem') and name != 'previous':
             text += ', 활성화 조건 미충족'
@@ -324,7 +336,9 @@ def summary(value):
                        else words.get(item['state'], item['state'])) for item in logins))
     exits = value['runtime_exits']
     if not _failed(exits):
-        early = [item for item in exits if item.get('initialize_completed') is False]
+        # A clean exit (0) before initialize is a frontend that closed stdin, not a failed start.
+        early = [item for item in exits
+                 if item.get('initialize_completed') is False and item.get('exit_code') not in (0, None)]
         if early:
             lines.append('초기화 전에 종료된 런타임: %d개 프로필 (%s)' % (len(early), ', '.join(
                 '%s 종료 코드 %s' % (item.get('profile') or item['profile_id'], item.get('exit_code')) for item in early)))

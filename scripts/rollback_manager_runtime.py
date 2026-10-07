@@ -8,6 +8,9 @@
         runtime is added to known-bad.json unless --keep-replaced is given.
     python scripts/rollback_manager_runtime.py --mark-bad [current|previous|last-known-good|RELEASE_ID]
         Add a runtime to known-bad.json; activation and rollback refuse it.
+        Profile launches do not read known-bad.json: marking the current
+        runtime bad does not stop it being launched until --rollback (or
+        another activation) replaces current.json.
 
 Like activation, nothing here restarts a running profile; the next launch of
 each profile uses the selected runtime.
@@ -77,13 +80,15 @@ def mark_bad(root=ROOT, target='current', reason=None):
     return _add_known_bad(root, release, reason or 'marked bad by hand')
 
 
-def _add_known_bad(root, release, reason):
+def _add_known_bad(root, release, reason, *, by_folder=True):
     entries = known_bad(root)
     existing = known_bad_entry(root, release)
     if existing is not None:
         return dict(known_bad=existing, added=False)
     entry = dict(release=_release_id(release), sha256=release['sha256'], version=release.get('version'),
                  reason=reason, marked_at=_now())
+    if not by_folder:
+        entry.pop('release')
     atomic_json(root / RUNTIMES / 'known-bad.json', dict(version=1, releases=[*entries, entry]))
     return dict(known_bad=entry, added=True)
 
@@ -104,8 +109,9 @@ def rollback(root=ROOT, *, keep_replaced=False):
         replaced = None  # An unreadable pointer is replaced; it names nothing to record.
     if not isinstance(replaced, dict):
         replaced = None
-    if (replaced is not None and replaced.get('sha256') == release['sha256']
-            and _release_id(replaced) == _release_id(release)):
+    same_binary = replaced is not None and replaced.get('sha256') == release['sha256']
+    same_folder = replaced is not None and _release_id(replaced) == _release_id(release)
+    if same_binary and same_folder:
         return dict(runtime=release['runtime'], sha256=release['sha256'], changed=False,
                     running_profiles_restarted=False)
     release.pop('marked_good_at', None)
@@ -114,7 +120,16 @@ def rollback(root=ROOT, *, keep_replaced=False):
     result = dict(runtime=release['runtime'], sha256=release['sha256'], changed=True,
                   replaced=_release_id(replaced) if replaced else None, running_profiles_restarted=False)
     if replaced is not None and not keep_replaced and isinstance(replaced.get('sha256'), str):
-        result['known_bad'] = _add_known_bad(root, replaced, 'replaced by --rollback')['known_bad']
+        if same_binary:
+            # Another folder with the very codex.exe being restored (a re-staged
+            # copy): a known-bad entry would match the restored runtime by digest
+            # and refuse it from the next activation or rollback on.
+            result['known_bad_skipped'] = 'The replaced runtime has the same codex.exe as last-known-good.'
+        else:
+            # Same folder with another digest (a pointer edited by hand): list the
+            # digest only, since the folder is the one being restored.
+            result['known_bad'] = _add_known_bad(root, replaced, 'replaced by --rollback',
+                                                 by_folder=not same_folder)['known_bad']
     return result
 
 
@@ -123,7 +138,9 @@ if __name__ == '__main__':
     action = parser.add_mutually_exclusive_group(required=True)
     action.add_argument('--mark-good', action='store_true')
     action.add_argument('--rollback', action='store_true')
-    action.add_argument('--mark-bad', nargs='?', const='current', metavar='TARGET')
+    action.add_argument('--mark-bad', nargs='?', const='current', metavar='TARGET',
+                        help='Refuse this runtime in later activations and rollbacks. Launches still use '
+                             'current.json until --rollback or another activation replaces it.')
     parser.add_argument('--keep-replaced', action='store_true',
                         help='With --rollback: do not add the replaced runtime to known-bad.json.')
     parser.add_argument('--reason', help='With --mark-bad: why the runtime is bad.')

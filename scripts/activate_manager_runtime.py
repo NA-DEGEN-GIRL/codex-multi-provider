@@ -83,18 +83,31 @@ def require_activatable(root, release):
 def replace_current(root, release):
     """Point future launches at `release` and return the replaced release.
 
-    The replaced runtime becomes previous.json only while its files still
-    verify: a pointer to a deleted or changed release is no fallback.
+    previous.json always names the runtime this switch replaced, so that
+    `--mark-bad previous` lists that one. When its files no longer verify
+    (deleted or changed release) the record is kept with verified=False: it
+    is no fallback, but its codex.exe digest can still be marked bad. An
+    unreadable pointer names nothing, and an older previous.json would name
+    the wrong runtime, so it is removed.
     """
     pointer = Path(root) / RUNTIMES / 'current.json'
+    previous = pointer.with_name('previous.json')
     replaced = None
     if pointer.is_file():
         try:
             replaced = load_release(root, pointer)
         except (OSError, ValueError, KeyError, TypeError, RuntimeError):
             replaced = None
+            try:
+                raw = json.loads(pointer.read_text(encoding='utf-8-sig'))
+            except (OSError, ValueError):
+                raw = None
+            if isinstance(raw, dict) and isinstance(raw.get('sha256'), str):
+                atomic_json(previous, dict(raw, verified=False))
+            else:
+                previous.unlink(missing_ok=True)
     if replaced is not None:
-        atomic_json(pointer.with_name('previous.json'), replaced)
+        atomic_json(previous, replaced)
     atomic_json(pointer, release)
     return replaced
 

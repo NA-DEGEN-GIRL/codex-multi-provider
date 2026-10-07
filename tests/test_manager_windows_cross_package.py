@@ -1,7 +1,8 @@
 """Offline Windows cross-build contracts; PE checks and the build use synthetic PE32+ files."""
-from contextlib import ExitStack
+from contextlib import ExitStack, redirect_stdout
 import hashlib
 import importlib.util
+import io
 import json
 from pathlib import Path
 import shutil
@@ -24,6 +25,7 @@ def load(name, path):
 
 WINDOWS = load('package_windows_runtime_test', 'scripts/remote_helpers/package_windows_runtime.py')
 STAGE = load('stage_manager_runtime_cross_test', 'scripts/stage_manager_runtime.py')
+ACTIVATE = load('activate_manager_runtime_cross_test', 'scripts/activate_manager_runtime.py')
 
 SETUP = 'codex-windows-sandbox-setup'
 # The manifest embedded in the baseline (local MSVC build) sandbox setup exe.
@@ -415,6 +417,29 @@ class CrossBuildTests(unittest.TestCase):
                  sha384=hashlib.sha384(CHECKOUT_MIGRATIONS['logs_migrations/0001_logs.sql']).hexdigest())])
         # The Windows staging side accepts exactly this package.
         self.assertEqual(STAGE._load_cross_build(self.root, package), manifest)
+
+    def stage_package(self, package):
+        with patch.object(STAGE.subprocess, 'check_output', return_value='codex-cli fixture\n'), \
+                redirect_stdout(io.StringIO()):
+            return STAGE.stage(self.root, source=package)
+
+    def test_built_package_stages_into_a_candidate_the_activation_gate_accepts(self):
+        package = Path(self.run_build()['package_directory'])
+        build = json.loads((package / 'windows-build.json').read_text(encoding='utf-8'))
+        candidate = self.stage_package(package)
+        manifest = json.loads(candidate.read_text(encoding='utf-8'))
+        # The PE checks repeated on the staged copies agree with the server's.
+        self.assertEqual(manifest['pe_checks'], build['pe_checks'])
+        self.assertIsNone(ACTIVATE.release_problem(manifest))
+        # A package whose manifest vouches for an executable that fails the checks is not staged.
+        damaged = package / 'codex-app-server.exe'
+        damaged.write_bytes(pe_image(stack_reserve=1 << 20))
+        build['files'][damaged.name] = dict(sha256=sha256(damaged.read_bytes()), size=damaged.stat().st_size)
+        (package / 'windows-build.json').write_text(json.dumps(build), encoding='utf-8')
+        releases = sorted(candidate.parent.parent.iterdir())
+        with self.assertRaisesRegex(RuntimeError, '^codex-app-server.exe: stack reserve 1048576'):
+            self.stage_package(package)
+        self.assertEqual(sorted(candidate.parent.parent.iterdir()), releases)
 
     def test_tree_mismatch_stops_before_cargo(self):
         with self.assertRaisesRegex(RuntimeError, 'runtime/ is not the recorded patch tree \\(' + 'e' * 40):

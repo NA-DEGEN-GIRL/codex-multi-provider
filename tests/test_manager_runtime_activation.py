@@ -207,7 +207,7 @@ class RuntimeActivationTests(unittest.TestCase):
             atomic_json(bad, dict(version=1, releases=[dict(release='another', sha256='0' * 64)]))
             self.assertEqual(activate(candidate, evidence, root)['sha256'], digest)
 
-    def test_previous_pointer_never_names_a_missing_or_changed_release(self):
+    def test_previous_pointer_names_the_replaced_runtime_even_when_it_no_longer_verifies(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             pointer = root / 'artifacts/manager-runtime/current.json'
@@ -215,17 +215,35 @@ class RuntimeActivationTests(unittest.TestCase):
             first, first_digest = stage_release(root, 'first')
             second, second_digest = stage_release(root, 'second')
             third, third_digest = stage_release(root, 'third')
+
+            def recorded():
+                return json.loads(previous.read_text(encoding='utf-8'))
+
             activate(first, handoff_evidence(root, first_digest, 'first'), root)
-            # The active release folder was deleted (as revision 118's cross build was).
-            shutil.rmtree(first.parent)
-            self.assertEqual(activate(second, handoff_evidence(root, second_digest, 'second'), root)['sha256'],
-                             second_digest)
-            self.assertFalse(previous.exists())
+            activate(second, handoff_evidence(root, second_digest, 'second'), root)
+            self.assertEqual(recorded()['sha256'], first_digest)
+            self.assertNotIn('verified', recorded())
+            # The active release folder was deleted (as revision 118's cross build was). previous.json
+            # must not keep naming the older runtime: `--mark-bad previous` would list the wrong one.
+            shutil.rmtree(second.parent)
+            self.assertEqual(activate(third, handoff_evidence(root, third_digest, 'third'), root)['sha256'],
+                             third_digest)
+            self.assertEqual((recorded()['sha256'], recorded()['verified']), (second_digest, False))
+            self.assertEqual(Path(recorded()['runtime']).parent.name, 'second')
+            # A changed active binary is recorded the same way, by the digest it was activated with.
+            (first.parent / 'codex.exe').write_bytes(b'changed')
+            atomic_json(pointer, json.loads(first.read_text(encoding='utf-8')))
             activate(third, handoff_evidence(root, third_digest, 'third'), root)
-            self.assertEqual(json.loads(previous.read_text(encoding='utf-8'))['sha256'], second_digest)
-            # A changed active binary is no fallback either; the last good previous.json stays.
-            (second.parent / 'codex.exe').write_bytes(b'changed')
-            atomic_json(pointer, json.loads(second.read_text(encoding='utf-8')))
+            self.assertEqual((recorded()['sha256'], recorded()['verified']), (first_digest, False))
+            # A verifying runtime is recorded as it was.
             activate(third, handoff_evidence(root, third_digest, 'third'), root)
-            self.assertEqual(json.loads(previous.read_text(encoding='utf-8'))['sha256'], second_digest)
-            self.assertEqual(json.loads(pointer.read_text(encoding='utf-8'))['sha256'], third_digest)
+            self.assertEqual(recorded()['sha256'], third_digest)
+            self.assertNotIn('verified', recorded())
+            # A pointer that names no digest names nothing; an older previous.json would be wrong.
+            for text in ('{broken', '[1]', json.dumps(dict(runtime=str(first.parent / 'codex.exe')))):
+                with self.subTest(pointer=text):
+                    atomic_json(previous, dict(runtime='older', sha256='0' * 64))
+                    pointer.write_text(text, encoding='utf-8')
+                    activate(third, handoff_evidence(root, third_digest, 'third'), root)
+                    self.assertFalse(previous.exists())
+                    self.assertEqual(json.loads(pointer.read_text(encoding='utf-8'))['sha256'], third_digest)

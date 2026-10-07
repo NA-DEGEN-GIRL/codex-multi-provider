@@ -116,6 +116,45 @@ class RuntimeRollbackTests(unittest.TestCase):
         self.assertEqual(rollback(self.root)['sha256'], good_digest)
         self.assertEqual(self.pointer(self.runtimes / 'previous.json')['sha256'], active_digest)
 
+    def test_rollback_to_the_same_codex_exe_in_another_folder_keeps_it_usable(self):
+        good, good_digest = self.activated('20261001-000000-aaaaaa', b'same binary')
+        mark_good(self.root)
+        # The same codex.exe staged again (for example to record its migrations) and activated.
+        restaged, digest = self.activated('20261002-000000-bbbbbb', b'same binary')
+        self.assertEqual(digest, good_digest)
+        result = rollback(self.root)
+        self.assertEqual((result['changed'], result['replaced']), (True, restaged.parent.name))
+        self.assertNotIn('known_bad', result)
+        self.assertIn('same codex.exe', result['known_bad_skipped'])
+        self.assertFalse(self.bad.exists())
+        self.assertEqual(Path(self.pointer(self.current)['runtime']).parent, good.parent)
+        # The restored runtime still passes the gates.
+        self.assertEqual(mark_good(self.root)['last_known_good'], good.parent.name)
+        self.assertEqual(rollback(self.root)['changed'], False)
+
+    def test_rollback_from_a_hand_edited_pointer_to_the_same_folder_lists_only_the_digest(self):
+        good, good_digest = self.activated('20261001-000000-aaaaaa')
+        mark_good(self.root)
+        atomic_json(self.current, dict(self.pointer(self.current), sha256='1' * 64))
+        result = rollback(self.root)
+        self.assertTrue(result['changed'])
+        self.assertEqual(self.pointer(self.bad)['releases'], [result['known_bad']])
+        self.assertEqual(result['known_bad']['sha256'], '1' * 64)
+        self.assertNotIn('release', result['known_bad'])
+        self.assertEqual(mark_good(self.root)['sha256'], good_digest)
+
+    def test_mark_bad_previous_names_the_replaced_runtime_after_its_folder_was_deleted(self):
+        first, first_digest = self.activated('20261001-000000-aaaaaa')
+        second, second_digest = self.activated('20261002-000000-bbbbbb')
+        shutil.rmtree(second.parent)
+        self.activated('20261003-000000-cccccc')
+        result = mark_bad(self.root, 'previous', 'exited at startup')
+        self.assertEqual((result['known_bad']['release'], result['known_bad']['sha256']),
+                         (second.parent.name, second_digest))
+        # The runtime before it is untouched.
+        self.assertEqual([entry['sha256'] for entry in self.pointer(self.bad)['releases']], [second_digest])
+        self.assertNotEqual(first_digest, second_digest)
+
     def test_mark_bad_records_a_deleted_previous_release_by_digest(self):
         first, first_digest = self.activated('20261001-000000-aaaaaa')
         self.activated('20261002-000000-bbbbbb')
