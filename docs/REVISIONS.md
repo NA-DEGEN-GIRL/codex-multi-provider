@@ -35,6 +35,14 @@
 
 ## 최근 수정
 
+### 수정 119 — Claude·SSH 버그 수정, 관리창 속도 개선, 재발 방지 장치
+
+- Claude 전환이 이어 쓰는 세션에서 뒤쪽 요약을 버려 `/compact` 뒤에도 거절되던 문제(런타임 `ccc7fae5`), SSH Claude 러너가 사용량 이벤트에서 죽던 문제,
+  SSH 포크 대화가 원래 메모를 공유하지 못하던 문제, 4958 데스크톱에서 SSH worktree 대화가 목록에서 사라지던 문제를 고쳤다.
+- 측정으로 찾은 느림: 같은 내용의 플러그인 표시 파일 재작성에 따른 재복사, 대화 열기 안의 Browser 복구, 무거운 상태 조회를 줄였다.
+- 재발 방지: 활성화 관문(마이그레이션·PE 검사·릴리스 빌드), 정상 확인 런타임으로만 되돌리기, 런타임 종료 원인 기록, `scripts/health_report.py`, SSH 업데이트 알림.
+- [원인·변경·남은 과제](design/stability-perf-119.md).
+
 ### 수정 118 — 원격 Codex 종료 멈춤 수정, 완전 종료 대기 선택지, Windows 교차 빌드
 
 - 완전 종료가 한 서버의 원격 Codex 종료 확인을 기다리며 멈췄다. 원인은 sqlx-core 0.9.0 풀 정리 작업의 무한 루프였다
@@ -352,3 +360,4 @@
 | 116 | [update-flow-ui-polish-116](design/update-flow-ui-polish-116.md) | 작업 중 공식 앱 업데이트 적용, 26.930.4958 지원, 관리창 정보 정리 |
 | 117 | [token-models-shortcut-order-117](design/token-models-shortcut-order-117.md) | Claude 토큰 자동 갱신, GPT 새 모델 목록, 작업 바로가기 순서 |
 | 118 | [remote-exit-hang-118](design/remote-exit-hang-118.md) | 원격 Codex 종료 멈춤(sqlx 정리 작업), 완전 종료 대기 선택지, 서버 64스레드 제한·Windows 교차 빌드 |
+| 119 | [stability-perf-119](design/stability-perf-119.md), [ssh-worktree-project-grouping-96](design/ssh-worktree-project-grouping-96.md) | Claude·SSH 버그, 관리창 속도, 재발 방지 장치 |
