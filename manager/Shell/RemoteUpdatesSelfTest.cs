@@ -20,6 +20,21 @@ internal static class RemoteUpdatesSelfTest
             checks++;
         }
 
+        var attention = JsonSerializer.SerializeToElement(new
+        {
+            profiles = new[] { new { id = "p1" }, new { id = "p2" } },
+            remote_updates = new { worker_active = false, items = new object[] {
+                new { profile_id = "p1", alias = "remote-a", managed = new { state = "update_available" }, job = (object?)null },
+                new { profile_id = "p1", alias = "remote-b", managed = new { state = "update_available" }, job = (object?)new { state = "complete" } },
+                new { profile_id = "p2", alias = "remote-a", managed = new { state = "update_available" }, job = (object?)new { state = "queued" } },
+                new { profile_id = "p2", alias = "remote-b", managed = new { state = "current" }, job = (object?)null },
+                new { profile_id = "removed", alias = "remote-a", managed = new { state = "update_available" }, job = (object?)null } } }
+        });
+        Require(RemoteUpdatesPresentation.PendingManaged(attention) == 2,
+            "the settings badge counts current profiles' unscheduled managed SSH updates only");
+        Require(RemoteUpdatesPresentation.PendingManaged(JsonSerializer.SerializeToElement(new { profiles = new[] { new { id = "p1" } } })) == 0,
+            "a state without remote_updates needs no SSH update attention");
+
         const string profileId = "fixture-profile";
         const string firstHost = "fixture-a";
         const string secondHost = "fixture-b";

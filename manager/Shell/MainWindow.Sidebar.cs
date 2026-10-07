@@ -449,6 +449,8 @@ public sealed partial class MainWindow
         else if (update.S("status") is "available" or "update_available") reasons.Add("Codex 업데이트 설치 가능");
         else if (update.S("status") is "recovery_required" or "failed_restore") { reasons.Add("Codex 업데이트 복구 필요"); warning = true; }
         if (_state.Get("startup_updates").S("state") == "attention") { reasons.Add("전체 프로필 업데이트 확인 필요"); warning = true; }
+        var remote = RemoteUpdatesPresentation.PendingManaged(_state);
+        if (remote > 0) reasons.Add($"SSH 런타임 업데이트 가능 {remote}건 · 계정 선택 후 ‘SSH 업데이트’에서 적용");
         _settingsBadge.Visibility = reasons.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
         _settingsBadge.Fill = warning ? WorkspaceAppearance.Warning : WorkspaceAppearance.Ready;
         var tip = reasons.Count == 0 ? "설정 및 관리" : "설정 및 관리\n" + string.Join("\n", reasons);

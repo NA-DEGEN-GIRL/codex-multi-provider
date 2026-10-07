@@ -12,6 +12,16 @@ internal static class RemoteUpdatesPresentation
         return managed.Success ? managed.Groups[1].Value : value;
     }
 
+    // Current profiles' SSH hosts still running an older managed runtime and
+    // not yet scheduled (the settings badge points to ‘SSH 업데이트’).
+    internal static int PendingManaged(JsonElement state)
+    {
+        var profiles = state.Arr("profiles").Select(p => p.S("id")).ToHashSet();
+        return state.Get("remote_updates").Arr("items").Count(item => profiles.Contains(item.S("profile_id"))
+            && item.Get("managed").S("state") == "update_available"
+            && item.Get("job").S("state") is not ("queued" or "waiting" or "applying" or "recovering"));
+    }
+
     internal static string Managed(JsonElement value) => value.S("observation_code") is { Length: > 0 } observation
         ? Error(observation)
         : value.S("state") switch

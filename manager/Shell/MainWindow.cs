@@ -76,6 +76,9 @@ public sealed partial class MainWindow : Window
     private readonly DispatcherTimer _activityTimer = new() { Interval = TimeSpan.FromSeconds(1) };
     private readonly Dictionary<Guid, (string Label, DateTime Started)> _pendingActions = [];
     private readonly ProfileActionGate _profileActions = new();
+    private const string ShortcutOpenAction = "대화 열기";
+    // Per account: the task its latest shortcut open is for and that open's ticket.
+    private readonly Dictionary<string, (string Id, int Ticket)> _shortcutOpens = [];
     private bool _logFlushPending;
     private readonly List<string> _events = [];
     private readonly DiagnosticLog _diagnostics;
@@ -236,6 +239,10 @@ public sealed partial class MainWindow : Window
         VirtualizingPanel.SetScrollUnit(_shortcuts, ScrollUnit.Pixel);
         _shortcuts.ItemTemplate = ShortcutCards.Create();
         _shortcuts.ItemContainerStyle = ProfileCards.ContainerStyle();
+        // Working dots stop in a minimized or hidden window and a closed overlay.
+        void UpdatePulse() => ShortcutCards.SetPulse(_shortcuts, _shortcuts.IsVisible && WindowState != WindowState.Minimized);
+        _shortcuts.IsVisibleChanged += (_, _) => UpdatePulse();
+        StateChanged += (_, _) => UpdatePulse();
         // Press-and-drag on a card reorders the links; released in place it
         // opens the task. A filtered list has no reliable neighbours, so search
         // turns reordering off and the cards are plain buttons again.
@@ -2438,11 +2445,31 @@ public sealed partial class MainWindow : Window
         using var timing = _responsiveness?.Time("shortcut.open." + id);
         var item = _state.Arr("shortcuts").FirstOrDefault(s => s.S("id") == id);
         var profileId = item.S("profile_id"); if (profileId == "") throw new InvalidOperationException("이 바로가기에 연결된 프로필이 없습니다.");
-        using var action = _profileActions.Enter(profileId, "대화 열기");
-        _shortcutSelection = (id, profileId, _state.Arr("profiles").FirstOrDefault(p => p.S("id") == profileId)
-            .Get("current_task").S("thread_id"));
-        _shortcuts.SelectedItem = _shortcuts.Items.OfType<Choice>().FirstOrDefault(c => c.Id == id);
+        void SelectCard()
+        {
+            _shortcutSelection = (id, profileId, _state.Arr("profiles").FirstOrDefault(p => p.S("id") == profileId)
+                .Get("current_task").S("thread_id"));
+            _shortcuts.SelectedItem = _shortcuts.Items.OfType<Choice>().FirstOrDefault(c => c.Id == id);
+        }
+        // Task opens of one account do not reject each other: a re-click of the
+        // task being opened joins it, and another task replaces it. The newer
+        // ticket discards the open in flight and this one follows once that
+        // releases the gate. Other actions on the account still meet the gate.
+        if (_profileActions.Held(profileId, ShortcutOpenAction) is { } inFlight)
+        {
+            if (_shortcutOpens.TryGetValue(profileId, out var opening) && opening.Id == id && opening.Ticket == _navigation) return;
+            var queued = ++_navigation;
+            _shortcutOpens[profileId] = (id, queued);
+            SelectCard();
+            SetStatus("앞선 대화 열기를 정리한 뒤 선택한 작업으로 이동합니다…");
+            Log($"대화 열기 교체 대기 · {id}");
+            await inFlight;
+            if (queued != _navigation || _closing) return;
+        }
+        using var action = _profileActions.Enter(profileId, ShortcutOpenAction);
+        SelectCard();
         var ticket = ++_navigation; if (_selectedProfile != profileId || _viewingCatalog) ParkCurrent(); _viewingCatalog = false; _selectedProfile = profileId;
+        _shortcutOpens[profileId] = (id, ticket);
         _expectedConversation = null; _expectedCanonicalThread = null;
         _hostDeck.Select(profileId); BeginAttach(); _profileRequestTicket = ticket;
         Render();
@@ -2453,6 +2480,8 @@ public sealed partial class MainWindow : Window
         SetStatus("선택한 계정에서 작업으로 이동하고 있습니다…");
         JsonElement result;
         try { result = await Request("conversation.open", new { shortcut_id = id, expected_profile_id = profileId }); }
+        // A replaced open's failure is logged by Request; it must not overwrite the newer open's status.
+        catch (Exception) when (ticket != _navigation || _closing) { return; }
         finally { if (_profileRequestTicket == ticket) _profileRequestTicket = null; }
         if (ticket != _navigation || _closing) return;
         if (result.S("state") == "waiting_for_reader")

@@ -18,6 +18,11 @@ public sealed partial class MainWindow
         bool Attached() => _host == host && host.HasLiveAttachment
             && _windowLaunches.TryGetValue(host, out var launch) && launch == expected
             && _attachedWindows.TryGetValue(host, out var window) && window.MatchesLifetime;
+        // Why a verification stopped early, for the log (first failing check of Current, then Attached).
+        string CancelReason() => _closing ? "관리창 종료" : superseded ? "화면에서 다른 대화로 이동"
+            : ticket != _navigation ? "새 이동 요청" : _selectedProfile != expected.ProfileId || _viewingCatalog ? "다른 화면 선택"
+            : !_embedRequested ? "창 표시 해제" : !expected.Matches(Latest(Profile())) ? "창 실행 정보 변경"
+            : !Attached() ? "창 연결 해제" : "확인 조건 변경";
         async Task<bool> Selected()
         {
             try
@@ -39,6 +44,11 @@ public sealed partial class MainWindow
         {
             var outcome = await ShortcutNavigationRecovery.RunAsync(Current, Attached, Selected,
                 token => host.NavigateAsync(target, token));
+            if (outcome == ShortcutRecoveryResult.Cancelled)
+            {
+                Log("대화 이동 · 화면 선택 확인 취소 · " + CancelReason());
+                return;
+            }
             if (!Current()) return;
             if (outcome is ShortcutRecoveryResult.Selected or ShortcutRecoveryResult.Recovered)
             {

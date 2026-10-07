@@ -98,6 +98,42 @@ internal static class ShortcutNavigationSelfTest
             checks.Add("Mismatched returned profiles are rejected and the action gate is released on failure.");
         }
         finally { invalidWindow.Close(); }
+
+        // Task opens of one account merge instead of rejecting each other.
+        var other = new { id = "other", profile_id = "profile", alias = "다른 작업", thread_id = "thread-2", host_id = "local" };
+        var pair = JsonSerializer.SerializeToElement(new { profiles = new[] { profile }, shortcuts = new[] { shortcut, other } });
+        var opens = new List<(string Id, TaskCompletionSource<JsonElement> Reply)>();
+        var mergeWindow = new MainWindow(root, fixture: true, fixtureRequest: (command, args) =>
+        {
+            if (command != "conversation.open") throw new InvalidOperationException("Unexpected request: " + command);
+            opens.Add((JsonSerializer.SerializeToElement(args).S("shortcut_id"), new(TaskCreationOptions.RunContinuationsAsynchronously)));
+            return opens[^1].Reply.Task;
+        }) { FixtureRefreshesState = true };
+        try
+        {
+            mergeWindow.UseFixture(pair);
+            var first = Invoke(mergeWindow, "OpenShortcutAsync", "shortcut");
+            var again = Invoke(mergeWindow, "OpenShortcutAsync", "shortcut");
+            Require(again.IsCompletedSuccessfully && opens.Count == 1,
+                "A re-click of the task being opened was rejected or sent a second open.");
+            var replacement = Invoke(mergeWindow, "OpenShortcutAsync", "other");
+            var repeat = Invoke(mergeWindow, "OpenShortcutAsync", "other");
+            Require(!replacement.IsCompleted && repeat.IsCompletedSuccessfully && opens.Count == 1,
+                "Another task of the account was rejected, or sent before the open in flight ended.");
+            opens[0].Reply.SetResult(ready);
+            await first.WaitAsync(TimeSpan.FromSeconds(3));
+            for (var started = Environment.TickCount64; opens.Count < 2; await Task.Delay(10))
+                Require(Environment.TickCount64 - started < 3000, "The replacing task was not opened after the open in flight ended.");
+            Require(opens[1].Id == "other" && Field<Dictionary<string, JsonElement>>(mergeWindow, "_shownProfiles").Count == 0,
+                "The replaced open presented its result, or the replacement opened the wrong task.");
+            opens[1].Reply.SetResult(ready);
+            await replacement.WaitAsync(TimeSpan.FromSeconds(3));
+            Require(opens.Count == 2 && Field<Dictionary<string, JsonElement>>(mergeWindow, "_shownProfiles")["profile"].S("generation") == "new",
+                "The replacing open did not present its returned launch.");
+            using (Field<ProfileActionGate>(mergeWindow, "_profileActions").Enter("profile", "fixture")) { }
+            checks.Add("A re-click of a task being opened joins it; another task of the account replaces it after the open in flight, with one open each and no rejection.");
+        }
+        finally { foreach (var open in opens) open.Reply.TrySetResult(ready); mergeWindow.Close(); }
         checks.AddRange(DesktopCompatibilitySelfTest.Run(root));
         checks.AddRange(LocalModelSelfTest.Run());
         checks.AddRange(await ProfileOpenStatusSelfTest.RunAsync(root));
