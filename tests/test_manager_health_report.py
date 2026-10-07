@@ -1,0 +1,182 @@
+"""Read-only health report over a temporary workspace; nothing live is read."""
+from contextlib import closing
+from datetime import datetime, timedelta, timezone
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import unittest
+from uuid import uuid4
+
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO / 'scripts'))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from activate_manager_runtime import activate
+from health_report import report, summary
+from manager_core.store import atomic_json
+from test_manager_runtime_activation import THREADS_CRLF, handoff_evidence, migrated_store, stage_release
+
+NOW = datetime(2026, 10, 7, 12, 0, tzinfo=timezone.utc)
+SECRET = 'fixture-access-token-must-not-appear'
+
+
+class HealthReportTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name).resolve() / 'sample-repo'
+        self.root.mkdir()
+        self.local = Path(self.temporary.name).resolve() / 'local-app-data'
+
+    def test_empty_workspace_reports_every_section_without_failing(self):
+        value = report(self.root, now=NOW, environ={'LOCALAPPDATA': str(self.local)})
+        self.assertEqual(value['manager_release'], dict(state='missing'))
+        self.assertEqual({name: pointer['state'] for name, pointer in value['runtime_pointers'].items()},
+                         {'current': 'missing', 'last-known-good': 'missing', 'previous': 'missing'})
+        self.assertEqual(value['candidates'], dict(pending=[], incomplete=[], older_count=0))
+        self.assertEqual(value['migrations']['state'], 'unknown')
+        self.assertEqual(value['remote_updates'], dict(state='missing'))
+        self.assertEqual((value['claude_logins'], value['runtime_exits'], value['known_bad']), ([], [], []))
+        lines = summary(value)
+        self.assertIn('런타임: current 없음 / last-known-good 없음 / previous 없음', lines)
+        self.assertIn('활성화 대기 후보: 없음', lines)
+
+    def test_populated_workspace(self):
+        root = self.root
+        # Runtime pointers: a valid current, previous naming a deleted release, no last-known-good.
+        old, old_digest = stage_release(root, '20261001-000000-aaaaaa')
+        current, digest = stage_release(root, '20261002-000000-bbbbbb')
+        activate(old, handoff_evidence(root, old_digest, 'old'), root)
+        activate(current, handoff_evidence(root, digest, 'current'), root)
+        shutil.rmtree(old.parent)
+        atomic_json(root / 'artifacts/manager-runtime/known-bad.json',
+                    dict(version=1, releases=[dict(release=old.parent.name, sha256=old_digest, reason='fixture')]))
+        # Staged releases: one older, one newer and activatable, one newer without migrations, one incomplete.
+        stage_release(root, '20260930-000000-cccccc')
+        stage_release(root, '20261003-000000-dddddd')
+        stage_release(root, '20261004-000000-eeeeee', migrations=None)
+        (root / 'artifacts/manager-runtime/releases/20261005-000000-ffffff').mkdir()
+        # Stores: the canonical home matches but was also migrated by a newer runtime;
+        # a profile store was migrated by an LF build.
+        home = root / 'record-home'
+        atomic_json(root / 'work/control-center/canonical-storage.json', dict(version=1, home=str(home)))
+        canonical = migrated_store(home / 'state_5.sqlite', hashlib.sha384(THREADS_CRLF).digest())
+        with closing(sqlite3.connect(canonical)) as connection:
+            connection.execute("INSERT INTO _sqlx_migrations VALUES (2, 'thread titles', '2026-10-02', 1, ?, 1)",
+                               (b'\x01' * 48,))
+            connection.commit()
+        profile_id, claude_id, expired_id = str(uuid4()), str(uuid4()), str(uuid4())
+        migrated_store(root / 'work/control-center/profiles' / profile_id / 'codex/state_5.sqlite',
+                       hashlib.sha384(THREADS_CRLF.replace(b'\r\n', b'\n')).digest())
+        # Manager state: SSH update backlog and Claude logins.
+        managed = dict(state='update_available', active_bundle='0.1-old', available_bundle='0.2-new',
+                       prepared_bundle='0.1-old')
+        atomic_json(root / 'work/control-center/state.json', dict(version=1, revision=1, profiles=[
+            dict(id=profile_id, alias='work-profile'),
+            dict(id=claude_id, alias='claude-profile', auth_mode='claude_code'),
+            dict(id=expired_id, alias='claude-expired', auth_mode='claude_code'),
+            dict(id=str(uuid4()), alias='claude-missing', auth_mode='claude_code'),
+            dict(id=str(uuid4()), alias='claude-removed', auth_mode='claude_code', removed_at='2026-10-01')],
+            remote_updates={
+                profile_id + ':remote-host': dict(profile_id=profile_id, alias='remote-host', auto_apply=False,
+                                                  managed=managed, job=None, checked_at='2026-10-07T11:00:00+00:00'),
+                profile_id + ':other-host': dict(profile_id=profile_id, alias='other-host',
+                                                 managed=dict(state='current'))}))
+        for identifier, expires in ((claude_id, NOW + timedelta(hours=5, minutes=30)), (expired_id, NOW - timedelta(hours=1))):
+            directory = self.local / 'codex-multi-provider/claude-profiles' / identifier
+            directory.mkdir(parents=True)
+            (directory / '.credentials.json').write_text(json.dumps({'claudeAiOauth': {
+                'accessToken': SECRET, 'refreshToken': SECRET, 'expiresAt': int(expires.timestamp() * 1000)}}),
+                encoding='utf-8')
+        # The runtime proxy's exit record and the manager release pointer.
+        atomic_json(root / 'work/control-center/instances' / profile_id / 'runtime-state.json', dict(
+            profile_id=profile_id, last_exit=dict(exit_code=1, uptime_ms=420, initialize_completed=False,
+                                                  exited_at='2026-10-07T11:59:00+00:00')))
+        release = root / 'artifacts/manager/releases/20261006-000000-000'
+        release.mkdir(parents=True)
+        atomic_json(root / 'artifacts/manager/current.json', dict(version=1, directory=str(release),
+                                                                 created_at='2026-10-06T00:00:00Z'))
+
+        value = report(root, now=NOW, environ={'LOCALAPPDATA': str(self.local)})
+        text = json.dumps(value, ensure_ascii=False)
+        self.assertNotIn(SECRET, text)
+        self.assertEqual(value['manager_release'], dict(id=release.name, created_at='2026-10-06T00:00:00Z',
+                                                        state='valid'))
+        pointers = value['runtime_pointers']
+        self.assertEqual((pointers['current']['state'], pointers['current']['release']), ('valid', current.parent.name))
+        self.assertNotIn('activation_problem', pointers['current'])
+        self.assertEqual(pointers['previous']['state'], 'missing_on_disk')
+        self.assertEqual(pointers['previous']['known_bad'], 'fixture')
+        self.assertEqual(pointers['last-known-good'], dict(state='missing'))
+        self.assertEqual(value['known_bad'], [old.parent.name])
+        staged = value['candidates']
+        self.assertEqual([item['release'] for item in staged['pending']],
+                         ['20261003-000000-dddddd', '20261004-000000-eeeeee'])
+        self.assertNotIn('activation_problem', staged['pending'][0])
+        self.assertIn('no embedded migrations', staged['pending'][1]['activation_problem'])
+        self.assertEqual((staged['incomplete'], staged['older_count']), (['20261005-000000-ffffff'], 1))
+        stores = value['migrations']
+        self.assertEqual((stores['state'], stores['stores']), ('incompatible', 2))
+        self.assertEqual(stores['incompatible'],
+                         ['work/control-center/profiles/%s/codex/state_5.sqlite: 1 threads' % profile_id])
+        self.assertEqual(stores['ahead'], ['record-home/state_5.sqlite: 2 thread titles'])
+        self.assertEqual(value['remote_updates']['pending'], [dict(
+            profile_id=profile_id, profile='work-profile', host='remote-host', state='update_available',
+            active_bundle='0.1-old', available_bundle='0.2-new', prepared_bundle='0.1-old', auto_apply=False,
+            checked_at='2026-10-07T11:00:00+00:00')])
+        self.assertEqual(value['remote_updates']['states'], {'update_available': 1, 'current': 1})
+        logins = {item['profile']: item for item in value['claude_logins']}
+        self.assertEqual(set(logins), {'claude-profile', 'claude-expired', 'claude-missing'})
+        self.assertEqual((logins['claude-profile']['state'], logins['claude-profile']['hours_left']), ('valid', 5.5))
+        self.assertEqual(logins['claude-expired']['state'], 'expired')
+        self.assertEqual(logins['claude-missing']['state'], 'missing')
+        self.assertEqual(value['runtime_exits'], [dict(profile_id=profile_id, profile='work-profile', exit_code=1,
+                                                       uptime_ms=420, initialize_completed=False,
+                                                       exited_at='2026-10-07T11:59:00+00:00')])
+        lines = summary(value)
+        self.assertEqual(lines[1], '관리 앱 릴리스: ' + release.name)
+        self.assertIn('previous %s 파일 없음, 불량 목록' % old.parent.name, lines[2])
+        self.assertIn('활성화 대기 후보: 2개 (20261003-000000-dddddd, 20261004-000000-eeeeee)', lines)
+        self.assertIn('저장소 마이그레이션: 불일치 1건 - 현재 런타임이 시작하지 못합니다, 런타임에 없는 적용 1건', lines)
+        self.assertIn('SSH 업데이트 대기: 1건 (work-profile@remote-host)', lines)
+        self.assertIn('Claude 로그인: claude-profile 5.5시간 남음, claude-expired 만료됨, claude-missing 자격 증명 없음',
+                      lines)
+        self.assertIn('초기화 전에 종료된 런타임: 1개 프로필 (work-profile 종료 코드 1)', lines)
+
+    def test_unreadable_files_are_reported_not_raised(self):
+        (self.root / 'work/control-center').mkdir(parents=True)
+        (self.root / 'work/control-center/state.json').write_text('{broken', encoding='utf-8')
+        (self.root / 'artifacts/manager-runtime').mkdir(parents=True)
+        (self.root / 'artifacts/manager-runtime/current.json').write_text('[1]', encoding='utf-8')
+        (self.root / 'artifacts/manager-runtime/known-bad.json').write_text('{broken', encoding='utf-8')
+        (self.root / 'artifacts/manager').mkdir(parents=True)
+        (self.root / 'artifacts/manager/current.json').write_text('{broken', encoding='utf-8')
+        value = report(self.root, now=NOW, environ={'LOCALAPPDATA': str(self.local)})
+        self.assertIn('state_error', value)
+        self.assertEqual(value['runtime_pointers']['current']['state'], 'invalid')
+        self.assertIn('error', value['manager_release'])
+        self.assertIn('error', value['known_bad'])
+        lines = summary(value)
+        self.assertIn('관리 앱 릴리스: 확인 실패', lines)
+        self.assertIn('SSH 업데이트 대기: 확인 불가', lines)
+
+    def test_runs_as_a_script_from_the_repository_root(self):
+        environment = {key: value for key, value in os.environ.items() if key != 'PYTHONPATH'}
+        environment.update(LOCALAPPDATA=str(self.local), PYTHONUTF8='1')
+        result = subprocess.run([sys.executable, 'scripts/health_report.py', '--root', str(self.root)], cwd=REPO,
+                                env=environment, capture_output=True, text=True, encoding='utf-8', timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        document, separator, rest = result.stdout.partition('\n\n[상태 점검] ')
+        self.assertTrue(separator)
+        self.assertEqual(json.loads(document)['runtime_pointers']['current'], dict(state='missing'))
+        self.assertIn('런타임: current 없음', rest)
+
+
+if __name__ == '__main__':
+    unittest.main()

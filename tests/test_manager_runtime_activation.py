@@ -2,6 +2,7 @@ from contextlib import closing
 import hashlib
 import json
 from pathlib import Path
+import shutil
 import sqlite3
 import tempfile
 import unittest
@@ -13,6 +14,33 @@ from activate_manager_runtime import activate, SHARED_CHECKS
 from manager_core.store import atomic_json
 
 THREADS_CRLF = b'CREATE TABLE threads (\r\n    id TEXT PRIMARY KEY\r\n);\r\n'
+MIGRATIONS = [dict(directory='migrations', version=1, description='threads',
+                   sha384=hashlib.sha384(THREADS_CRLF).hexdigest())]
+
+
+def stage_release(root, name, content=None, **fields):
+    """A staged release folder with a verifiable codex.exe; returns (candidate, digest)."""
+    folder = Path(root) / 'artifacts/manager-runtime/releases' / name
+    folder.mkdir(parents=True)
+    binary = folder / 'codex.exe'
+    binary.write_bytes(content or name.encode())
+    digest = hashlib.sha256(binary.read_bytes()).hexdigest()
+    manifest = dict(runtime=str(binary), sha256=digest, files={'codex.exe': digest}, build_profile='release',
+                    migrations=MIGRATIONS)
+    manifest.update(fields)
+    candidate = folder / 'candidate.json'
+    atomic_json(candidate, manifest)
+    return candidate, digest
+
+
+def handoff_evidence(root, digest, name='fixture'):
+    """Completed same-runtime handoff validation for a release without shared execution."""
+    evidence = Path(root) / 'artifacts/results' / name / 'report.json'
+    atomic_json(evidence, dict(status='PASS', finished_at='complete', runtime_sha256=digest,
+                               checks={'proof': True}, parent_thread_id='root', transfers=[
+                                   dict(writer_release_verified=True, binding_reloaded=True,
+                                        root_thread_id='root') for _ in range(2)]))
+    return evidence
 
 
 def migrated_store(path, checksum):
@@ -38,7 +66,7 @@ class RuntimeActivationTests(unittest.TestCase):
             binary = release / 'codex.exe'; binary.write_bytes(b'shared fixture')
             digest = hashlib.sha256(binary.read_bytes()).hexdigest()
             candidate = release / 'candidate.json'
-            atomic_json(candidate, dict(runtime=str(binary), sha256=digest,
+            atomic_json(candidate, dict(runtime=str(binary), sha256=digest, build_profile='release', migrations=MIGRATIONS,
                 capabilities={'shared_record_execution': True}, files={'codex.exe': digest}))
             evidence = root / 'artifacts/results/shared/report.json'
             report = dict(status='PASS', finished_at='complete', runtime_sha256=digest,
@@ -61,8 +89,8 @@ class RuntimeActivationTests(unittest.TestCase):
             binary.write_bytes(b'isolated fixture')
             digest = hashlib.sha256(binary.read_bytes()).hexdigest()
             candidate = release / 'candidate.json'
-            atomic_json(candidate, dict(runtime=str(binary), sha256=digest,
-                                        files={'codex.exe': digest}))
+            atomic_json(candidate, dict(runtime=str(binary), sha256=digest, build_profile='release',
+                                        migrations=MIGRATIONS, files={'codex.exe': digest}))
             evidence = root / 'artifacts/results/fixture/report.json'
             report = dict(status='PASS', finished_at='complete', runtime_sha256=digest,
                           checks={'proof': True}, parent_thread_id='root', transfers=[
@@ -98,7 +126,7 @@ class RuntimeActivationTests(unittest.TestCase):
                                sha384=hashlib.sha384(THREADS_CRLF).hexdigest())]
             candidate = release / 'candidate.json'
             atomic_json(candidate, dict(runtime=str(binary), sha256=digest, files={'codex.exe': digest},
-                                        migrations=migrations))
+                                        build_profile='release', migrations=migrations))
             evidence = root / 'artifacts/results/fixture/report.json'
             atomic_json(evidence, dict(status='PASS', finished_at='complete', runtime_sha256=digest,
                                        checks={'proof': True}, parent_thread_id='root', transfers=[
@@ -129,3 +157,75 @@ class RuntimeActivationTests(unittest.TestCase):
             self.assertEqual(activate(candidate, evidence, root)['sha256'], digest)
             self.assertEqual(json.loads(previous.read_text(encoding='utf-8'))['sha256'], digest)
             self.assertEqual(json.loads(pointer.read_text(encoding='utf-8'))['migrations'], migrations)
+
+    def test_debug_builds_releases_without_migrations_and_unchecked_cross_builds_are_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            candidate, digest = stage_release(root, 'cross')
+            runner = candidate.with_name('codex-command-runner.exe')
+            runner.write_bytes(b'runner fixture')
+            base = json.loads(candidate.read_text(encoding='utf-8'))
+            base['files'] = {'codex.exe': digest, runner.name: hashlib.sha256(runner.read_bytes()).hexdigest()}
+            evidence = handoff_evidence(root, digest)
+            pointer = root / 'artifacts/manager-runtime/current.json'
+            cross = dict(build_origin='linux-cross-xwin')
+            for changes, removed, message in (
+                    (dict(build_profile='debug'), (), 'Only release builds'),
+                    ({}, ('build_profile',), 'Only release builds'),
+                    ({}, ('migrations',), 'no embedded migrations'),
+                    (dict(migrations=[]), (), 'no embedded migrations'),
+                    (cross, (), 'PE checks'),
+                    (dict(cross, pe_checks={'codex': {'stack_reserve': 8388608}}), (), 'PE checks')):
+                with self.subTest(changes=changes, removed=removed):
+                    manifest = {key: value for key, value in {**base, **changes}.items() if key not in removed}
+                    atomic_json(candidate, manifest)
+                    with self.assertRaisesRegex(ValueError, message):
+                        activate(candidate, evidence, root)
+                    self.assertFalse(pointer.exists())
+            checks = {'codex': {'stack_reserve': 8388608}, 'codex-command-runner': {'stack_reserve': 8388608}}
+            atomic_json(candidate, dict(base, **cross, pe_checks=checks))
+            self.assertEqual(activate(candidate, evidence, root)['sha256'], digest)
+            self.assertEqual(json.loads(pointer.read_text(encoding='utf-8'))['pe_checks'], checks)
+
+    def test_known_bad_release_is_refused_by_folder_or_digest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            candidate, digest = stage_release(root, '20261001-000000-aaaaaa')
+            evidence = handoff_evidence(root, digest)
+            bad = root / 'artifacts/manager-runtime/known-bad.json'
+            pointer = root / 'artifacts/manager-runtime/current.json'
+            for entry in (dict(sha256=digest, reason='exited at startup'), dict(release=candidate.parent.name)):
+                with self.subTest(entry=entry):
+                    atomic_json(bad, dict(version=1, releases=[entry]))
+                    with self.assertRaisesRegex(ValueError, 'known-bad.json'):
+                        activate(candidate, evidence, root)
+                    self.assertFalse(pointer.exists())
+            bad.write_text('{not json', encoding='utf-8')
+            with self.assertRaisesRegex(ValueError, 'known-bad.json is unreadable'):
+                activate(candidate, evidence, root)
+            self.assertFalse(pointer.exists())
+            atomic_json(bad, dict(version=1, releases=[dict(release='another', sha256='0' * 64)]))
+            self.assertEqual(activate(candidate, evidence, root)['sha256'], digest)
+
+    def test_previous_pointer_never_names_a_missing_or_changed_release(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            pointer = root / 'artifacts/manager-runtime/current.json'
+            previous = pointer.with_name('previous.json')
+            first, first_digest = stage_release(root, 'first')
+            second, second_digest = stage_release(root, 'second')
+            third, third_digest = stage_release(root, 'third')
+            activate(first, handoff_evidence(root, first_digest, 'first'), root)
+            # The active release folder was deleted (as revision 118's cross build was).
+            shutil.rmtree(first.parent)
+            self.assertEqual(activate(second, handoff_evidence(root, second_digest, 'second'), root)['sha256'],
+                             second_digest)
+            self.assertFalse(previous.exists())
+            activate(third, handoff_evidence(root, third_digest, 'third'), root)
+            self.assertEqual(json.loads(previous.read_text(encoding='utf-8'))['sha256'], second_digest)
+            # A changed active binary is no fallback either; the last good previous.json stays.
+            (second.parent / 'codex.exe').write_bytes(b'changed')
+            atomic_json(pointer, json.loads(second.read_text(encoding='utf-8')))
+            activate(third, handoff_evidence(root, third_digest, 'third'), root)
+            self.assertEqual(json.loads(previous.read_text(encoding='utf-8'))['sha256'], second_digest)
+            self.assertEqual(json.loads(pointer.read_text(encoding='utf-8'))['sha256'], third_digest)

@@ -6,6 +6,7 @@ separately. No raw RPCs, credentials, prompts, or command output are logged here
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -137,6 +138,10 @@ def proxy(runtime: Path, arguments: list[str], observer_path: Path, profile_id: 
                              env=runtime_environment(source_environment),
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                              stderr=None, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+    started = time.monotonic()
+    # Set once the child exits. A runtime that refuses its stores exits before
+    # initialize completes; stderr stays inherited (a pipe here could deadlock).
+    last_exit = None
     from manager_core.catalog_projection import CatalogProjectionIds
     projections = CatalogProjectionIds(source_environment.get('CODEX_MANAGER_SHARED_CATALOG')
                                        or source_environment.get('CODEX_MANAGER_RECORD_CATALOG'))
@@ -274,6 +279,8 @@ def proxy(runtime: Path, arguments: list[str], observer_path: Path, profile_id: 
                 value['maintenance']['pendingMutationCount'] += admin_broker.pending_mutation_count()
             if auth.account_fingerprint is not None:
                 value['auth_binding']['account_fingerprint'] = auth.account_fingerprint
+            if last_exit is not None:
+                value['last_exit'] = dict(last_exit)
         try:
             temporary.write_text(json.dumps(value, ensure_ascii=False), encoding='utf-8')
             os.replace(temporary, target)
@@ -430,6 +437,9 @@ def proxy(runtime: Path, arguments: list[str], observer_path: Path, profile_id: 
                 app_bridge_state = 'unavailable'
         threading.Thread(target=publish_app_connection, daemon=True).start()
     exit_code = child.wait()
+    last_exit = dict(exit_code=exit_code, uptime_ms=int((time.monotonic() - started) * 1000),
+                     initialize_completed=observer.initialize_succeeded,
+                     exited_at=datetime.now(timezone.utc).isoformat())
     outgoing.join(timeout=5)
     stop.set()
     if record_signals is not None:

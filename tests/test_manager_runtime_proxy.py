@@ -198,6 +198,31 @@ raise SystemExit(proxy(Path(sys.executable),[sys.argv[2],'app-server'],Path(sys.
             self.assertFalse(data['connected'])
             self.assertFalse(data['safe_to_restart'])
             self.assertEqual(data['profile_id'], profile_id)
+            self.assertEqual((data['last_exit']['exit_code'], data['last_exit']['initialize_completed']), (0, True))
+
+    def test_runtime_exit_before_initialize_is_recorded(self):
+        # Like a runtime refusing its stores: it exits at startup, before any reply.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake = root / 'runtime.py'
+            fake.write_text('import sys\nsys.stderr.write("failed to initialize\\n")\nraise SystemExit(3)\n',
+                            encoding='utf-8')
+            bootstrap = root / 'bootstrap.py'
+            bootstrap.write_text("import sys,os\nfrom pathlib import Path\nsys.path.insert(0,sys.argv[1])\nfrom manager_core.runtime_proxy import proxy\nraise SystemExit(proxy(Path(sys.executable),[sys.argv[2]],Path(sys.argv[3]),sys.argv[4],dict(os.environ)))\n", encoding='utf-8')
+            environment = {key: value for key, value in os.environ.items() if not key.upper().startswith('CODEX_')}
+            environment.update(CODEX_HOME=str(root), CODEX_MANAGER_REAL_RUNTIME=sys.executable)
+            snapshot = root / 'observer.json'
+            response = subprocess.run([sys.executable, str(bootstrap), str(SCRIPT_ROOT), str(fake), str(snapshot),
+                                       str(uuid4())], env=environment, capture_output=True, timeout=15,
+                                      input=json.dumps({'id': 1, 'method': 'initialize', 'params': {}}).encode() + b'\n')
+            self.assertEqual(response.returncode, 3)
+            # The runtime's own stderr is inherited, never piped through the proxy.
+            self.assertIn(b'failed to initialize', response.stderr)
+            last_exit = json.loads(snapshot.read_text(encoding='utf-8'))['last_exit']
+            self.assertEqual((last_exit['exit_code'], last_exit['initialize_completed']), (3, False))
+            self.assertIsInstance(last_exit['uptime_ms'], int)
+            self.assertGreaterEqual(last_exit['uptime_ms'], 0)
+            self.assertTrue(last_exit['exited_at'].endswith('+00:00'))
 
     def test_native_identity_gate_rejects_execution_before_runtime_receives_it(self):
         with tempfile.TemporaryDirectory() as directory:

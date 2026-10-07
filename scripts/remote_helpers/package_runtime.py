@@ -33,6 +33,9 @@ from manager_core.remote import ARCHES, REMOTE_CAPABILITY_MARKERS, _verify_elf
 # which `-j` alone does not.
 SERVER_BUILD_JOBS = 64
 SERVER_BUILD_CPUS = "0-31,64-95"
+# Generous: a codex that still carries its line tables is ~1.4 GB, and every
+# SSH host would download it.
+MAX_STRIPPED_CODEX_BYTES = 600 * 1024 * 1024
 
 
 def parse_cpus(text):
@@ -188,6 +191,10 @@ def build(root=ROOT, *, build_cache=None, jobs=SERVER_BUILD_JOBS):
         subprocess.run(["strip", "--strip-debug", "--strip-unneeded", str(copy)], check=True)
     binary = staged / "codex"
     companion = staged / "codex-code-mode-host"
+    size = binary.stat().st_size
+    if size > MAX_STRIPPED_CODEX_BYTES:
+        raise RuntimeError("The stripped codex is %d MB, above the %d MB limit; strip probably kept its debug "
+                           "sections. Nothing was published." % (size // 2**20, MAX_STRIPPED_CODEX_BYTES // 2**20))
     for file in (binary, companion, bwrap):
         _verify_elf(file, arch)
     if not contains_marker(binary, b"external_agents"):
