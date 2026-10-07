@@ -37,9 +37,14 @@ _DIGEST_LIMIT = 8192
 # changes its folder's mtime, so a new link falls back to the full check.
 _verified = OrderedDict()
 _verified_lock = threading.Lock()
-# Normalized home -> the request queued behind its running background job.
+# Normalized home -> [the request queued behind its running background job,
+# an Event set when that job has ended].
 _jobs = {}
 _jobs_lock = threading.Lock()
+# A background pass is recorded only if it failed, changed files or took this
+# long; a remembered check on every selection would crowd out launch timings.
+_SLOW_PASS_SECONDS = 1.0
+_STAGE = re.compile(r'\.manager-stage-[0-9a-f]{32}')
 
 
 def _plain(path):
@@ -286,6 +291,7 @@ def ensure(home, executable):
     parent.mkdir(parents=True, exist_ok=True)
     target = _inside(parent, parent / version)
     with _locked(parent):
+        _sweep(parent)
         # Stamps taken before and after one verification prove that the
         # verified bytes are the stamped ones.
         before, folders, published = _stamps(target, expected), {}, {}
@@ -302,6 +308,30 @@ def ensure(home, executable):
                       {name: expected[name] for name in published['fresh']},
                       frozenset(name for name, (_, mtime) in published['folders'].items() if mtime > limit))
         return result
+
+
+def _sweep(parent):
+    """Remove staging folders that an interrupted earlier call left behind.
+
+    Called only under _locked(parent). Every Browser stage of this home is made
+    under that lock, so none of these belongs to a running call. A background
+    job is a daemon thread, so a manager exit can stop it before its cleanup.
+    Older managers staged inside the Browser folder itself. A folder that
+    cannot be proven plain, or removed now, is left for a later call.
+    """
+    for folder in (parent.parent.parent, parent):
+        try:
+            stale = [path for path in folder.iterdir() if _STAGE.fullmatch(path.name)]
+        except OSError:
+            continue
+        for path in stale:
+            try:
+                path = _inside(folder, path)
+                if path.is_dir():
+                    _inventory(path)  # Rejects links inside it; bounded.
+                    shutil.rmtree(path)
+            except (OSError, ValueError):
+                pass
 
 
 def _publish(source, parent, target, version, expected, folders=None, published=None):
@@ -364,10 +394,10 @@ def ensure_later(home, executable, *, metrics=None, profile_id=None):
     Selecting a running profile or opening its task never waits for, or fails
     on, a Browser repair. One job runs per home; a request while it runs
     queues one more pass with its own arguments, so a change after the running
-    pass's check is still seen. Each pass is recorded in the launch metrics,
-    a failure by its exception class only. Returns the started thread, or None
-    when the request was queued behind a running job, or there is nothing to
-    prepare or no thread to prepare it now.
+    pass's check is still seen. A pass is recorded in the launch metrics only
+    if it failed (by its exception class), changed files or was slow. Returns
+    the started thread, or None when the request was queued behind a running
+    job, or there is nothing to prepare or no thread to prepare it now.
     """
     try:
         bundled = _source(executable).exists()
@@ -375,43 +405,72 @@ def ensure_later(home, executable, *, metrics=None, profile_id=None):
         bundled = True  # The job records why it cannot check.
     if not bundled:
         return None  # Desktop editions without Browser.
-    key = os.path.normcase(os.path.abspath(home))
+    key = _job_key(home)
     request = (home, executable, metrics, profile_id)
     with _jobs_lock:
         if key in _jobs:
-            _jobs[key] = request
+            _jobs[key][0] = request
             return None
-        _jobs[key] = None
-    thread = threading.Thread(target=_run_later, args=(key, request),
+        job = _jobs[key] = [None, threading.Event()]
+    thread = threading.Thread(target=_run_later, args=(key, job, request),
                               name='browser-bundle-repair', daemon=True)
     try:
         thread.start()
     except RuntimeError:
         # No thread is available now; the next selection asks again.
-        with _jobs_lock:
-            _jobs.pop(key, None)
+        _end_job(key, job)
         return None
     return thread
 
 
-def _run_later(key, request):
+def settle(home, timeout=60):
+    """Let this home's background job finish before a launch prepares Browser.
+
+    The job holds the Browser lock during a full check or repair, and a
+    launch's ensure() would fail after waiting 10 s for it. A pass still
+    queued is dropped: the launch prepares the version it starts in place.
+    Returns False if a job is still running at the timeout.
+    """
+    key = _job_key(home)
+    deadline = time.monotonic() + timeout
+    while True:
+        with _jobs_lock:
+            job = _jobs.get(key)
+            if job is not None:
+                job[0] = None
+        if job is None:
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not job[1].wait(remaining):
+            return False
+
+
+def _job_key(home):
+    return os.path.normcase(os.path.abspath(home))
+
+
+def _end_job(key, job):
+    with _jobs_lock:
+        if _jobs.get(key) is job:
+            del _jobs[key]
+    job[1].set()
+
+
+def _run_later(key, job, request):
     try:
         while request is not None:
             home, executable, metrics, profile_id = request
-            started, error = time.perf_counter(), None
+            started, error, changed = time.perf_counter(), None, 0
             try:
-                ensure(home, executable)
+                changed = ensure(home, executable).get('changed_files', 0)
             except Exception as failure:
                 error = type(failure).__name__  # The message can carry paths.
-            if metrics is not None:
+            if metrics is not None and (error is not None or changed
+                                        or time.perf_counter() - started >= _SLOW_PASS_SECONDS):
                 metrics.record(profile_id, 'browser_bundle_background', started, error is None, error=error)
             with _jobs_lock:
-                request = _jobs[key]
-                if request is None:
+                request, job[0] = job[0], None
+                if request is None and _jobs.get(key) is job:
                     del _jobs[key]
-                else:
-                    _jobs[key] = None
-    except BaseException:
-        with _jobs_lock:
-            _jobs.pop(key, None)
-        raise
+    finally:
+        _end_job(key, job)

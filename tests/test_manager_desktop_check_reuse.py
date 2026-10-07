@@ -7,7 +7,7 @@ import sys
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 from manager_core.instances import Instances
@@ -27,7 +27,7 @@ class DesktopCheckReuseTests(unittest.TestCase):
         (installed / 'ChatGPT.exe').write_bytes(b'installed program')
         self.installed = dict(executable=str(installed / 'ChatGPT.exe'), Version='26.900.1.0')
         self.copy = self.root / 'artifacts/managed-desktop/26.900.1.0-fixture'
-        for name, data in {'ChatGPT.exe': b'program', 'chrome.dll': b'library',
+        for name, data in {'ChatGPT.exe': b'program', 'chrome.dll': b'library', 'vulkan-1.dll': b'top-level library',
                            'resources/app.asar': b'patched archive', 'locales/en-US.pak': b'resource'}.items():
             (self.copy / name).parent.mkdir(parents=True, exist_ok=True)
             (self.copy / name).write_bytes(data)
@@ -60,7 +60,87 @@ class DesktopCheckReuseTests(unittest.TestCase):
             self.assertEqual(self.check(), self.app)
         self.assertEqual(self.prepare.call_count, 1)
         checked = {Path(call.args[0]).relative_to(self.copy).as_posix() for call in lstat.call_args_list}
-        self.assertEqual(checked, set(self.HASHED))  # not the copy's other files
+        self.assertEqual(checked, {*self.HASHED, 'vulkan-1.dll'})  # not the copy's deeper files
+        self.assertLessEqual(Instances.DESKTOP_REUSE_SECONDS, 30)  # one launch wave, not later relaunches
+
+    def test_lost_top_level_library_is_found_while_reused(self):
+        self.check()
+        (self.copy / 'vulkan-1.dll').unlink()  # e.g. quarantined by antivirus software
+        self.check()
+        self.assertEqual(self.prepare.call_count, 2)
+
+    def test_hashed_file_replaced_by_a_link_is_never_reused(self):
+        if os.name != 'nt':
+            self.skipTest('junctions are Windows-only')
+        import _winapi
+        self.check()
+        outside = self.root / 'outside'
+        outside.mkdir()
+        (self.copy / 'chrome.dll').unlink()
+        _winapi.CreateJunction(str(outside), str(self.copy / 'chrome.dll'))
+        self.check()
+        self.assertEqual(self.prepare.call_count, 2)
+        os.rmdir(self.copy / 'chrome.dll')
+
+    def test_relaunch_of_a_profile_gets_a_check_that_started_after_it_asked(self):
+        for profile_id in ('first', 'second'):  # first launches of one wave
+            self.instances._join_desktop_wave(profile_id)
+            self.check()
+        self.assertEqual(self.prepare.call_count, 1)
+        self.instances._join_desktop_wave('first')  # its desktop exited; it launches again
+        self.check()
+        self.assertEqual(self.prepare.call_count, 2)
+        self.instances._join_desktop_wave('third')  # the new check serves the rest of the wave
+        self.check()
+        self.assertEqual(self.prepare.call_count, 2)
+
+    def test_check_running_when_reuse_is_distrusted_is_not_reused(self):
+        def distrusted_meanwhile(root, installed):
+            self.instances._distrust_desktop_checks()  # e.g. another launch failed
+            return dict(self.app)
+        self.prepare.side_effect = distrusted_meanwhile
+        self.check()
+        self.prepare.side_effect = lambda root, installed: dict(self.app)
+        self.check()
+        self.check()
+        self.assertEqual(self.prepare.call_count, 2)
+
+    def test_launch_failing_after_the_desktop_check_ends_its_reuse(self):
+        store = self.instances.store
+        profiles = [store.add_profile(name)['id'] for name in ('first', 'second', 'third')]
+        installed = self.enterContext(patch.object(self.instances, 'installed_app', return_value=dict(self.installed)))
+        self.enterContext(patch.object(self.instances, 'observe', return_value=dict(status='stopped')))
+        self.enterContext(patch.object(self.instances, 'prepare', return_value={}))
+        self.enterContext(patch('manager_core.login_health.require'))
+        failure = self.enterContext(patch.object(self.instances, '_launch_prepared',
+                                                 return_value=dict(state='launched')))
+        self.instances._show(profiles[0])
+        self.instances._show(profiles[1])
+        self.assertEqual(self.prepare.call_count, 1)  # one wave
+        failure.side_effect = OSError('fixture spawn failure')
+        with self.assertRaises(OSError):
+            self.instances._show(profiles[2])
+        self.assertEqual(self.prepare.call_count, 1)
+        failure.side_effect = None
+        self.instances._show(store.add_profile('fourth')['id'])
+        self.assertEqual(self.prepare.call_count, 2)  # the failure ended the reuse
+        self.assertTrue(installed.called)
+
+    def test_desktop_exiting_before_its_window_ends_the_reuse(self):
+        store = self.instances.store
+        profile = store.add_profile('fixture')
+        lifetime = dict(generation='fixture', process_id=4242, process_created=1, executable_path='fixture.exe')
+        store.mutate(lambda data: store.profile(profile['id'], data).update(lifetime))
+        process = Mock(pid=4242)
+        process.poll.return_value = 1  # exited during startup
+        self.instances.processes[profile['id']] = process
+        self.check()
+        with patch('manager_core.instances.main_window', return_value=None), \
+                patch('manager_core.instances.process_identity', return_value=None):
+            self.instances._finish_show(dict(state='launched', profile_id=profile['id'],
+                                             profile={**store.profile(profile['id']), **lifetime}))
+        self.check()
+        self.assertEqual(self.prepare.call_count, 2)
 
     def test_changed_hashed_file_is_found_by_its_digest_while_reused(self):
         self.check()

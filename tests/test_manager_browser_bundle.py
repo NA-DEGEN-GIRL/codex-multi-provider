@@ -244,7 +244,7 @@ class BrowserBundleTests(unittest.TestCase):
             calls.append(home)
             started.set()
             release.wait(10)
-            return dict(state='ready')
+            return dict(state='repaired', changed_files=1)  # recorded in the metrics
         metrics = Mock()
         other = self.root / 'other-profile'
         with patch.object(bundle, 'ensure', side_effect=slow):
@@ -267,6 +267,138 @@ class BrowserBundleTests(unittest.TestCase):
         with patch.object(bundle, 'ensure', side_effect=AssertionError('not bundled')):
             self.assertIsNone(bundle.ensure_later(self.home, self.root / 'older/ChatGPT.exe'))
         self.assertFalse(self.home.exists())
+
+    def test_background_pass_is_recorded_only_if_it_failed_changed_files_or_was_slow(self):
+        self.ensure()
+        metrics = Mock()
+        def run():
+            thread = bundle.ensure_later(self.home, self.executable, metrics=metrics, profile_id='fixture')
+            thread.join(10)
+            self.assertFalse(thread.is_alive())
+        with patch.object(bundle, '_SLOW_PASS_SECONDS', 60):
+            run()  # a quick pass that changed nothing, as on most selections
+            metrics.record.assert_not_called()
+            (self.target / 'scripts/browser-service.mjs').unlink()
+            run()
+            self.assertEqual(metrics.record.call_count, 1)  # the repair
+        with patch.object(bundle, '_SLOW_PASS_SECONDS', 0):
+            run()
+        self.assertEqual(metrics.record.call_count, 2)  # a slow pass, though nothing changed
+        self.assertEqual([call.args[1] for call in metrics.record.call_args_list], ['browser_bundle_background'] * 2)
+        self.assert_bundle()
+
+    def test_launch_settles_the_homes_background_job_and_drops_its_queued_pass(self):
+        started, release, calls = threading.Event(), threading.Event(), []
+        def slow(home, executable):
+            calls.append(executable)
+            started.set()
+            release.wait(10)
+            return dict(state='ready')
+        with patch.object(bundle, 'ensure', side_effect=slow):
+            thread = bundle.ensure_later(self.home, self.executable)
+            self.assertTrue(started.wait(10))
+            self.assertIsNone(bundle.ensure_later(self.home, self.executable, profile_id='queued'))
+            self.assertFalse(bundle.settle(self.home, timeout=.1))  # still holds the lock
+            timer = threading.Timer(.2, release.set)
+            timer.start()
+            self.addCleanup(timer.cancel)
+            self.assertTrue(bundle.settle(self.home, timeout=10))
+            self.assertNotIn(os.path.normcase(os.path.abspath(self.home)), bundle._jobs)
+            thread.join(10)
+        self.assertEqual(len(calls), 1)  # the launch prepares in place instead
+        self.assertTrue(bundle.settle(self.home, timeout=0))  # no job: no wait
+
+    def test_launch_waits_for_a_background_check_holding_its_browser_lock(self):
+        from manager_core.instances import Instances
+        store = Store(self.root)
+        profile = store.add_profile('fixture')
+        home = Path(profile['home'])
+        parent = home / 'plugins/cache/openai-bundled/browser'
+        parent.mkdir(parents=True)
+        instances = Instances(self.root, store, None)
+        entered, release, seen, real = threading.Event(), threading.Event(), [], bundle.ensure
+        def tracked(home, executable):
+            if threading.current_thread().name == 'browser-bundle-repair':
+                with bundle._locked(bundle._plain(parent)):
+                    entered.set()
+                    release.wait(10)  # a full check or repair holding the lock
+            else:
+                seen.append(os.path.normcase(os.path.abspath(home)) in bundle._jobs)
+            return real(home, executable)
+        class Stop(Exception):
+            pass
+        app = dict(executable=str(self.executable), Version='26.900.1.0', desktop_isolation_revision='fixture')
+        with patch.object(bundle, 'ensure', side_effect=tracked), \
+                patch.object(instances, 'observe', return_value=dict(status='stopped')), \
+                patch.object(instances, 'prepare', return_value={}), \
+                patch.object(instances, 'installed_app', return_value=dict(app)), \
+                patch.object(instances, 'environment', side_effect=Stop), \
+                patch('manager_core.desktop_bundle.prepare', return_value=dict(app)), \
+                patch('manager_core.runtime_build.resolve', return_value=dict(capabilities={})), \
+                patch('manager_core.login_health.require'):
+            self.assertIsNotNone(bundle.ensure_later(home, self.executable))
+            self.assertTrue(entered.wait(10))
+            timer = threading.Timer(.3, release.set)
+            timer.start()
+            self.addCleanup(timer.cancel)
+            with self.assertRaises(Stop):  # stopped right after the Browser phase
+                instances._show(profile['id'])
+            self.join_background()
+        self.assertEqual(seen, [False])  # the launch's own check started after the job ended
+        self.assertTrue((parent / self.version / 'scripts/browser-service.mjs').is_file())
+
+    def test_job_without_a_thread_is_ended_for_the_next_request_and_launch(self):
+        with patch.object(threading.Thread, 'start', side_effect=RuntimeError("can't start new thread")):
+            self.assertIsNone(bundle.ensure_later(self.home, self.executable))
+        self.assertNotIn(os.path.normcase(os.path.abspath(self.home)), bundle._jobs)
+        self.assertTrue(bundle.settle(self.home, timeout=0))
+        thread = bundle.ensure_later(self.home, self.executable)
+        self.assertIsNotNone(thread)
+        thread.join(10)
+        self.assert_bundle()
+
+    def test_stale_staging_folders_are_swept_under_the_browser_lock(self):
+        cache = self.home / 'plugins/cache'
+        stale = [cache / ('.manager-stage-' + 'a' * 32), self.parent / ('.manager-stage-' + 'b' * 32)]
+        for folder in stale:  # an interrupted job, and an older manager's stage in the plugin folder
+            (folder / 'scripts').mkdir(parents=True)
+            (folder / 'scripts/browser-service.mjs').write_bytes(b'partial')
+        kept = [cache / '.manager-stage-not-ours', self.parent / '26.100.1']
+        for folder in kept:
+            folder.mkdir(parents=True)
+            (folder / 'keep').write_bytes(b'kept')
+        self.assertEqual(self.ensure()['state'], 'prepared')
+        self.assertFalse(any(folder.exists() for folder in stale))
+        self.assertTrue(all((folder / 'keep').read_bytes() == b'kept' for folder in kept))
+        self.assert_bundle()
+
+    def test_stale_staging_folder_with_a_link_inside_is_left_alone(self):
+        if os.name != 'nt':
+            self.skipTest('junctions are Windows-only')
+        import _winapi
+        outside = self.root / 'outside'
+        outside.mkdir()
+        (outside / 'keep.js').write_bytes(b'untouched')
+        stale = self.home / 'plugins/cache' / ('.manager-stage-' + 'c' * 32)
+        stale.mkdir(parents=True)
+        _winapi.CreateJunction(str(outside), str(stale / 'linked'))
+        self.assertEqual(self.ensure()['state'], 'prepared')  # never blocks the call
+        self.assertTrue((stale / 'linked').exists())
+        self.assertEqual((outside / 'keep.js').read_bytes(), b'untouched')
+        os.rmdir(stale / 'linked')  # the junction only, before the fixture cleanup
+
+    def test_listing_a_just_changed_folder_rejects_a_link(self):
+        if os.name != 'nt':
+            self.skipTest('junctions are Windows-only')
+        import _winapi
+        self.ensure()
+        folders = {Path(): None, Path('scripts'): None}
+        self.assertTrue(bundle._listed(self.target, Path('scripts'), folders))
+        outside = self.root / 'outside'
+        outside.mkdir()
+        _winapi.CreateJunction(str(outside), str(self.target / 'scripts/linked'))
+        self.assertFalse(bundle._listed(self.target, Path('scripts'), folders))
+        os.rmdir(self.target / 'scripts/linked')
 
     def test_repair_stages_only_changed_files_outside_the_plugin_folder(self):
         copied, real_copy = [], bundle.shutil.copyfile
