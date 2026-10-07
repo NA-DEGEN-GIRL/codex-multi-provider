@@ -506,7 +506,10 @@ class RealPreparationParallelTests(unittest.TestCase):
             self.assertEqual(result['state'], 'launched')
             common = result['preparation']['common']
             self.assertEqual(common['personal_skills']['errors'], [])
-            self.assertEqual(common['shared_plugins']['errors'], [])
+            # A launch that meets another launch's plugin pass skips it instead of waiting.
+            plugins = common['shared_plugins']
+            self.assertEqual(['busy'] if plugins.get('busy') else [],
+                             [error.get('code') for error in plugins['errors']])
             self.assertEqual(result['preparation']['browser_plugin']['state'], 'prepared')
             home = Path(result['profile']['home'])
             config = tomllib.loads((home / 'config.toml').read_text(encoding='utf-8'))
@@ -516,6 +519,8 @@ class RealPreparationParallelTests(unittest.TestCase):
             self.assertEqual(config['subagent_model_selection'], 'automatic')
             self.assertTrue(any(rule.get('path', '').endswith('SKILL.md') for rule in config['skills']['config']))
             self.assertTrue((home / 'plugins/cache/openai-bundled/browser/1.2.3/scripts/browser-service.mjs').is_file())
+        self.assertTrue(any(not call.results[0]['preparation']['common']['shared_plugins'].get('busy')
+                            for call in calls))
         stored = {p['id']: p for p in self.store.read()['profiles']}
         self.assertEqual({stored[p]['status'] for p in self.profiles}, {'running'})
         self.assertEqual(len({stored[p]['process_id'] for p in self.profiles}), 3)

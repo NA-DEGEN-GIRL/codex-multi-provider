@@ -1,4 +1,6 @@
 """Shared plugin mirror tests using only temporary synthetic homes."""
+import contextlib
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -15,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 from manager_core import plugin_sync
 from manager_core.plugin_sync import MARKETPLACE, PluginSync, edit_config, inventory, signature
 from manager_core.store import Store
+from manager_core.updates import _lock_file, _unlock_file
 
 
 SKILL = '---\nname: demo\ndescription: Synthetic mirror skill.\n---\n\nBody.\n'
@@ -40,6 +43,9 @@ class PluginSyncTests(unittest.TestCase):
                 profile['home'] = str(self.homes[profile['alias']])
         self.store.mutate(relink)
         self.sync = PluginSync(self.store, source=self.original)
+        for cache in (plugin_sync._config_cache, plugin_sync._marker_cache):
+            cache.clear()
+            self.addCleanup(cache.clear)
 
     def install_native(self, home, *, plugin='github', marketplace='openai-curated-remote',
                        version='1.0.0', marker=True, link=False, modified=None):
@@ -142,6 +148,253 @@ class PluginSyncTests(unittest.TestCase):
             self.assertTrue((self.mirror(home) / '1.0.0/skills/demo/extra.txt').is_file())
         self.assertEqual(0, self.sync.reconcile(force=True)['applied'])
         self.assertEqual(second, self.signal()['revision'])
+
+    def test_marker_rewrite_with_same_content_keeps_the_generation(self):
+        base = self.install_native(self.homes['02'])
+        self.sync.reconcile(force=True)
+        first = self.signal()['revision']
+        generation = self.sync.status()['shared']['github']['source_generation']
+        marker = base / '.codex-remote-plugin-install.json'
+        # A desktop rewrite: same install identity, other formatting, newer time.
+        marker.write_text(json.dumps({'remote_plugin_id': 'plugin_synthetic', 'schema_version': 1},
+                                     indent=2) + '\n', encoding='utf-8')
+        later = time.time() + 30
+        os.utime(marker, (later, later))
+        self.assertEqual(0, self.sync.reconcile(force=True)['applied'])
+        self.assertEqual(first, self.signal()['revision'])
+        record = self.sync.status()['shared']['github']
+        self.assertEqual(generation, record['source_generation'])
+        self.assertNotIn('previous_generation', record)
+        # A reinstall changes the identity; the registry names the plugin that moved.
+        marker.write_text(json.dumps({'schema_version': 1, 'remote_plugin_id': 'plugin_reinstalled'}),
+                          encoding='utf-8')
+        self.assertGreaterEqual(self.sync.reconcile(force=True)['applied'], 1)
+        self.assertNotEqual(first, self.signal()['revision'])
+        record = self.sync.status()['shared']['github']
+        self.assertNotEqual(generation, record['source_generation'])
+        self.assertEqual(generation, record['previous_generation'])
+        self.assertIs(int, type(record['generation_changed_at_ns']))
+        registry = json.loads((self.store.directory / 'plugin-sync.json').read_text(encoding='utf-8'))
+        self.assertEqual(generation, registry['shared']['github']['previous_generation'])
+        applied = json.loads((self.mirror(self.original) / plugin_sync._GENERATION_FILE)
+                             .read_text(encoding='utf-8'))
+        self.assertEqual(record['source_generation'], applied['generation'])
+
+    def test_marker_identity_ignores_formatting_and_counts_unreadable_bytes(self):
+        marker = self.root / 'marker.json'
+        self.assertEqual('0', plugin_sync._marker_identity(marker))
+        marker.write_text('{"schema_version": 1, "remote_plugin_id": "plugin_a"}', encoding='utf-8')
+        first = plugin_sync._marker_identity(marker)
+        marker.write_text('{\n  "remote_plugin_id": "plugin_a",\n  "schema_version": 1\n}\n',
+                          encoding='utf-8')
+        self.assertEqual(first, plugin_sync._marker_identity(marker))
+        marker.write_text('{"schema_version": 1, "remote_plugin_id": "plugin_b"}', encoding='utf-8')
+        self.assertNotEqual(first, plugin_sync._marker_identity(marker))
+        marker.write_text('{damaged', encoding='utf-8')
+        damaged = plugin_sync._marker_identity(marker)
+        marker.write_text('{damaged!', encoding='utf-8')
+        self.assertNotEqual(damaged, plugin_sync._marker_identity(marker))
+
+    def test_config_state_is_parsed_once_per_config_revision(self):
+        home = self.homes['03']
+        config = home / 'config.toml'
+        plugin_sync._config_cache.clear()
+        config.write_text('[plugins."github@openai-curated-remote"]\nenabled = true\n', encoding='utf-8')
+        settled = time.time() - 60
+        os.utime(config, (settled, settled))
+        with mock.patch.object(plugin_sync.tomllib, 'loads', wraps=tomllib.loads) as parse:
+            states, names = plugin_sync._config_state(home)
+            states['github@openai-curated-remote'] = False
+            names.append('mutated')
+            self.assertEqual(({'github@openai-curated-remote': True}, []),
+                             plugin_sync._config_state(home))
+            self.assertEqual(1, parse.call_count)
+            config.write_text('[plugins."github@openai-curated-remote"]\nenabled = false\n',
+                              encoding='utf-8')
+            os.utime(config, (settled + 1, settled + 1))
+            self.assertEqual({'github@openai-curated-remote': False},
+                             plugin_sync._config_state(home)[0])
+            self.assertEqual(2, parse.call_count)
+            # A file inside the settle window is parsed again on every call. It
+            # is dated ahead of now so no stall between calls can settle it.
+            config.write_text('model = "synthetic"\n', encoding='utf-8')
+            ahead = time.time() + 600
+            os.utime(config, (ahead, ahead))
+            plugin_sync._config_state(home)
+            plugin_sync._config_state(home)
+            self.assertEqual(4, parse.call_count)
+
+    def test_in_process_pass_returns_busy_without_waiting(self):
+        self.install_native(self.homes['02'])
+        held, release = threading.Event(), threading.Event()
+
+        def hold():
+            with self.sync.lock:
+                held.set()
+                release.wait(10)
+
+        worker = threading.Thread(target=hold, daemon=True)
+        worker.start()
+        self.assertTrue(held.wait(5))
+        try:
+            started = time.monotonic()
+            result = self.sync.reconcile(force=True)
+            elapsed = time.monotonic() - started
+        finally:
+            release.set()
+            worker.join(timeout=5)
+        self.assertTrue(result.get('busy'))
+        self.assertEqual(0, result['applied'])
+        self.assertLess(elapsed, 2)
+        self.assertFalse((self.store.directory / 'shared-plugins').exists())
+        self.assertFalse(self.mirror(self.original).exists())
+        self.assertFalse(self.sync.reconcile(force=True).get('busy'))
+        self.assertTrue((self.mirror(self.original) / '1.0.0').is_dir())
+
+    @contextlib.contextmanager
+    def watcher_pass_running(self):
+        """Hold the in-process pass lock from another thread, like a running watcher pass."""
+        held, release = threading.Event(), threading.Event()
+
+        def hold():
+            with self.sync.lock:
+                held.set()
+                release.wait(10)
+
+        worker = threading.Thread(target=hold, daemon=True)
+        worker.start()
+        self.assertTrue(held.wait(5))
+        try:
+            yield
+        finally:
+            release.set()
+            worker.join(timeout=5)
+
+    @contextlib.contextmanager
+    def other_process_pass_running(self):
+        """Hold the OS-owned pass lock, like a pass in another manager process."""
+        handle = _lock_file(self.sync.lock_path)
+        try:
+            yield
+        finally:
+            _unlock_file(handle)
+
+    def assert_busy_launch_converges_on_next_tick(self, running):
+        signal = self.store.directory / 'record-signals/plugins.json'
+        # An earlier idle pass leaves a stamp, so the later tick is not forced.
+        self.assertEqual([], self.sync.reconcile()['errors'])
+        before = self.signal()['revision'] if signal.exists() else None
+        self.install_native(self.homes['02'])
+        with running():
+            # Profile 03's launch meets the running pass and skips it.
+            launch = self.sync.reconcile()
+        self.assertTrue(launch.get('busy'))
+        self.assertEqual(['busy'], [error.get('code') for error in launch['errors']])
+        self.assertFalse(self.mirror(self.homes['03']).exists())
+        self.assertNotIn(MARKETPLACE, self.home(self.homes['03']).get('marketplaces', {}))
+        # One unforced watcher tick afterwards brings home 03 up to date.
+        tick = self.sync.reconcile()
+        self.assertFalse(tick.get('busy'))
+        self.assertEqual([], tick['errors'])
+        self.assertGreaterEqual(tick['applied'], 1)
+        self.assertTrue((self.mirror(self.homes['03']) / '1.0.0/.codex-plugin/plugin.json').is_file())
+        self.assertTrue((self.mirror(self.homes['03']) / '1.0.0/skills/demo/SKILL.md').is_file())
+        config = self.home(self.homes['03'])
+        self.assertEqual(str(self.store.directory / 'shared-plugins' / MARKETPLACE),
+                         config['marketplaces'][MARKETPLACE]['source'])
+        self.assertTrue(config['plugins'][f'github@{MARKETPLACE}']['enabled'])
+        after = self.signal()['revision']
+        self.assertNotEqual(before, after)
+        # Converged: the following tick is idle and does not signal again.
+        self.sync.reconcile()
+        self.assertEqual(after, self.signal()['revision'])
+
+    def test_launch_skipped_by_in_process_pass_converges_on_next_watcher_tick(self):
+        self.assert_busy_launch_converges_on_next_tick(self.watcher_pass_running)
+
+    def test_launch_skipped_by_other_process_pass_converges_on_next_watcher_tick(self):
+        self.assert_busy_launch_converges_on_next_tick(self.other_process_pass_running)
+
+    def track_opens(self, target):
+        """Patch ``Path.open`` and collect each open of ``target``."""
+        opened, real_open = [], Path.open
+
+        def tracking_open(path, *args, **kwargs):
+            if os.path.normcase(str(path)) == os.path.normcase(str(target)):
+                opened.append(path)
+            return real_open(path, *args, **kwargs)
+
+        return opened, mock.patch.object(Path, 'open', tracking_open)
+
+    def test_settled_marker_identity_is_cached_without_reopening_the_marker(self):
+        marker = self.root / 'marker.json'
+        staged = self.root / 'marker.json.tmp'
+
+        def replace(text, stamp):
+            # The runtime writes a temporary file and renames it over the marker.
+            staged.write_text(text, encoding='utf-8')
+            os.utime(staged, (stamp, stamp))
+            os.replace(staged, marker)
+
+        opened, tracking = self.track_opens(marker)
+        settled = time.time() - 60
+        replace('{"schema_version": 1, "remote_plugin_id": "plugin_a"}', settled)
+        with tracking:
+            first = plugin_sync._marker_identity(marker)
+            self.assertEqual(first, plugin_sync._marker_identity(marker))
+            self.assertEqual(first, plugin_sync._marker_identity(marker))
+        self.assertEqual(1, len(opened))
+        # Same size, other identity: the new mtime alone invalidates the cache.
+        replace('{"schema_version": 1, "remote_plugin_id": "plugin_b"}', settled + 1)
+        with tracking:
+            second = plugin_sync._marker_identity(marker)
+            self.assertEqual(second, plugin_sync._marker_identity(marker))
+        self.assertNotEqual(first, second)
+        self.assertEqual(2, len(opened))
+        # Inside the settle window every call reads the marker, because a
+        # same-size rewrite within one clock tick would keep a stale identity.
+        # It is dated ahead of now so no stall between calls can settle it.
+        ahead = time.time() + 600
+        replace('{"schema_version": 1, "remote_plugin_id": "plugin_c"}', ahead)
+        with tracking:
+            third = plugin_sync._marker_identity(marker)
+            self.assertEqual(third, plugin_sync._marker_identity(marker))
+        self.assertNotIn(third, (first, second))
+        self.assertEqual(4, len(opened))
+
+    def test_passes_do_not_reopen_a_settled_marker(self):
+        base = self.install_native(self.homes['02'])
+        marker = base / '.codex-remote-plugin-install.json'
+        settled = time.time() - 60
+        os.utime(marker, (settled, settled))
+        generation = inventory(self.homes['02'])['github']['generation']
+        opened, tracking = self.track_opens(marker)
+        with tracking:
+            self.assertEqual(generation, inventory(self.homes['02'])['github']['generation'])
+            self.assertEqual([], self.sync.reconcile(force=True)['errors'])
+            self.assertEqual([], self.sync.reconcile(force=True)['errors'])
+        self.assertEqual([], opened)
+        self.assertTrue((self.mirror(self.homes['03']) / '1.0.0').is_dir())
+
+    def test_deeply_nested_json_is_unreadable_instead_of_fatal(self):
+        nested = '[' * 200_000
+        document = self.root / 'nested.json'
+        document.write_text(nested, encoding='utf-8')
+        self.assertIsNone(plugin_sync._json_file(document, plugin_sync._MAX_MANIFEST_BYTES))
+        # A marker counts by its raw bytes, like any other marker that is not JSON.
+        self.assertEqual(hashlib.sha256(nested.encode('utf-8')).hexdigest()[:32],
+                         plugin_sync._marker_identity(document))
+        base = self.install_native(self.homes['02'])
+        (base / '.codex-remote-plugin-install.json').write_text(nested, encoding='utf-8')
+        self.assertEqual([], self.sync.reconcile(force=True)['errors'])
+        self.assertTrue((self.mirror(self.homes['03']) / '1.0.0').is_dir())
+        # A registry nested that deep is kept and reported as unreadable; the
+        # watcher survives a ValueError but not a RecursionError.
+        registry = self.store.directory / 'plugin-sync.json'
+        registry.write_text(nested, encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, 'could not be read'):
+            self.sync.reconcile(force=True)
+        self.assertEqual(nested, registry.read_text(encoding='utf-8'))
 
     def test_peer_disable_is_preserved_and_native_peer_drops_the_mirror(self):
         self.install_native(self.homes['02'])
