@@ -214,7 +214,8 @@ def read_header(stream):
 def patch_archive(source, destination):
     """Patch exact native entry points and preserve unrelated archive assets."""
     from .original_sync_bundle import (main_sync_plan, renderer_patches_for, renderer_plugin_patches,
-        renderer_host_identity_patches, renderer_remote_root_patches)
+        renderer_host_identity_patches, renderer_remote_root_patches, renderer_summary_dir_patches,
+        require_project_grouping, archive_version)
     from .desktop_reasoning_ui import PICKER_MARKER, patch as patch_reasoning
     from .desktop_chrome_host import Plan as ChromeHostPlan
     with Path(source).open('rb') as src:
@@ -232,6 +233,8 @@ def patch_archive(source, destination):
         reasoning_settings = False
         host_filters = []
         remote_roots = []
+        summary_dirs = []
+        grouping_chunks = []
         chrome_host = ChromeHostPlan()
         for name, item in entries:
             if name.startswith('webview/assets/app-primary') and name.endswith('.js') and item['size'] <= 32 * 1024 * 1024:
@@ -250,10 +253,13 @@ def patch_archive(source, destination):
                 renderer_sync_patches = renderer_patches_for(data)
                 if renderer_sync_patches:
                     sync_renderers.append((name, item, data, renderer_sync_patches))
+                grouping_chunks.append(name)
                 if renderer_host_identity_patches(data):
                     host_filters.append(name)
                 if renderer_remote_root_patches(data):
                     remote_roots.append(name)
+                if renderer_summary_dir_patches(data):
+                    summary_dirs.append(name)
                 if PICKER_MARKER in data:
                     pickers.append(name)
                 reasoning_settings = reasoning_settings or b'enabled-reasoning-efforts' in data
@@ -266,10 +272,13 @@ def patch_archive(source, destination):
                 if browser_pattern:
                     browser_runtimes.append((name, item, data, browser_pattern))
                 if name.startswith('webview/'):
+                    grouping_chunks.append(name)
                     if renderer_host_identity_patches(data):
                         host_filters.append(name)
                     if renderer_remote_root_patches(data):
                         remote_roots.append(name)
+                    if renderer_summary_dir_patches(data):
+                        summary_dirs.append(name)
                     if PICKER_MARKER in data:
                         pickers.append(name)
                     reasoning_settings = reasoning_settings or b'enabled-reasoning-efforts' in data
@@ -331,6 +340,7 @@ def patch_archive(source, destination):
             changed[renderer_name] = (renderer_target, renderer_data)
         # The host filter and the remote project grouping live in app-initial
         # (26.917) or app-shared (26.930); each exists in at most one chunk.
+        # The remote worktree folder lookup follows the guard of its chunk.
         entries_by_name = dict(entries)
         def webview_data(name):
             if name in changed:
@@ -339,7 +349,8 @@ def patch_archive(source, destination):
             src.seek(base + int(item['offset']))
             return src.read(item['size'])
         for found, patches_of, label in ((host_filters, renderer_host_identity_patches, 'host-specific archive filter'),
-                                         (remote_roots, renderer_remote_root_patches, 'remote project grouping')):
+                                         (remote_roots, renderer_remote_root_patches, 'remote project grouping'),
+                                         (summary_dirs, renderer_summary_dir_patches, 'remote worktree folder lookup')):
             if len(found) > 1:
                 raise ValueError('Ambiguous desktop ' + label + '.')
             for filter_name in found:
@@ -347,6 +358,10 @@ def patch_archive(source, destination):
                 for before, after in patches_of(filter_data).items():
                     filter_data = filter_data.replace(before, after)
                 changed[filter_name] = (entries_by_name[filter_name], filter_data)
+        # 26.930 refuses to publish without both grouping patches (see
+        # require_project_grouping); other versions keep the native fallback.
+        require_project_grouping(archive_version(src, base, entries),
+                                 [webview_data(chunk) for chunk in grouping_chunks])
         plan = main_sync_plan([(module, data) for module, _, data in main_modules])
         if plan is None:
             # A previously sync-patched archive is used by the isolated desktop

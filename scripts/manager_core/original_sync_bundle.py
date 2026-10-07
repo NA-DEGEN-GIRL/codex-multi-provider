@@ -125,6 +125,7 @@ def renderer_host_identity_patches(data):
 _REMOTE_ROOT_VARIANTS = (
     (b'TYr', b'gXr', b'wXr', b'hXr', b'R', b'_Xr', b'vXr', b'CYr', b'dXr'),  # 26.917
     (b'NFn', b'MIn', b'BIn', b'jIn', b'Ch', b'NIn', b'PIn', b'jFn', b'DIn'),  # 26.930
+    (b'yFn', b'yIn', b'DIn', b'vIn', b'Yu', b'bIn', b'xIn', b'_Fn', b'mIn'),  # 26.930.4958 (AIn)
 )
 
 
@@ -171,6 +172,109 @@ def renderer_remote_root_patches(data):
     if len(patches) > 1:
         raise ValueError('Ambiguous desktop remote project grouping.')
     return patches
+
+
+def _remote_root_names(data):
+    # The grouping variant this chunk holds, before or after the guard.
+    found = [names for names in _REMOTE_ROOT_VARIANTS
+             if sum(data.count(form) for form in _remote_root_section(*names)) == 1]
+    return found[0] if len(found) == 1 else None
+
+
+# Renderer names in the sidebar's git-info folder collector (gIn in
+# 26.930.4958, pXr in 26.917): the same-machine host test and the Codex
+# worktree-root test (the grouping function's worktree name).
+_SUMMARY_DIR_VARIANTS = (
+    (b'zs', b'R'),  # 26.917
+    (b'Fi', b'Yu'),  # 26.930.4958
+)
+
+
+def _summary_dir_section(local_host, worktree):
+    # One thread row of the collector, from its host binding e (t is the
+    # collector's primary host) to the skip, so e and t are its own bindings.
+    before = (b'let e=n.hostId==null||%s(n.hostId)?t:n.hostId,c=o?.threadProjectAssignments?.[n.conversationId];'
+              b'if(!(o?.projectlessThreadIds?.has(n.conversationId)||c?.projectKind===`local`&&'
+              b'(c.projectOrigin===`chatgpt`||d.has(c.projectId))||c?.projectKind===`remote`&&c.hostId===e&&'
+              b'r.some(t=>t.id===c.projectId&&t.hostId===e))&&n.cwd&&f(e,n.cwd),'
+              b'n.summary!=null&&!%s(n.cwd,i,a?.[e])||n.workspaceKind===`projectless`||n.cwd===`~`)continue'
+              % (local_host, worktree))
+    return before, before.replace(b'n.summary!=null&&!', b'n.summary!=null&&e===t&&!')
+
+
+def renderer_summary_dir_patches(data):
+    # Verified 26.930.4958 renderer: the sidebar asks git about a thread's cwd
+    # only for rows without a summary (live, loaded threads) or inside a Codex
+    # worktree. A remote thread in a linked git worktree folder that is no
+    # declared project root is placed only through that answer (the common-dir
+    # remap); without it the grouping drops the thread (`if(p)return`). So
+    # worktree threads appeared under the repo project only after one of them
+    # was opened in that window. Ask for remote rows with a summary too. The
+    # collector still skips assigned, projectless and `~` rows, hosts without
+    # a connected remote project, and local rows (unchanged).
+    #
+    # Querying every remote summary row makes the common-dir remap run for
+    # threads of a worktree project declared through a symlink as well, which
+    # is the revision 96 symptom for every such thread. The patch is therefore
+    # applied only beside this build's remote-root guard (same chunk, same
+    # worktree test): unguarded, the native lookup stays.
+    found = []
+    for local_host, worktree in _SUMMARY_DIR_VARIANTS:
+        before, after = _summary_dir_section(local_host, worktree)
+        count = data.count(before)
+        if count > 1:
+            raise ValueError('Ambiguous desktop remote worktree folder lookup.')
+        if count == 1:
+            found.append((before, after, worktree))
+    if len(found) > 1:
+        raise ValueError('Ambiguous desktop remote worktree folder lookup.')
+    if not found:
+        return {}
+    (before, after, worktree), = found
+    grouping = _remote_root_names(data)
+    if grouping is None or grouping[4] != worktree:
+        return {}
+    return {before: after}
+
+
+def project_grouping_patched(data):
+    """True when data holds the guarded grouping and the summary-row lookup."""
+    names = _remote_root_names(data)
+    if names is None or data.count(_remote_root_section(*names)[1]) != 1:
+        return False
+    return sum(data.count(_summary_dir_section(*pair)[1])
+               for pair in _SUMMARY_DIR_VARIANTS if pair[1] == names[4]) == 1
+
+
+def require_project_grouping(version, chunks):
+    """Refuse a 26.930 renderer whose SSH worktree grouping is not patched.
+
+    Other versions keep the rule of the other optional renderer patches (host
+    filter, plugin refresh, remote-root guard): a missing variant leaves the
+    native grouping. On 26.930, the managed release line, a silent skip hides
+    remote worktree threads, so publication stops until the names are added.
+    chunks are the final app-initial/app-shared sources; an archive patched
+    earlier (isolated fixture) passes as it is.
+    """
+    if not isinstance(version, str) or not version.startswith('26.930.'):
+        return
+    if sum(1 for data in chunks if project_grouping_patched(data)) != 1:
+        raise ValueError(f'이 Codex 버전({version})의 SSH worktree 프로젝트 분류 위치를 확인하지 못했습니다. '
+                         '관리 앱 호환성 업데이트가 필요합니다.')
+
+
+def archive_version(stream, base, entries):
+    """The desktop version in the archive's package.json, or None."""
+    item = dict(entries).get('package.json')
+    if item is None or not 0 < item.get('size', 0) <= 1024 * 1024:
+        return None
+    stream.seek(base + int(item['offset']))
+    try:
+        value = json.loads(stream.read(item['size']))
+    except ValueError:
+        return None
+    version = value.get('version') if isinstance(value, dict) else None
+    return version if isinstance(version, str) else None
 
 
 # Main process (t8e in 26.917, B6e in 26.915): before a local project gains
@@ -309,8 +413,10 @@ def patch_archive(source, destination):
         changes[renderer] = updated
         # 26.917 keeps the host filter and grouping beside the sync; 26.930
         # moved the filter to app-shared. Each exists in at most one chunk.
+        # The folder lookup follows the remote-root guard of its chunk.
         for patches_of, label in ((renderer_host_identity_patches, 'host-specific archive filter'),
-                                  (renderer_remote_root_patches, 'remote project grouping')):
+                                  (renderer_remote_root_patches, 'remote project grouping'),
+                                  (renderer_summary_dir_patches, 'remote worktree folder lookup')):
             found = [(module, patches) for module, (_, data) in webviews.items() if (patches := patches_of(data))]
             if len(found) > 1:
                 raise ValueError('Ambiguous desktop ' + label + '.')
@@ -319,6 +425,8 @@ def patch_archive(source, destination):
                 for pattern, replacement in patches.items():
                     updated = updated.replace(pattern, replacement)
                 changes[module] = updated
+        require_project_grouping(archive_version(stream, base, entries),
+                                 [changes.get(module, data) for module, (_, data) in webviews.items()])
         changes[renderer] = (helper('desktop_profile_resume.cjs') + helper('desktop_plugin_renderer_sync.cjs')
                              + helper('desktop_renderer_record_sync.cjs') + changes[renderer])
         segments = []
