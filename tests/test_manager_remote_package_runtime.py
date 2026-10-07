@@ -123,6 +123,20 @@ class PackageRuntimeTests(unittest.TestCase):
     def test_explicit_jobs_reach_every_cargo_build(self):
         self.run_build(jobs=12)
 
+    def test_oversized_stripped_codex_is_not_published(self):
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(PACKAGE.platform, 'system', return_value='Linux'))
+            stack.enter_context(patch.object(PACKAGE.platform, 'machine', return_value='x86_64'))
+            stack.enter_context(patch.object(PACKAGE.shutil, 'which', return_value='cargo'))
+            stack.enter_context(patch.object(PACKAGE, 'prepare_v8', return_value={'RUSTY_V8_ARCHIVE': 'fixture-v8'}))
+            stack.enter_context(patch.object(PACKAGE.subprocess, 'run', side_effect=self.tool))
+            # The fixture codex is a few hundred bytes after its fake strip.
+            stack.enter_context(patch.object(PACKAGE, 'MAX_STRIPPED_CODEX_BYTES', 64))
+            with self.assertRaisesRegex(RuntimeError, r'stripped codex is \d+ MB, above the 0 MB limit'):
+                PACKAGE.build(self.root)
+        self.assertFalse((self.root / 'artifacts/remote/linux-x86_64').exists())
+        self.assertNotIn('codex', [Path(command[0]).name for command, _ in self.calls])
+
     def test_cpu_list_parses_server_ranges_and_rejects_malformed_lists(self):
         self.assertEqual(PACKAGE.parse_cpus('0-31,64-95'), set(range(32)) | set(range(64, 96)))
         self.assertEqual(PACKAGE.parse_cpus('7, 3-3'), {3, 7})

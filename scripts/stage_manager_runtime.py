@@ -10,6 +10,7 @@ from uuid import uuid4
 from manager_core.runtime_migrations import require_compatible, source_migrations
 from manager_core.store import atomic_json
 from remote_helpers.package_runtime import contains_marker
+from remote_helpers.package_windows_runtime import verify_pe
 
 ROOT = Path(__file__).resolve().parents[1]
 BINARIES = ('codex', 'codex-code-mode-host', 'codex-windows-sandbox-setup',
@@ -30,7 +31,8 @@ def _load_cross_build(root, source):
     if (build.get('schema') != 1 or build.get('target') != CROSS_TARGET
             or build.get('profile') != 'release' or build.get('build_kind') != 'linux-cross-xwin'
             or not isinstance(build.get('files'), dict) or not isinstance(build.get('migrations'), list)
-            or build.get('line_endings') != 'crlf'):
+            or build.get('line_endings') != 'crlf' or not isinstance(build.get('pe_checks'), dict)
+            or any(not isinstance(build['pe_checks'].get(name), dict) for name in BINARIES)):
         raise RuntimeError('Unsupported cross-build package: ' + str(source))
     if (build.get('result_tree') != recorded['result_tree']
             or build.get('build_source_sha256') != recorded['patch_sha256']
@@ -86,6 +88,12 @@ def _stage_into(root, destination, source, profile, cross, migrations):
         files[target.name] = _digest(target)
         if cross is not None and files[target.name] != cross['files'][target.name]['sha256']:
             raise RuntimeError('Cross-built companion changed while staging: ' + target.name)
+    # Activation refuses a cross build without PE checks for every executable.
+    # Repeat them on the staged copies (stack reserve, static CRT, ASLR/NX,
+    # manifests) rather than trusting the server's manifest.
+    pe_checks = None
+    if cross is not None:
+        pe_checks = {name: verify_pe(destination / (name + '.exe'), name) for name in BINARIES}
     binary = destination / 'codex.exe'
     version = subprocess.check_output([str(binary), '--version'], text=True, timeout=15).strip()
     if cross is None:
@@ -119,7 +127,8 @@ def _stage_into(root, destination, source, profile, cross, migrations):
     if cross is not None:
         manifest.update(build_origin=cross['build_kind'], source_tree=cross['result_tree'],
                         build_source_sha256=cross['build_source_sha256'],
-                        build_toolchain=cross.get('toolchain'), build_xwin=cross.get('xwin'))
+                        build_toolchain=cross.get('toolchain'), build_xwin=cross.get('xwin'),
+                        pe_checks=pe_checks)
     manifest['migrations'] = migrations
     path = destination / 'candidate.json'
     atomic_json(path, manifest)

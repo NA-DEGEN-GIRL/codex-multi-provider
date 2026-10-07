@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 
+from activate_manager_runtime import release_problem, require_activatable
 from manager_core import runtime_build
 from manager_core.runtime_migrations import source_migrations
 import stage_manager_runtime as STAGE
@@ -26,6 +27,12 @@ def sha256(path):
 
 MISSING = object()  # cross_package(field=MISSING) omits the field from windows-build.json
 THREADS_CRLF = b'CREATE TABLE threads (\r\n    id TEXT PRIMARY KEY\r\n);\r\n'
+SETUP = 'codex-windows-sandbox-setup'
+
+
+def local_pe_check(name):
+    # What the fake verify_pe reports for a staged copy (the real one needs PE32+ files).
+    return dict(stack_reserve=8 << 20, imports=['kernel32.dll'], manifest=name == SETUP)
 
 
 def make_store(path, rows):
@@ -53,6 +60,8 @@ class StageRuntimeTests(unittest.TestCase):
         self.git_head = None
         self.version_error = None
         self.calls = []
+        self.pe_checked = []
+        self.pe_failures = {}
         # What the package says its codex.exe embeds (a CRLF checkout's bytes).
         self.migrations = [dict(directory='migrations', version=1, description='threads',
                                 sha384=hashlib.sha384(THREADS_CRLF).hexdigest())]
@@ -88,7 +97,10 @@ class StageRuntimeTests(unittest.TestCase):
                      build_source_sha256=self.recorded['patch_sha256'],
                      toolchain=dict(rustc='rustc 1.90.0', cargo='cargo 1.90.0'),
                      xwin=dict(splat='xwin-fixture', libraries_sha256='e' * 64), files=files,
-                     line_endings='crlf', migrations=self.migrations)
+                     line_endings='crlf', migrations=self.migrations,
+                     # The server's claims; staging repeats the checks on its own copies.
+                     pe_checks={name: dict(stack_reserve=8 << 20, imports=['server-claim.dll'],
+                                           manifest=name == SETUP) for name in STAGE.BINARIES})
         build.update(changes)
         build = {key: value for key, value in build.items() if value is not MISSING}
         (package / 'windows-build.json').write_text(json.dumps(build), encoding='utf-8')
@@ -104,11 +116,18 @@ class StageRuntimeTests(unittest.TestCase):
             return self.git_head + '\n'
         self.fail('Unexpected tool invocation: ' + repr(command))
 
+    def verify_pe(self, path, name):
+        self.pe_checked.append((Path(path), name))
+        if name in self.pe_failures:
+            raise RuntimeError(name + '.exe: ' + self.pe_failures[name])
+        return local_pe_check(name)
+
     def release_directories(self):
         return sorted(self.releases.iterdir()) if self.releases.is_dir() else []
 
     def stage(self, **arguments):
         with patch.object(STAGE.subprocess, 'check_output', side_effect=self.tool), \
+                patch.object(STAGE, 'verify_pe', side_effect=self.verify_pe), \
                 redirect_stdout(io.StringIO()) as output:
             candidate = STAGE.stage(self.root, **arguments)
         self.assertEqual(json.loads(output.getvalue()),
@@ -155,6 +174,26 @@ class StageRuntimeTests(unittest.TestCase):
         self.assertEqual(loaded['files'], expected)
         self.assertEqual(loaded['migrations'], self.migrations)
 
+    def test_staged_cross_build_records_pe_checks_and_passes_the_activation_gate(self):
+        candidate = self.stage(source=self.cross_package())
+        release = candidate.parent
+        # Verified on the staged copies, before the staged codex.exe runs.
+        self.assertEqual(self.pe_checked, [(release / (name + '.exe'), name) for name in STAGE.BINARIES])
+        manifest = json.loads(candidate.read_text(encoding='utf-8'))
+        self.assertEqual(manifest['pe_checks'], {name: local_pe_check(name) for name in STAGE.BINARIES})
+        loaded = runtime_build.load_release(self.root, candidate)
+        self.assertIsNone(release_problem(loaded))
+        require_activatable(self.root, loaded)
+        # The gate this feeds: without the record, activation refuses the build.
+        self.assertIn('PE checks', release_problem({key: value for key, value in loaded.items()
+                                                    if key != 'pe_checks'}))
+
+    def test_failed_pe_check_of_a_staged_copy_removes_the_partial_release(self):
+        self.pe_failures['codex-command-runner'] = 'stack reserve 1048576'
+        self.assertRejected(RuntimeError, '^codex-command-runner.exe: stack reserve', source=self.cross_package())
+        self.assertEqual(self.release_directories(), [])
+        self.assertEqual(self.pe_checked[-1][1], 'codex-command-runner')
+
     def test_changed_or_missing_cross_companion_is_rejected(self):
         for change in ('tampered', 'missing'):
             with self.subTest(change=change):
@@ -189,7 +228,10 @@ class StageRuntimeTests(unittest.TestCase):
         for field, value in (('target', 'aarch64-pc-windows-msvc'), ('target', None),
                              ('schema', 2), ('profile', 'debug'),
                              ('build_kind', MISSING), ('build_kind', 'windows-msvc'),
-                             ('files', MISSING), ('files', [])):
+                             ('files', MISSING), ('files', []),
+                             # A package whose server-side PE checks were not recorded.
+                             ('pe_checks', MISSING), ('pe_checks', []),
+                             ('pe_checks', {'codex': local_pe_check('codex')})):
             with self.subTest(field=field, value=value):
                 self.assertRejected(RuntimeError, '^Unsupported cross-build package',
                                     source=self.cross_package(**{field: value}))
@@ -279,11 +321,13 @@ class StageRuntimeTests(unittest.TestCase):
                                  {name + '.exe': sha256(source / (name + '.exe')) for name in STAGE.BINARIES})
                 self.assertEqual(manifest['build_profile'], profile)
                 self.assertEqual(manifest['source_base'], 'f' * 40)
-                for key in ('build_origin', 'source_tree', 'build_source_sha256'):
+                for key in ('build_origin', 'source_tree', 'build_source_sha256', 'pe_checks'):
                     self.assertNotIn(key, manifest)
                 self.assertEqual(self.calls, [[str(candidate.parent / 'codex.exe'), '--version'],
                                               ['git', '-C', str(self.root / 'runtime'), 'rev-parse', 'HEAD']])
                 runtime_build.load_release(self.root, candidate)
+        # A local MSVC build is not PE-checked; only cross builds are.
+        self.assertEqual(self.pe_checked, [])
 
 
 if __name__ == '__main__':
