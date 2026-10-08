@@ -35,6 +35,15 @@
 
 ## 최근 수정
 
+### 수정 120 — 런타임 시작 실패 자동 재시도, 시작 실패 뒤 오류창 정리
+
+- 프로필 여러 개가 한꺼번에 시작할 때 커밋 메모리가 한도에 가까우면 런타임이 DLL 초기화 단계에서 `0xC0000142`로 끝났다.
+  이어서 런타임 프록시가 종료 중 `sys.stdin` 잠금 때문에 강제 중단되어, 앱에는 "failed to start (code=3221225477) … finalizing" 창이 떴다.
+- 프록시가 앱 입력을 `os.read`로 읽고 항상 `os._exit(런타임 종료 코드)`로 끝난다. `0xC0000142`는 런타임이 아무것도 출력하지 않았고 initialize도 끝나지 않았을 때만
+  보관한 입력을 그대로 넘겨 최대 2회 다시 시작한다(10초·4 MiB 한도, 접근 위반은 재시도하지 않음). 런타임은 프록시의 콘솔을 같이 써서 콘솔 호스트가 하나 줄었다.
+- `runtime-state.json`의 `start_retries`와 `health_report.py`의 복구 줄로 재시도를 확인한다.
+- [원인·변경·검증](design/runtime-start-retry-120.md).
+
 ### 수정 119 — Claude·SSH 버그 수정, 관리창 속도 개선, 재발 방지 장치
 
 - Claude 전환이 이어 쓰는 세션에서 뒤쪽 요약을 버려 `/compact` 뒤에도 거절되던 문제(런타임 `ccc7fae5`), SSH Claude 러너가 사용량 이벤트에서 죽던 문제,
@@ -361,3 +370,4 @@
 | 117 | [token-models-shortcut-order-117](design/token-models-shortcut-order-117.md) | Claude 토큰 자동 갱신, GPT 새 모델 목록, 작업 바로가기 순서 |
 | 118 | [remote-exit-hang-118](design/remote-exit-hang-118.md) | 원격 Codex 종료 멈춤(sqlx 정리 작업), 완전 종료 대기 선택지, 서버 64스레드 제한·Windows 교차 빌드 |
 | 119 | [stability-perf-119](design/stability-perf-119.md), [ssh-worktree-project-grouping-96](design/ssh-worktree-project-grouping-96.md) | Claude·SSH 버그, 관리창 속도, 재발 방지 장치 |
+| 120 | [runtime-start-retry-120](design/runtime-start-retry-120.md) | 런타임 시작 실패 재시도, 시작 실패 뒤 오류창, 콘솔 공유 |
