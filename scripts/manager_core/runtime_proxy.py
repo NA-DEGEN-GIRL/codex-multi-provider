@@ -43,13 +43,10 @@ except ImportError:
 
 MAX_FRAME_BYTES = 32 * 1024 * 1024
 
-# NTSTATUS exit codes of a Windows process that failed while the process was
-# still starting: a DLL initialization failure before any runtime code ran
-# (seen while a launch wave of many profiles started together), or an access
-# violation within the first second.
+# The NTSTATUS exit code of a Windows process whose DLL initialization failed
+# while it was still starting, before any runtime code ran (seen while a launch
+# wave of many profiles started together).
 STATUS_DLL_INIT_FAILED = 0xC0000142
-STATUS_ACCESS_VIOLATION = 0xC0000005
-EARLY_ACCESS_VIOLATION_SECONDS = 1.0
 # Such a start is replaced, once per delay, only while the app's input is still
 # replayable: the runtime wrote nothing, initialize never completed, and no
 # runtime child outlived this window. The jitter spreads the profiles of one
@@ -60,21 +57,20 @@ START_RETRY_JITTER = 0.5
 START_REPLAY_LIMIT = 4 * 1024 * 1024
 
 
-def transient_start_failure(exit_code, uptime, *, windows=os.name == 'nt') -> bool:
+def transient_start_failure(exit_code, *, windows=os.name == 'nt') -> bool:
     """Whether a runtime exit is a Windows process-start failure worth another start.
 
     0xC0000142 as a process exit code is the loader failing before the
     runtime's own code ran, whenever this launcher noticed it: under load the
     launcher can be busy for seconds after the spawn. The start window is
-    enforced by sealing the replay instead. An access violation counts only
-    when it came that early (uptime is measured by this launcher, so it can
-    only overstate the runtime's life).
+    enforced by sealing the replay instead. An access violation is never
+    retried: it is runtime code that crashed, and Windows Error Reporting holds
+    a crashed process for about 20 s, past any early-crash window, before this
+    launcher sees its exit.
     """
     if not windows or type(exit_code) is not int:
         return False
-    code = exit_code & 0xFFFFFFFF
-    return code == STATUS_DLL_INIT_FAILED or (
-        code == STATUS_ACCESS_VIOLATION and uptime < EARLY_ACCESS_VIOLATION_SECONDS)
+    return exit_code & 0xFFFFFFFF == STATUS_DLL_INIT_FAILED
 
 
 def exit_status(code) -> int:
@@ -240,23 +236,27 @@ class RuntimeInput:
 
     def write(self, body, before_write=None):
         gap = False
-        with self.lock:
-            if self.closed:
-                raise OSError('Runtime pipe is closed.')
-            if self.replay is not None:
-                if before_write is not None or self.replay_bytes + len(body) > self.limit:
-                    gap = self._seal()
-                else:
-                    self.replay.append(body)
-                    self.replay_bytes += len(body)
-            try:
-                self.writer.write(body, before_write)
-            except OSError:
-                if self.replay is None:
-                    raise
-                # Kept for a replacement; the exited child cannot read it.
-        if gap:
-            self.failed()
+        try:
+            with self.lock:
+                if self.closed:
+                    raise OSError('Runtime pipe is closed.')
+                if self.replay is not None:
+                    if before_write is not None or self.replay_bytes + len(body) > self.limit:
+                        gap = self._seal()
+                    else:
+                        self.replay.append(body)
+                        self.replay_bytes += len(body)
+                try:
+                    self.writer.write(body, before_write)
+                except OSError:
+                    if self.replay is None:
+                        raise
+                    # Kept for a replacement; the exited child cannot read it.
+        finally:
+            # The seal took the deferred gap over: report it even when this
+            # write to the same exited child raises.
+            if gap:
+                self.failed()
 
     def _seal(self):
         gap = self.deferred_gap
@@ -328,15 +328,20 @@ def proxy(runtime: Path, arguments: list[str], observer_path: Path, profile_id: 
     storage_args = (['-c', 'sqlite_home=' + json.dumps(source_environment['CODEX_RECORD_HOME'])]
                     if source_environment.get('CODEX_RECORD_HOME') else [])
     creationflags = runtime_creation_flags()
+    started = None
 
     def spawn():
+        nonlocal started
+        # Taken before the process exists, so the measured uptime of every
+        # runtime child (also a replacement started under the input lock) can
+        # only overstate its life.
+        started = time.monotonic()
         return subprocess.Popen([str(runtime), *arguments, *storage_args],
                                 env=runtime_environment(source_environment),
                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=None, creationflags=creationflags)
 
     child = spawn()
-    started = time.monotonic()
     # Set once the child exits. A runtime that refuses its stores exits before
     # initialize completes; stderr stays inherited (a pipe here could deadlock).
     last_exit = None
@@ -625,9 +630,10 @@ def proxy(runtime: Path, arguments: list[str], observer_path: Path, profile_id: 
                 raise AdminError('unavailable')
             admin_server = AdminServer(managed_root, profile_id, generation, child.pid, admin_dispatch).start()
             admin_state = 'ready'
-        except (AdminError, OSError, ValueError):
+        except (AdminError, OSError, ValueError, RuntimeError):
             # UI/stdin forwarding can continue, but update/handoff must fail
-            # closed when authenticated administration is unavailable.
+            # closed when authenticated administration is unavailable (also
+            # when its accept thread could not start).
             admin_state = 'unavailable'
 
     def publish_app_connection():
@@ -657,7 +663,7 @@ def proxy(runtime: Path, arguments: list[str], observer_path: Path, profile_id: 
             try:
                 admin_server.rebind_runtime(child.pid)
                 return
-            except (AdminError, OSError, ValueError):
+            except (AdminError, OSError, ValueError, RuntimeError):
                 admin_server.close()
                 admin_server = None
                 admin_state = 'unavailable'
@@ -697,11 +703,12 @@ def proxy(runtime: Path, arguments: list[str], observer_path: Path, profile_id: 
         # finished without reading any output, initialize never completed, and
         # the app still waits with its input intact.
         if (attempt >= len(START_RETRY_DELAYS) or outgoing.is_alive() or observer.initialize_succeeded
-                or not transient_start_failure(exit_code, uptime) or not runtime_output.replaceable()):
+                or not transient_start_failure(exit_code) or not runtime_output.replaceable()):
             break
         time.sleep(START_RETRY_DELAYS[attempt] * (1 + random.random() * START_RETRY_JITTER))
         with protocol_lock:
             try:
+                # spawn() also restarts the uptime clock.
                 replacement = runtime_output.replace(spawn)
             except (OSError, ValueError, RuntimeError):
                 replacement = None
@@ -712,10 +719,23 @@ def proxy(runtime: Path, arguments: list[str], observer_path: Path, profile_id: 
                     observer.runtime_pid = child.pid
         if replacement is None:
             break
-        started = time.monotonic()
-        outgoing = threading.Thread(target=pump, args=(child.stdout, 'runtime'), daemon=True)
-        outgoing.start()
-        rebind_admin()
+        try:
+            outgoing = threading.Thread(target=pump, args=(child.stdout, 'runtime'), daemon=True)
+            outgoing.start()
+            rebind_admin()
+        except Exception:
+            # A replacement without its output reader, or whose endpoint
+            # failed unexpectedly, must not run on. The app gets the code of
+            # the start failure it replaced.
+            try:
+                child.kill()
+            except OSError:
+                pass
+            try:
+                child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            break
         try:
             snapshot()
         except OSError:
@@ -776,7 +796,17 @@ def main(arguments=None) -> int:
 
 
 if __name__ == '__main__':
-    code = main()
+    try:
+        code = main()
+    except BaseException:
+        # Leave through os._exit below in any case. The exception text can
+        # quote caller paths or protocol values, so only a fixed line is shown.
+        code = 70
+        try:
+            print('Codex managed runtime proxy stopped unexpectedly. Check Control Center diagnostics.',
+                  file=sys.stderr)
+        except (OSError, ValueError, AttributeError):
+            pass
     try:
         sys.stderr.flush()
     except (OSError, ValueError, AttributeError):

@@ -252,6 +252,28 @@ class NamedPipeTests(unittest.TestCase):
         self.assertEqual(set(identities), {'runtime', 'proxy', 'generation'})
         self.assertEqual(identities['runtime']['pid'], os.getpid())
 
+    def test_endpoint_whose_accept_loop_cannot_start_is_withdrawn(self):
+        from manager_core import runtime_admin
+        generation = str(uuid4())
+        server = AdminServer(self.root, self.profile_id, generation, os.getpid(), lambda *_: {})
+        real = threading.Thread
+
+        class NoAcceptThread(real):
+            def start(self):
+                if self.name == 'codex-admin-accept':
+                    raise RuntimeError('cannot start a new thread')
+                super().start()
+
+        with patch.object(runtime_admin.threading, 'Thread', NoAcceptThread):
+            with self.assertRaises(RuntimeError):
+                server.start()
+        self.assertFalse(server.path.exists())
+        with self.assertRaises(AdminError) as caught:
+            AdminClient(self.root, self.profile_id, generation).request('thread/loaded/list', {}, 1)
+        self.assertEqual(caught.exception.code, 'unavailable')
+        # The endpoint that did start is untouched.
+        self.client.request('thread/loaded/list', {}, 3)
+
     def test_wrong_key_cannot_dispatch_and_valid_client_still_works(self):
         with self.assertRaises(Exception):
             Client(self.server._address, family='AF_PIPE', authkey=b'wrong-authentication-key')
@@ -496,7 +518,9 @@ raise SystemExit(proxy(Path(sys.executable),[sys.argv[5],'app-server'],Path(sys.
         # replays the app's input to a replacement; the endpoint and status
         # must then name the replacement. 'late': the first runtime had exited
         # before the endpoint could bind, so it starts with the replacement.
-        for mode in ('rebind', 'late'):
+        # 'rebind-error': the endpoint cannot follow (RuntimeError), so a new
+        # one starts for the replacement, which keeps running.
+        for mode in ('rebind', 'late', 'rebind-error'):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 profile_id, generation, thread_id = [str(uuid4()) for _ in range(3)]
@@ -535,6 +559,9 @@ if sys.argv[7]=='late':
         if len(calls)==1: time.sleep(1.5)  # The first runtime has exited meanwhile.
         return original(*arguments,**options)
     runtime_proxy.AdminServer=late
+elif sys.argv[7]=='rebind-error':
+    def refuse(self,runtime_pid): raise RuntimeError('fixture')
+    runtime_proxy.AdminServer.rebind_runtime=refuse
 environment={k:v for k,v in os.environ.items() if not k.startswith('CODEX_MANAGER_')}
 environment.update(CODEX_MANAGER_ROOT=sys.argv[2],CODEX_MANAGER_GENERATION=sys.argv[4],CODEX_MANAGER_REAL_RUNTIME=sys.executable)
 raise SystemExit(runtime_proxy.proxy(Path(sys.executable),[sys.argv[5],sys.argv[8],sys.argv[9],'app-server'],
@@ -557,7 +584,7 @@ raise SystemExit(runtime_proxy.proxy(Path(sys.executable),[sys.argv[5],sys.argv[
                 try:
                     client = AdminClient(root, profile_id, generation)
                     first = None
-                    if mode == 'rebind':
+                    if mode != 'late':
                         deadline = time.monotonic() + 5
                         while not client.path.exists() and time.monotonic() < deadline:
                             time.sleep(.02)
@@ -580,10 +607,11 @@ raise SystemExit(runtime_proxy.proxy(Path(sys.executable),[sys.argv[5],sys.argv[
                     self.assertEqual([item['exit_code'] for item in state['start_retries']], [0xC0000142])
                     self.assertEqual(client.identities()['runtime']['pid'], pids[1])
                     if first is not None:
-                        # Same endpoint, re-published for the replacement runtime.
+                        # The same endpoint re-published for the replacement
+                        # runtime, or a new one when it could not follow.
                         second = _decode(client.path.read_bytes())
                         self.assertEqual((first['runtime']['pid'], second['runtime']['pid']), tuple(pids))
-                        self.assertEqual(first['address'], second['address'])
+                        self.assertEqual(first['address'] == second['address'], mode == 'rebind')
                     result = client.request('thread/read', {'threadId': thread_id}, 5)
                     self.assertEqual(result['thread']['sessionId'], thread_id)
                     process.stdin.close()

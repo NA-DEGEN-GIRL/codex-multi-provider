@@ -672,11 +672,12 @@ class AdminServer:
         try:
             with self._publish_lock:
                 self._publish()
+            threading.Thread(target=self._accept, name='codex-admin-accept', daemon=True).start()
         except BaseException:
-            self._listener.close()
-            self._listener = None
+            # Also when the accept thread cannot start (RuntimeError): never
+            # leave a published endpoint that nothing serves.
+            self.close()
             raise
-        threading.Thread(target=self._accept, name='codex-admin-accept', daemon=True).start()
         return self
 
     def rebind_runtime(self, runtime_pid):

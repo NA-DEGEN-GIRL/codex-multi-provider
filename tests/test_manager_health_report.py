@@ -44,7 +44,8 @@ class HealthReportTests(unittest.TestCase):
         self.assertEqual(value['candidates'], dict(pending=[], incomplete=[], older_count=0))
         self.assertEqual(value['migrations']['state'], 'unknown')
         self.assertEqual(value['remote_updates'], dict(state='missing'))
-        self.assertEqual((value['claude_logins'], value['runtime_exits'], value['known_bad']), ([], [], []))
+        self.assertEqual((value['claude_logins'], value['runtime_exits'], value['runtime_start_retries'],
+                          value['known_bad']), ([], [], [], []))
         lines = summary(value)
         self.assertIn('런타임: current 없음 / last-known-good 없음 / previous 없음', lines)
         self.assertIn('활성화 대기 후보: 없음', lines)
@@ -202,6 +203,39 @@ class HealthReportTests(unittest.TestCase):
         self.assertEqual([item.get('retries') for item in value['runtime_exits']], [None, None, 2, None])
         self.assertIn('초기화 전에 종료된 런타임: 2개 프로필 (failed 종료 코드 101, '
                       'retried 종료 코드 3221225794 · 시작 재시도 2회)', summary(value))
+
+    def test_runtimes_recovered_after_start_retries_are_summarized(self):
+        profile_id = 'aaaaaaaa-0000-4000-8000-000000000001'
+        atomic_json(self.root / 'work/control-center/state.json', dict(version=1, revision=1, profiles=[
+            dict(id=profile_id, alias='work-profile')]))
+        failed_start = dict(exit_code=0xC0000142, uptime_ms=900, exited_at='2026-10-07T11:58:00+00:00')
+        states = {
+            # Still running; the observer saw the replacement complete initialize.
+            profile_id: dict(initialized=True, start_retries=[failed_start]),
+            # Ended after a replacement; only the exit record's count remains.
+            'counted': dict(initialized=True, last_exit=dict(exit_code=0, initialize_completed=True, retries=1)),
+            'ended': dict(initialized=True, start_retries=[failed_start] * 2,
+                          last_exit=dict(exit_code=0, uptime_ms=60000, initialize_completed=True, retries=2)),
+            # Every start failed: an early exit with its retry count, not a recovery.
+            'failed': dict(initialized=False, start_retries=[failed_start] * 2,
+                           last_exit=dict(exit_code=0xC0000142, uptime_ms=300, initialize_completed=False, retries=2)),
+            'starting': dict(initialized=False, start_retries=[failed_start]),
+            'plain': dict(initialized=True),
+        }
+        for name, data in states.items():
+            atomic_json(self.root / 'work/control-center/instances' / name / 'runtime-state.json', data)
+        value = report(self.root, now=NOW, environ={'LOCALAPPDATA': str(self.local)})
+        retried = {item['profile_id']: item for item in value['runtime_start_retries']}
+        self.assertEqual({name: (item['retries'], item['recovered']) for name, item in retried.items()},
+                         {profile_id: (1, True), 'counted': (1, True), 'ended': (2, True), 'failed': (2, False),
+                          'starting': (1, False)})
+        self.assertEqual(retried[profile_id], dict(profile_id=profile_id, profile='work-profile', retries=1,
+                                                   recovered=True, exit_codes=[0xC0000142],
+                                                   last_retry_at='2026-10-07T11:58:00+00:00'))
+        lines = summary(value)
+        self.assertIn('시작 재시도 후 복구된 런타임: 3개 프로필 (work-profile 시작 재시도 1회 · 실패 종료 코드 3221225794, '
+                      'counted 시작 재시도 1회, ended 시작 재시도 2회 · 실패 종료 코드 3221225794)', lines)
+        self.assertIn('초기화 전에 종료된 런타임: 1개 프로필 (failed 종료 코드 3221225794 · 시작 재시도 2회)', lines)
 
     def test_candidate_that_cannot_be_read_is_listed_as_incomplete(self):
         stage_release(self.root, '20261001-000000-aaaaaa')

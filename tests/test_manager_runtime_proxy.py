@@ -52,14 +52,52 @@ with open(state / ('received-%d.txt' % attempt), 'ab') as log:
 
 # Runs proxy() in-process with test-sized retry delays, then normal interpreter
 # finalization (daemon readers still blocked on stdin must not abort it).
-RETRY_BOOTSTRAP = '''import os, sys
+# FIXTURE_PROXY_PATCH: 'slow-spawn' makes every process creation take 0.5 s
+# (a loaded machine); 'no-reader-thread' cannot start the second runtime
+# output reader (thread exhaustion).
+RETRY_BOOTSTRAP = '''import os, sys, threading, time, types
 from pathlib import Path
 sys.path.insert(0, sys.argv[1])
 from manager_core import runtime_proxy
 runtime_proxy.START_RETRY_DELAYS = tuple(float(value) for value in sys.argv[5].split(','))
+fixture = os.environ.pop('FIXTURE_PROXY_PATCH', '')
+if fixture == 'slow-spawn':
+    popen = runtime_proxy.subprocess.Popen
+    def slow(*arguments, **options):
+        time.sleep(0.5)
+        return popen(*arguments, **options)
+    runtime_proxy.subprocess = types.SimpleNamespace(**{**vars(runtime_proxy.subprocess), 'Popen': slow})
+elif fixture == 'no-reader-thread':
+    class Thread(threading.Thread):
+        readers = 0
+        def start(self):
+            if self._args[1:] == ('runtime',):
+                Thread.readers += 1
+                if Thread.readers == 2:
+                    raise RuntimeError('cannot start a new thread')
+            super().start()
+    runtime_proxy.threading = types.SimpleNamespace(**{**vars(threading), 'Thread': Thread})
 raise SystemExit(runtime_proxy.proxy(Path(sys.executable), [sys.argv[2], *sys.argv[6:]], Path(sys.argv[3]),
                                      sys.argv[4], dict(os.environ)))
 '''
+
+
+def process_running(pid):
+    import ctypes
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel.WaitForSingleObject.restype = wintypes.DWORD
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = kernel.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+    if not handle:
+        return False
+    try:
+        return kernel.WaitForSingleObject(handle, 0) == 258  # WAIT_TIMEOUT: still running.
+    finally:
+        kernel.CloseHandle(handle)
 
 
 def clean_environment(root, **extra):
@@ -72,7 +110,7 @@ class RetryHarness:
     """A desktop stand-in: keeps stdin open and collects replies on a thread."""
 
     def __init__(self, test, *, failures, code=STATUS_DLL_INIT_FAILED, die_after=0.3,
-                 mode='quiet', delays='0.05,0.05'):
+                 mode='quiet', delays='0.05,0.05', patch=''):
         directory = tempfile.TemporaryDirectory()
         test.addCleanup(directory.cleanup)  # Cleanups run last-in first-out: after close().
         self.root = root = Path(directory.name)
@@ -86,7 +124,8 @@ class RetryHarness:
         self.process = subprocess.Popen(
             [sys.executable, str(bootstrap), str(SCRIPT_ROOT), str(runtime), str(self.snapshot), str(uuid4()),
              delays, str(self.state), str(failures), hex(code), str(die_after), mode],
-            env=clean_environment(root), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env=clean_environment(root, FIXTURE_PROXY_PATCH=patch), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
         self.replies = queue.Queue()
         self.reader = threading.Thread(target=self._read, daemon=True)
@@ -472,18 +511,48 @@ class EarlyRuntimeExitTests(unittest.TestCase):
                 self.assertNotIn('retries', last_exit)
                 self.assertEqual(len((state / 'starts.txt').read_text(encoding='utf-8').split()), 1)
 
+    def test_entrypoint_turns_an_unexpected_failure_into_a_fixed_diagnostic(self):
+        # Whatever escapes main() still leaves through os._exit, and only a
+        # fixed line is shown: exception text can quote paths or values.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile_id = str(uuid4())
+            observer = root / 'work/control-center/instances' / profile_id / 'runtime-state.json'
+            wrapper = root / 'wrapper.py'
+            wrapper.write_text('''import runpy, sys
+sys.path.insert(0, sys.argv[1])
+import manager_core.proxy_auth
+class Broken:
+    def __init__(self, *arguments, **options):
+        raise RuntimeError('fixture-detail-must-not-appear')
+manager_core.proxy_auth.AuthProxy = Broken
+sys.argv = [sys.argv[2], '--', 'app-server']
+runpy.run_path(sys.argv[0], run_name='__main__')
+''', encoding='utf-8')
+            environment = clean_environment(root, CODEX_MANAGER_ROOT=str(root), CODEX_MANAGER_PROFILE_ID=profile_id,
+                                            CODEX_MANAGER_OBSERVER_PATH=str(observer))
+            result = subprocess.run(
+                [sys.executable, str(wrapper), str(SCRIPT_ROOT), str(SCRIPT_ROOT / 'manager_core' / 'runtime_proxy.py')],
+                env=environment, stdin=subprocess.DEVNULL, capture_output=True, timeout=30,
+                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        self.assertEqual(result.returncode, 70, result.stderr)
+        self.assertIn(b'Codex managed runtime proxy stopped unexpectedly.', result.stderr)
+        self.assertNotIn(b'fixture-detail-must-not-appear', result.stderr)
+        self.assertNotIn(b'Traceback', result.stderr)
+
     def test_only_windows_process_start_failures_are_transient(self):
         from manager_core.runtime_proxy import transient_start_failure
         # A busy launcher can notice a loader failure late; the replay seal
-        # (first output, start window) bounds which starts are replaced.
-        cases = [((STATUS_DLL_INIT_FAILED, 1.2), True), ((STATUS_DLL_INIT_FAILED - (1 << 32), 0.1), True),
-                 ((STATUS_DLL_INIT_FAILED, 12.0), True), ((STATUS_ACCESS_VIOLATION, 0.2), True),
-                 ((STATUS_ACCESS_VIOLATION, 1.3), False), ((STATUS_STACK_BUFFER_OVERRUN, 0.1), False),
-                 ((1, 0.1), False), ((0, 0.1), False), ((None, 0.1), False)]
-        for (code, uptime), expected in cases:
-            with self.subTest(code=code, uptime=uptime):
-                self.assertIs(transient_start_failure(code, uptime, windows=True), expected)
-        self.assertFalse(transient_start_failure(STATUS_DLL_INIT_FAILED, 0.1, windows=False))
+        # (first output, start window) bounds which starts are replaced. An
+        # access violation is a crash of runtime code, however early.
+        cases = [(STATUS_DLL_INIT_FAILED, True), (STATUS_DLL_INIT_FAILED - (1 << 32), True),
+                 (STATUS_ACCESS_VIOLATION, False), (STATUS_ACCESS_VIOLATION - (1 << 32), False),
+                 (STATUS_STACK_BUFFER_OVERRUN, False), (1, False), (0, False), (None, False),
+                 (float(STATUS_DLL_INIT_FAILED), False)]
+        for code, expected in cases:
+            with self.subTest(code=code):
+                self.assertIs(transient_start_failure(code, windows=True), expected)
+        self.assertFalse(transient_start_failure(STATUS_DLL_INIT_FAILED, windows=False))
 
     def test_exit_status_keeps_the_ntstatus_bits(self):
         from manager_core.runtime_proxy import exit_status
@@ -563,6 +632,23 @@ class RuntimeInputTests(unittest.TestCase):
         bounded.write(b'b')
         self.assertFalse(bounded.replaceable())
 
+    def test_a_seal_reports_the_deferred_gap_even_when_its_write_fails(self):
+        # An admin write or the replay bound seals the input after the exited
+        # child's writer failed: the write raises, and the gap is still reported.
+        from manager_core.runtime_proxy import RuntimeInput
+        for name, body, before_write in (('admin', b'{"id":2}\n', lambda: True), ('bound', b'x' * 2048, None)):
+            with self.subTest(name):
+                gaps = []
+                runtime_input = RuntimeInput(RecordingStream(broken=True), lambda: gaps.append('gap'), limit=1024)
+                writer = runtime_input.writer
+                runtime_input.write(b'{"id":1}\n')
+                writer.thread.join(5)
+                self.assertEqual(gaps, [])
+                with self.assertRaises(OSError):
+                    runtime_input.write(body, before_write)
+                self.assertEqual(gaps, ['gap'])
+                self.assertFalse(runtime_input.replaceable())
+
     def test_closed_input_is_not_replaced(self):
         self.input.close()
         self.assertFalse(self.input.replaceable())
@@ -624,8 +710,38 @@ class RuntimeStartRetryTests(unittest.TestCase):
         self.assertEqual(len(state['start_retries']), 2)
         self.assertTrue(harness.replies.empty())
 
+    def test_uptime_includes_process_creation_for_every_start(self):
+        # On a loaded machine creating the process is part of the start. The
+        # replacement's clock, like the first child's, starts before it.
+        harness = RetryHarness(self, failures=2, patch='slow-spawn')
+        harness.send({'id': 1, 'method': 'initialize', 'params': {}})
+        self.assertEqual(harness.replies.get(timeout=20)['result']['attempt'], 3)
+        harness.process.stdin.close()
+        code, error = harness.finish()
+        self.assertEqual(code, 0, error)
+        retries = harness.observed()['start_retries']
+        self.assertEqual(len(retries), 2)
+        # Each failed child lived die_after (0.3 s) after a 0.5 s process creation.
+        self.assertTrue(all(item['uptime_ms'] >= 800 for item in retries), retries)
+
+    def test_replacement_without_an_output_reader_is_stopped(self):
+        harness = RetryHarness(self, failures=1, patch='no-reader-thread')
+        harness.send({'id': 1, 'method': 'initialize', 'params': {}})
+        code, error = harness.finish()  # The app's input stays open.
+        self.assertNotIn(b'Fatal Python error', error)
+        self.assertNotIn(b'Traceback', error)
+        self.assertEqual(code & 0xFFFFFFFF, STATUS_DLL_INIT_FAILED, error)
+        state = harness.observed()
+        self.assertEqual((state['last_exit']['exit_code'], state['last_exit']['retries'],
+                          state['last_exit']['initialize_completed']), (STATUS_DLL_INIT_FAILED, 1, False))
+        # The status names the replacement, which no longer runs.
+        self.assertNotIn(state['runtime_process_id'], harness.starts()[:1])
+        self.assertFalse(process_running(state['runtime_process_id']))
+        self.assertTrue(harness.replies.empty())
+
     def test_runtime_output_or_a_closed_app_input_prevents_a_retry(self):
-        cases = [dict(mode='notify'), dict(code=STATUS_ACCESS_VIOLATION, die_after=1.3), dict(close=True)]
+        # An access violation is never retried, however early it came.
+        cases = [dict(mode='notify'), dict(code=STATUS_ACCESS_VIOLATION, die_after=0.2), dict(close=True)]
         for case in cases:
             with self.subTest(**case):
                 close = case.pop('close', False)

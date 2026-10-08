@@ -6,8 +6,8 @@ Prints one JSON document, then a short Korean summary: the runtime pointers
 (current, last-known-good, previous) and whether their files still verify,
 staged candidates newer than the active runtime, whether the current runtime's
 migrations fit the live stores (and store migrations it does not embed), the
-SSH update backlog, Claude login expiry, the last runtime exit of each profile
-and the manager release. It writes nothing and starts or stops nothing; of a
+SSH update backlog, Claude login expiry, the last runtime exit of each profile,
+runtimes that recovered after process-start retries and the manager release. It writes nothing and starts or stops nothing; of a
 Claude credential file it reads expiresAt only.
 """
 import argparse
@@ -226,6 +226,37 @@ def runtime_exits(root, state):
     return exits
 
 
+def runtime_start_retries(root, state):
+    """Profiles whose runtime_proxy replaced runtimes that failed during process start.
+
+    start_retries lists each failed start a replacement took over (while the
+    proxy runs and after); last_exit.retries counts them once it ended.
+    recovered: the last runtime completed initialize - by its exit record, or
+    while it still runs, by the observer.
+    """
+    aliases, result = _aliases(state), []
+    for path in sorted((root / CONTROL / 'instances').glob('*/runtime-state.json')):
+        try:
+            data = _json(path, 16 * 1024 * 1024)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        attempts = data.get('start_retries')
+        attempts = [item for item in attempts if isinstance(item, dict)] if isinstance(attempts, list) else []
+        last = data.get('last_exit') if isinstance(data.get('last_exit'), dict) else None
+        retries = len(attempts) or (last or {}).get('retries')
+        if type(retries) is not int or retries <= 0:
+            continue
+        initialized = last.get('initialize_completed') if last is not None else data.get('initialized')
+        result.append(_compact(dict(profile_id=path.parent.name, profile=aliases.get(path.parent.name),
+                                    retries=retries, recovered=initialized is True,
+                                    exit_codes=[item['exit_code'] for item in attempts
+                                                if type(item.get('exit_code')) is int] or None,
+                                    last_retry_at=attempts[-1].get('exited_at') if attempts else None)))
+    return result
+
+
 def manager_release(root):
     pointer = _json(root / 'artifacts/manager/current.json')
     if pointer is None:
@@ -256,7 +287,8 @@ def report(root=ROOT, *, now=None, environ=None):
                  migrations=_section(migrations, root),
                  remote_updates=_section(remote_updates, state),
                  claude_logins=_section(claude_logins, state, now, environ),
-                 runtime_exits=_section(runtime_exits, root, state))
+                 runtime_exits=_section(runtime_exits, root, state),
+                 runtime_start_retries=_section(runtime_start_retries, root, state))
     if state_error is not None:
         value['state_error'] = state_error
     return value
@@ -344,6 +376,16 @@ def summary(value):
                 '%s 종료 코드 %s%s' % (item.get('profile') or item['profile_id'], item.get('exit_code'),
                                      ' · 시작 재시도 %s회' % item['retries'] if item.get('retries') else '')
                 for item in early)))
+    retried = value.get('runtime_start_retries')
+    if isinstance(retried, list):
+        # A failed last start is already listed above with its retry count.
+        recovered = [item for item in retried if item.get('recovered')]
+        if recovered:
+            lines.append('시작 재시도 후 복구된 런타임: %d개 프로필 (%s)' % (len(recovered), ', '.join(
+                '%s 시작 재시도 %s회%s' % (item.get('profile') or item['profile_id'], item['retries'],
+                                       ' · 실패 종료 코드 %s' % '/'.join(str(code) for code in dict.fromkeys(
+                                           item['exit_codes'])) if item.get('exit_codes') else '')
+                for item in recovered)))
     return lines
 
 
