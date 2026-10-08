@@ -222,7 +222,7 @@ def runtime_exits(root, state):
             exits.append(_compact(dict(profile_id=path.parent.name, profile=aliases.get(path.parent.name),
                                        exit_code=last.get('exit_code'), uptime_ms=last.get('uptime_ms'),
                                        initialize_completed=last.get('initialize_completed'),
-                                       exited_at=last.get('exited_at'))))
+                                       exited_at=last.get('exited_at'), retries=last.get('retries'))))
     return exits
 
 
@@ -341,7 +341,9 @@ def summary(value):
                  if item.get('initialize_completed') is False and item.get('exit_code') not in (0, None)]
         if early:
             lines.append('초기화 전에 종료된 런타임: %d개 프로필 (%s)' % (len(early), ', '.join(
-                '%s 종료 코드 %s' % (item.get('profile') or item['profile_id'], item.get('exit_code')) for item in early)))
+                '%s 종료 코드 %s%s' % (item.get('profile') or item['profile_id'], item.get('exit_code'),
+                                     ' · 시작 재시도 %s회' % item['retries'] if item.get('retries') else '')
+                for item in early)))
     return lines
 
 

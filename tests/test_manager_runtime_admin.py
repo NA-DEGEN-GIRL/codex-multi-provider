@@ -491,6 +491,120 @@ raise SystemExit(proxy(Path(sys.executable),[sys.argv[5],'app-server'],Path(sys.
                 process.stderr.close()
                 self.assertEqual(errors, '')
 
+    def test_replaced_runtime_start_rebinds_the_admin_endpoint(self):
+        # The first runtime dies during process start (0xC0000142). The proxy
+        # replays the app's input to a replacement; the endpoint and status
+        # must then name the replacement. 'late': the first runtime had exited
+        # before the endpoint could bind, so it starts with the replacement.
+        for mode in ('rebind', 'late'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                profile_id, generation, thread_id = [str(uuid4()) for _ in range(3)]
+                observer = root / 'work/control-center/instances' / profile_id / 'runtime-state.json'
+                starts = root / 'starts.txt'
+                fake = root / 'fake.py'
+                fake.write_text('''import json,os,sys,time
+from pathlib import Path
+with open(sys.argv[1],'a') as handle: handle.write('%d\\n' % os.getpid())
+if len(Path(sys.argv[1]).read_text().split())==1:
+    time.sleep(float(sys.argv[2]))
+    os._exit(0xC0000142-(1<<32))
+for line in sys.stdin:
+    message=json.loads(line)
+    method=message.get('method')
+    if 'id' not in message: continue
+    if method=='initialize': result={'userAgent':'fixture'}
+    elif method=='account/read': result={'account':{'type':'apiKey'}}
+    elif method=='thread/read':
+        tid=message['params']['threadId']
+        result={'thread':{'id':tid,'sessionId':tid,'parentThreadId':None,'forkedFromId':None,'status':{'type':'idle'}}}
+    else: result={}
+    print(json.dumps({'id':message['id'],'result':result}),flush=True)
+''', encoding='utf-8')
+                bootstrap = root / 'bootstrap.py'
+                bootstrap.write_text('''import os,sys,time
+from pathlib import Path
+sys.path.insert(0,sys.argv[1])
+from manager_core import runtime_proxy
+runtime_proxy.START_RETRY_DELAYS=(0.05,0.05)
+if sys.argv[7]=='late':
+    original=runtime_proxy.AdminServer
+    calls=[]
+    def late(*arguments,**options):
+        calls.append(1)
+        if len(calls)==1: time.sleep(1.5)  # The first runtime has exited meanwhile.
+        return original(*arguments,**options)
+    runtime_proxy.AdminServer=late
+environment={k:v for k,v in os.environ.items() if not k.startswith('CODEX_MANAGER_')}
+environment.update(CODEX_MANAGER_ROOT=sys.argv[2],CODEX_MANAGER_GENERATION=sys.argv[4],CODEX_MANAGER_REAL_RUNTIME=sys.executable)
+raise SystemExit(runtime_proxy.proxy(Path(sys.executable),[sys.argv[5],sys.argv[8],sys.argv[9],'app-server'],
+                                     Path(sys.argv[6]),sys.argv[3],environment))
+''', encoding='utf-8')
+                process = subprocess.Popen([sys.executable, str(bootstrap),
+                    str(Path(__file__).resolve().parents[1] / 'scripts'), str(root), profile_id, generation,
+                    str(fake), str(observer), mode, str(starts), '0' if mode == 'late' else '2.0'],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                    encoding='utf-8', creationflags=subprocess.CREATE_NO_WINDOW)
+                replies = queue.Queue()
+                def read_stdout():
+                    for line in process.stdout:
+                        replies.put(json.loads(line))
+                reader = threading.Thread(target=read_stdout, daemon=True)
+                reader.start()
+                def send(value):
+                    process.stdin.write(json.dumps(value) + '\n')
+                    process.stdin.flush()
+                try:
+                    client = AdminClient(root, profile_id, generation)
+                    first = None
+                    if mode == 'rebind':
+                        deadline = time.monotonic() + 5
+                        while not client.path.exists() and time.monotonic() < deadline:
+                            time.sleep(.02)
+                        first = _decode(client.path.read_bytes())
+                    send({'id': 1, 'method': 'initialize', 'params': {}})
+                    self.assertEqual(replies.get(timeout=15)['id'], 1)
+                    send({'method': 'initialized'})
+                    send({'id': 2, 'method': 'account/read', 'params': {}})
+                    self.assertEqual(replies.get(timeout=5)['id'], 2)
+                    pids = [int(pid) for pid in starts.read_text().split()]
+                    self.assertEqual(len(pids), 2)
+                    deadline = time.monotonic() + 8
+                    while True:
+                        state = json.loads(observer.read_text(encoding='utf-8'))
+                        if ((state['runtime_process_id'], state['admin_channel']['state']) == (pids[1], 'ready')
+                                or time.monotonic() > deadline):
+                            break
+                        time.sleep(.05)
+                    self.assertEqual((state['runtime_process_id'], state['admin_channel']['state']), (pids[1], 'ready'))
+                    self.assertEqual([item['exit_code'] for item in state['start_retries']], [0xC0000142])
+                    self.assertEqual(client.identities()['runtime']['pid'], pids[1])
+                    if first is not None:
+                        # Same endpoint, re-published for the replacement runtime.
+                        second = _decode(client.path.read_bytes())
+                        self.assertEqual((first['runtime']['pid'], second['runtime']['pid']), tuple(pids))
+                        self.assertEqual(first['address'], second['address'])
+                    result = client.request('thread/read', {'threadId': thread_id}, 5)
+                    self.assertEqual(result['thread']['sessionId'], thread_id)
+                    process.stdin.close()
+                    self.assertEqual(process.wait(timeout=10), 0)
+                    reader.join(2)
+                    self.assertFalse(client.path.exists())
+                    final = json.loads(observer.read_text(encoding='utf-8'))
+                    self.assertEqual((final['admin_channel']['state'], final['last_exit']['retries']), ('closed', 1))
+                finally:
+                    if process.poll() is None:
+                        process.stdin.close()
+                        try:
+                            process.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            process.terminate()
+                            process.wait(timeout=5)
+                    process.stdout.close()
+                    errors = process.stderr.read()
+                    process.stderr.close()
+                    self.assertEqual(errors, '')
+
 
 if __name__ == '__main__':
     unittest.main()

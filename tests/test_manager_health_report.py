@@ -191,13 +191,17 @@ class HealthReportTests(unittest.TestCase):
         self.assertNotIn('불량 목록 /', runtimes)
 
     def test_clean_exit_before_initialize_is_not_a_failed_start(self):
-        exits = dict(clean=dict(exit_code=0), failed=dict(exit_code=101), unknown=dict(exit_code=None))
+        exits = dict(clean=dict(exit_code=0), failed=dict(exit_code=101), unknown=dict(exit_code=None),
+                     retried=dict(exit_code=0xC0000142, retries=2))
         for name, fields in exits.items():
             atomic_json(self.root / 'work/control-center/instances' / name / 'runtime-state.json',
                         dict(last_exit=dict(initialize_completed=False, uptime_ms=10, **fields)))
         value = report(self.root, now=NOW, environ={'LOCALAPPDATA': str(self.local)})
-        self.assertEqual(sorted(item['profile_id'] for item in value['runtime_exits']), ['clean', 'failed', 'unknown'])
-        self.assertIn('초기화 전에 종료된 런타임: 1개 프로필 (failed 종료 코드 101)', summary(value))
+        self.assertEqual(sorted(item['profile_id'] for item in value['runtime_exits']),
+                         ['clean', 'failed', 'retried', 'unknown'])
+        self.assertEqual([item.get('retries') for item in value['runtime_exits']], [None, None, 2, None])
+        self.assertIn('초기화 전에 종료된 런타임: 2개 프로필 (failed 종료 코드 101, '
+                      'retried 종료 코드 3221225794 · 시작 재시도 2회)', summary(value))
 
     def test_candidate_that_cannot_be_read_is_listed_as_incomplete(self):
         stage_release(self.root, '20261001-000000-aaaaaa')

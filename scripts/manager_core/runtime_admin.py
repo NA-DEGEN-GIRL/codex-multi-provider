@@ -634,6 +634,25 @@ class AdminServer:
         self._slots = threading.BoundedSemaphore(4)
         self._connections = set()
         self._lock = threading.Lock()
+        # Orders descriptor publication against close().
+        self._publish_lock = threading.Lock()
+
+    def _publish(self):
+        temporary = None
+        try:
+            descriptor = {'version': _VERSION, 'profile_id': self.profile_id,
+                          'generation': self.generation, 'runtime': self.runtime,
+                          'proxy': self.proxy, 'address': self._address,
+                          'key_dpapi': base64.b64encode(_crypt_secret(self._key, True)).decode('ascii')}
+            handle, temporary = tempfile.mkstemp(prefix='endpoint-', suffix='.tmp', dir=self.path.parent)
+            with os.fdopen(handle, 'wb') as output:
+                output.write(_encode(descriptor, _MAX_REQUEST))
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, self.path)
+        finally:
+            if temporary is not None and os.path.exists(temporary):
+                os.unlink(temporary)
 
     def start(self):
         if self._listener is not None:
@@ -650,27 +669,29 @@ class AdminServer:
         # Authentication runs in bounded client workers so an unauthenticated
         # connection cannot monopolize the only accept loop.
         self._listener = Listener(self._address, family='AF_PIPE', authkey=None)
-        temporary = None
         try:
-            descriptor = {'version': _VERSION, 'profile_id': self.profile_id,
-                          'generation': self.generation, 'runtime': self.runtime,
-                          'proxy': self.proxy, 'address': self._address,
-                          'key_dpapi': base64.b64encode(_crypt_secret(self._key, True)).decode('ascii')}
-            handle, temporary = tempfile.mkstemp(prefix='endpoint-', suffix='.tmp', dir=self.path.parent)
-            with os.fdopen(handle, 'wb') as output:
-                output.write(_encode(descriptor, _MAX_REQUEST))
-                output.flush()
-                os.fsync(output.fileno())
-            os.replace(temporary, self.path)
+            with self._publish_lock:
+                self._publish()
         except BaseException:
             self._listener.close()
             self._listener = None
             raise
-        finally:
-            if temporary is not None and os.path.exists(temporary):
-                os.unlink(temporary)
         threading.Thread(target=self._accept, name='codex-admin-accept', daemon=True).start()
         return self
+
+    def rebind_runtime(self, runtime_pid):
+        """Bind this endpoint to the proxy's replacement runtime child.
+
+        The proxy replaces a runtime only when it failed during process start,
+        before initialize. The address and key stay; requests that name the
+        previous runtime are rejected as stale like after any runtime change.
+        """
+        identity = _identity(runtime_pid)
+        with self._publish_lock:
+            if self._stop.is_set() or self._listener is None:
+                raise AdminError('closed')
+            self.runtime = identity
+            self._publish()
 
     def _accept(self):
         while not self._stop.is_set():
@@ -760,12 +781,13 @@ class AdminServer:
         with self._lock:
             for connection in tuple(self._connections):
                 _close_connection(connection)
-        try:
-            descriptor = _decode(self.path.read_bytes())
-            if descriptor.get('address') == self._address:
-                self.path.unlink()
-        except (OSError, AdminError):
-            pass
+        with self._publish_lock:
+            try:
+                descriptor = _decode(self.path.read_bytes())
+                if descriptor.get('address') == self._address:
+                    self.path.unlink()
+            except (OSError, AdminError):
+                pass
 
 
 class AdminClient:
