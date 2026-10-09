@@ -75,9 +75,10 @@ profile codex_workspace_bwrap "/home/USER/.local/share/codex-control-center/runt
 
 ## 세션 복원과 검증 범위
 
-`catalog_legacy.discover()`는 `$HOME/.codex` 및 지원하는 `llm-usage` 레지스트리의 Codex home을
-검색합니다. 관리 프로필들은 별도의 공통 source 목록으로 검색합니다. 기본 home 디렉터리는
-관리 런타임을 시작하기 전에 만들어 두면 빈 상태에서도 목록에 포함할 수 있습니다.
+`catalog_legacy.discover()`는 기본 Codex home인 `$HOME/.codex`만 검색합니다.
+이전 릴리스가 설치한 helper는 다음 준비 전까지 예전 `llm-usage` 레지스트리를 계속 읽을 수 있으며,
+관리 앱은 그 오류 코드(`llm_usage`)를 계속 허용합니다. 관리 프로필들은 별도의 공통 source 목록으로
+검색합니다. 기본 home 디렉터리는 관리 런타임을 시작하기 전에 만들어 두면 빈 상태에서도 목록에 포함할 수 있습니다.
 다른 임의 경로의 백업을 자동으로 찾아내는 기능은 아닙니다.
 
 일반 CLI 기록은 원래 `sessions/`, `archived_sessions/`의 구조와 관련 인덱스를 보존해 복원합니다.

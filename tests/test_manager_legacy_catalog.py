@@ -36,88 +36,78 @@ class LegacyDiscoveryTests(unittest.TestCase):
         self.managed = dict(id='manager:' + str(uuid4()), home=str(self.root / 'managed'))
         self.stock = self.root / '.codex'
         self.stock.mkdir()
-        self.usage = self.root / 'usage/profile'
-        self.usage.mkdir(parents=True)
-        self.registry = self.root / '.config/llm-usage/config.json'
-        self.accounts = [dict(id=str(uuid4()), provider='codex', alias='04', profile_dir=str(self.usage))]
-        self.save_registry()
+        self.imported = self.root / 'imported/profile'
+        self.imported.mkdir(parents=True)
 
-    def save_registry(self, version=3):
-        atomic_json(self.registry, dict(schema_version=version, accounts=self.accounts))
+    def discover(self, environ=None):
+        return legacy.discover(self.root, [self.managed], environ=environ if environ is not None else {})
 
-    def discover(self):
-        return legacy.discover(self.root, [self.managed], environ={})
-
-    def test_stock_and_registry_versions_are_read_without_account_or_config_access(self):
-        # Only the registry is opened; login/config/rollout files are not read.
-        original = Path.open
-        opened = []
+    def test_stock_home_is_found_without_opening_any_file(self):
         def open_path(path, *args, **kwargs):
-            opened.append(path)
-            self.assertEqual(path, self.registry)
-            return original(path, *args, **kwargs)
-        for version in (1, 2, 3):
-            self.save_registry(version)
-            with patch.object(Path, 'open', open_path):
-                result = self.discover()
-            self.assertEqual(result['errors'], [])
-            self.assertEqual({s['home'] for s in result['sources']}, {str(self.stock), str(self.usage)})
-        self.assertEqual(len(opened), 3)
+            raise AssertionError('Discovery must not open ' + str(path))
+        with patch.object(Path, 'open', open_path):
+            result = self.discover()
+        self.assertEqual(result['errors'], [])
+        self.assertEqual([s['home'] for s in result['sources']], [str(self.stock)])
+        self.assertEqual(result['sources'][0]['alias'], '기존 Codex')
 
-    def test_other_providers_duplicate_homes_and_managed_homes_are_not_reenrolled(self):
-        self.accounts.extend([
-            dict(provider='claude', alias='Ignored', profile_dir='/not/read'),
-            dict(provider='codex', alias='Same store', profile_dir=str(self.stock)),
-            dict(provider='codex', alias='Managed', profile_dir=self.managed['home']),
-        ])
-        self.save_registry()
-        self.assertEqual(len(self.discover()['sources']), 2)
+    def test_missing_stock_home_is_an_empty_successful_discovery(self):
+        self.stock.rmdir()
+        self.assertEqual(self.discover(), dict(sources=[], errors=[]))
 
-    def test_custom_xdg_registry_and_unavailable_profile_have_stable_paths(self):
-        old = self.registry
-        self.registry = self.root / 'custom/llm-usage/config.json'
-        self.accounts[0]['profile_dir'] = str(self.root / 'unavailable')
-        self.save_registry()
-        result = legacy.discover(self.root, [], environ={'XDG_CONFIG_HOME': str(self.root / 'custom')})
-        self.assertFalse(result['errors'])
-        self.assertIn(str(self.root / 'unavailable'), {s['home'] for s in result['sources']})
-        self.assertTrue(old.is_file())
+    def test_old_account_registry_is_ignored_whether_valid_invalid_or_oversize(self):
+        # An old account registry under the default or a custom config root
+        # never adds a home and never reports a discovery error.
+        valid = dict(schema_version=3, accounts=[
+            dict(id=str(uuid4()), provider='codex', alias='04', profile_dir=str(self.imported))])
+        for config_root, environ in ((self.root / '.config', {}),
+                                     (self.root / 'custom', {'XDG_CONFIG_HOME': str(self.root / 'custom')})):
+            registry = config_root / 'llm-usage/config.json'
+            for content in (json.dumps(valid).encode(), json.dumps({'schema_version': 99}).encode(),
+                            b'not json', b' ' * (1024 * 1024 + 1)):
+                with self.subTest(root=config_root.name, size=len(content)):
+                    registry.parent.mkdir(parents=True, exist_ok=True)
+                    registry.write_bytes(content)
+                    result = self.discover(environ)
+                    self.assertEqual(result['errors'], [])
+                    self.assertEqual([s['home'] for s in result['sources']], [str(self.stock)])
 
-    def test_malformed_relative_or_oversize_registry_is_not_successful_deletion(self):
-        for value in ([], {'schema_version': 99}, {'schema_version': 3, 'accounts': {}}):
-            atomic_json(self.registry, value)
-            self.assertEqual(self.discover()['errors'], ['llm_usage'])
-        self.accounts[0]['profile_dir'] = 'relative/path'
-        self.save_registry()
-        self.assertEqual(self.discover()['errors'], ['llm_usage'])
-        self.registry.write_bytes(b' ' * (1024 * 1024 + 1))
-        self.assertEqual(self.discover()['errors'], ['llm_usage'])
+    def test_managed_stock_home_is_not_reenrolled(self):
+        managed = dict(id='manager:' + str(uuid4()), home=str(self.stock))
+        self.assertEqual(legacy.discover(self.root, [managed]), dict(sources=[], errors=[]))
 
-    def test_rename_keeps_identity_and_a_changed_home_does_not_retarget_it(self):
-        before = self.discover()['sources'][1]
-        self.accounts[0]['alias'] = 'Personal'
-        self.save_registry()
-        renamed = self.discover()['sources'][1]
-        self.assertEqual(before['id'], renamed['id'])
-        self.assertEqual(renamed['alias'], 'Personal')
-        self.accounts[0]['profile_dir'] = str(self.root / 'replacement')
-        self.save_registry()
-        self.assertNotEqual(before['id'], self.discover()['sources'][1]['id'])
+    def test_identity_follows_the_resolved_home(self):
+        first = self.discover()['sources'][0]
+        self.assertEqual(first, self.discover()['sources'][0])
+        other_home = self.root / 'other-user'
+        (other_home / '.codex').mkdir(parents=True)
+        moved = legacy.discover(other_home, [])['sources'][0]
+        self.assertNotEqual(first['id'], moved['id'])
+
+    def test_stock_error_is_reported_without_sources(self):
+        real = Path.stat
+        def stat(path, *args, **kwargs):
+            if path == self.stock:
+                raise PermissionError('fixture')
+            return real(path, *args, **kwargs)
+        with patch.object(Path, 'stat', stat):
+            self.assertEqual(self.discover(), dict(sources=[], errors=['stock']))
 
     def test_shared_session_links_map_both_database_and_compact_index_to_original(self):
+        managed_home = Path(self.managed['home'])
+        managed_home.mkdir()
         for name in ('sessions', 'archived_sessions'):
             (self.stock / name).mkdir()
             try:
-                (self.usage / name).symlink_to(self.stock / name, target_is_directory=True)
+                (managed_home / name).symlink_to(self.stock / name, target_is_directory=True)
             except OSError as error:
                 self.skipTest('Directory symlinks unavailable: ' + str(error))
         path = self.stock / 'sessions/fixture.jsonl'
         path.write_text('History must not be opened by origin resolution.', encoding='utf-8')
-        sources = self.discover()['sources']
-        stock, usage = sources
-        homes, roots = legacy.origins(sources)
-        self.assertEqual(legacy.origin_for({'rollout_path': str(path)}, usage['id'], homes, roots), stock['id'])
-        self.assertEqual(legacy.origin_for({}, usage['id'], homes, roots), stock['id'])
+        stock, = self.discover()['sources']
+        homes, roots = legacy.origins([self.managed, stock])
+        self.assertEqual(legacy.origin_for({'rollout_path': str(path)}, self.managed['id'], homes, roots), stock['id'])
+        self.assertEqual(legacy.origin_for({}, self.managed['id'], homes, roots), stock['id'])
         self.assertFalse((self.stock / 'managed-source.json').exists())
 
     def test_helper_reads_existing_legacy_rows_without_changing_source_bytes(self):
@@ -127,7 +117,7 @@ class LegacyDiscoveryTests(unittest.TestCase):
         managed = dict(id='manager:' + profile_id, home=str(managed_home))
         atomic_json(managed_home / 'managed-source.json', dict(host_id='local', store_id=managed['id']))
         tid = str(uuid4())
-        index = self.usage / 'session_index.jsonl'
+        index = self.stock / 'session_index.jsonl'
         index.write_text(json.dumps(dict(id=tid, title='Existing work', updated_at=1789300000)) + '\n', encoding='utf-8')
         before = {str(p): p.read_bytes() for p in self.root.rglob('*') if p.is_file()}
         result = helper.read(dict(host_identity='a' * 64, sources=[managed], discover_legacy=True),
@@ -135,6 +125,7 @@ class LegacyDiscoveryTests(unittest.TestCase):
         self.assertFalse(result['errors'])
         self.assertFalse(result['discovery_errors'])
         self.assertEqual(result['conversations'][0]['thread_id'], tid)
+        self.assertEqual(result['conversations'][0]['source_store_id'], legacy.source(self.stock, '')['id'])
         self.assertEqual(before, {str(p): p.read_bytes() for p in self.root.rglob('*') if p.is_file()})
 
 

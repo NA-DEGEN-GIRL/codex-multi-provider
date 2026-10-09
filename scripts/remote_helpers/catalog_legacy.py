@@ -1,7 +1,5 @@
 """Discover existing Codex homes from metadata only; never load account auth."""
 import hashlib
-import json
-import os
 from pathlib import Path
 
 
@@ -11,8 +9,11 @@ def source(home, alias):
 
 
 def discover(user_home, managed, *, environ=None):
-    """Return read-only catalog homes. A changed home has a different identity."""
-    environ = os.environ if environ is None else environ
+    """Return read-only catalog homes. A changed home has a different identity.
+
+    Only the stock ``$HOME/.codex`` is discovered; no account registry is read.
+    ``environ`` is accepted for older callers and ignored.
+    """
     user_home = Path(user_home)
     seen = {str(Path(item['home']).resolve()) for item in managed}
     found, errors = [], []
@@ -35,54 +36,11 @@ def discover(user_home, managed, *, environ=None):
             add(stock, '기존 Codex')
     except (OSError, ValueError, RuntimeError):
         errors.append('stock')
-    try:
-        configured = environ.get('XDG_CONFIG_HOME')
-        config_home = Path(configured).expanduser() if configured else user_home / '.config'
-        if not config_home.is_absolute():
-            raise ValueError('Relative registry root')
-        registry = config_home / 'llm-usage/config.json'
-        if registry.is_symlink():
-            raise ValueError('Registry path changed')
-        try:
-            metadata = registry.stat()
-        except FileNotFoundError:
-            metadata = None
-        if metadata is not None:
-            if not registry.is_file() or metadata.st_size > 1024 * 1024:
-                raise ValueError('Registry size limit')
-            with registry.open(encoding='utf-8') as stream:
-                content = stream.read(1024 * 1024 + 1)
-            if len(content) > 1024 * 1024:
-                raise ValueError('Registry size limit')
-            value = json.loads(content)
-            if type(value.get('schema_version')) is not int or value['schema_version'] not in (1, 2, 3):
-                raise ValueError('Unsupported registry version')
-            accounts = value['accounts']
-            if not isinstance(accounts, list) or len(accounts) > 256:
-                raise ValueError('Invalid account inventory')
-            for account in accounts:
-                if not isinstance(account, dict):
-                    raise ValueError('Invalid account metadata')
-                if account.get('provider') != 'codex':
-                    continue
-                home, alias = account.get('profile_dir'), account.get('alias')
-                if (not isinstance(home, str) or not 1 <= len(home) <= 4096
-                        or not isinstance(alias, str) or not 1 <= len(alias.strip()) <= 160
-                        or any(ord(c) < 32 for c in home + alias)):
-                    raise ValueError('Invalid Codex source metadata')
-                # llm-usage writes resolved paths. Do not interpret relative
-                # paths using the SSH process working directory.
-                path = Path(home).expanduser()
-                if not path.is_absolute():
-                    raise ValueError('Relative Codex home')
-                add(path, alias.strip())
-    except (OSError, ValueError, KeyError, TypeError, AttributeError, RuntimeError):
-        errors.append('llm_usage')
     return dict(sources=found, errors=errors)
 
 
 def origins(sources):
-    """Physical record roots handle llm-usage's shared sessions symlinks."""
+    """Physical record roots handle symlinked sessions folders."""
     homes = {item['id']: Path(item['home']) for item in sources}
     roots = {}
     for sid, home in homes.items():

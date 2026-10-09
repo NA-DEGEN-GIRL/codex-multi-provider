@@ -101,14 +101,15 @@ class RemoteSourceTests(unittest.TestCase):
         self.assertEqual({source['sourceStoreId'] for source in catalog['sources']},
                          {'manager:' + profile.name for profile in [self.one, self.two, *profiles]})
 
-    def test_mixed_catalog_enrolls_legacy_homes_without_managed_authority(self):
+    def test_mixed_catalog_enrolls_the_stock_home_without_managed_authority(self):
         user_home = self.root.parent / 'user'
         stock = user_home / '.codex'
         stock.mkdir(parents=True)
-        registry = user_home / '.config/llm-usage/config.json'
-        atomic_json(registry, dict(schema_version=3, accounts=[
-            dict(provider='codex', alias='04', profile_dir=str(stock)),
-            dict(provider='codex', alias='Unavailable', profile_dir=str(user_home / 'absent'))]))
+        # An old account registry naming other homes is not consulted.
+        imported = user_home / 'imported'
+        imported.mkdir()
+        atomic_json(user_home / '.config/llm-usage/config.json', dict(schema_version=3, accounts=[
+            dict(provider='codex', alias='Imported', profile_dir=str(imported))]))
         (stock / 'auth.json').write_bytes(b'Private fixture; discovery must not open this file.')
         before = (stock / 'auth.json').read_bytes()
         with patch('pathlib.Path.home', return_value=user_home), patch.dict('os.environ', {'XDG_CONFIG_HOME': str(user_home / '.config')}):
@@ -137,14 +138,19 @@ class RemoteSourceTests(unittest.TestCase):
         inventory = json.loads((self.root.parent / 'catalog-sources.json').read_text())
         self.assertIn('manager:' + added.name, {s['sourceStoreId'] for s in inventory['sources']})
 
-    def test_bad_registry_preserves_previous_mixed_and_managed_catalogs(self):
+    def test_stock_discovery_error_preserves_previous_mixed_and_managed_catalogs(self):
         user_home = self.root.parent / 'user'
-        (user_home / '.codex').mkdir(parents=True)
-        with patch('pathlib.Path.home', return_value=user_home), patch.dict('os.environ', {'XDG_CONFIG_HOME': str(user_home / '.config')}):
+        stock = user_home / '.codex'
+        stock.mkdir(parents=True)
+        real = Path.stat
+        def stat(path, *args, **kwargs):
+            if path == stock:
+                raise PermissionError('fixture')
+            return real(path, *args, **kwargs)
+        with patch('pathlib.Path.home', return_value=user_home):
             generate(self.one, atomic=atomic_json, shared_catalog=True, legacy_discovery=True)
             paths = [self.root.parent / name for name in ('catalog-sources.json', 'catalog-mixed-sources.json')]
             before = [p.read_bytes() for p in paths]
-            atomic_json(user_home / '.config/llm-usage/config.json', {'schema_version': 999})
-            with self.assertRaises(ValueError):
+            with patch.object(Path, 'stat', stat), self.assertRaisesRegex(ValueError, 'discovery unavailable'):
                 generate(self.one, atomic=atomic_json, shared_catalog=True, legacy_discovery=True)
             self.assertEqual([p.read_bytes() for p in paths], before)
