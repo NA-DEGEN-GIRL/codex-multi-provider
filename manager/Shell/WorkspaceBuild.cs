@@ -9,7 +9,7 @@ namespace Codex.ControlCenter.Shell;
 internal static class WorkspaceBuild
 {
     internal const int Revision = 121;
-    internal const string Description = "llm-usage 연동 정리";
+    internal const string Description = "Claude 로그인 자동 갱신·장기 토큰·llm-usage 정리";
     internal static string Label => $"수정 {Revision}";
     internal static string Title => "Codex 작업 공간";
     internal static string BuildId { get; } = RunningBuildId();

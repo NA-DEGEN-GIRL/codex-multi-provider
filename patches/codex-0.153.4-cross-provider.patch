@@ -15262,7 +15262,7 @@ index 2f08b0fdc..6c6d5e9c9 100644
  [target.'cfg(windows)'.dependencies]
  codex-windows-sandbox = { workspace = true }
 diff --git a/codex-rs/app-server/README.md b/codex-rs/app-server/README.md
-index a0aa92b7f..fcf89b8a3 100644
+index a0aa92b7f..b2eacb1c3 100644
 --- a/codex-rs/app-server/README.md
 +++ b/codex-rs/app-server/README.md
 @@ -1,5 +1,53 @@
@@ -15336,7 +15336,7 @@ index a0aa92b7f..fcf89b8a3 100644
  Paginated threads keep the same resume contract as legacy threads. A default resume materializes the full projected history into `thread.turns`; `excludeTurns: true` keeps that array empty and includes `turnsBackwardsCursor` and `itemsBackwardsCursor` for the durable history visible at the resume boundary. Pass each cursor directly to its matching list API with `sortDirection: "desc"`; the first page includes the row identified by the cursor, while newer records arrive through live notifications. Either cursor is `null` when there is no durable row yet.
  
  Only one app-server process can hold a paginated thread open for writing at a time. If another process already owns the thread, `thread/resume`, `thread/archive`, and `thread/delete` fail with JSON-RPC error `-32600`. Archive and deletion also fail if another process owns any spawned descendant. Read-only requests remain available without resuming the thread.
-@@ -630,6 +681,231 @@ Gauges register when first used. Depending on process activity, the snapshot can
+@@ -630,6 +681,234 @@ Gauges register when first used. Depending on process activity, the snapshot can
  }
  ```
  
@@ -15426,11 +15426,14 @@ index a0aa92b7f..fcf89b8a3 100644
 +`catalog-mixed-sources.json` for runtimes with the mixed-source capability. An
 +older profile's enrollment can update the managed inventory without replacing
 +the legacy source descriptor. Existing legacy source enrollment is discovered
-+from `~/.codex` and llm-usage metadata when a capable managed profile starts;
-+records created later in an enrolled home are discovered natively without
-+republishing the descriptor. A newly registered legacy home requires another
-+enrollment publication. These manifests are read-only view configuration and
-+never add legacy homes to the managed execution allowlist.
++from `~/.codex` and the homes already listed in `catalog-mixed-sources.json`
++(kept while the folder still resolves to the same path) when a capable managed
++profile starts; no account registry is read. Helpers prepared by an older
++release may still read the former llm-usage registry until the binding is
++prepared again. Records created later in an enrolled home are discovered
++natively without republishing the descriptor. A newly registered legacy home
++requires another enrollment publication. These manifests are read-only view
++configuration and never add legacy homes to the managed execution allowlist.
 +
 +Read-only projections expose experimental `thread.extra.managedRecord` containing
 +`hostId`, `sourceStoreId`, and `canonicalThreadId`. List entries, membership pushes,

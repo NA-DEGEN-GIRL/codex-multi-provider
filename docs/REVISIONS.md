@@ -35,7 +35,28 @@
 
 ## 최근 수정
 
-### 수정 121 — llm-usage 연동 정리
+### 수정 121 — SSH Claude 로그인 자동 갱신·계정별 장기 토큰, llm-usage 연동 정리
+
+**Claude 로그인 갱신과 장기 토큰** ([원인·변경·호환·적용 순서](design/claude-login-renewal-121.md))
+
+- 증상: SSH Claude 작업 6개가 함께 일반 오류 "Claude did not complete this turn"로 끝났다. 원인은 턴 시작 때 빌린 8시간짜리 Windows 로그인 토큰이 턴 중에 만료된 것(401)이다.
+  CLI는 이 토큰을 갱신할 수 없었고, 실행 중인 턴에 새 토큰을 넘길 경로도 없었다.
+- 러너·런타임 변경:
+  - 인증 실패를 `claude_auth_expired`/`claude_auth_rejected`/`claude_login_required`로 구분한다.
+  - 만료되면 한 번 갱신해 같은 세션(`--resume`)으로 이어 한다.
+  - 갱신하지 못한 멈춤은 다음 턴이 같은 세션을 이어 쓴다(`auth_stop`).
+  - 실행 중인 CLI의 토큰을 미리·거부 뒤에 교체한다(`update_environment_variables`, 401 대기).
+- Windows 중개자는 270초 이상 남은 토큰만 빌려 주고, 같은 계정의 동시 요청을 한 번의 읽기로 합친다(작업자 8개).
+- SSH 호스트(Linux)의 토큰 전달:
+  - 러너에는 stdin 채널로, CLI에는 `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`로 넘기고, 모두 소켓 쌍이다. 파일·환경 변수·로그에는 남지 않는다.
+  - 러너와 프록시는 non-dumpable이다. Claude 계정이 있는 프로필의 런타임은 core hard 제한 0으로 시작하므로 그 프로필에서는 `ulimit -c`를 올릴 수 없다.
+- 계정별 장기 토큰(`claude setup-token`, 1년):
+  - Claude 로그인·설정 창에서 발급 창을 열고 붙여넣어 DPAPI로 저장한다. `claude.token.save/remove/retry/issue` 명령으로 다룬다.
+  - 런타임이 `executionPresetCredentialSources: 2`를 알리고 수정 121로 준비한 바인딩일 때만 SSH 작업에 빌려 준다.
+  - 거부되면 턴마다 한 번만 기록하고 같은 턴은 PC 로그인으로 이어 한다. 같은 Linux 사용자의 프로세스가 작업 중 토큰을 읽을 수 있다는 점은 패널이 경고한다.
+- 적용: Windows·Linux 런타임 빌드(트리 `0511f3be…`), 관리 앱 빌드, 완전 종료 뒤 다시 열기, SSH 업데이트·다시 준비가 필요하다. 각 단계는 이전 판과 섞여도 안전하게 동작한다.
+
+**llm-usage 연동 정리** ([없앤 것·남긴 호환 경로·정리 순서](design/llm-usage-removal-121.md))
 
 - 쓰지 않는 llm-usage 연동이 계속 돌았다. 상태 조회가 30초마다 계정 동기화를 했고, SSH 목록 읽기가 호스트마다 계정 레지스트리를 확인했다.
   둘 다 없앴다. `profile.bind`·`accounts.list` 명령을 지웠고, ↻(`accounts.refresh`)는 Windows 로그인 프로필만 확인한다.
@@ -45,7 +66,7 @@
   호스트에서는 `~/.config/llm-usage`를 통째로 지우거나 먼저 다시 준비한다.
 - 새 릴리스를 활성화하기 전에는 llm-usage 체크아웃과 `%LOCALAPPDATA%\llm-usage`를 지우지 않는다.
   사용자의 Claude Code `statusLine`도 아직 llm-usage를 실행한다.
-- [없앤 것·남긴 호환 경로·정리 순서](design/llm-usage-removal-121.md).
+- 런타임 README의 SSH 기존 기록 검색 문장도 "기본 `~/.codex`와 이미 등록된 home"으로 고쳤다.
 
 ### 수정 120 — 런타임 시작 실패 자동 재시도, 시작 실패 뒤 오류창 정리
 
@@ -300,8 +321,8 @@
   커밋하지 않습니다.
 - 사용 설정 선택지(사용자 결정): Fast 등급 범위, 자동 압축 기준, 쓰지 않는 플러그인·MCP 정리.
 - 수정 97의 나머지: 원격 서버의 쓰지 않는 런타임 자동 정리(현재 바인딩과 실행 중 프로세스 기준).
-- 수정 121의 나머지(런타임 작업): 런타임 패치 문서의 "llm-usage metadata" SSH 검색 문장을 "기본 `~/.codex`와
-  이미 등록된 home"으로 고치고 패치와 `patches/runtime-source.json`을 다시 만든다.
+- 수정 121의 나머지: 문서화되지 않은 Claude CLI 동작(토큰 교체·401 대기·디스크립터 토큰)은 CLI 2.1.282에서만 확인했다.
+  CLI가 바뀌면 다시 확인한다. SSH 런타임 데몬의 non-dumpable 처리와 `ptrace_scope` 준비 경고는 하지 않았다.
 
 ## 전체 목록
 
@@ -385,4 +406,4 @@
 | 118 | [remote-exit-hang-118](design/remote-exit-hang-118.md) | 원격 Codex 종료 멈춤(sqlx 정리 작업), 완전 종료 대기 선택지, 서버 64스레드 제한·Windows 교차 빌드 |
 | 119 | [stability-perf-119](design/stability-perf-119.md), [ssh-worktree-project-grouping-96](design/ssh-worktree-project-grouping-96.md) | Claude·SSH 버그, 관리창 속도, 재발 방지 장치 |
 | 120 | [runtime-start-retry-120](design/runtime-start-retry-120.md) | 런타임 시작 실패 재시도, 시작 실패 뒤 오류창, 콘솔 공유 |
-| 121 | [llm-usage-removal-121](design/llm-usage-removal-121.md) | llm-usage 계정 동기화·명령·SSH 레지스트리 검색 제거, 기존 프로필·SSH home 호환 |
+| 121 | [claude-login-renewal-121](design/claude-login-renewal-121.md), [llm-usage-removal-121](design/llm-usage-removal-121.md) | SSH Claude 로그인 자동 갱신·이어 쓰기·실행 중 토큰 교체, 계정별 장기 토큰과 토큰 전달 보호, llm-usage 연동 제거와 기존 프로필·SSH home 호환 |

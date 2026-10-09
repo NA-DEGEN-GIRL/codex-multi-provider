@@ -62,8 +62,10 @@
    - 호스트에서는 `~/.config/llm-usage` 폴더를 통째로 지우거나, 바인딩을 먼저 다시 준비한다. 파일을 비우거나 편집하지 않는다.
 4. 가져온 Codex home의 `sessions` 링크는 `~/.codex`를 가리킬 수 있다. 링크만 지우고 대상은 지우지 않는다.
 5. 호스트에 남은 `~/.local/bin/llm-usage`는 손으로 지워도 된다.
-6. **후속(런타임 작업):** `patches/codex-0.153.4-cross-provider.patch`의 런타임 문서에 "llm-usage metadata" 검색 문장이 남아 있다.
-   런타임 작업에서 "기본 `~/.codex`와 이미 등록된 home"으로 고치고, 패치와 `patches/runtime-source.json`을 다시 만든다.
+6. **런타임 문서(완료):** `runtime/codex-rs/app-server/README.md`의 "llm-usage metadata" 검색 문장을 "기본 `~/.codex`와
+   `catalog-mixed-sources.json`에 이미 등록된 home"으로 고쳤다. 이전 helper가 다시 준비할 때까지 레지스트리를 읽을 수 있다는 점도 적었다.
+   패치와 `patches/runtime-source.json`을 다시 만들었고(트리 `0511f3be…`), 빌드 서버의 `restore_runtime.py`가 같은 트리를 재현했다.
+   런타임 코드의 llm-usage 주석 두 곳은 기존 프로필 home 설명이라 그대로 두었다.
 
 ## 5. 검증
 
