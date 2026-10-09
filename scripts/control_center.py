@@ -390,8 +390,9 @@ class ControlCenter:
 
     def dispatch(self,command,args,*,open_arrival=None):
         if not isinstance(args,dict):raise ValueError('명령 인수가 올바르지 않습니다.')
-        if command in ENDS_WAITING_OPENS and isinstance(args.get('profile_id'),str):
-            try:self.navigations.forget(identifier(args['profile_id']))
+        navigations=getattr(self,'navigations',None)  # Absent in partial test centers.
+        if command in ENDS_WAITING_OPENS and navigations is not None and isinstance(args.get('profile_id'),str):
+            try:navigations.forget(identifier(args['profile_id']))
             except ValueError:pass
         if command=='notes.refresh_forks':
             host=args['task'].get('host_id', 'local')
