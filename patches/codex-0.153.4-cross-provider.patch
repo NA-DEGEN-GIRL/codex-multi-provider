@@ -53105,10 +53105,10 @@ index a75dbe2af..27eb8f8c6 100644
              output.needs_follow_up = true;
 diff --git a/codex-rs/core/src/tasks/claude_code.rs b/codex-rs/core/src/tasks/claude_code.rs
 new file mode 100644
-index 000000000..f76b7a501
+index 000000000..3cbca6b5c
 --- /dev/null
 +++ b/codex-rs/core/src/tasks/claude_code.rs
-@@ -0,0 +1,471 @@
+@@ -0,0 +1,497 @@
 +//! Runs the official installed Claude Code CLI through the manager's authenticated runner.
 +//! All shared history and events still go through the native session recorder.
 +mod auth_refresh;
@@ -53119,8 +53119,11 @@ index 000000000..f76b7a501
 +mod images;
 +mod messages;
 +
++use std::future::Future;
++use std::pin::Pin;
 +use std::sync::Arc;
 +use std::time::Duration;
++use std::time::Instant;
 +
 +use codex_history::RolloutItem;
 +use codex_protocol::config_types::ModeKind;
@@ -53425,23 +53428,18 @@ index 000000000..f76b7a501
 +        )
 +        .await
 +        .map_err(|_| failure("the selected Claude account is unavailable"))?;
-+    let credential_environment = credentials
++    let lent = credentials
 +        .as_ref()
-+        .map(|credentials| {
-+            serde_json::to_string(&auth_refresh::credentials(&agent.profile_id, credentials)?)
-+                .map_err(|_| failure("the selected Claude account is unavailable"))
-+        })
++        .map(|credentials| auth_refresh::credentials(&agent.profile_id, credentials))
 +        .transpose()?;
 +    let mut renewal = if credentials.is_some() {
 +        AuthRefresh::borrowed()
 +    } else {
 +        AuthRefresh::unavailable()
 +    };
-+    *bridge_slot = Some(Bridge::spawn(
-+        agent,
-+        cwd.as_path(),
-+        credential_environment.as_deref(),
-+    )?);
++    drop(credentials);
++    *bridge_slot = Some(Bridge::start(agent, cwd.as_path(), lent.as_ref()).await?);
++    drop(lent);
 +    let Some(bridge) = bridge_slot.as_mut() else {
 +        return Err(failure("runner was not initialized"));
 +    };
@@ -53454,8 +53452,10 @@ index 000000000..f76b7a501
 +        // Older runners ignore this; newer ones offer a session stopped by an expired login.
 +        "auth_resume":1});
 +    if renewal.announced() {
-+        // Older runners ignore unknown hello fields and never ask for a renewal.
++        // Older runners ignore unknown hello fields and never ask for a renewal. Rotation
++        // requests carry their own reason and budget, and are answered while events flow.
 +        hello["auth_refresh"] = json!(1);
++        hello["auth_rotate"] = json!(1);
 +    }
 +    bridge.send(&hello).await?;
 +    let ready = tokio::time::timeout(Duration::from_secs(60), bridge.receive())
@@ -53500,8 +53500,30 @@ index 000000000..f76b7a501
 +        "exclude_dynamic_sections":agent.exclude_dynamic_sections,"permission_mode":if ctx.mode() == ModeKind::Plan {"plan"} else {"auto"},
 +        "system_prompt":system_prompt,
 +        "permission_prompts":if matches!(ctx.approval_policy(), AskForApproval::Never) {"none"} else {"host"}})).await?;
++    // The same account request as the turn start: main profile or this role.
++    let role = ctx.session_source.get_agent_role();
++    // At most one renewal is outstanding. It resolves while the runner keeps streaming, so a
++    // live rotation never stalls the turn; its reply goes out as soon as it is ready.
++    let mut renewing: Option<
++        Pin<Box<dyn Future<Output = codex_protocol::error::Result<Value>> + Send + '_>>,
++    > = None;
 +    loop {
-+        let event = bridge.receive().await?;
++        let event = tokio::select! {
++            reply = async {
++                match renewing.as_mut() {
++                    Some(renewal) => renewal.await,
++                    None => std::future::pending().await,
++                }
++            }, if renewing.is_some() => {
++                renewing = None;
++                // A runner that stopped waiting has already queued its terminal message.
++                if bridge.send(&reply?).await.is_err() {
++                    tracing::debug!("Claude runner closed before its login renewal arrived");
++                }
++                continue;
++            }
++            event = bridge.receive() => event?,
++        };
 +        match event["type"].as_str() {
 +            Some("event") => output.handle(session, ctx, &event, &snapshot).await,
 +            // An answer can outlive the runner: one that stopped its CLI (for example on an
@@ -53523,17 +53545,21 @@ index 000000000..f76b7a501
 +                }
 +            }
 +            Some("auth_refresh") => {
-+                // The same account request as the turn start: main profile or this role.
-+                let role = ctx.session_source.get_agent_role();
-+                let renewed = session
-+                    .services
-+                    .agent_control
-+                    .resolve_execution_preset_credentials(&ctx.config, role.as_deref());
-+                let reply = renewal
-+                    .respond(&agent.profile_id, renewed, cancellation)
-+                    .await?;
-+                // A runner that stopped waiting has already queued its terminal message.
-+                if bridge.send(&reply).await.is_err() {
++                if renewing.is_some() {
++                    // Replies are matched to requests by order; never answer one out of turn.
++                    return Err(failure("runner asked for a second login renewal at once"));
++                }
++                if renewal.admit(auth_refresh::Reason::of(&event), Instant::now()) {
++                    let renewed = session
++                        .services
++                        .agent_control
++                        .resolve_execution_preset_credentials(&ctx.config, role.as_deref());
++                    renewing = Some(Box::pin(auth_refresh::respond(
++                        &agent.profile_id,
++                        renewed,
++                        cancellation,
++                    )));
++                } else if bridge.send(&auth_refresh::unavailable()).await.is_err() {
 +                    tracing::debug!("Claude runner closed before its login renewal arrived");
 +                }
 +            }
@@ -53582,17 +53608,19 @@ index 000000000..f76b7a501
 +}
 diff --git a/codex-rs/core/src/tasks/claude_code/auth_refresh.rs b/codex-rs/core/src/tasks/claude_code/auth_refresh.rs
 new file mode 100644
-index 000000000..c7e884f38
+index 000000000..0bda56ade
 --- /dev/null
 +++ b/codex-rs/core/src/tasks/claude_code/auth_refresh.rs
-@@ -0,0 +1,96 @@
-+//! Renews a borrowed Claude access token when the runner reports that it expired mid-turn.
+@@ -0,0 +1,163 @@
++//! Renews the Claude access token lent for this turn when the runner asks.
 +//!
-+//! The runner asks with `{"type":"auth_refresh"}` only after the hello announced
-+//! `"auth_refresh":1`, which is sent only when this turn lent it a token. The reply
-+//! is always an `auth_update`; the token never reaches logs, events or errors.
++//! The runner asks with `{"type":"auth_refresh","reason":...}` only after the hello
++//! announced `"auth_refresh":1` (and `"auth_rotate":1` for live rotation), which is sent
++//! only when this turn lent it a token. Every request gets exactly one `auth_update`, in
++//! order; the token never reaches logs, events or errors.
 +use std::future::Future;
 +use std::time::Duration;
++use std::time::Instant;
 +
 +use codex_app_server_protocol::ExecutionPresetAuthTokensReadResponse;
 +use codex_protocol::error::CodexErr;
@@ -53603,64 +53631,129 @@ index 000000000..c7e884f38
 +
 +use super::bridge::failure;
 +
-+/// One expiry per runner, plus one retry while the host is still renewing the login.
-+const MAX_REFRESHES: u8 = 2;
++/// One expired launch is resumed, with one retry while the host is still renewing the login.
++const EXPIRY_REQUESTS: u8 = 2;
++/// The same for a switch to another credential source after the lent one was rejected.
++const SWITCH_REQUESTS: u8 = 2;
++/// Live rotations keep a running CLI signed in across long turns: about one per token
++/// lifetime, plus retries spaced by the runner and by this interval.
++const ROTATIONS: u16 = 32;
++const ROTATION_INTERVAL: Duration = Duration::from_secs(15);
 +/// The manager transport answers within 30 seconds; never hold the turn much longer.
 +const RESOLVE_TIMEOUT: Duration = Duration::from_secs(35);
 +
++/// Why the runner asks. Each reason has its own budget, so rotations during a long turn
++/// never use up the renewal that resumes an expired launch, and neither uses up a switch.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(super) enum Reason {
++    /// The CLI stopped on an expired login and the runner relaunches it; older runners send
++    /// no reason.
++    Expired,
++    /// The lent credential was rejected and the runner continues with another source.
++    Switch,
++    /// A running CLI receives the renewed token without stopping.
++    Rotate,
++    Unknown,
++}
++
++impl Reason {
++    pub(super) fn of(request: &Value) -> Self {
++        match request.get("reason") {
++            None | Some(Value::Null) => Self::Expired,
++            Some(reason) => match reason.as_str() {
++                Some("expired") => Self::Expired,
++                Some("switch") => Self::Switch,
++                Some("rotate") => Self::Rotate,
++                _ => Self::Unknown,
++            },
++        }
++    }
++}
++
 +pub(super) struct AuthRefresh {
 +    borrowed: bool,
-+    requests: u8,
++    expired: u8,
++    switched: u8,
++    rotations: u16,
++    last_rotation: Option<Instant>,
 +}
 +
 +impl AuthRefresh {
 +    pub(super) fn borrowed() -> Self {
 +        Self {
 +            borrowed: true,
-+            requests: 0,
++            expired: 0,
++            switched: 0,
++            rotations: 0,
++            last_rotation: None,
 +        }
 +    }
 +
 +    pub(super) fn unavailable() -> Self {
 +        Self {
 +            borrowed: false,
-+            requests: 0,
++            ..Self::borrowed()
 +        }
 +    }
 +
-+    /// Only a token this turn lent can be renewed; older runners ignore the hello flag.
++    /// Only a token this turn lent can be renewed; older runners ignore the hello flags.
 +    pub(super) fn announced(&self) -> bool {
 +        self.borrowed
 +    }
 +
-+    /// Resolves the turn's account again with the same request as the turn start.
-+    pub(super) async fn respond(
-+        &mut self,
-+        profile_id: &str,
-+        resolve: impl Future<Output = anyhow::Result<Option<ExecutionPresetAuthTokensReadResponse>>>,
-+        cancellation: &CancellationToken,
-+    ) -> Result<Value> {
-+        let unavailable = json!({"type":"auth_update","available":false});
-+        if !self.borrowed || self.requests >= MAX_REFRESHES {
-+            return Ok(unavailable);
++    /// Counts a request against its reason's budget; `false` means the reply is
++    /// `available:false` at once, without asking the host.
++    pub(super) fn admit(&mut self, reason: Reason, now: Instant) -> bool {
++        fn take(used: &mut u8, budget: u8) -> bool {
++            let admitted = *used < budget;
++            *used += u8::from(admitted);
++            admitted
 +        }
-+        self.requests += 1;
-+        let resolved = tokio::select! {
-+            biased;
-+            _ = cancellation.cancelled() => return Err(CodexErr::TurnAborted),
-+            resolved = tokio::time::timeout(RESOLVE_TIMEOUT, resolve) => resolved,
-+        };
-+        // A refused, changed or late account is reported by the runner's own error.
-+        let Ok(Ok(Some(response))) = resolved else {
-+            return Ok(unavailable);
-+        };
-+        Ok(match credentials(profile_id, &response) {
-+            Ok(credentials) => {
-+                json!({"type":"auth_update","available":true,"credentials":credentials})
++        if !self.borrowed {
++            return false;
++        }
++        match reason {
++            Reason::Expired => take(&mut self.expired, EXPIRY_REQUESTS),
++            Reason::Switch => take(&mut self.switched, SWITCH_REQUESTS),
++            Reason::Rotate => {
++                let early = self
++                    .last_rotation
++                    .is_some_and(|last| now.duration_since(last) < ROTATION_INTERVAL);
++                if early || self.rotations >= ROTATIONS {
++                    return false;
++                }
++                self.rotations += 1;
++                self.last_rotation = Some(now);
++                true
 +            }
-+            Err(_) => unavailable,
-+        })
++            Reason::Unknown => false,
++        }
 +    }
++}
++
++pub(super) fn unavailable() -> Value {
++    json!({"type":"auth_update","available":false})
++}
++
++/// Resolves the turn's account again with the same request as the turn start.
++pub(super) async fn respond(
++    profile_id: &str,
++    resolve: impl Future<Output = anyhow::Result<Option<ExecutionPresetAuthTokensReadResponse>>>,
++    cancellation: &CancellationToken,
++) -> Result<Value> {
++    let resolved = tokio::select! {
++        biased;
++        _ = cancellation.cancelled() => return Err(CodexErr::TurnAborted),
++        resolved = tokio::time::timeout(RESOLVE_TIMEOUT, resolve) => resolved,
++    };
++    // A refused, changed or late account is reported by the runner's own error.
++    let Ok(Ok(Some(response))) = resolved else {
++        return Ok(unavailable());
++    };
++    Ok(match credentials(profile_id, &response) {
++        Ok(credentials) => json!({"type":"auth_update","available":true,"credentials":credentials}),
++        Err(_) => unavailable(),
++    })
 +}
 +
 +/// The access-only credential the runner validates; the refresh token never leaves the host.
@@ -53684,10 +53777,10 @@ index 000000000..c7e884f38
 +mod tests;
 diff --git a/codex-rs/core/src/tasks/claude_code/auth_refresh_tests.rs b/codex-rs/core/src/tasks/claude_code/auth_refresh_tests.rs
 new file mode 100644
-index 000000000..1d5addf1a
+index 000000000..c21b400a1
 --- /dev/null
 +++ b/codex-rs/core/src/tasks/claude_code/auth_refresh_tests.rs
-@@ -0,0 +1,107 @@
+@@ -0,0 +1,139 @@
 +use super::*;
 +use codex_protocol::error::CodexErrorDetails;
 +use pretty_assertions::assert_eq;
@@ -53704,22 +53797,15 @@ index 000000000..1d5addf1a
 +    }))
 +}
 +
-+fn unavailable() -> Value {
-+    json!({"type":"auth_update","available":false})
-+}
-+
 +#[tokio::test]
 +async fn borrowed_token_is_renewed_with_the_runner_credential_shape() {
-+    let mut refresh = AuthRefresh::borrowed();
-+    assert!(refresh.announced());
-+    let reply = refresh
-+        .respond(
-+            PROFILE,
-+            async { renewed("claude") },
-+            &CancellationToken::new(),
-+        )
-+        .await
-+        .expect("reply");
++    let reply = respond(
++        PROFILE,
++        async { renewed("claude") },
++        &CancellationToken::new(),
++    )
++    .await
++    .expect("reply");
 +    assert_eq!(
 +        reply,
 +        json!({"type":"auth_update","available":true,"credentials":{
@@ -53730,77 +53816,116 @@ index 000000000..1d5addf1a
 +
 +#[tokio::test]
 +async fn refused_missing_or_foreign_credentials_are_unavailable() {
-+    let mut refresh = AuthRefresh::borrowed();
 +    let cancellation = CancellationToken::new();
-+    let refused = refresh
-+        .respond(
-+            PROFILE,
-+            async { Err(anyhow::anyhow!("account changed")) },
-+            &cancellation,
-+        )
++    let refused = respond(
++        PROFILE,
++        async { Err(anyhow::anyhow!("account changed")) },
++        &cancellation,
++    )
++    .await
++    .expect("reply");
++    let missing = respond(PROFILE, async { Ok(None) }, &cancellation)
 +        .await
 +        .expect("reply");
-+    let foreign = refresh
-+        .respond(PROFILE, async { renewed("openai") }, &cancellation)
++    let foreign = respond(PROFILE, async { renewed("openai") }, &cancellation)
 +        .await
 +        .expect("reply");
-+    assert_eq!((refused, foreign), (unavailable(), unavailable()));
++    assert_eq!(
++        (refused, missing, foreign),
++        (unavailable(), unavailable(), unavailable())
++    );
 +}
 +
-+#[tokio::test]
-+async fn a_turn_without_a_borrowed_token_never_resolves() {
++#[test]
++fn reasons_are_read_from_the_request_and_older_runners_mean_expiry() {
++    let reasons = [
++        json!({"type":"auth_refresh"}),
++        json!({"type":"auth_refresh","reason":"expired"}),
++        json!({"type":"auth_refresh","reason":"switch"}),
++        json!({"type":"auth_refresh","reason":"rotate"}),
++        json!({"type":"auth_refresh","reason":"later"}),
++        json!({"type":"auth_refresh","reason":2}),
++    ]
++    .iter()
++    .map(Reason::of)
++    .collect::<Vec<_>>();
++    assert_eq!(
++        reasons,
++        vec![
++            Reason::Expired,
++            Reason::Expired,
++            Reason::Switch,
++            Reason::Rotate,
++            Reason::Unknown,
++            Reason::Unknown
++        ]
++    );
++}
++
++#[test]
++fn a_turn_without_a_borrowed_token_never_resolves() {
 +    let mut refresh = AuthRefresh::unavailable();
 +    assert!(!refresh.announced());
-+    let reply = refresh
-+        .respond(
-+            PROFILE,
-+            async { panic!("no borrowed token can be renewed") },
-+            &CancellationToken::new(),
-+        )
-+        .await
-+        .expect("reply");
-+    assert_eq!(reply, unavailable());
++    let now = Instant::now();
++    for reason in [Reason::Expired, Reason::Switch, Reason::Rotate] {
++        assert!(!refresh.admit(reason, now), "{reason:?}");
++    }
 +}
 +
-+#[tokio::test]
-+async fn at_most_two_renewals_are_resolved_per_runner() {
++#[test]
++fn expiry_and_source_switch_budgets_are_separate_and_unknown_reasons_are_refused() {
 +    let mut refresh = AuthRefresh::borrowed();
-+    let cancellation = CancellationToken::new();
-+    for _ in 0..2 {
-+        let reply = refresh
-+            .respond(PROFILE, async { Ok(None) }, &cancellation)
-+            .await
-+            .expect("reply");
-+        assert_eq!(reply, unavailable());
++    assert!(refresh.announced());
++    let now = Instant::now();
++    let admitted = [
++        Reason::Expired,
++        Reason::Expired,
++        Reason::Expired,
++        Reason::Switch,
++        Reason::Switch,
++        Reason::Switch,
++        Reason::Unknown,
++    ]
++    .into_iter()
++    .map(|reason| refresh.admit(reason, now))
++    .collect::<Vec<_>>();
++    assert_eq!(admitted, vec![true, true, false, true, true, false, false]);
++    // Rotations have their own budget after both others are spent.
++    assert!(refresh.admit(Reason::Rotate, now));
++}
++
++#[test]
++fn rotations_are_spaced_and_capped_without_touching_the_expiry_budget() {
++    let mut refresh = AuthRefresh::borrowed();
++    let start = Instant::now();
++    assert!(refresh.admit(Reason::Rotate, start));
++    assert!(!refresh.admit(Reason::Rotate, start + Duration::from_secs(14)));
++    let mut admitted: u16 = 1;
++    for step in 1..=40u32 {
++        if refresh.admit(Reason::Rotate, start + ROTATION_INTERVAL * step) {
++            admitted += 1;
++        }
 +    }
-+    let reply = refresh
-+        .respond(
-+            PROFILE,
-+            async { panic!("the renewal cap was exceeded") },
-+            &cancellation,
-+        )
-+        .await
-+        .expect("reply");
-+    assert_eq!(reply, unavailable());
++    assert_eq!(admitted, ROTATIONS);
++    assert!(refresh.admit(Reason::Expired, start));
++    assert!(refresh.admit(Reason::Expired, start));
 +}
 +
 +#[tokio::test]
 +async fn cancellation_stops_a_pending_renewal() {
-+    let mut refresh = AuthRefresh::borrowed();
 +    let cancellation = CancellationToken::new();
 +    cancellation.cancel();
-+    let error = refresh
-+        .respond(PROFILE, std::future::pending(), &cancellation)
++    let error = respond(PROFILE, std::future::pending(), &cancellation)
 +        .await
 +        .expect_err("cancelled");
 +    assert!(matches!(error.details(), CodexErrorDetails::TurnAborted));
 +}
 diff --git a/codex-rs/core/src/tasks/claude_code/bridge.rs b/codex-rs/core/src/tasks/claude_code/bridge.rs
 new file mode 100644
-index 000000000..64333cba1
+index 000000000..85048282e
 --- /dev/null
 +++ b/codex-rs/core/src/tasks/claude_code/bridge.rs
-@@ -0,0 +1,134 @@
+@@ -0,0 +1,209 @@
 +//! Versioned, bounded JSONL transport. Only the manager runner starts Claude Code.
 +use std::process::Stdio;
 +use std::time::Duration;
@@ -53809,8 +53934,8 @@ index 000000000..64333cba1
 +use codex_protocol::error::CodexErr;
 +use codex_protocol::error::Result;
 +use serde_json::Value;
++use serde_json::json;
 +use tokio::io::AsyncBufReadExt;
-+use tokio::io::AsyncReadExt;
 +use tokio::io::AsyncWriteExt;
 +use tokio::io::BufReader;
 +use tokio::process::Child;
@@ -53818,25 +53943,81 @@ index 000000000..64333cba1
 +use tokio::process::ChildStdout;
 +use tokio::process::Command;
 +
-+const MAX_LINE_BYTES: u64 = 8 * 1024 * 1024;
++const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
++/// The lent credential in a runner's environment, for helpers prepared before the stdin channel.
++const AUTH_ENV: &str = "CODEX_MANAGER_CLAUDE_AUTH";
++/// Asks the runner to receive the lent credential on stdin. It never carries the credential.
++const AUTH_CHANNEL_ENV: &str = "CODEX_MANAGER_CLAUDE_AUTH_CHANNEL";
++const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 +
 +pub(super) struct Bridge {
 +    child: Child,
 +    stdin: ChildStdin,
 +    stdout: BufReader<ChildStdout>,
++    /// The start of a line whose read a `select!` cancelled; the next receive completes it.
++    partial: Vec<u8>,
++}
++
++/// How a runner process receives the credential lent for this turn.
++enum Delivery<'a> {
++    Nothing,
++    /// The runner announces `auth_channel` and reads `auth_init` before its hello, so the
++    /// credential never appears in `/proc/<pid>/environ` of the runner.
++    Stdin,
++    Environment(&'a str),
 +}
 +
 +impl Bridge {
-+    pub(super) fn spawn(
++    /// Starts the runner and hands it the lent credential, if this turn has one.
++    ///
++    /// A helper prepared before the stdin channel ignores the channel request and refuses at
++    /// once without its environment credential; it is then started again the old way.
++    pub(super) async fn start(
 +        agent: &AgentProviderInfo,
 +        cwd: &std::path::Path,
-+        credentials: Option<&str>,
++        credentials: Option<&Value>,
++    ) -> Result<Self> {
++        let Some(credentials) = credentials else {
++            return Self::spawn(agent, cwd, Delivery::Nothing);
++        };
++        let mut bridge = Self::spawn(agent, cwd, Delivery::Stdin)?;
++        let first = tokio::time::timeout(HANDSHAKE_TIMEOUT, bridge.receive())
++            .await
++            .map_err(|_| failure("runner handshake timed out"))??;
++        match first["type"].as_str() {
++            Some("auth_channel") if first["protocol"] == 1 => {
++                bridge
++                    .send(&json!({"type":"auth_init","credentials":credentials}))
++                    .await?;
++                Ok(bridge)
++            }
++            Some("refused") => {
++                tracing::debug!("Claude runner predates stdin credential delivery");
++                drop(bridge);
++                let environment = serde_json::to_string(credentials)
++                    .map_err(|_| failure("the selected Claude account is unavailable"))?;
++                Self::spawn(agent, cwd, Delivery::Environment(&environment))
++            }
++            _ => Err(failure("runner refused or uses an unsupported protocol")),
++        }
++    }
++
++    fn spawn(
++        agent: &AgentProviderInfo,
++        cwd: &std::path::Path,
++        delivery: Delivery<'_>,
 +    ) -> Result<Self> {
 +        let mut command = Command::new(&agent.command);
 +        // Ambient credentials must never authorize a different registered role.
-+        command.env_remove("CODEX_MANAGER_CLAUDE_AUTH");
-+        if let Some(credentials) = credentials {
-+            command.env("CODEX_MANAGER_CLAUDE_AUTH", credentials);
++        command.env_remove(AUTH_ENV).env_remove(AUTH_CHANNEL_ENV);
++        match delivery {
++            Delivery::Nothing => {}
++            Delivery::Stdin => {
++                command.env(AUTH_CHANNEL_ENV, "stdin");
++            }
++            Delivery::Environment(credentials) => {
++                command.env(AUTH_ENV, credentials);
++            }
 +        }
 +        command
 +            .args(&agent.args)
@@ -53864,12 +54045,13 @@ index 000000000..64333cba1
 +            child,
 +            stdin,
 +            stdout,
++            partial: Vec::new(),
 +        })
 +    }
 +
 +    pub(super) async fn send(&mut self, message: &Value) -> Result<()> {
 +        let mut bytes = serde_json::to_vec(message).map_err(|err| failure(err.to_string()))?;
-+        if bytes.len() as u64 >= MAX_LINE_BYTES {
++        if bytes.len() >= MAX_LINE_BYTES {
 +            return Err(failure(
 +                "handoff exceeds the runner message limit; compact or reduce the request",
 +            ));
@@ -53885,22 +54067,36 @@ index 000000000..64333cba1
 +            .map_err(|err| failure(err.to_string()))
 +    }
 +
++    /// Reads one JSONL message. Cancellation safe: bytes already read stay in `partial`.
 +    pub(super) async fn receive(&mut self) -> Result<Value> {
-+        let mut bytes = Vec::new();
-+        let read = (&mut self.stdout)
-+            .take(MAX_LINE_BYTES)
-+            .read_until(b'\n', &mut bytes)
-+            .await
-+            .map_err(|err| failure(format!("cannot read runner: {err}")))?;
-+        if read == 0 {
-+            return Err(failure("runner exited without a terminal response"));
++        loop {
++            let chunk = self
++                .stdout
++                .fill_buf()
++                .await
++                .map_err(|err| failure(format!("cannot read runner: {err}")))?;
++            if chunk.is_empty() {
++                return Err(failure(if self.partial.is_empty() {
++                    "runner exited without a terminal response"
++                } else {
++                    "runner sent an incomplete or oversized JSONL message"
++                }));
++            }
++            let end = chunk.iter().position(|byte| *byte == b'\n');
++            let used = end.map_or(chunk.len(), |end| end + 1);
++            if self.partial.len() + used > MAX_LINE_BYTES {
++                return Err(failure(
++                    "runner sent an incomplete or oversized JSONL message",
++                ));
++            }
++            self.partial.extend_from_slice(&chunk[..used]);
++            self.stdout.consume(used);
++            if end.is_some() {
++                let line = std::mem::take(&mut self.partial);
++                return serde_json::from_slice(&line)
++                    .map_err(|err| failure(format!("invalid runner JSON: {err}")));
++            }
 +        }
-+        if bytes.last() != Some(&b'\n') {
-+            return Err(failure(
-+                "runner sent an incomplete or oversized JSONL message",
-+            ));
-+        }
-+        serde_json::from_slice(&bytes).map_err(|err| failure(format!("invalid runner JSON: {err}")))
 +    }
 +
 +    pub(super) async fn interrupt(&mut self) {
@@ -53934,6 +54130,126 @@ index 000000000..64333cba1
 +
 +pub(super) fn failure(message: impl std::fmt::Display) -> CodexErr {
 +    CodexErr::InvalidRequest(format!("Claude agent: {message}"))
++}
++
++#[cfg(test)]
++#[path = "bridge_tests.rs"]
++mod tests;
+diff --git a/codex-rs/core/src/tasks/claude_code/bridge_tests.rs b/codex-rs/core/src/tasks/claude_code/bridge_tests.rs
+new file mode 100644
+index 000000000..0c5d4f403
+--- /dev/null
++++ b/codex-rs/core/src/tasks/claude_code/bridge_tests.rs
+@@ -0,0 +1,110 @@
++use super::*;
++use pretty_assertions::assert_eq;
++
++fn runner(script: &str) -> AgentProviderInfo {
++    serde_json::from_value(json!({
++        "kind":"claude_code", "command":if cfg!(windows) {"python"} else {"python3"},
++        "args":["-u","-c",script], "profile_id":"fake-profile"
++    }))
++    .expect("agent fixture")
++}
++
++fn credentials() -> Value {
++    json!({"profileId":"fake-profile","accessToken":"dummy-token-1","expiresAt":2_000_000_000,
++        "accountIdentity":"fixture-identity"})
++}
++
++/// Reports what the runner received; the dummy token is echoed only inside this test.
++const STDIN_RUNNER: &str = r#"
++import json, os, sys
++assert os.environ.pop('CODEX_MANAGER_CLAUDE_AUTH_CHANNEL') == 'stdin'
++print(json.dumps({'type':'auth_channel','protocol':1}), flush=True)
++init = json.loads(sys.stdin.readline())
++print(json.dumps({'type':'seen','init':init,'environment':'CODEX_MANAGER_CLAUDE_AUTH' in os.environ}), flush=True)
++"#;
++
++/// A helper prepared before the stdin channel: it reads only its environment.
++const ENVIRONMENT_RUNNER: &str = r#"
++import json, os, sys
++raw = os.environ.pop('CODEX_MANAGER_CLAUDE_AUTH', '')
++if not raw:
++    print(json.dumps({'type':'refused','code':'remote_claude_unavailable','message':'unavailable'}), flush=True)
++    sys.exit(1)
++print(json.dumps({'type':'seen','credentials':json.loads(raw),
++    'channel':os.environ.get('CODEX_MANAGER_CLAUDE_AUTH_CHANNEL')}), flush=True)
++"#;
++
++#[tokio::test]
++async fn a_lent_credential_reaches_the_runner_over_stdin_only() {
++    let cwd = tempfile::tempdir().expect("cwd");
++    let mut bridge = Bridge::start(&runner(STDIN_RUNNER), cwd.path(), Some(&credentials()))
++        .await
++        .expect("start");
++    let seen = bridge.receive().await.expect("receive");
++    assert_eq!(
++        seen,
++        json!({"type":"seen","init":{"type":"auth_init","credentials":credentials()},"environment":false})
++    );
++}
++
++#[tokio::test]
++async fn a_helper_without_the_stdin_channel_is_started_again_with_its_environment_credential() {
++    let cwd = tempfile::tempdir().expect("cwd");
++    let mut bridge = Bridge::start(
++        &runner(ENVIRONMENT_RUNNER),
++        cwd.path(),
++        Some(&credentials()),
++    )
++    .await
++    .expect("start");
++    let seen = bridge.receive().await.expect("receive");
++    assert_eq!(
++        seen,
++        json!({"type":"seen","credentials":credentials(),"channel":null})
++    );
++}
++
++#[tokio::test]
++async fn a_turn_without_a_lent_credential_never_asks_for_a_channel() {
++    let cwd = tempfile::tempdir().expect("cwd");
++    let script = r#"
++import json, os
++print(json.dumps({'type':'seen','channel':os.environ.get('CODEX_MANAGER_CLAUDE_AUTH_CHANNEL'),
++    'credentials':os.environ.get('CODEX_MANAGER_CLAUDE_AUTH')}), flush=True)
++"#;
++    let mut bridge = Bridge::start(&runner(script), cwd.path(), None)
++        .await
++        .expect("start");
++    let seen = bridge.receive().await.expect("receive");
++    assert_eq!(
++        seen,
++        json!({"type":"seen","channel":null,"credentials":null})
++    );
++}
++
++#[tokio::test]
++async fn a_cancelled_receive_keeps_the_partial_line_for_the_next_one() {
++    let cwd = tempfile::tempdir().expect("cwd");
++    let script = r#"
++import sys, time
++sys.stdout.write('{"type":"ev'); sys.stdout.flush()
++time.sleep(1.5)
++sys.stdout.write('ent","n":1}\n{"type":"done"}\n'); sys.stdout.flush()
++"#;
++    let mut bridge = Bridge::start(&runner(script), cwd.path(), None)
++        .await
++        .expect("start");
++    let cancelled = tokio::time::timeout(Duration::from_millis(500), bridge.receive()).await;
++    assert!(
++        cancelled.is_err(),
++        "the first read must still wait for its newline"
++    );
++    let mut received = Vec::new();
++    for _ in 0..2 {
++        received.push(bridge.receive().await.expect("receive"));
++    }
++    assert_eq!(
++        received,
++        vec![json!({"type":"event","n":1}), json!({"type":"done"})]
++    );
 +}
 diff --git a/codex-rs/core/src/tasks/claude_code/context.rs b/codex-rs/core/src/tasks/claude_code/context.rs
 new file mode 100644
@@ -63832,10 +64148,10 @@ index ace2f50a7..e65800ce9 100644
          "followup-call",
 diff --git a/codex-rs/core/tests/suite/claude_code.rs b/codex-rs/core/tests/suite/claude_code.rs
 new file mode 100644
-index 000000000..eeedfc834
+index 000000000..e1f0de5dd
 --- /dev/null
 +++ b/codex-rs/core/tests/suite/claude_code.rs
-@@ -0,0 +1,237 @@
+@@ -0,0 +1,243 @@
 +//! Native task regression: no paid model or real Claude process is invoked.
 +use codex_core::TurnInputRequest;
 +use codex_model_provider_info::ModelProviderInfo;
@@ -64021,22 +64337,28 @@ index 000000000..eeedfc834
 +async fn claude_renewal_request_without_a_borrowed_token_is_unavailable() -> anyhow::Result<()> {
 +    let server = responses::start_mock_server().await;
 +    let fixture = tempfile::tempdir()?;
-+    // The runner asks for a renewed login mid-turn, then completes normally.
++    // The runner asks for a renewed login mid-turn, then for a live rotation while it keeps
++    // streaming, and completes normally.
 +    let runner = RUNNER.replace(
 +        "assert run['type'] == 'run'\n",
 +        r#"assert run['type'] == 'run'
 +emit({'type':'auth_refresh'})
 +reply = read()
++emit({'type':'auth_refresh','reason':'rotate'})
++emit({'type':'event','kind':'text_delta','text':'Streaming '})
++rotation = read()
 +with log.open('a', encoding='utf-8') as out:
-+    out.write(json.dumps({'announced':'auth_refresh' in hello,'reply':reply}) + '\n')
++    out.write(json.dumps({'announced':[key for key in ('auth_refresh','auth_rotate') if key in hello],
++                          'replies':[reply, rotation]}) + '\n')
 +"#,
 +    );
 +    let test = claude_task(&server, fixture.path(), &runner).await?;
 +    complete_turn(&test, "Request").await;
 +    let records = logged(fixture.path())?;
++    let unavailable = serde_json::json!({"type":"auth_update","available":false});
 +    assert_eq!(
 +        records[1],
-+        serde_json::json!({"announced":false,"reply":{"type":"auth_update","available":false}})
++        serde_json::json!({"announced":[],"replies":[unavailable, unavailable]})
 +    );
 +    Ok(())
 +}

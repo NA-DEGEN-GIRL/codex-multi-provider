@@ -22,7 +22,8 @@ from manager_core.claude_runner import (SessionLedger, compact_summary, digest, 
                                        serve, session_lock, PermissionBridge, system_prompt_text,
                                        private_temporary_directory, build_command, AUTH_FAILURES,
                                        AUTH_STOP_NOTE, AUTH_TOOL_STOPPED, BorrowedLogin, renew_login,
-                                       token_expired)
+                                       token_expired, CLI_TOKEN_DESCRIPTOR, AUTH_ROTATE_ATTEMPTS,
+                                       AUTH_ROTATE_RECOVERIES, Rotation)
 
 
 FAKE = r'''
@@ -31,13 +32,40 @@ from pathlib import Path
 args = sys.argv[1:]
 session = args[args.index('--resume') + 1] if '--resume' in args else args[args.index('--session-id') + 1]
 scenario = os.environ.get('CLAUDE_FIXTURE_SCENARIO', 'success')
+# A lent token arrives like the official CLI reads it: an inherited pipe, else the environment.
+source, token = None, os.environ.get('CLAUDE_CODE_OAUTH_TOKEN')
+if os.environ.get('CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR'):
+    with open('/proc/self/fd/' + os.environ['CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR'], 'rb') as pipe:
+        source, token = 'fd', pipe.read().decode()
+elif token is not None:
+    source = 'env'
+assert os.environ.get('CLAUDE_FIXTURE_TOKEN') in (None, token)
 def emit(value):
     print(json.dumps(value, ensure_ascii=False), flush=True)
+def record(value):
+    if os.environ.get('CLAUDE_FIXTURE_TRACE'):
+        with open(os.environ['CLAUDE_FIXTURE_TRACE'], 'a', encoding='utf-8') as out:
+            out.write(json.dumps(value)+'\n')
+def rotated(acknowledge='success'):
+    # The official CLI applies update_environment_variables to the next request and acknowledges it.
+    global token
+    for line in sys.stdin:
+        update = json.loads(line)
+        if update.get('type') != 'update_environment_variables':
+            continue
+        record({'rotated':update['variables'].get('CLAUDE_CODE_OAUTH_TOKEN'),'request_id':update.get('request_id'),
+               'keys':sorted(update['variables'])})
+        if acknowledge:
+            emit({'type':'control_response','response':{'subtype':acknowledge,'request_id':update['request_id']}})
+        if acknowledge == 'success':
+            token = update['variables']['CLAUDE_CODE_OAUTH_TOKEN']
+        return
 request = json.loads(sys.stdin.readline())
-if os.environ.get('CLAUDE_FIXTURE_TRACE'):
-    with open(os.environ['CLAUDE_FIXTURE_TRACE'], 'a', encoding='utf-8') as trace:
-        trace.write(json.dumps({'token':os.environ.get('CLAUDE_CODE_OAUTH_TOKEN'),'resume':'--resume' in args,
-            'session':session,'request':request,'checkpoint':'CODEX_PORTABLE_CHECKPOINT_V1' in json.dumps(request)})+'\n')
+record({'token':token,'source':source,'resume':'--resume' in args,'session':session,'request':request,
+       'checkpoint':'CODEX_PORTABLE_CHECKPOINT_V1' in json.dumps(request),
+       'scopes':os.environ.get('CLAUDE_CODE_OAUTH_SCOPES'),'wait':os.environ.get('CLAUDE_CODE_OAUTH_401_WAIT_MS'),
+       'secret_in_environment':any('dummy-token' in value for value in os.environ.values()),
+       'secret_in_arguments':any('dummy-token' in value for value in args)})
 if 'CODEX_PORTABLE_CHECKPOINT_V1' in json.dumps(request):
     assert '--resume' in args and '--plugin-dir' not in args and '--permission-prompt-tool' not in args
     assert args[args.index('--tools')+1] == '' and args[args.index('--disallowedTools')+1] == '*'
@@ -49,7 +77,7 @@ if 'CODEX_PORTABLE_CHECKPOINT_V1' in json.dumps(request):
         emit({'type':'system','subtype':'compact_boundary','compact_metadata':{'trigger':'auto'}})
     if scenario == 'compact_rate_limit':
         emit({'type':'rate_limit_event','rate_limit_info':{'status':'allowed_warning','utilization':0.9}})
-    if scenario == 'auth_checkpoint' and os.environ.get('CLAUDE_CODE_OAUTH_TOKEN') == 'dummy-token-1':
+    if scenario == 'auth_checkpoint' and token == 'dummy-token-1':
         text = 'Failed to authenticate. API Error: 401 OAuth access token has expired'
         emit({'type':'assistant','error':'authentication_failed',
               'message':{'content':[{'type':'text','text':text}],'usage':{'input_tokens':0,'output_tokens':0}}})
@@ -107,8 +135,19 @@ else:
               'total_cost_usd':0.05})
     elif scenario == 'wait':
         emit({'type':'stream_event','event':{'type':'content_block_delta','delta':{'type':'text_delta','text':'waiting'}}})
+    elif scenario in ('rotate_silent', 'rotate_refused') and token == 'dummy-token-1':
+        # The token pushed during the turn is never applied; the next request still uses the old one.
+        rotated(acknowledge=None if scenario == 'rotate_silent' else 'error')
+        if scenario == 'rotate_silent':
+            import time
+            time.sleep(1)
+        text = 'Failed to authenticate. API Error: 401 OAuth access token has expired'
+        emit({'type':'assistant','error':'authentication_failed',
+              'message':{'content':[{'type':'text','text':text}],'usage':{'input_tokens':0,'output_tokens':0}}})
+        emit({'type':'result','subtype':'success','is_error':True,'session_id':session,'result':text,
+              'api_error_status':401,'usage':{'input_tokens':1,'output_tokens':0},'total_cost_usd':0.01})
     elif scenario == 'api_error' or (scenario.startswith('auth_') and scenario != 'auth_checkpoint' and (
-            scenario == 'auth_always' or os.environ.get('CLAUDE_CODE_OAUTH_TOKEN') == 'dummy-token-1')):
+            scenario == 'auth_always' or token == 'dummy-token-1')):
         if scenario == 'auth_tool':
             # A background agent's command that is still running when the main request fails.
             emit({'type':'assistant','parent_tool_use_id':'agent-1','message':{'content':[
@@ -136,6 +175,24 @@ else:
         emit({'type':'result','subtype':'success','is_error':False,'session_id':session,'result':'Agent finished.',
               'usage':{'input_tokens':6,'output_tokens':3},'total_cost_usd':0.03})
     else:
+        if scenario == 'rotate_retry':
+            # The API refused the lent token; the CLI polls for a rotated one before it gives up.
+            emit({'type':'system','subtype':'api_retry','attempt':1,'max_retries':10,'retry_delay_ms':500,
+                  'error_status':401,'error':'authentication_failed'})
+            rotated()
+            assert token == 'dummy-token-2', 'the request was retried without a rotated token'
+        if scenario == 'rotate_between':
+            # The first answer is in; a background agent still runs when the token is rotated.
+            emit({'type':'system','subtype':'background_tasks_changed',
+                  'tasks':[{'task_id':'agent-1','task_type':'local_agent','description':'review'}]})
+            emit({'type':'result','subtype':'success','is_error':False,'session_id':session,'result':'Agent started.',
+                  'usage':{'input_tokens':5,'output_tokens':2},'total_cost_usd':0.01})
+            rotated()
+            emit({'type':'system','subtype':'background_tasks_changed','tasks':[]})
+        if scenario == 'rotate_wait':
+            rotated()
+        if scenario.startswith('rotate_'):
+            record({'final_token':token})
         if scenario == 'managed_leaf':
             assert '--mcp-config' not in args
             assert args[args.index('--disallowedTools')+1] == 'Agent,Task'
@@ -238,13 +295,12 @@ class BorrowedContext:
 
     def prepare(self, cwd):
         self.configuration_directory.mkdir(exist_ok=True)
-        environment = scrub_environment(self.configuration_directory)
-        environment['CLAUDE_CODE_OAUTH_TOKEN'] = 'dummy-token-1'
-        return dict(settings={}, configuration_directory=self.configuration_directory, environment=environment,
+        return dict(settings={}, configuration_directory=self.configuration_directory,
+                    environment=scrub_environment(self.configuration_directory),
                     cli=self.cli, plugins=[], status=dict(logged_in=True, method='oauth_token',
                     cli_version='2.1.282', account_identity=self.identity),
                     borrowed_auth=dict(profileId=self.profile, accountIdentity=self.identity,
-                                       expiresAt=self.expires_at))
+                                       expiresAt=self.expires_at), lent_token='dummy-token-1')
 
     def renewal(self, token='dummy-token-2', expires_in=8 * 3600, **changes):
         credentials = dict(profileId=self.profile, accessToken=token, accountIdentity=self.identity,
@@ -409,8 +465,10 @@ class ClaudeRunnerTests(unittest.TestCase):
         return code, events
 
     def run_borrowed(self, scenario, expires_in, updates=(), announce=True, turn='turn-1', prior=(),
-                     auth_resume=False):
-        """Run with a lent dummy token; `updates` answer each auth_refresh in order."""
+                     auth_resume=False, rotate=False, defer=False):
+        """Run with a lent dummy token; `updates` answer each auth_refresh in order.
+
+        `rotate` announces live rotation; `defer` holds every answer until the turn's done."""
         context = BorrowedContext(self.root, [sys.executable, str(self.fake)], self.profile,
                                   int(time.time()) + expires_in)
         incoming, events, replies = Incoming(), [], list(updates)
@@ -421,7 +479,10 @@ class ClaudeRunnerTests(unittest.TestCase):
             hello['auth_refresh'] = 1
         if auth_resume:
             hello['auth_resume'] = 1
+        if rotate:
+            hello['auth_rotate'] = 1
         incoming.send(hello)
+        deferred = []
         def on_output(message):
             events.append(message)
             if message['type'] == 'ready':
@@ -430,10 +491,12 @@ class ClaudeRunnerTests(unittest.TestCase):
                                    permission_mode='acceptEdits', permission_prompts='none'))
             elif message['type'] == 'auth_refresh':
                 reply = replies.pop(0)
-                incoming.send(reply(context) if callable(reply) else reply)
+                (deferred.append if defer else incoming.send)(reply(context) if callable(reply) else reply)
             elif scenario == 'wait' and message.get('kind') == 'text_delta':
                 incoming.send(dict(type='auth_update', available=False))
             elif message['type'] == 'done':
+                for reply in deferred:
+                    incoming.send(reply)
                 incoming.send(dict(type='commit', snapshot=self.snapshot(list(prior) + [turn]))
                               if message['status'] == 'success' else None)
         output = Outgoing(on_output)
@@ -446,7 +509,16 @@ class ClaudeRunnerTests(unittest.TestCase):
         for path in context.ledger_directory.rglob('*'):
             if path.is_file():
                 self.assertNotIn(b'dummy-token', path.read_bytes())
-        launches = [json.loads(line) for line in trace.read_text(encoding='utf-8').splitlines()] if trace.exists() else []
+        # Nor the runner's environment, nor any CLI argument; on Linux not the CLI environment either.
+        self.assertFalse(any('dummy-token' in value for value in os.environ.values()))
+        entries = [json.loads(line) for line in trace.read_text(encoding='utf-8').splitlines()] if trace.exists() else []
+        launches = [entry for entry in entries if 'session' in entry]
+        for launch in launches:
+            self.assertFalse(launch['secret_in_arguments'])
+            self.assertEqual((launch['source'], launch['secret_in_environment'], launch['scopes']),
+                             ('fd' if CLI_TOKEN_DESCRIPTOR else 'env', not CLI_TOKEN_DESCRIPTOR, 'user:inference'))
+        self.rotations = [entry for entry in entries if 'rotated' in entry]
+        self.final_tokens = [entry['final_token'] for entry in entries if 'final_token' in entry]
         return code, events, launches
 
     def test_expired_borrowed_token_is_renewed_and_the_same_session_resumes_once(self):
@@ -612,12 +684,115 @@ class ClaudeRunnerTests(unittest.TestCase):
                     else:
                         events.put(('host', reply))
                 with patch('manager_core.claude_runner.AUTH_REFRESH_RETRY_SECONDS', 1.0):
-                    token, outcome = renew_login(borrowed, events, emit, None, None)
+                    outcome = renew_login(borrowed, events, emit, None, None)
                 self.assertEqual((outcome, len(sent)), ('renewed', 2))
-                self.assertIsNotNone(token)
+                self.assertEqual(borrowed.token, 'dummy-token-2')
+                self.assertNotIn('dummy-token', repr(borrowed))
                 # A quick refusal still waits for the window; a slow one is retried at once.
                 self.assertTrue(low <= sent[1] - sent[0] < high, sent[1] - sent[0])
                 borrowed.expires_at = int(time.time()) + 45
+
+    def test_lent_token_reaches_every_launch_by_pipe_with_inference_scope_only(self):
+        # First launch, the renewed relaunch and the portable checkpoint each get their own pipe.
+        code, events, launches = self.run_borrowed('auth_compact', 45, [lambda context: context.renewal()])
+        self.assertEqual(code, 0, events)
+        self.assertEqual([(launch['token'], launch['checkpoint'], launch['wait']) for launch in launches],
+                         [('dummy-token-1', False, None), ('dummy-token-2', False, None),
+                          ('dummy-token-2', True, None)])
+        # Without auth_rotate (an older runtime) a token close to expiry is never rotated live.
+        code, events, launches = self.run_borrowed('success', 200)
+        self.assertEqual(code, 0, events)
+        self.assertFalse(any(event['type'] == 'auth_refresh' for event in events))
+        self.assertEqual([launch['wait'] for launch in launches], [None])
+
+    def test_a_running_cli_receives_a_rotated_token_before_its_own_expires(self):
+        code, events, launches = self.run_borrowed('rotate_wait', 200, [lambda context: context.renewal()],
+                                                   rotate=True)
+        self.assertEqual(code, 0, events)
+        self.assertEqual([event for event in events if event['type'] == 'auth_refresh'],
+                         [dict(type='auth_refresh', reason='rotate')])
+        self.assertEqual([(launch['token'], launch['wait']) for launch in launches], [('dummy-token-1', '60000')])
+        self.assertEqual([(entry['rotated'], entry['keys']) for entry in self.rotations],
+                         [('dummy-token-2', ['CLAUDE_CODE_OAUTH_TOKEN'])])
+        self.assertTrue(self.rotations[0]['request_id'].startswith('codex-auth-'))
+        self.assertEqual(self.final_tokens, ['dummy-token-2'])
+        self.assertEqual(next(event for event in events if event['type'] == 'done')['status'], 'success')
+
+    def test_a_cli_waiting_between_turns_for_background_work_receives_the_rotated_token(self):
+        code, events, launches = self.run_borrowed('rotate_between', 200, [lambda context: context.renewal()],
+                                                   rotate=True)
+        self.assertEqual(code, 0, events)
+        done = next(event for event in events if event['type'] == 'done')
+        self.assertEqual((done['status'], done['result_text']), ('success', '안녕하세요'))
+        self.assertEqual((len(launches), self.final_tokens), (1, ['dummy-token-2']))
+
+    def test_a_refused_request_gets_a_rotated_token_while_the_cli_waits_for_one(self):
+        code, events, launches = self.run_borrowed('rotate_retry', 3600, [lambda context: context.renewal()],
+                                                   rotate=True)
+        self.assertEqual(code, 0, events)
+        kinds = [event.get('kind') or event['type'] for event in events]
+        # Only the CLI's wait after its refused request asks: this token is valid for an hour.
+        self.assertEqual((kinds.count('auth_refresh'), kinds.count('retry')), (1, 1))
+        self.assertEqual((len(launches), self.final_tokens), (1, ['dummy-token-2']))
+        self.assertEqual(next(event for event in events if event['type'] == 'done')['status'], 'success')
+
+    def test_an_unacknowledged_rotation_relaunches_once_with_the_newer_token_without_asking_again(self):
+        for scenario in ('rotate_silent', 'rotate_refused'):
+            with self.subTest(scenario=scenario), patch('manager_core.claude_runner.AUTH_ROTATE_ACK_SECONDS', .3):
+                code, events, launches = self.run_borrowed(scenario, 200, [lambda context: context.renewal()],
+                                                           rotate=True)
+                self.assertEqual(code, 0, events)
+                self.assertEqual([event for event in events if event['type'] == 'auth_refresh'],
+                                 [dict(type='auth_refresh', reason='rotate')])
+                self.assertEqual([(launch['token'], launch['resume']) for launch in launches],
+                                 [('dummy-token-1', False), ('dummy-token-2', True)])
+                self.assertEqual(next(event for event in events if event['type'] == 'done')['status'], 'success')
+
+    def test_a_rotation_answer_that_arrives_after_the_result_is_consumed_before_the_commit(self):
+        code, events, launches = self.run_borrowed('success', 200, [lambda context: context.renewal()],
+                                                   rotate=True, defer=True)
+        self.assertEqual(code, 0, events)
+        self.assertEqual(events[-1]['type'], 'committed')
+        self.assertEqual(sum(event['type'] == 'auth_refresh' for event in events), 1)
+
+    def test_rotation_requests_never_overlap_and_are_spaced_and_capped(self):
+        class Process:
+            def __init__(self):
+                self.stdin = io.BytesIO()
+        identity = digest('remote-account')
+        borrowed = BorrowedLogin(dict(profileId=self.profile, accountIdentity=identity,
+                                      expiresAt=int(time.time()) + 100), 'dummy-token-1')
+        sent = []
+        rotation = Rotation(borrowed, sent.append, True)
+        rotation.launch(Process())
+        unavailable = dict(type='auth_update', available=False)
+        with patch('manager_core.claude_runner.AUTH_REFRESH_RETRY_SECONDS', .05), \
+             patch('manager_core.claude_runner.AUTH_ROTATE_SPACING', .05):
+            rotation.tick()
+            rotation.tick()
+            self.assertEqual(sent, [dict(type='auth_refresh', reason='rotate')])
+            for _ in range(AUTH_ROTATE_ATTEMPTS + 2):
+                rotation.answered(unavailable)
+                time.sleep(.06)
+                rotation.tick()
+            self.assertEqual(len(sent), AUTH_ROTATE_ATTEMPTS)
+            # A refused request still asks again, a bounded number of times.
+            rotation.answered(unavailable)
+            for _ in range(AUTH_ROTATE_RECOVERIES + 2):
+                time.sleep(.06)
+                rotation.recover()
+                rotation.answered(unavailable)
+            self.assertEqual(len(sent), AUTH_ROTATE_ATTEMPTS + AUTH_ROTATE_RECOVERIES)
+            # A credential for another account is never pushed and ends rotation for this process.
+            rotation.recoveries = 0
+            time.sleep(.06)
+            rotation.recover()
+            rotation.answered(dict(type='auth_update', available=True, credentials=dict(
+                profileId=self.profile, accessToken='dummy-token-9', accountIdentity=digest('another'),
+                expiresAt=int(time.time()) + 8 * 3600)))
+            self.assertTrue(rotation.failed)
+            self.assertEqual(rotation.process.stdin.getvalue(), b'')
+            self.assertEqual(borrowed.token, 'dummy-token-1')
 
     def borrowed_record(self):
         return json.loads(next(self.root.glob('remote-state/sessions/*/*/*.json')).read_text(encoding='utf-8'))
