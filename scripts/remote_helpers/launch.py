@@ -149,10 +149,31 @@ def managed_instances(profile_id):
             continue
         try:
             executable = os.readlink(entry / "exe")
+        except PermissionError:
+            # A non-dumpable process hides its executable: the managed proxy, which relays lent
+            # credentials and holds no instance lock. It is never reaped as stale.
+            continue
         except OSError:
             executable = ""
         found.append((int(entry.name), executable))
     return found
+
+
+def lends_saved_tokens(definition):
+    """Whether this definition's runtime may receive a saved long-lived Claude token: its
+    prepared authority has an account whose helpers accept a credential's source."""
+    path = definition / "manager-execution-authority.json"
+    try:
+        if path.is_symlink() or not path.is_file():
+            return False
+        authority = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(authority, dict):
+        return False
+    roles = authority.get("roles") if isinstance(authority.get("roles"), dict) else {}
+    return any(isinstance(item, dict) and item.get("credential_sources") == 1
+               for item in [authority.get("main_auth"), *roles.values()])
 
 
 def stale_instances(instances, runtime):
@@ -427,6 +448,13 @@ def run(profile, revision, argv, *, managed_socket=None):
         os.set_inheritable(lock.fileno(), True)
         if managed_socket is not None:
             from native_controller import process_record
+            if lends_saved_tokens(definition):
+                # A saved long-lived Claude token passes through this runtime's memory. A hard core
+                # limit of 0, inherited by everything it starts, keeps it out of a core dump that
+                # a same-user process could otherwise force (prlimit, then a signal). The runtime
+                # stays dumpable: maintenance identifies it through /proc/<pid>/exe.
+                import resource
+                resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
             # The detached listener publishes its own ownership while it holds the
             # runtime lock. Losing the initiating SSH command cannot orphan an
             # otherwise healthy daemon without a reconnectable identity record.

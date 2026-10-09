@@ -199,6 +199,21 @@ class NativeMaintenanceTests(unittest.TestCase):
                 NATIVE.main(self.profile, self.revision, 'native-proxy')
         self.assertEqual(raised.exception.code, 'remote_listener_unavailable')
 
+    def test_proxy_asks_the_runtime_to_hide_its_relayed_credentials(self):
+        execve = MagicMock(side_effect=SystemExit(0))
+        with patch.object(NATIVE, '_descriptor', return_value={'runtime': str(self.profile / 'runtime')}), \
+                patch.object(NATIVE, 'socket_path', return_value=self.profile / 'control.sock'), \
+                patch.object(NATIVE, '_ready', return_value=True), \
+                patch.object(NATIVE, '_forward_agent'), \
+                patch.dict(NATIVE.os.environ, {'CODEX_MANAGER_PRIVATE_PROXY': '0', 'CODEX_OTHER': 'x'}), \
+                patch.object(NATIVE.os, 'execve', execve):
+            with self.assertRaises(SystemExit):
+                NATIVE.main(self.profile, self.revision, 'native-proxy')
+        executable, argv, env = execve.call_args.args
+        self.assertEqual(argv[1:4], ['app-server', 'proxy', '--sock'])
+        self.assertEqual(env['CODEX_MANAGER_PRIVATE_PROXY'], '1')
+        self.assertNotIn('CODEX_OTHER', env)
+
     def test_unverified_transport_reply_preserves_the_process(self):
         for error in (EOFError("truncated"), ValueError("oversized"), TimeoutError("late")):
             with self.subTest(error=error):

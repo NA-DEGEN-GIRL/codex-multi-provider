@@ -40,8 +40,10 @@ REMOTE_CAPABILITY_MARKERS = {
     'execution_preset_auth_present': b'account/executionPresetAuthTokens/read',
     'claude_account_auth_present': b'CODEX_MANAGER_CLAUDE_AUTH',
 }
-# Optional: a runtime that reports a lent Claude credential's source (initialize capability).
-CLAUDE_CREDENTIAL_SOURCES_MARKER = b'executionPresetCredentialSources'
+# Optional: a runtime that reports a lent Claude credential's source (initialize capability
+# executionPresetCredentialSources version 2). Version 1 runtimes have that name too, so the
+# marker is a refusal reason only version 2 explains.
+CLAUDE_CREDENTIAL_SOURCES_MARKER = b'claude_pc_login_required'
 _CAPABILITY_CACHE = {}
 
 

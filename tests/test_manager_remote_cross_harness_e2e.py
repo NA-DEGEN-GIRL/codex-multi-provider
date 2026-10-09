@@ -19,21 +19,27 @@ import test_manager_cross_harness_e2e as cross_native
 from test_manager_claude_runtime_e2e import Rpc
 from test_manager_execution_preset_auth import ParentAuth
 from manager_core.claude_profiles import render_for_host
-from manager_core.execution_preset_auth import ExecutionPresetAuthProxy
+from manager_core.execution_preset_auth import SOURCES_VERSION, ExecutionPresetAuthProxy
 from manager_core.providers import _BEGIN, _END
 from manager_core.store import atomic_json
 from remote_helpers.install import DISPATCHER
 
 
-# Prepended to the shared fake CLI: the lent token arrives through an inherited pipe, never the
-# environment. Each launch records which credential it got (by label, never the token). With
-# REFUSE_SAVED the API refuses the saved long-lived token like CLI 2.1.282 reports it.
+# Prepended to the shared fake CLI: the lent token arrives through an inherited descriptor (a
+# pipe from older helpers, a socket from current ones), never the environment. Each launch
+# records which credential it got (by label, never the token). With REFUSE_SAVED the API
+# refuses the saved long-lived token like CLI 2.1.282 reports it.
 FAKE_PREFIX = r'''import json,os,sys
 if sys.argv[1:]==["--version"]:
     print("2.1.282 (Claude Code)"); raise SystemExit(0)
 _lent = {"synthetic-claude-access": "windows", "synthetic-long-lived": "long"}
-with open("/proc/self/fd/"+os.environ["CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR"]) as _pipe:
-    _token = _pipe.read()
+_fd, _data = int(os.environ["CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR"]), b""
+while True:
+    _chunk = os.read(_fd, 4096)
+    if not _chunk: break
+    _data += _chunk
+os.close(_fd)
+_token = _data.decode()
 assert _token in _lent, "unexpected lent token"
 assert not any(_secret in _value for _value in os.environ.values() for _secret in _lent)
 assert os.environ["CLAUDE_CODE_OAUTH_SCOPES"]=="user:inference"
@@ -131,18 +137,23 @@ class RemoteCrossHarnessTests(unittest.TestCase):
         machine = Path('/etc/machine-id').read_text().strip()
         self.host = hashlib.sha256((machine + '\\0' + str(os.getuid()) + '\\0' + str(Path.home())).encode()).hexdigest()
         self.private_reads = []
-        # The saved long-lived token: offered only by tests that ask for it, refused once lent.
+        # The saved long-lived token: offered only by tests that ask for it; a recorded refusal
+        # stops lending it (the saved metadata's mark).
         self.offer_saved, self.saved_lends, self.saved_refused = False, [], set()
+        self.recorded = []
         self.tokens_path = self.base / 'lent-token-labels.txt'
 
-    def lend_saved(self, root, profile_id, identity, rejected):
-        self.saved_lends.append(rejected)
-        if rejected is not None:
-            self.saved_refused.add(rejected)
-        if not self.offer_saved or SAVED_ID in self.saved_refused:
+    def lend_saved(self, root, profile_id, identity, excluded):
+        self.saved_lends.append(excluded)
+        if not self.offer_saved or SAVED_ID in self.saved_refused or excluded == SAVED_ID:
             return None
         return dict(accessToken='synthetic-long-lived', expiresAt=int(time.time()) + 365 * 86400,
                     accountIdentity=self.identity, credentialSource='longLivedToken', credentialId=SAVED_ID)
+
+    def record_refusal(self, root, profile_id, credential_id):
+        self.recorded.append((profile_id, credential_id))
+        self.saved_refused.add(credential_id)
+        return True
 
     def lent_labels(self):
         return self.tokens_path.read_text().split() if self.tokens_path.exists() else []
@@ -220,7 +231,8 @@ class RemoteCrossHarnessTests(unittest.TestCase):
             return dict(accessToken='synthetic-claude-access', expiresAt=int(time.time()) + 3600,
                         accountIdentity=self.identity)
         broker = ExecutionPresetAuthProxy(ParentAuth(), self.store, authority, owner['generation'],
-                                          claude_reader=read_claude, long_lived_reader=self.lend_saved)
+                                          claude_reader=read_claude, long_lived_reader=self.lend_saved,
+                                          rejection_recorder=self.record_refusal)
         environment = self.environment(home, owner['id'])
         environment.update(CODEX_MANAGER_EXECUTION_PRESETS=str(manifest_path),
                            CODEX_MANAGER_DEFINITION_REVISION=revision)
@@ -266,19 +278,24 @@ class RemoteCrossHarnessTests(unittest.TestCase):
         claude = [value for value in self.rpc.private_requests if value['kind'] == 'claude']
         fields = {'ownerProfileId', 'roleId', 'profileId', 'kind', 'expectedAccountFingerprint',
                   'expectedAccountIdentity'}
-        if client.broker.credential_sources != 1:
-            # An older runtime never declares the capability: only the PC login is lent, in the
-            # original shape, and nothing is reported.
-            self.assertEqual((self.saved_lends, self.lent_labels()), ([], ['windows']))
+        if client.broker.credential_sources != SOURCES_VERSION:
+            # An older runtime never declares the capability (or declares the unreleased version 1):
+            # only the PC login is lent, in the original shape, and nothing is reported.
+            self.assertEqual((self.saved_lends, self.lent_labels(), self.recorded), ([], ['windows'], []))
             self.assertTrue(all(set(value) == fields for value in claude))
         else:
-            # The saved token is lent first (six fields, no rejection), refused by the API, reported,
-            # and the same turn resumes on the PC login; every later read names the refused ID.
+            # The saved token is lent first (six fields, no rejection) and refused by the API. The
+            # refusal is reported once, in a read that lends nothing, and recorded; every other
+            # later read only excludes it, and the same turn resumes on the PC login.
             self.assertEqual(self.lent_labels(), ['long', 'windows'])
             self.assertEqual(set(claude[0]), fields)
             self.assertEqual(self.saved_lends[0], None)
-            self.assertTrue(claude[1:] and all(value.get('rejectedCredentialId') == SAVED_ID for value in claude[1:]))
-            self.assertEqual(self.saved_refused, {SAVED_ID})
+            reports = [value for value in claude[1:] if value.get('reportOnly') is True]
+            reads = [value for value in claude[1:] if 'reportOnly' not in value]
+            self.assertEqual(len(reports) + len(reads), len(claude) - 1)
+            self.assertEqual([value.get('rejectedCredentialId') for value in reports], [SAVED_ID])
+            self.assertTrue(reads and all(value.get('rejectedCredentialId') == SAVED_ID for value in reads))
+            self.assertEqual(self.recorded, [(self.claude['id'], SAVED_ID)])
         self._assert_private_credentials(True)
         restored = client.request('thread/read', {'threadId': thread, 'includeTurns': True})
         self.assertIn('CLAUDE_CHILD_FIRST_DONE', json.dumps(restored))

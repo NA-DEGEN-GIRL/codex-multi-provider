@@ -120,4 +120,28 @@ class RemoteHistoryRepairTests(unittest.TestCase):
             self.assertEqual(db.execute('SELECT count(*) FROM thread_items WHERE thread_id=?',(self.tid,)).fetchone()[0],1)
 
 
+class HiddenProcessTests(unittest.TestCase):
+    """Processes that hide their descriptors on purpose (non-dumpable) and never open task
+    history are skipped by the open-file scan; any other unreadable process still refuses."""
+    def process(self, *argv):
+        directory=Path(self.tmp.name)/str(len(list(Path(self.tmp.name).iterdir())))
+        directory.mkdir()
+        (directory/'cmdline').write_bytes(b'\0'.join(argv)+b'\0')
+        return directory
+
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_only_the_managed_proxy_and_the_claude_runner_are_skipped(self):
+        cases=[
+            (self.process(b'/home/dev/.local/share/codex-control-center/runtime/b/codex',b'app-server',b'proxy',b'--sock',b'/x.sock'),True),
+            (self.process(b'/usr/bin/python3',b'-X',b'utf8',b'/home/dev/p/launch.py',b'claude-runner',b'--binding',b'/b.json'),True),
+            (self.process(b'/home/dev/runtime/codex',b'app-server',b'--listen',b'unix:///x.sock'),False),
+            (self.process(b'/usr/bin/python3',b'tool.py',b'app-server',b'proxy'),False),
+            (Path(self.tmp.name)/'missing',False),
+        ]
+        self.assertEqual([repair.never_opens_task_history(proc) for proc,_ in cases],[expected for _,expected in cases])
+
+
 if __name__=='__main__':unittest.main()

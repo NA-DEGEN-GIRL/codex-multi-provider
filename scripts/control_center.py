@@ -483,7 +483,8 @@ class ControlCenter:
                 token = args.pop('token', None)
                 try:
                     return long_lived.save(self.root, args['profile_id'], token, attested=args.get('attested'),
-                                           minted_on=args.get('minted_on'), validity_days=args.get('validity_days'))
+                                           minted_on=args.get('minted_on'), validity_days=args.get('validity_days'),
+                                           attested_account=args.get('attested_account'))
                 finally:
                     token = None
             if command == 'claude.token.remove':

@@ -182,6 +182,9 @@ internal static class ClaudeProfileSelfTest
         var signedOut = new ClaudeLongLivedTokenPanel(tokenOwner, new StackPanel(), LongLivedProfile(false, noToken), TokenRequest);
         signedOut.ApplyPaste(dummy); signedOut.Attested.IsChecked = true;
         Require(!signedOut.Save.IsEnabled && !signedOut.Section.IsExpanded, "Saving a long-lived token was offered before the profile was logged in.");
+        // A disabled Save says why: its tooltip shows while disabled, and a visible line says it too.
+        Require(ToolTipService.GetShowOnDisabled(signedOut.Save) && signedOut.Hint.Visibility == Visibility.Visible
+            && signedOut.Hint.Text == ClaudeLongLivedTokenPanel.LoginHint, "A save blocked by the missing login was not explained.");
         signedOut.Token.Clear();
         var tokenPanel = new ClaudeLongLivedTokenPanel(tokenOwner, new StackPanel(), LongLivedProfile(true, noToken), TokenRequest);
         var clipboard = new List<bool>();
@@ -193,12 +196,23 @@ internal static class ClaudeProfileSelfTest
         Require(!tokenPanel.Save.IsEnabled, "Saving was offered before the account attestation was checked.");
         tokenPanel.Attested.IsChecked = true;
         Require(tokenPanel.Save.IsEnabled && Equals(tokenPanel.Attested.Content, "이 토큰은 c***@example.test 계정으로 발급했습니다")
-            && tokenPanel.Status.Text == "장기 토큰 · 없음", "The attestation did not name the masked account or the empty state was mislabelled.");
-        await tokenPanel.SaveAsync();
+            && tokenPanel.Status.Text == "장기 토큰 · 없음" && tokenPanel.Hint.Visibility == Visibility.Collapsed,
+            "The attestation did not name the masked account or the empty state was mislabelled.");
+        // The attestation names one account: a login check that shows another account clears it.
+        tokenPanel.UpdateLogin(JsonSerializer.SerializeToElement(new { logged_in = true, masked_email = "d***@example.test" }));
+        Require(tokenPanel.Attested.IsChecked != true && !tokenPanel.Save.IsEnabled,
+            "An attestation made for one account stayed checked after the login showed another account.");
+        tokenPanel.UpdateLogin(JsonSerializer.SerializeToElement(new { logged_in = true, masked_email = "c***@example.test" }));
+        tokenPanel.Attested.IsChecked = true;
+        // Saved through the button, as a user does; the label then says the next save replaces it.
+        tokenPanel.Save.RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent));
+        for (var wait = 0; wait < 50 && tokenRequests.Count == 0; wait++) await Task.Delay(20);
         Require(tokenPanel.Token.Password == "" && !tokenPanel.HasUnsavedToken && clipboard.SequenceEqual(new[] { true })
             && tokenPanel.Status.Text == "설정됨 · c***@example.test · 만료 2027-10-01" && Equals(tokenPanel.Save.Content, "교체")
-            && tokenPanel.Remove.Visibility == Visibility.Visible && !tokenPanel.Result.Text.Contains("Fixture"),
-            "The token field or clipboard was not cleared, or the saved state was not shown.");
+            && tokenPanel.Remove.Visibility == Visibility.Visible && !tokenPanel.Result.Text.Contains("Fixture")
+            && tokenPanel.Attested.IsChecked != true
+            && tokenRequests.Count == 1 && tokenRequests[0].Args.Contains("\"attested_account\":\"c***@example.test\""),
+            "The token field or clipboard was not cleared, the saved state was not shown, or the attested account was not sent.");
         tokenPanel.Confirm = message => message.Contains("이 PC에서만") && message.Contains("claude.ai") && message.Contains("진행 중인 SSH 작업");
         await tokenPanel.RemoveAsync();
         Require(tokenRequests.Select(r => r.Command).SequenceEqual(new[] { "claude.token.save", "claude.token.remove" })

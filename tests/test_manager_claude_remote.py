@@ -434,6 +434,24 @@ class RemoteRunnerEntryTests(unittest.TestCase):
         result = subprocess.run([sys.executable, '-c', script], capture_output=True, text=True, timeout=60)
         self.assertEqual(result.stdout.split(), ['0', '1'], result.stderr)
 
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux core limits.')
+    def test_a_cli_started_by_the_runner_can_never_write_a_core_dump(self):
+        # A same-user process could otherwise raise the CLI's soft core limit (prlimit) and
+        # signal it; the hard limit of 0 is inherited and only a privileged process can raise it.
+        helpers = Path(__file__).resolve().parents[1] / 'scripts'
+        script = ('import json, resource, subprocess, sys\n'
+                  'sys.path[:0] = [%r, %r]\n'
+                  'from remote_helpers.claude_remote import _hide_process\n'
+                  '_hide_process()\n'
+                  'cli = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])\n'
+                  'line = next(l for l in open("/proc/%%d/limits" %% cli.pid) if l.startswith("Max core file size"))\n'
+                  'probe = "import resource, sys; resource.prlimit(int(sys.argv[1]), resource.RLIMIT_CORE, (-1, -1))"\n'
+                  'raised = subprocess.run([sys.executable, "-c", probe, str(cli.pid)], stderr=subprocess.DEVNULL).returncode\n'
+                  'cli.kill()\n'
+                  'print(json.dumps([line.split()[4:6], raised]))\n') % (str(helpers), str(helpers / 'remote_helpers'))
+        result = subprocess.run([sys.executable, '-c', script], capture_output=True, text=True, timeout=60)
+        self.assertEqual(json.loads(result.stdout), [['0', '0'], 1], result.stderr)
+
 
 if __name__ == '__main__':
     unittest.main()

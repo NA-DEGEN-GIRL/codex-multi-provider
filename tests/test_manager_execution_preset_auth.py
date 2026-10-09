@@ -289,19 +289,21 @@ class BorrowingTests(unittest.TestCase):
     LENT = '33333333-3333-4333-8333-333333333333'
     NEWER = '55555555-5555-4555-8555-555555555555'
 
-    def sources_fixture(self, capability=True, prepared=True, long_lived=None, windows=None):
-        """Main Claude account with dummy long-lived and Windows-login readers."""
+    def sources_fixture(self, capability=2, prepared=True, long_lived=None, windows=None):
+        """Main Claude account with dummy long-lived and Windows-login readers.
+
+        `capability` is the runtime's executionPresetCredentialSources (None: absent)."""
         params = self.claude_params()
         identity = params['expectedAccountIdentity']
         if prepared:
             self.broker.authority['main_auth']['credential_sources'] = 1
         self.broker.process('runtime', {'id':'init', 'result':{
-            'executionPresetsVersion':1, **({'executionPresetCredentialSources':1} if capability else {})}})
-        self.lends, self.windows = [], []
-        def lend(root, profile, expected, rejected):
-            self.lends.append((profile, expected, rejected))
+            'executionPresetsVersion':1, **({'executionPresetCredentialSources':capability} if capability else {})}})
+        self.lends, self.windows, self.recorded = [], [], []
+        def lend(root, profile, expected, excluded):
+            self.lends.append((profile, expected, excluded))
             if long_lived is not None:
-                return long_lived(len(self.lends), rejected)
+                return long_lived(len(self.lends), excluded)
             return dict(accessToken='dummy-token-long', expiresAt=2_000_000_000, accountIdentity=expected,
                         credentialSource='longLivedToken', credentialId=self.LENT)
         def read(root, profile, expected):
@@ -309,7 +311,11 @@ class BorrowingTests(unittest.TestCase):
             if windows is not None:
                 return windows(len(self.windows))
             return dict(accessToken='dummy-token-windows', expiresAt=1_900_000_000, accountIdentity=expected)
+        def record(root, profile, credential):
+            self.recorded.append((profile, credential))
+            return True
         self.broker._long_lived_reader, self.broker._claude_reader = lend, read
+        self.broker._rejection_recorder = record
         return params
 
     def test_long_lived_token_is_lent_only_with_runtime_capability_and_prepared_flag(self):
@@ -317,7 +323,8 @@ class BorrowingTests(unittest.TestCase):
         identity = 'd' * 64
         legacy = dict(kind='claude', accessToken='dummy-token-windows', chatgptAccountId=None,
                       expiresAt=1_900_000_000, accountIdentity=identity)
-        for capability, prepared in ((False, True), (True, False), (False, False)):
+        # Version 1 (never released) recorded a refusal on every read that named it.
+        for capability, prepared in ((None, True), (2, False), (None, False), (1, True), (3, True)):
             with self.subTest(capability=capability, prepared=prepared):
                 params = self.sources_fixture(capability, prepared)
                 result = self.request(params, f'gated-{capability}-{prepared}')['result']
@@ -330,59 +337,116 @@ class BorrowingTests(unittest.TestCase):
                                       credentialSource='longLivedToken', credentialId=self.LENT))
         self.assertEqual((self.lends, self.windows), ([(self.peer, identity, None)], []))
         # Without a usable saved token the PC login is lent and says so.
-        params = self.sources_fixture(long_lived=lambda count, rejected: None)
+        params = self.sources_fixture(long_lived=lambda count, excluded: None)
         self.assertEqual(self.request(params, 'fallback')['result'],
                          dict(legacy, credentialSource='windowsLogin', credentialId=None))
         self.assert_secret_free(logs)
         self.broker.close()
         self.assertEqual((self.broker.credential_sources, self.broker._lent), (0, set()))
 
-    def test_rejection_is_recorded_only_for_a_credential_this_connection_lent(self):
+    RECORDED = dict(REFUSED, data={'reason': 'claude_long_lived_recorded'})
+
+    def test_a_refusal_is_recorded_by_its_report_only_for_a_credential_this_connection_lent(self):
+        logs = capture_logs(self)
         params = self.sources_fixture()
+        report = dict(params, rejectedCredentialId=self.LENT, reportOnly=True)
+        # Not lent here (a reconnected runtime, or an invented ID): never recorded.
+        self.assertEqual(self.request(report, 'early'), {'id': 'early', 'error': REFUSED})
         self.assertEqual(self.request(params, 1)['result']['credentialId'], self.LENT)
-        # Now the saved token counts as refused: the lender returns nothing for it.
-        self.broker._long_lived_reader = lambda root, profile, expected, rejected: (
-            self.lends.append((profile, expected, rejected)) or None)
-        result = self.request(dict(params, rejectedCredentialId=self.LENT), 2)['result']
+        # The report is recorded, lends nothing and reads no login at all.
+        reads = (len(self.lends), len(self.windows))
+        self.assertEqual(self.request(report, 2), {'id': 2, 'error': self.RECORDED})
+        self.assertEqual(self.recorded, [(self.peer, self.LENT)])
+        self.assertEqual((len(self.lends), len(self.windows)), reads)
+        # Every later read of that turn only excludes the refused token.
+        self.broker._long_lived_reader = lambda root, profile, expected, excluded: (
+            self.lends.append((profile, expected, excluded)) or None)
+        result = self.request(dict(params, rejectedCredentialId=self.LENT), 3)['result']
         self.assertEqual((result['credentialSource'], result['accessToken']), ('windowsLogin', 'dummy-token-windows'))
-        self.assertEqual(self.lends[-1][2], self.LENT, 'a lent ID is passed on to be recorded')
-        # Another connection's (or an invented) ID is never recorded, and still keeps the saved
-        # token with that ID out of this read.
-        params = self.sources_fixture()
+        self.assertEqual(self.lends[-1][2], self.LENT)
+        self.assertEqual(self.recorded, [(self.peer, self.LENT)], 'an excluding read records nothing')
+        # Another connection's ID still keeps the saved token with that ID out of this read.
         other = str(uuid4())
-        self.broker._lent.clear()
-        self.broker._long_lived_reader = lambda root, profile, expected, rejected: (
-            self.lends.append((profile, expected, rejected)) or dict(
+        self.broker._long_lived_reader = lambda root, profile, expected, excluded: (
+            self.lends.append((profile, expected, excluded)) or dict(
                 accessToken='dummy-token-long', expiresAt=2_000_000_000, accountIdentity=expected,
                 credentialSource='longLivedToken', credentialId=other))
-        result = self.request(dict(params, rejectedCredentialId=other), 3)['result']
-        self.assertEqual((result['credentialSource'], self.lends[-1][2]), ('windowsLogin', None))
+        self.assertEqual(self.request(dict(params, rejectedCredentialId=other), 4)['result']['credentialSource'],
+                         'windowsLogin')
         # A newer saved token than the refused one is lent.
-        self.assertEqual(self.request(dict(params, rejectedCredentialId=self.NEWER), 4)['result']['credentialId'],
+        self.assertEqual(self.request(dict(params, rejectedCredentialId=self.NEWER), 5)['result']['credentialId'],
                          other)
+        self.assert_secret_free(logs)
+
+    def test_a_turn_that_outlives_the_users_retry_never_records_the_refusal_again(self):
+        params = self.sources_fixture()
+        marks = {}
+        def record(root, profile, credential):
+            marks['rejected'] = credential
+            return True
+        self.broker._rejection_recorder = record
+        self.assertEqual(self.request(params, 'turn-a')['result']['credentialId'], self.LENT)
+        self.assertEqual(self.request(dict(params, rejectedCredentialId=self.LENT, reportOnly=True), 'report'),
+                         {'id': 'report', 'error': self.RECORDED})
+        self.assertEqual(marks, {'rejected': self.LENT})
+        marks.clear()  # 다시 시도
+        self.assertEqual(self.request(params, 'turn-b')['result']['credentialId'], self.LENT)
+        # Turn A rotates its Windows login hours later, and again; nothing is recorded.
+        for request_id in ('rotate-1', 'rotate-2'):
+            result = self.request(dict(params, rejectedCredentialId=self.LENT), request_id)['result']
+            self.assertEqual(result['credentialSource'], 'windowsLogin')
+        self.assertEqual(marks, {})
+
+    def test_a_saved_token_waiting_for_the_pc_login_says_so(self):
+        params = self.sources_fixture()
+        self.store.profiles[self.peer]['claude_account_identity'] = None
+        with patch('manager_core.claude_long_lived_auth.waits_for_pc_login', return_value=True) as waits:
+            self.assertEqual(self.request(params, 'waiting'), {'id': 'waiting', 'error': dict(
+                REFUSED, data={'reason': 'claude_pc_login_required'})})
+        waits.assert_called_once()
+        self.assertEqual(waits.call_args.args[1], 'd' * 64)
+        with patch('manager_core.claude_long_lived_auth.waits_for_pc_login', return_value=False):
+            self.assertEqual(self.request(params, 'none-saved'), {'id': 'none-saved', 'error': REFUSED})
+        # A runtime without the capability keeps its generic refusal.
+        params = self.sources_fixture(capability=None)
+        self.store.profiles[self.peer]['claude_account_identity'] = None
+        with patch('manager_core.claude_long_lived_auth.waits_for_pc_login', return_value=True):
+            self.assertEqual(self.request(params, 'old'), {'id': 'old', 'error': REFUSED})
+        self.assertEqual((self.lends, self.windows), ([], []))
 
     def test_malformed_rejection_reports_are_refused_before_any_read(self):
         params = self.sources_fixture()
         bad = [dict(params, rejectedCredentialId=value) for value in
                ('not-a-uuid', self.NEWER.replace('5', 'A'), '../' + self.LENT, 7, '')]
         bad.append(dict(params, rejectedCredentialId=self.LENT, extra=True))
+        # A report names its credential and says so with exactly true.
+        bad += [dict(params, reportOnly=True), dict(params, rejectedCredentialId=None, reportOnly=True)]
+        bad += [dict(params, rejectedCredentialId=self.LENT, reportOnly=value) for value in (False, 1, 'true')]
         openai = self.params()
         openai['rejectedCredentialId'] = self.LENT
         bad.append(openai)
+        bad.append(dict(openai, reportOnly=True))
+        self.broker._lent.add(self.LENT)
         for index, value in enumerate(bad):
             self.assertEqual(self.request(value, f'bad-{index}'), {'id': f'bad-{index}', 'error': REFUSED})
-        self.assertEqual((self.lends, self.windows, self.reads), ([], [], []))
+        self.assertEqual((self.lends, self.windows, self.reads, self.recorded), ([], [], [], []))
+        # A report from a runtime without the capability is refused too.
+        params = self.sources_fixture(capability=None)
+        self.broker._lent.add(self.LENT)
+        self.assertEqual(self.request(dict(params, rejectedCredentialId=self.LENT, reportOnly=True), 'old'),
+                         {'id': 'old', 'error': REFUSED})
+        self.assertEqual(self.recorded, [])
 
-    def test_a_rejecting_read_never_joins_a_read_that_may_lend_the_rejected_token(self):
+    def test_an_excluding_read_never_joins_a_read_that_may_lend_the_excluded_token(self):
         params = self.sources_fixture()
         entered, release = threading.Event(), threading.Event()
         self.addCleanup(release.set)
-        def lend(root, profile, expected, rejected):
-            self.lends.append(rejected)
-            if rejected is None:
+        def lend(root, profile, expected, excluded):
+            self.lends.append(excluded)
+            if excluded is None:
                 entered.set()
                 release.wait(5)
-            return None if rejected else dict(accessToken='dummy-token-long', expiresAt=2_000_000_000,
+            return None if excluded else dict(accessToken='dummy-token-long', expiresAt=2_000_000_000,
                                                accountIdentity=expected, credentialSource='longLivedToken',
                                                credentialId=self.LENT)
         self.broker._long_lived_reader = lend
@@ -401,15 +465,18 @@ class BorrowingTests(unittest.TestCase):
     def test_no_fallback_after_a_refused_saved_token_reports_a_reason_code(self):
         def refuse(count):
             raise ClaudeError('claude_account_unavailable', 'The selected Claude account needs a current local login.')
-        params = self.sources_fixture(long_lived=lambda count, rejected: None, windows=refuse)
+        params = self.sources_fixture(long_lived=lambda count, excluded: None, windows=refuse)
         self.broker._lent.add(self.LENT)
-        with patch('manager_core.claude_long_lived_auth.refusal_reason', return_value='claude_long_lived_rejected'):
+        with patch('manager_core.claude_long_lived_auth.refusal_reason', return_value='claude_long_lived_rejected') \
+                as reason:
             answer = self.request(dict(params, rejectedCredentialId=self.LENT), 'none')
         self.assertEqual(answer, {'id': 'none', 'error': dict(REFUSED, data={'reason': 'claude_long_lived_rejected'})})
+        # The refusal of this turn counts even before its report is recorded.
+        self.assertEqual(reason.call_args.kwargs, {'excluded': self.LENT})
         with patch('manager_core.claude_long_lived_auth.refusal_reason', return_value=None):
             self.assertEqual(self.request(params, 'plain'), {'id': 'plain', 'error': REFUSED})
         # Without the capability the generic refusal stays exactly as before.
-        params = self.sources_fixture(capability=False, windows=refuse)
+        params = self.sources_fixture(capability=None, windows=refuse)
         with patch('manager_core.claude_long_lived_auth.refusal_reason', return_value='claude_long_lived_rejected'):
             self.assertEqual(self.request(params, 'old'), {'id': 'old', 'error': REFUSED})
 

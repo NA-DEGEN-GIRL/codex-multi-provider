@@ -28,6 +28,44 @@ class StaleInstanceTests(unittest.TestCase):
         sibling = self.runtime + "-copy/codex"
         self.assertEqual(launch.stale_instances([(14, sibling)], self.runtime), [(14, sibling)])
 
+    def test_a_process_that_hides_its_executable_is_never_reaped_as_stale(self):
+        # The managed proxy is non-dumpable (it relays lent credentials): its exe link is
+        # unreadable, and it holds no instance lock. An exited process stays stale as before.
+        profile_id = "0123456789abcdef"
+        command = f"{self.current} app-server proxy --sock /home/dev/profiles/{profile_id}/control.sock"
+        links = {"11": PermissionError(13, "denied"), "12": self.old, "13": FileNotFoundError(2, "gone")}
+        def readlink(path):
+            value = links[Path(path).parent.name]
+            if isinstance(value, Exception):
+                raise value
+            return value
+        entries = [Path("/proc") / name for name in ("11", "12", "13", "self")]
+        with patch.object(launch.Path, "iterdir", return_value=entries), \
+                patch.object(launch, "_proc_cmdline", return_value=command), \
+                patch.object(launch.os, "readlink", side_effect=readlink):
+            found = launch.managed_instances(profile_id)
+        self.assertEqual(found, [(12, self.old), (13, "")])
+        self.assertEqual(launch.stale_instances(found, self.runtime), [(12, self.old), (13, "")])
+
+    def test_only_a_runtime_that_may_receive_a_saved_token_limits_core_dumps(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            definition = Path(temporary)
+            self.assertFalse(launch.lends_saved_tokens(definition))
+            authority = definition / "manager-execution-authority.json"
+            cases = [
+                ({"main_auth": {"kind": "claude", "credential_sources": 1}, "roles": {}}, True),
+                ({"roles": {"r": {"auth_source": "manager_proxy", "credential_sources": 1}}}, True),
+                ({"main_auth": {"kind": "claude"}, "roles": {"r": {"credential_sources": 2}}}, False),
+                ({"roles": []}, False),
+                ([], False),
+            ]
+            for value, expected in cases:
+                with self.subTest(value=value):
+                    authority.write_text(json.dumps(value), encoding="utf-8")
+                    self.assertEqual(launch.lends_saved_tokens(definition), expected)
+            authority.write_text("{not json", encoding="utf-8")
+            self.assertFalse(launch.lends_saved_tokens(definition))
+
     def test_managed_instance_scan_ignores_unrelated_processes(self):
         # The scan runs on Linux; on this platform it must degrade to no matches.
         if sys.platform.startswith("linux"):

@@ -25,6 +25,12 @@ Locks
   The lender takes neither: it reads the metadata, opens the blob and, when a
   concurrent replace removed that blob, reads the metadata once more.
 
+Refusals
+  A runtime reports a refused token once, in a report-only read; the broker
+  records it with record_rejection(). Every later read of that turn only
+  excludes the token (lend(excluded_credential_id=...)), so a turn that is still
+  running never marks it rejected again after the user pressed 다시 시도.
+
 Errors carry fixed text only. No message, log line or return value except
 lend()'s result contains the token.
 """
@@ -291,8 +297,13 @@ def _encrypt(profile_id, credential_id, token):
         payload[:] = bytes(len(payload))
 
 
+LOGIN_CHANGED_MESSAGE = 'Claude 로그인 계정이 바뀌었습니다. 로그인 상태를 확인한 뒤 다시 저장하세요.'
+ATTESTED_ACCOUNT_MESSAGE = ('확인란에 표시된 계정과 지금 이 프로필에 로그인된 Claude 계정이 다릅니다. '
+                            '로그인 상태를 확인하고 계정을 다시 확인한 뒤 저장하세요.')
+
+
 def save(root, profile_id, token, *, attested, minted_on=None, validity_days=None,
-         refresh=None, now=None):
+         refresh=None, now=None, attested_account=None):
     """Save (or replace) the profile's token; return the presentation, never the token.
 
     Order (critique S4): validate, encrypt and drop the plaintext before the
@@ -300,11 +311,18 @@ def save(root, profile_id, token, *, attested, minted_on=None, validity_days=Non
     credential lock, write the generation file, update the metadata, and
     remove older generations best-effort. A crash before the metadata update
     keeps the previous token in use; the orphan file is ignored.
+
+    ``attested_account`` is the masked account the user confirmed in the dialog
+    (empty when none was shown). The token is bound to the login found at save
+    time, so a different masked account there refuses the save: a token cannot
+    be checked against its account locally, and the attestation is the only guard.
     """
     profile_id = _profile_id(profile_id)
     current = time.time() if now is None else now
     if attested is not True:
         raise _error('claude_token_attestation', '토큰을 발급한 계정이 이 프로필의 계정인지 확인하고 확인란을 선택하세요.')
+    if attested_account is not None and (not isinstance(attested_account, str) or len(attested_account) > 320):
+        raise _error('claude_login_changed', ATTESTED_ACCOUNT_MESSAGE)
     validity = _validity(validity_days)
     minted_at, minted_source = _minted(minted_on, current)
     expires_at = minted_at + validity * 86400
@@ -326,15 +344,18 @@ def save(root, profile_id, token, *, attested, minted_on=None, validity_days=Non
         raise _error('claude_login_required',
                      '이 프로필의 Claude 로그인을 먼저 확인하세요. 로그인된 계정에만 장기 토큰을 저장할 수 있습니다.')
     label = (profile.get('claude_status') or {}).get('masked_email')
+    label = label if isinstance(label, str) else None
+    if attested_account is not None and attested_account != (label or ''):
+        raise _error('claude_login_changed', ATTESTED_ACCOUNT_MESSAGE)
     value = dict(version=1, credential_id=credential_id, saved_at=int(current), minted_at=minted_at,
                  minted_source=minted_source, validity_days=validity, expires_at=expires_at,
-                 account_identity=identity, account_label=label if isinstance(label, str) else None,
+                 account_identity=identity, account_label=label,
                  rejected_credential_id=None, rejection_kind=None, last_rejected_at=None, unreadable_at=None)
 
     def update(data):
         profile = _claude_profile(store, profile_id, data)
         if profile.get('claude_account_identity') != identity:
-            raise _error('claude_login_changed', 'Claude 로그인 계정이 바뀌었습니다. 로그인 상태를 확인한 뒤 다시 저장하세요.')
+            raise _error('claude_login_changed', LOGIN_CHANGED_MESSAGE)
         replaced = METADATA_KEY in profile
         profile[METADATA_KEY] = value
         return dict(profile=profile, replaced=replaced)
@@ -358,7 +379,7 @@ def save(root, profile_id, token, *, attested, minted_on=None, validity_days=Non
                if result['replaced'] else
                '장기 토큰을 이 Windows 사용자용으로 암호화해 저장했습니다.')
     return dict(saved=True, replaced=result['replaced'],
-                long_lived=state(result['profile'], now=current), message=message)
+                long_lived=presentation(root, profile_id, now=current), message=message)
 
 
 def replace(root, profile_id, token, **options):
@@ -388,7 +409,7 @@ def delete(root, profile_id):
             _cleanup(root, profile_id)
     except OSError:
         raise _error('claude_token_storage', '장기 토큰을 삭제하지 못했습니다. 잠시 후 다시 시도하세요.') from None
-    return dict(removed=True, existed=existed, long_lived=state({}),
+    return dict(removed=True, existed=existed, long_lived=presentation(root, profile_id),
                 message=('이 PC에서 장기 토큰을 삭제했습니다. Claude 계정에서 토큰이 해지되지는 않으며, '
                          '진행 중인 SSH 작업은 끝날 때까지 이 토큰을 계속 사용합니다.') if existed else
                         '저장된 장기 토큰이 없습니다.')
@@ -409,8 +430,8 @@ def retry(root, profile_id, *, now=None):
         profile[METADATA_KEY].update(rejected_credential_id=None, rejection_kind=None, last_rejected_at=None)
         return profile
 
-    profile = store.mutate(update)
-    return dict(retried=True, long_lived=state(profile, now=now),
+    store.mutate(update)
+    return dict(retried=True, long_lived=presentation(root, profile_id, now=now),
                 message='거부 기록을 지웠습니다. 다음 SSH 작업부터 장기 토큰을 다시 사용합니다.')
 
 
@@ -480,16 +501,16 @@ def _read_blob(root, profile_id, credential_id):
         raise _Unreadable() from None
 
 
-def lend(root, profile_id, expected_identity, rejected_credential_id=None, *, now=None):
+def lend(root, profile_id, expected_identity, excluded_credential_id=None, *, now=None):
     """The broker's long-lived credential, or None to fall back to the PC login.
 
     The broker calls this only when the runtime declared the capability and the
     prepared authority allows it; every other condition is checked here:
     metadata valid, not marked rejected, the bound identity equal to both the
     role's expected identity and the profile's current login, before the stop
-    margin, and a blob that decrypts with matching IDs. ``rejected_credential_id``
-    (already checked by the broker against the IDs it lent) is recorded first,
-    and that credential is never returned.
+    margin, and a blob that decrypts with matching IDs. ``excluded_credential_id``
+    names a token the turn's runner reported as refused: it is never returned,
+    and nothing is recorded here (the report itself is, once).
     """
     current = int(time.time() if now is None else now)
     try:
@@ -498,14 +519,10 @@ def lend(root, profile_id, expected_identity, rejected_credential_id=None, *, no
         return None
     if not isinstance(expected_identity, str) or not _IDENTITY.fullmatch(expected_identity):
         return None
-    if rejected_credential_id is not None:
-        rejected_credential_id = _canonical(rejected_credential_id)
-        if rejected_credential_id is None:
+    if excluded_credential_id is not None:
+        excluded_credential_id = _canonical(excluded_credential_id)
+        if excluded_credential_id is None:
             return None
-        try:
-            record_rejection(root, profile_id, rejected_credential_id, now=current)
-        except (ValueError, RuntimeError, OSError):
-            pass
     store = Store(root)
     previous = None
     for _attempt in range(2):
@@ -516,7 +533,7 @@ def lend(root, profile_id, expected_identity, rejected_credential_id=None, *, no
         value = metadata(profile)
         if (value is None or profile.get('auth_mode') != 'claude_code'
                 or profile.get('removed_at') or profile.get('view_only')
-                or value['credential_id'] in (value['rejected_credential_id'], rejected_credential_id)
+                or value['credential_id'] in (value['rejected_credential_id'], excluded_credential_id)
                 or not (value['account_identity'] == expected_identity
                         == profile.get('claude_account_identity'))
                 or current >= value['expires_at'] - STOP_MARGIN):
@@ -545,10 +562,18 @@ def lend(root, profile_id, expected_identity, rejected_credential_id=None, *, no
 # Reason codes the broker adds to a refused read when the saved token was refused or expired
 # and the PC login could not replace it; the runtime explains them in English.
 REJECTED_REASON, EXPIRED_REASON = 'claude_long_lived_rejected', 'claude_long_lived_expired'
+# A token is saved for this account but the PC login is not confirmed, so the token is not
+# lent (C10); older runtimes show their generic message for it.
+PC_LOGIN_REASON = 'claude_pc_login_required'
+# The answer to a report-only read: the refusal was recorded and no credential is lent.
+RECORDED_REASON = 'claude_long_lived_recorded'
 
 
-def refusal_reason(root, profile_id, *, now=None):
-    """Why the saved token cannot be lent, when it was refused or has expired; else None."""
+def refusal_reason(root, profile_id, *, now=None, excluded=None):
+    """Why the saved token cannot be lent, when it was refused or has expired; else None.
+
+    ``excluded`` is a token this turn's runner reported as refused; its report may still be on
+    its way, so it already counts as refused here."""
     current = int(time.time() if now is None else now)
     try:
         value = metadata(Store(root).profile(_profile_id(profile_id)))
@@ -558,7 +583,28 @@ def refusal_reason(root, profile_id, *, now=None):
         return None
     if value['rejected_credential_id'] == value['credential_id']:
         return EXPIRED_REASON if value['rejection_kind'] == 'expired' else REJECTED_REASON
-    return EXPIRED_REASON if current >= value['expires_at'] - STOP_MARGIN else None
+    if current >= value['expires_at'] - STOP_MARGIN:
+        return EXPIRED_REASON
+    if excluded is not None and excluded == value['credential_id']:
+        return EXPIRED_REASON if abs(current - value['expires_at']) <= EXPIRY_WINDOW else REJECTED_REASON
+    return None
+
+
+def waits_for_pc_login(profile, expected_identity):
+    """Whether a token is saved for ``expected_identity`` while the profile's PC login is not
+    confirmed, which is the only reason that token is not lent."""
+    value = metadata(profile)
+    return (value is not None and isinstance(profile, dict) and profile.get('auth_mode') == 'claude_code'
+            and not profile.get('removed_at') and profile.get('claude_account_identity') is None
+            and value['account_identity'] == expected_identity)
+
+
+def presentation(root, profile_id, *, now=None):
+    """The settings panel's view of one profile after an action, with its SSH usage."""
+    store = Store(root)
+    data = store.read()
+    profile = store.profile(profile_id, data)
+    return state(profile, now=now, ssh=ssh_usage(data.get('profiles') or [], profile['id'], preset_users(root)))
 
 
 def preset_users(root):
@@ -642,11 +688,13 @@ def state(profile, *, now=None, ssh=None):
                   expanded=raw is not None or ssh['bindings'] > 0, logged_in=logged_in)
     if raw is None:
         return result
+    # Where SSH turns of this account get their login while the saved token is not lent (U3).
     fallback = '지금은 Windows 로그인 토큰 사용' if logged_in else 'Windows 로그인도 필요'
+    unreadable = dict(state='unreadable', label=f'읽을 수 없음 · 다시 저장 필요 · {fallback}', tone='warning',
+                      attention=True, card_text='토큰 확인', fallback=fallback,
+                      attention_text=f'Claude 장기 토큰을 읽을 수 없습니다 · {fallback} · Claude 로그인·설정에서 다시 저장하세요')
     if value is None:
-        return dict(result, state='unreadable', label='읽을 수 없음 · 다시 저장 필요', tone='warning',
-                    attention=True, card_text='토큰 확인', fallback=fallback,
-                    attention_text='Claude 장기 토큰을 읽을 수 없습니다 · Claude 로그인·설정에서 다시 저장하세요')
+        return dict(result, **unreadable)
     label = value['account_label'] or ''
     expires_on = _day(value['expires_at'])
     days = max(0, (value['expires_at'] - current) // 86400)
@@ -656,29 +704,35 @@ def state(profile, *, now=None, ssh=None):
                   last_rejected_on=_day(value['last_rejected_at']) if value['last_rejected_at'] else '')
     who = (' · ' + label) if label else ''
     if current >= value['expires_at'] or (rejected and value['rejection_kind'] == 'expired'):
-        return dict(result, state='expired', label='만료됨 · 교체 필요', tone='warning', attention=True,
+        return dict(result, state='expired', label=f'만료됨 · 교체 필요 · {fallback}', tone='warning', attention=True,
                     card_text='토큰 확인', fallback=fallback,
-                    attention_text='Claude 장기 토큰 만료 · Claude 로그인·설정에서 교체하세요')
+                    attention_text=f'Claude 장기 토큰 만료 · {fallback} · Claude 로그인·설정에서 교체하세요')
     if rejected:
         when = f' ({result["last_rejected_on"]})' if result['last_rejected_on'] else ''
         return dict(result, state='rejected', label=f'거부됨{when} · 교체 필요 · {fallback}', tone='warning',
                     attention=True, card_text='토큰 확인', fallback=fallback, retry_available=True,
-                    attention_text='Claude 장기 토큰 거부됨 · Claude 로그인·설정에서 교체하거나 다시 시도하세요')
+                    attention_text=f'Claude 장기 토큰 거부됨 · {fallback} · Claude 로그인·설정에서 교체하거나 다시 시도하세요')
+    # The token's own problems come before the login it depends on: a new login does not fix them.
+    if current >= value['expires_at'] - STOP_MARGIN:
+        return dict(result, state='stopped', label=f'만료(사용 중지) · {expires_on} · 교체 필요 · {fallback}',
+                    tone='warning', attention=True, card_text='토큰 확인', fallback=fallback,
+                    attention_text=f'Claude 장기 토큰 만료(사용 중지) · {expires_on} · {fallback} · '
+                                   'Claude 로그인·설정에서 교체하세요')
+    if value['unreadable_at'] is not None:
+        return dict(result, **unreadable)
     if identity is None or not logged_in:
-        return dict(result, state='login_needed', tone='muted',
-                    label=f'저장됨{who} · 이 PC의 Claude 로그인이 확인되면 사용합니다')
+        # The token is lent only while the PC login of the same account is confirmed (C10); SSH
+        # turns of this account then fail, which matters only where an SSH binding runs it.
+        attention = ssh['bindings'] > 0
+        return dict(result, state='login_needed', tone='warning' if attention else 'muted',
+                    label=f'저장됨{who} · 이 PC의 Claude 로그인이 확인되면 사용합니다',
+                    attention=attention, card_text='토큰 확인' if attention else '',
+                    attention_text=('Claude 장기 토큰을 쓰려면 이 PC의 Claude 로그인이 필요합니다 · '
+                                    'Claude 로그인·설정에서 로그인 상태를 확인하세요') if attention else '')
     if identity != value['account_identity']:
         return dict(result, state='other_account', label='다른 계정용 · 교체 필요', tone='warning',
                     attention=True, card_text='토큰 확인',
                     attention_text='Claude 장기 토큰이 다른 계정용입니다 · Claude 로그인·설정에서 교체하세요')
-    if value['unreadable_at'] is not None:
-        return dict(result, state='unreadable', label='읽을 수 없음 · 다시 저장 필요', tone='warning',
-                    attention=True, card_text='토큰 확인', fallback=fallback,
-                    attention_text='Claude 장기 토큰을 읽을 수 없습니다 · Claude 로그인·설정에서 다시 저장하세요')
-    if current >= value['expires_at'] - STOP_MARGIN:
-        return dict(result, state='stopped', label=f'만료(사용 중지) · {expires_on} · 교체 필요', tone='warning',
-                    attention=True, card_text='토큰 확인', fallback=fallback,
-                    attention_text=f'Claude 장기 토큰 만료(사용 중지) · {expires_on} · Claude 로그인·설정에서 교체하세요')
     if value['expires_at'] - current <= WARNING_DAYS * 86400:
         return dict(result, state='expiring', label=f'만료 임박{who} · {expires_on} ({days}일 남음)', tone='warning',
                     attention=True, card_text='토큰 확인', lendable=True,
@@ -686,12 +740,31 @@ def state(profile, *, now=None, ssh=None):
     return dict(result, state='active', label=f'설정됨{who} · 만료 {expires_on}', tone='ready', lendable=True)
 
 
+def issue_command(cli, environment):
+    """The console command line that keeps the window open after `claude setup-token` exits.
+
+    CLI 2.1.282 exits half a second after it prints the token, and a console that belongs to
+    the CLI alone closes with it (conhost at once; Windows Terminal on exit code 0), before the
+    token can be copied. cmd.exe /k keeps the window until the user closes it; /d skips AutoRun
+    commands and /s takes the quoted CLI path verbatim. Returns (cmd.exe path, command line).
+    """
+    comspec = Path(environment.get('SystemRoot') or environment.get('SYSTEMROOT') or r'C:\Windows') / 'System32' / 'cmd.exe'
+    if not comspec.is_absolute() or not comspec.is_file():
+        raise _error('configuration_path', '발급 창을 열 Windows 명령 프롬프트(cmd.exe)를 찾지 못했습니다.')
+    cli = str(cli)
+    # cmd.exe expands %NAME% even inside quotes; such a path would run something else.
+    if any(char in cli for char in '%"\r\n') or not Path(cli).is_absolute():
+        raise _error('configuration_path', 'Claude CLI 경로에 발급 창에서 쓸 수 없는 문자가 있습니다. 직접 실행하세요.')
+    return str(comspec), f'"{comspec}" /d /s /k ""{cli}" setup-token"'
+
+
 def launch_issue_console(profile_id, cli_path=None, environ=None):
     """Open the official `claude setup-token` in a new console the manager never reads.
 
     The environment is scrubbed of every credential variable, and the CLI runs
     with a new, empty, throwaway configuration directory, never the profile's
-    own, so it cannot touch the profile's login. No pipes are attached.
+    own, so it cannot touch the profile's login. No pipes are attached. A
+    command prompt stays open around the CLI until the user closes it.
     """
     if os.name != 'nt':
         raise _error('interactive_login_required', '장기 토큰 발급 창은 Windows에서만 열 수 있습니다.')
@@ -712,8 +785,9 @@ def launch_issue_console(profile_id, cli_path=None, environ=None):
     environment = scrub_environment(directory, environ)
     cli = discover_cli(cli_path, environ)
     cli_version(cli, environment)
-    process = subprocess.Popen([str(cli), 'setup-token'], env=environment, cwd=directory,
+    executable, command = issue_command(cli, environment)
+    process = subprocess.Popen(command, executable=executable, env=environment, cwd=directory,
                                creationflags=subprocess.CREATE_NEW_CONSOLE, close_fds=True)
     return dict(pid=process.pid, status='issue_started',
                 message='새 콘솔 창에서 claude setup-token을 시작했습니다. 브라우저 승인 화면의 계정이 이 프로필과 같은지 확인하세요. '
-                        '이 관리 앱은 그 창의 내용을 읽지 않습니다.')
+                        '토큰을 복사한 뒤 그 창은 직접 닫으세요. 이 관리 앱은 그 창의 내용을 읽지 않습니다.')

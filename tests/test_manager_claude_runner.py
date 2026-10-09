@@ -22,24 +22,45 @@ from manager_core.claude_runner import (SessionLedger, compact_summary, digest, 
                                        serve, session_lock, PermissionBridge, system_prompt_text,
                                        private_temporary_directory, build_command, AUTH_FAILURES,
                                        AUTH_STOP_NOTE, AUTH_TOOL_STOPPED, BorrowedLogin, renew_login,
-                                       token_expired, CLI_TOKEN_DESCRIPTOR, AUTH_ROTATE_ATTEMPTS,
+                                       token_expired, PRIVATE_CHANNELS, AUTH_ROTATE_ATTEMPTS,
                                        AUTH_ROTATE_RECOVERIES, Rotation, LONG_LIVED_FAILURES,
-                                       LONG_LIVED_SWITCH_NOTICE)
+                                       LONG_LIVED_SWITCH_NOTICE, AUTH_WAIT_ASKS, AUTH_WAIT_NOTICE, AUTH_WAIT_STOP)
 
 
 FAKE = r'''
-import json, os, subprocess, sys
+import json, os, stat, subprocess, sys
 from pathlib import Path
 args = sys.argv[1:]
 session = args[args.index('--resume') + 1] if '--resume' in args else args[args.index('--session-id') + 1]
 scenario = os.environ.get('CLAUDE_FIXTURE_SCENARIO', 'success')
-# A lent token arrives like the official CLI reads it: an inherited pipe, else the environment.
-source, token = None, os.environ.get('CLAUDE_CODE_OAUTH_TOKEN')
+def kind(fd):
+    mode = os.fstat(fd).st_mode
+    return 'socket' if stat.S_ISSOCK(mode) else 'pipe' if stat.S_ISFIFO(mode) else 'other'
+def proc_open(fd):
+    # What another same-user process gets for this descriptor through /proc (Linux).
+    try:
+        os.close(os.open('/proc/self/fd/%d' % fd, os.O_RDONLY | os.O_NONBLOCK))
+        return 'opened'
+    except OSError as error:
+        return error.errno
+# A lent token arrives like the official CLI reads it: an inherited descriptor read to its end
+# (2.1.282 accepts a pipe or a socket), else the environment.
+source, token, channels = None, os.environ.get('CLAUDE_CODE_OAUTH_TOKEN'), {}
 if os.environ.get('CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR'):
-    with open('/proc/self/fd/' + os.environ['CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR'], 'rb') as pipe:
-        source, token = 'fd', pipe.read().decode()
+    descriptor = int(os.environ['CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR'])
+    channels['token'] = kind(descriptor)
+    data = b''
+    while True:
+        chunk = os.read(descriptor, 4096)
+        if not chunk:
+            break
+        data += chunk
+    os.close(descriptor)
+    source, token = 'fd', data.decode()
 elif token is not None:
     source = 'env'
+if sys.platform.startswith('linux'):
+    channels.update(stdin=kind(0), stdout=kind(1), proc_stdin=proc_open(0), proc_stdout=proc_open(1))
 assert os.environ.get('CLAUDE_FIXTURE_TOKEN') in (None, token)
 def emit(value):
     print(json.dumps(value, ensure_ascii=False), flush=True)
@@ -63,7 +84,7 @@ def rotated(acknowledge='success'):
         return
 request = json.loads(sys.stdin.readline())
 record({'token':token,'source':source,'resume':'--resume' in args,'session':session,'request':request,
-       'checkpoint':'CODEX_PORTABLE_CHECKPOINT_V1' in json.dumps(request),
+       'checkpoint':'CODEX_PORTABLE_CHECKPOINT_V1' in json.dumps(request),'channels':channels,
        'scopes':os.environ.get('CLAUDE_CODE_OAUTH_SCOPES'),'wait':os.environ.get('CLAUDE_CODE_OAUTH_401_WAIT_MS'),
        'secret_in_environment':any('dummy-token' in value for value in os.environ.values()),
        'secret_in_arguments':any('dummy-token' in value for value in args)})
@@ -179,6 +200,36 @@ else:
         emit({'type':'result','subtype':'success','is_error':False,'session_id':session,'result':'Agent finished.',
               'usage':{'input_tokens':6,'output_tokens':3},'total_cost_usd':0.03})
     else:
+        if scenario == 'wait401' and token == 'dummy-token-1':
+            # The API refused the lent token. With CLAUDE_CODE_OAUTH_401_WAIT_MS the CLI polls its
+            # environment for any other value; an interrupt is answered at once but ends the
+            # request only once that value changes (2.1.282).
+            emit({'type':'system','subtype':'api_retry','attempt':1,'max_retries':10,'retry_delay_ms':500,
+                  'error_status':401,'error':'authentication_failed'})
+            interrupted = False
+            for line in sys.stdin:
+                update = json.loads(line)
+                if update.get('type') == 'control_request' and update['request'].get('subtype') == 'interrupt':
+                    interrupted = True
+                    record({'interrupt':True})
+                    emit({'type':'control_response','response':{'subtype':'success','request_id':update['request_id'],
+                          'response':{'still_queued':[]}}})
+                    continue
+                if update.get('type') != 'update_environment_variables':
+                    continue
+                value = update['variables'].get('CLAUDE_CODE_OAUTH_TOKEN')
+                record({'rotated':value,'request_id':update.get('request_id'),'keys':sorted(update['variables'])})
+                emit({'type':'control_response','response':{'subtype':'success','request_id':update['request_id']}})
+                if interrupted:
+                    emit({'type':'result','subtype':'error_during_execution','is_error':True,'session_id':session,
+                          'terminal_reason':'aborted_streaming','usage':{'input_tokens':1,'output_tokens':0},
+                          'total_cost_usd':0.01})
+                    for line in sys.stdin:
+                        pass
+                    sys.exit(1)
+                token = value
+                break
+            record({'final_token':token})
         if scenario == 'rotate_retry':
             # The API refused the lent token; the CLI polls for a rotated one before it gives up.
             emit({'type':'system','subtype':'api_retry','attempt':1,'max_retries':10,'retry_delay_ms':500,
@@ -540,9 +591,16 @@ class ClaudeRunnerTests(unittest.TestCase):
         for launch in launches:
             self.assertFalse(launch['secret_in_arguments'])
             self.assertEqual((launch['source'], launch['secret_in_environment'], launch['scopes']),
-                             ('fd' if CLI_TOKEN_DESCRIPTOR else 'env', not CLI_TOKEN_DESCRIPTOR, 'user:inference'))
+                             ('fd' if PRIVATE_CHANNELS else 'env', not PRIVATE_CHANNELS, 'user:inference'))
+            if PRIVATE_CHANNELS:
+                # The token, the stdin that carries rotated tokens and the stdout that reports
+                # refused requests are sockets, which no other process can open through /proc.
+                import errno
+                self.assertEqual(launch['channels'], dict(token='socket', stdin='socket', stdout='socket',
+                                                          proc_stdin=errno.ENXIO, proc_stdout=errno.ENXIO))
         self.rotations = [entry for entry in entries if 'rotated' in entry]
         self.final_tokens = [entry['final_token'] for entry in entries if 'final_token' in entry]
+        self.interrupts = sum('interrupt' in entry for entry in entries)
         return code, events, launches
 
     def test_expired_borrowed_token_is_renewed_and_the_same_session_resumes_once(self):
@@ -800,16 +858,28 @@ class ClaudeRunnerTests(unittest.TestCase):
                 time.sleep(.06)
                 rotation.tick()
             self.assertEqual(len(sent), AUTH_ROTATE_ATTEMPTS)
-            # A refused request still asks again, a bounded number of times.
             rotation.answered(unavailable)
-            for _ in range(AUTH_ROTATE_RECOVERIES + 2):
-                time.sleep(.06)
-                rotation.recover()
-                rotation.answered(unavailable)
-            self.assertEqual(len(sent), AUTH_ROTATE_ATTEMPTS + AUTH_ROTATE_RECOVERIES)
-            # A credential for another account is never pushed and ends rotation for this process.
-            rotation.recoveries = 0
+            # A refused request: the host is asked while the CLI waits, at most twice, the
+            # second time after the renewal cooldown; then the wait is to be ended.
             time.sleep(.06)
+            rotation.recover()
+            self.assertEqual(len(sent), AUTH_ROTATE_ATTEMPTS + 1)
+            rotation.answered(unavailable)
+            rotation.tick()
+            self.assertEqual(len(sent), AUTH_ROTATE_ATTEMPTS + 1, 'the second ask waits for the cooldown')
+            time.sleep(.06)
+            rotation.recover()  # The CLI's own second attempt changes nothing.
+            rotation.tick()
+            self.assertEqual(len(sent), AUTH_ROTATE_ATTEMPTS + AUTH_WAIT_ASKS)
+            self.assertFalse(rotation.gave_up)
+            rotation.answered(unavailable)
+            self.assertTrue(rotation.gave_up)
+            time.sleep(.06)
+            rotation.recover()
+            rotation.tick()
+            self.assertEqual(len(sent), AUTH_ROTATE_ATTEMPTS + AUTH_WAIT_ASKS)
+            # A credential for another account is never pushed and ends rotation for this process.
+            rotation.launch(Process())
             rotation.recover()
             rotation.answered(dict(type='auth_update', available=True, credentials=dict(
                 profileId=self.profile, accessToken='dummy-token-9', accountIdentity=digest('another'),
@@ -817,6 +887,50 @@ class ClaudeRunnerTests(unittest.TestCase):
             self.assertTrue(rotation.failed)
             self.assertEqual(rotation.process.stdin.getvalue(), b'')
             self.assertEqual(borrowed.token, 'dummy-token-1')
+            # A wait whose token was pushed and acknowledged can be refused again later.
+            rotation.launch(Process())
+            time.sleep(.06)
+            rotation.recover()
+            rotation.answered(dict(type='auth_update', available=True, credentials=dict(
+                profileId=self.profile, accessToken='dummy-token-2', accountIdentity=identity,
+                expiresAt=int(time.time()) + 8 * 3600)))
+            pushed = json.loads(rotation.process.stdin.getvalue())
+            self.assertTrue(rotation.acknowledged(dict(type='control_response', response=dict(
+                subtype='success', request_id=pushed['request_id']))))
+            self.assertEqual((rotation.waiting, rotation.asked, rotation.gave_up), (False, 0, False))
+            time.sleep(.06)
+            rotation.recover()
+            self.assertTrue(rotation.outstanding)
+        self.assertEqual(AUTH_ROTATE_RECOVERIES, 2 * AUTH_WAIT_ASKS)
+
+    def test_a_saved_token_lent_to_a_running_cli_is_never_written_to_its_stdin(self):
+        class Process:
+            def __init__(self):
+                self.stdin = io.BytesIO()
+        identity = digest('remote-account')
+        borrowed = BorrowedLogin(dict(profileId=self.profile, accountIdentity=identity,
+                                      expiresAt=int(time.time()) + 100, credentialSource='windowsLogin',
+                                      credentialId=None), 'dummy-token-1')
+        sent = []
+        rotation = Rotation(borrowed, sent.append, True)
+        rotation.launch(Process())
+        rotation.tick()
+        self.assertEqual(sent, [dict(type='auth_refresh', reason='rotate')])
+        saved = dict(profileId=self.profile, accessToken='dummy-token-saved', accountIdentity=identity,
+                     expiresAt=int(time.time()) + 365 * 86400, credentialSource='longLivedToken',
+                     credentialId=SAVED_ID)
+        rotation.answered(dict(type='auth_update', available=True, credentials=saved))
+        # Kept for the next launch, which receives it through its descriptor; never pushed.
+        self.assertEqual(rotation.process.stdin.getvalue(), b'')
+        self.assertEqual((borrowed.token, borrowed.credential_id, rotation.held), ('dummy-token-saved', SAVED_ID, True))
+        self.assertEqual(rotation.credential[1], 'windowsLogin')
+        with patch('manager_core.claude_runner.AUTH_REFRESH_RETRY_SECONDS', 0):
+            rotation.tick()
+        self.assertEqual(len(sent), 1, 'no more proactive requests while a saved token waits')
+        # The process's own token is then refused: its wait ends at once, without asking.
+        rotation.recover()
+        self.assertEqual((rotation.gave_up, len(sent)), (True, 1))
+        self.assertNotIn(b'dummy-token-saved', rotation.process.stdin.getvalue())
 
     # Saved long-lived tokens (rev 121): refusals are always reported, and replaced once.
     YEAR = 365 * 86400
@@ -898,8 +1012,9 @@ class ClaudeRunnerTests(unittest.TestCase):
         self.assertEqual(code, 0, events)
         # The API's 401 is a refusal of the saved token: reported, then a switch, never a rotation.
         self.assertEqual(self.of_type(events, 'auth_rejected'), [dict(type='auth_rejected', credential_id=SAVED_ID)])
+        # `live` gives this switch the runtime's rotation budget; a relaunch keeps its own.
         self.assertEqual(self.of_type(events, 'auth_refresh'),
-                         [dict(type='auth_refresh', reason='switch', rejected_credential_id=SAVED_ID)])
+                         [dict(type='auth_refresh', reason='switch', live=True, rejected_credential_id=SAVED_ID)])
         self.assertEqual((len(launches), self.final_tokens), (1, ['dummy-token-2']))
         self.assertEqual([entry['rotated'] for entry in self.rotations], ['dummy-token-2'])
         self.assertIn(LONG_LIVED_SWITCH_NOTICE, [event.get('message') for event in events])
@@ -911,6 +1026,56 @@ class ClaudeRunnerTests(unittest.TestCase):
         self.assertEqual(code, 0, events)
         self.assertEqual(self.of_type(events, 'auth_refresh'), [])
         self.assertEqual([launch['wait'] for launch in launches], ['60000'])
+
+    def test_a_waiting_cli_is_told_and_its_wait_ends_once_the_host_has_no_login(self):
+        unavailable = dict(type='auth_update', available=False)
+        code, events, launches = self.run_borrowed('wait401', 3600, [unavailable, unavailable], rotate=True,
+                                                   auth_resume=True)
+        notices = [event.get('message') for event in events if event.get('kind') == 'notice']
+        self.assertEqual(notices.count(AUTH_WAIT_NOTICE), 1)
+        self.assertEqual(self.of_type(events, 'auth_refresh'), [dict(type='auth_refresh', reason='rotate')] * AUTH_WAIT_ASKS)
+        # The wait is ended by an interrupt and a value that wakes the CLI's poll, never a token.
+        self.assertEqual(self.interrupts, 1)
+        self.assertEqual([entry['rotated'] for entry in self.rotations], [AUTH_WAIT_STOP])
+        done = self.of_type(events, 'done')[0]
+        self.assertEqual(done['error'], dict(code='claude_auth_rejected', message=AUTH_FAILURES['claude_auth_rejected']))
+        # The host was asked twice during the wait: no relaunch asks it again.
+        self.assertEqual(len(launches), 1)
+        # The interrupted request ended cleanly, so the next turn resumes the session.
+        self.assertEqual(self.borrowed_record()['auth_stop']['turn_id'], 'turn-1')
+
+    def test_the_second_ask_of_a_wait_still_recovers_the_same_process(self):
+        code, events, launches = self.run_borrowed(
+            'wait401', 3600, [dict(type='auth_update', available=False), lambda context: context.renewal()],
+            rotate=True)
+        self.assertEqual(code, 0, events)
+        self.assertEqual(len(self.of_type(events, 'auth_refresh')), 2)
+        self.assertEqual((len(launches), self.final_tokens, self.interrupts), (1, ['dummy-token-2'], 0))
+        self.assertEqual(self.of_type(events, 'done')[0]['status'], 'success')
+
+    def test_a_refused_saved_token_without_a_replacement_ends_the_wait_with_its_own_message(self):
+        unavailable = dict(type='auth_update', available=False)
+        code, events, launches = self.run_borrowed('wait401', self.YEAR, [unavailable, unavailable], rotate=True,
+                                                   credential_id=SAVED_ID, sources=True)
+        self.assertEqual(self.of_type(events, 'auth_rejected'), [dict(type='auth_rejected', credential_id=SAVED_ID)])
+        self.assertEqual(self.of_type(events, 'auth_refresh'), [dict(
+            type='auth_refresh', reason='switch', live=True, rejected_credential_id=SAVED_ID)] * AUTH_WAIT_ASKS)
+        done = self.of_type(events, 'done')[0]
+        self.assertEqual(done['error'], dict(code='claude_auth_rejected', message=LONG_LIVED_FAILURES['claude_auth_rejected'],
+                                             credential_source='longLivedToken', credential_id=SAVED_ID))
+        self.assertEqual((len(launches), self.interrupts), (1, 1))
+
+    def test_a_saved_token_lent_during_the_turn_reaches_the_next_launch_by_descriptor_only(self):
+        # The turn started on the PC login; its rotation is answered with the saved token.
+        code, events, launches = self.run_borrowed('wait401', 50, [lambda context: context.saved()], rotate=True,
+                                                   sources=True)
+        self.assertEqual(code, 0, events)
+        self.assertEqual(self.of_type(events, 'auth_refresh'), [dict(type='auth_refresh', reason='rotate')])
+        # Never written to the running CLI's stdin; that CLI's wait ends at once instead.
+        self.assertEqual([entry['rotated'] for entry in self.rotations], [AUTH_WAIT_STOP])
+        self.assertEqual([(launch['token'], launch['resume']) for launch in launches],
+                         [('dummy-token-1', False), ('dummy-token-2', True)])
+        self.assertEqual(self.of_type(events, 'done')[0]['status'], 'success')
 
     def test_saved_token_classification_and_switch_acceptance(self):
         identity = digest('remote-account')

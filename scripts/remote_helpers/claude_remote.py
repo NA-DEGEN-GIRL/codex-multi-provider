@@ -23,9 +23,19 @@ AUTH_ENV = 'CODEX_MANAGER_CLAUDE_AUTH'
 
 def _hide_process():
     """Keep same-user processes, the agent's own tools included, out of this process's /proc
-    files and memory while it holds a lent token. Its CLI child is unaffected."""
+    files and memory while it holds a lent token, and keep a lent token out of core dumps.
+
+    Non-dumpable covers this process only; its CLI child is dumpable again after exec. A hard
+    core limit of 0 is inherited by the CLI and everything it starts, and only a privileged
+    process can raise it again: otherwise a same-user process could raise the CLI's soft limit
+    (prlimit), signal it and read the token from its core file."""
     if not sys.platform.startswith('linux'):
         return
+    try:
+        import resource
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    except (ImportError, OSError, ValueError):
+        pass
     try:
         import ctypes
         ctypes.CDLL(None, use_errno=True).prctl(4, 0, 0, 0, 0)  # PR_SET_DUMPABLE, 0
@@ -102,7 +112,7 @@ class RemoteExecution:
         plugin = prepare_shared_skills(self.root, self.binding['target_profile_id'], cwd,
             config_home=self.profile / 'codex', output_root=self.ledger_directory / 'skill-plugins')
         # The runner keeps who lent the token, when it expires and (when reported) its source
-        # apart from the token, which reaches each CLI launch by pipe and never enters an
+        # apart from the token, which reaches each CLI launch by descriptor and never enters an
         # environment or the ledger.
         borrowed = {key: self.auth[key] for key in ('profileId', 'accountIdentity', 'expiresAt',
                                                      'credentialSource', 'credentialId') if key in self.auth}

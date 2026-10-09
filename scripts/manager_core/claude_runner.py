@@ -13,6 +13,7 @@ from pathlib import Path
 import queue
 import re
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -685,11 +686,16 @@ AUTH_STOP_CODES = ('claude_auth_expired', 'claude_auth_rejected')
 # carries the credential itself.
 AUTH_CHANNEL_ENV = 'CODEX_MANAGER_CLAUDE_AUTH_CHANNEL'
 AUTH_INIT_LIMIT = 70000
-# On Linux a lent token reaches each CLI launch through an inherited pipe, never through the
-# CLI's environment: 2.1.282 drains the pipe at start, before any hook, MCP server or tool,
-# keeps the descriptor variable out of their environments, and /proc/<pid>/environ of the CLI
-# holds no token. Verified with the binding CLI, a local fake API and dummy tokens.
-CLI_TOKEN_DESCRIPTOR = sys.platform.startswith('linux')
+# On Linux a lent token reaches each CLI launch through an inherited descriptor, never through
+# the CLI's environment: 2.1.282 drains it at start, before any hook, MCP server or tool, keeps
+# the descriptor variable out of their environments, and /proc/<pid>/environ of the CLI holds no
+# token. The descriptor, the CLI's stdin (which carries rotated tokens) and its stdout (which
+# reports refused requests) are Unix socket pairs: a same-user process, the agent's own tools
+# included, can open another process's pipe through /proc/<pid>/fd/N to read or inject data, but
+# opening a socket that way fails (ENXIO). 2.1.282 reads the token descriptor as a socket and runs
+# its stream-json protocol over socket stdio. Verified with the binding CLI, a local fake API and
+# dummy tokens.
+PRIVATE_CHANNELS = sys.platform.startswith('linux')
 # A descriptor token would otherwise claim more than inference; a lent token keeps exactly the
 # scope a token in CLAUDE_CODE_OAUTH_TOKEN has.
 LENT_TOKEN_SCOPES = 'user:inference'
@@ -703,8 +709,18 @@ AUTH_ROTATE_MARGIN = 240
 # proactive retries wait out the host's 30 s renewal cooldown (AUTH_REFRESH_RETRY_SECONDS).
 AUTH_ROTATE_SPACING = 15
 AUTH_ROTATE_ATTEMPTS = 4
-AUTH_ROTATE_RECOVERIES = 3
+# Reactive requests per CLI process: two while one refused request waits (the second after the
+# host's renewal cooldown), so two refusals in a row can each be recovered.
+AUTH_ROTATE_RECOVERIES = 4
+AUTH_WAIT_ASKS = 2
 AUTH_ROTATE_ACK_SECONDS = 30
+AUTH_WAIT_NOTICE = ('Claude could not authenticate this request; waiting up to a minute for a renewed or '
+                    'replacement login...')
+# After the host had nothing usable for a waiting CLI, an interrupt ends its request, and this
+# value (never a token, and never sent: the request is already interrupted) wakes its wait loop,
+# which polls CLAUDE_CODE_OAUTH_TOKEN every 2 s and otherwise ignores the interrupt for up to a
+# minute (2.1.282).
+AUTH_WAIT_STOP = 'codex-manager-login-stopped'
 
 
 def receive_lent_credentials(incoming, outgoing):
@@ -724,39 +740,72 @@ def receive_lent_credentials(incoming, outgoing):
     return message['credentials']
 
 
-def _token_pipe(token):
-    """A pipe that holds only the token, write end closed; None if it cannot hold it whole."""
-    reader, writer = os.pipe()
+def _token_channel(token):
+    """A socket that holds only the token, sending end closed; None if it cannot hold it whole."""
     try:
-        os.set_blocking(writer, False)
+        sender, receiver = socket.socketpair()
+    except OSError:
+        return None
+    try:
+        sender.setblocking(False)
         data = token.encode('ascii')
-        if os.write(writer, data) == len(data):
-            return reader
+        if sender.send(data) == len(data):
+            return receiver
     except (OSError, UnicodeError):
         pass
     finally:
-        os.close(writer)
-    os.close(reader)
+        sender.close()
+    receiver.close()
     return None
 
 
-def start_cli(command, cwd, environment, token, options):
-    """Start one CLI process. A lent token goes through a drained pipe where supported."""
-    environment, reader, descriptors = dict(environment), None, ()
-    if token is not None:
-        environment['CLAUDE_CODE_OAUTH_SCOPES'] = LENT_TOKEN_SCOPES
-        reader = _token_pipe(token) if CLI_TOKEN_DESCRIPTOR else None
-        if reader is None:
-            environment['CLAUDE_CODE_OAUTH_TOKEN'] = token
-        else:
-            environment['CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR'] = str(reader)
-            descriptors = (reader,)
+def _stdio_channels():
+    """(parent, child) socket pairs for a CLI's stdin and stdout, or None where unavailable."""
+    pairs = []
     try:
-        return subprocess.Popen(command, cwd=cwd, env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, pass_fds=descriptors, **options)
+        for _ in range(2):
+            pairs.append(socket.socketpair())
+    except OSError:
+        for pair in pairs:
+            for end in pair:
+                end.close()
+        return None
+    return pairs
+
+
+def start_cli(command, cwd, environment, token, options):
+    """Start one CLI process. A lent token goes through a drained socket where supported, and
+    on Linux the CLI's stdin and stdout are sockets too (see PRIVATE_CHANNELS)."""
+    environment, descriptors = dict(environment), ()
+    stdio = _stdio_channels() if PRIVATE_CHANNELS else None
+    closing = [child for _, child in stdio] if stdio else []
+    try:
+        if token is not None:
+            environment['CLAUDE_CODE_OAUTH_SCOPES'] = LENT_TOKEN_SCOPES
+            receiver = _token_channel(token) if PRIVATE_CHANNELS else None
+            if receiver is None:
+                environment['CLAUDE_CODE_OAUTH_TOKEN'] = token
+            else:
+                closing.append(receiver)
+                environment['CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR'] = str(receiver.fileno())
+                descriptors = (receiver.fileno(),)
+        if stdio is None:
+            return subprocess.Popen(command, cwd=cwd, env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, pass_fds=descriptors, **options)
+        (stdin_parent, stdin_child), (stdout_parent, stdout_child) = stdio
+        process = subprocess.Popen(command, cwd=cwd, env=environment, stdin=stdin_child.fileno(),
+                                   stdout=stdout_child.fileno(), stderr=subprocess.PIPE, pass_fds=descriptors,
+                                   **options)
+        # Plain files over the parent ends: closing stdin is the CLI's end of input, as with a pipe.
+        process.stdin = os.fdopen(stdin_parent.detach(), 'wb')
+        process.stdout = os.fdopen(stdout_parent.detach(), 'rb')
+        return process
     finally:
-        if reader is not None:
-            os.close(reader)
+        # This process keeps only its own ends; a detached socket's close does nothing.
+        for end in closing:
+            end.close()
+        for parent, _ in stdio or ():
+            parent.close()
 
 
 def auth_retry(message):
@@ -853,15 +902,23 @@ class Rotation:
     Without that acknowledgement this process keeps its token, rotation stops for it, and the
     relaunch path handles its next failure with the newer token.
 
-    A saved long-lived token is never rotated ahead of time. When the API refuses it, the
-    refusal is reported (`refuse`) and the host is asked to switch to another credential
-    (reason "switch"), which reaches the waiting CLI the same way.
+    When the API refuses the process's token the CLI waits for a rotated one (up to a minute).
+    The host is asked at most AUTH_WAIT_ASKS times for it, the second time after the host's
+    renewal cooldown. A refused saved long-lived token is reported (`refuse`) and the host is
+    asked to switch to another credential instead (reason "switch", live). When nothing usable
+    comes, `gave_up` tells the caller to end the CLI's wait, so the turn ends with its specific
+    error at once instead of after the CLI's own waits.
+
+    A saved long-lived token is never rotated ahead of time and never pushed into a running CLI:
+    it reaches a CLI only through a launch's descriptor (C9, S1b). One lent while this process
+    runs another login is kept for the next launch (`held`), and a refused request then ends the
+    wait at once so that launch takes over.
     """
     def __init__(self, borrowed, emit, enabled, refuse=None):
         self.borrowed, self.emit, self.enabled = borrowed, emit, enabled
         self.refuse = refuse or (lambda credential: None)
-        self.outstanding, self.switching, self.requested_at, self.process = False, False, None, None
-        self.credential = borrowed.credential() if borrowed is not None else None
+        self.outstanding, self.switching, self.requested_at = False, False, None
+        self.launch(None)
 
     @property
     def expires_at(self):
@@ -871,9 +928,13 @@ class Rotation:
         """A CLI process started with the newest token."""
         self.process, self.credential = process, self.borrowed.credential() if self.borrowed else None
         self.failed, self.ack, self.urgent, self.attempts, self.recoveries = False, None, False, 0, 0
+        # waiting: the CLI reported a refused request and polls for a rotated token; asked: host
+        # answers without a usable token during that wait; held: a newer saved token waits for the
+        # next launch; gave_up: no token is coming for this wait.
+        self.waiting, self.asked, self.held, self.gave_up = False, 0, False, False
 
     def stop(self):
-        self.process, self.ack, self.urgent = None, None, False
+        self.process, self.ack, self.urgent, self.waiting = None, None, False, False
 
     def _active(self):
         return self.enabled and self.process is not None and not self.failed
@@ -883,8 +944,9 @@ class Rotation:
 
     def _request(self):
         if self._long_lived():
-            # Only a refusal gets here: the host records it and lends another credential.
-            self.emit(dict(type='auth_refresh', reason='switch', rejected_credential_id=self.credential[2]))
+            # Only a refusal gets here: the host lends another credential to the waiting CLI.
+            # `live` counts it like a rotation, so the relaunch keeps its own switch budget.
+            self.emit(dict(type='auth_refresh', reason='switch', live=True, rejected_credential_id=self.credential[2]))
             self.switching = True
         else:
             self.emit(dict(type='auth_refresh', reason='rotate'))
@@ -897,14 +959,17 @@ class Rotation:
             return
         if self.ack is not None and time.monotonic() >= self.ack[1]:
             self.failed, self.ack = True, None
+            self.gave_up = self.gave_up or self.waiting  # The relaunch applies the newer token.
             return
-        if self.outstanding or self.ack is not None:
+        if self.outstanding or self.ack is not None or self.gave_up:
             return
         since = float('inf') if self.requested_at is None else time.monotonic() - self.requested_at
-        if self.urgent and since >= AUTH_ROTATE_SPACING:
-            self.urgent, self.recoveries = False, self.recoveries + 1
-            self._request()
-        elif (not self._long_lived() and self.attempts < AUTH_ROTATE_ATTEMPTS
+        if self.urgent:
+            # Asking again for the same wait first waits out the host's renewal cooldown.
+            if since >= (AUTH_REFRESH_RETRY_SECONDS if self.asked else AUTH_ROTATE_SPACING):
+                self.urgent, self.recoveries = False, self.recoveries + 1
+                self._request()
+        elif (not self.waiting and not self.held and not self._long_lived() and self.attempts < AUTH_ROTATE_ATTEMPTS
               and since >= AUTH_REFRESH_RETRY_SECONDS and time.time() >= self.expires_at - AUTH_ROTATE_MARGIN):
             self.attempts += 1
             self._request()
@@ -913,24 +978,51 @@ class Rotation:
         """The API refused this process's token and the CLI waits for a rotated one."""
         if self.process is not None and self._long_lived():
             self.refuse(self.credential)  # A refused long-lived token is reported even without a switch.
-        if (self._active() and not self.outstanding and self.ack is None
-                and self.recoveries < AUTH_ROTATE_RECOVERIES):
-            self.urgent = True
-            self.tick()
+        if not self.enabled or self.process is None or self.gave_up:
+            return
+        self.waiting = True
+        if self.failed or self.held:
+            # This process takes no token from its stdin any more: the next launch applies the
+            # held one by descriptor, or asks for one itself.
+            self.gave_up = True
+        elif not self.outstanding and self.ack is None and not self.urgent:
+            if self.recoveries < AUTH_ROTATE_RECOVERIES and self.asked < AUTH_WAIT_ASKS:
+                self.urgent = True
+                self.tick()
+            else:
+                self.gave_up = True
 
     def answered(self, update):
         """The host's reply to the outstanding request; a newer token goes to a live CLI."""
         self.outstanding = False
-        if update.get('available') is not True:
+        outcome = self._apply(update)
+        if outcome in ('pushed', 'failed') or not self.waiting:
             return
+        if outcome == 'held':
+            self.gave_up = True
+            return
+        self.asked += 1
+        if self.asked >= AUTH_WAIT_ASKS or self.recoveries >= AUTH_ROTATE_RECOVERIES:
+            self.gave_up = True
+        else:
+            self.urgent = True
+
+    def _apply(self, update):
+        """Keep a newer token: 'pushed' to the live CLI, 'held' for the next launch, 'failed', or
+        'none' when the reply has nothing usable."""
+        if update.get('available') is not True:
+            return 'none'
         try:
             if not self.borrowed.renewed(update.get('credentials'), switch=self.switching):
-                return
+                return 'none'
         except ValueError:
             self.failed = True  # Another account or a malformed credential is never applied.
-            return
+            return 'failed'
+        if self.borrowed.source == LONG_LIVED_TOKEN:
+            self.held = True  # Never written to a CLI's stdin; the next launch's descriptor carries it.
+            return 'held'
         if not self._active():
-            return  # Kept for the next launch or the checkpoint.
+            return 'held'  # Kept for the next launch or the checkpoint.
         request_id = 'codex-auth-' + uuid4().hex
         try:
             self.process.stdin.write(encode_message({'type': 'update_environment_variables', 'variables': {
@@ -938,8 +1030,9 @@ class Rotation:
             self.process.stdin.flush()
         except (OSError, ValueError):
             self.failed = True
-            return
+            return 'failed'
         self.ack = (request_id, time.monotonic() + AUTH_ROTATE_ACK_SECONDS, self.borrowed.credential())
+        return 'pushed'
 
     def acknowledged(self, message):
         """Consume the CLI's answer to a pushed token; False for any other control response."""
@@ -949,10 +1042,12 @@ class Rotation:
         if response.get('subtype') == 'success':
             switched = self._long_lived() and self.ack[2][1] != LONG_LIVED_TOKEN
             self.credential, self.attempts, self.recoveries = self.ack[2], 0, 0
+            self.waiting, self.asked = False, 0
             if switched:
                 self.emit(dict(type='event', kind='notice', message=LONG_LIVED_SWITCH_NOTICE))
         else:
             self.failed = True
+            self.gave_up = self.gave_up or self.waiting  # The relaunch applies the newer token.
         self.ack = None
         return True
 
@@ -962,6 +1057,28 @@ class Rotation:
             self.answered(message)
             return True
         return False
+
+
+def stop_auth_wait(process):
+    """End a CLI's wait for a rotated token: interrupt its request, then wake the wait loop."""
+    try:
+        process.stdin.write(encode_message({'type': 'control_request', 'request_id': 'codex-auth-stop-' + uuid4().hex,
+                                            'request': {'subtype': 'interrupt'}}))
+        process.stdin.write(encode_message({'type': 'update_environment_variables', 'request_id':
+                                            'codex-auth-stop-' + uuid4().hex,
+                                            'variables': {'CLAUDE_CODE_OAUTH_TOKEN': AUTH_WAIT_STOP}}))
+        process.stdin.flush()
+    except (OSError, ValueError):
+        pass  # The CLI already stopped; its end of output decides the launch.
+
+
+def replacement_held(borrowed, failed, switch):
+    """Whether `borrowed` already holds a token that may replace the refused `failed` one."""
+    if switch:
+        held = borrowed.credential() != failed and borrowed.credential_id not in borrowed.refused
+    else:
+        held = borrowed.expires_at > failed[0]
+    return held and borrowed.expires_at >= time.time() + AUTH_RENEWAL_MINIMUM
 
 
 def resume_command(command):
@@ -1190,6 +1307,9 @@ def execute(command, cwd, environment, incoming, emit, bridge, stopped, observed
             result, problem, auth_error, relaunch, switch = None, None, None, False, False
             refused_credential = None
             prompt_seen, auth_seen, expired_reported, forced, tree = False, False, False, False, None
+            # retry_noticed: the user was told this launch waits for a login; stopping: its wait
+            # was ended because no usable token is coming.
+            retry_noticed, stopping = False, False
             launch_results = len(results)
             # Workflows and background agents report back after the turn's first
             # result; the CLI then starts the next turn by itself. The final result
@@ -1212,6 +1332,11 @@ def execute(command, cwd, environment, incoming, emit, bridge, stopped, observed
                     if settle_deadline is not None and time.monotonic() >= settle_deadline:
                         break
                     rotation.tick()
+                    if rotation.gave_up and not stopping:
+                        # No usable token is coming for the waiting CLI: end its wait now. Its
+                        # interrupted request ends with an error result, a login failure.
+                        stopping = auth_seen = True
+                        stop_auth_wait(process)
                     try:
                         source, message = events.get(timeout=.2)
                     except queue.Empty:
@@ -1267,6 +1392,9 @@ def execute(command, cwd, environment, incoming, emit, bridge, stopped, observed
                                       and task.get('task_type') in ('local_workflow', 'local_agent')}
                         background_seen = background_seen or bool(background)
                     if auth_retry(message):
+                        if rotation.enabled and not retry_noticed:
+                            retry_noticed = True
+                            emit(dict(type='event', kind='notice', message=AUTH_WAIT_NOTICE))
                         rotation.recover()  # The CLI polls for a rotated token before it gives up.
                     if settle_deadline is not None and message.get('type') in ('assistant', 'stream_event', 'user'):
                         settle_deadline = None  # A background report started the next turn.
@@ -1359,6 +1487,9 @@ def execute(command, cwd, environment, incoming, emit, bridge, stopped, observed
                     else:
                         auth_error = (code, AUTH_FAILURES[code])
                         relaunch = code == 'claude_auth_expired' and renewable and not relaunches['expired']
+                    if relaunch and rotation.gave_up and not replacement_held(borrowed, credential, switch):
+                        # The host was already asked while this CLI waited and had nothing usable.
+                        relaunch = switch = False
             finally:
                 rotation.stop()
                 if not relaunch:
@@ -1390,18 +1521,19 @@ def execute(command, cwd, environment, incoming, emit, bridge, stopped, observed
             for tool_id in stale:
                 emit(dict(type='event', kind='tool_end', id=tool_id, output=AUTH_TOOL_STOPPED, is_error=True))
             failed = rotation.credential
+            held = replacement_held(borrowed, failed, switch)
             if switch:
                 emit(dict(type='event', kind='notice', message=(
+                    'Claude rejected the long-lived token saved for this profile; resuming this turn with the newer '
+                    'long-lived token saved for it.' if held and borrowed.source == LONG_LIVED_TOKEN else
                     'Claude rejected the long-lived token saved for this profile; switching to the Windows login '
                     "and resuming this turn. Replace the long-lived token in the manager's Claude profile settings.")))
                 relaunches['switch'] += 1
-                held = borrowed.credential() != failed and borrowed.credential_id not in borrowed.refused
             else:
                 emit(dict(type='event', kind='notice',
                           message='Claude access token expired; renewing it and resuming this turn...'))
                 relaunches['expired'] += 1
-                held = borrowed.expires_at > failed[0]
-            if held and borrowed.expires_at >= time.time() + AUTH_RENEWAL_MINIMUM:
+            if held:
                 outcome = 'renewed'  # This launch received a newer token it could not apply.
             else:
                 renewal_requested = renewal_requested or not switch
@@ -1709,7 +1841,7 @@ def serve(root, profile_id, incoming=None, outgoing=None, cli_path=None, plugin_
                                     managed_delegation=managed_delegation)
             borrowed = None
             if remote is not None and remote.get('borrowed_auth') is not None:
-                # The lent token stays out of the CLI environment; each launch receives it by pipe.
+                # The lent token stays out of the CLI environment; each launch receives it by descriptor.
                 borrowed = BorrowedLogin(remote['borrowed_auth'], remote.get('lent_token')
                                          or environment.pop('CLAUDE_CODE_OAUTH_TOKEN', None))
             execute(command, cwd, environment, incoming, emit, bridge, stopped, observed,

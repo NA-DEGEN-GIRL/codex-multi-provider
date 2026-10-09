@@ -416,11 +416,13 @@ class RemoteExecutionPresetTests(unittest.TestCase):
         role_only = dict(roles={'role': dict(auth_source='manager_proxy', credential_sources=1)})
         older = dict(roles={}, main_auth=dict(kind='claude', auth_source='manager_proxy'))
         cases = []
-        for content in (b'\x7fELF executionPresetCredentialSources', b'\x7fELF without it'):
+        # A version 1 runtime (never released) has the capability name but not the version 2 marker.
+        for content in (b'\x7fELF claude_pc_login_required', b'\x7fELF executionPresetCredentialSources',
+                        b'\x7fELF without it'):
             binary.write_bytes(content)
             cases += [RemoteManager._claude_credential_sources(dict(directory=artifact), value)
                       for value in (authority, role_only, older)]
-        self.assertEqual(cases, [True, True, False, False, False, False])
+        self.assertEqual(cases, [True, True, False] + [False] * 6)
         self.assertFalse(RemoteManager._claude_credential_sources(dict(directory=self.root / 'missing'), authority))
 
     def test_missing_prepared_authority_requires_preparation_for_every_selection(self):

@@ -172,7 +172,19 @@ for proc in Path('/proc').iterdir():
                     raise ValueError('Another process still has this task open; record was preserved.')
         except FileNotFoundError: continue
         except PermissionError:
+            if never_opens_task_history(proc): continue
             raise ValueError('Cannot verify task file users; no repair was performed.') from None
+
+
+def never_opens_task_history(proc):
+    """A same-user process that hides its descriptors on purpose (non-dumpable, it relays or
+    holds lent credentials) and never opens task history: the managed SSH proxy, which only
+    relays bytes, or the SSH Claude runner."""
+    try:
+        argv = (proc/'cmdline').read_bytes().split(b'\0')
+    except OSError:
+        return False
+    return (argv[1:3] == [b'app-server', b'proxy'] and argv[0].endswith(b'/codex')) or b'claude-runner' in argv
 
 
 def write_journal(path, report):

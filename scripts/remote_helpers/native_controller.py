@@ -780,5 +780,10 @@ def main(profile, revision, operation, *, expected_process=None, wait_seconds=No
         _forward_agent(profile)
         env = {key: value for key, value in os.environ.items() if not key.startswith("CODEX_")}
         env["CODEX_HOME"] = str(profile / "codex")
+        # The relayed stream carries lent credentials. A runtime that knows this flag makes the
+        # proxy non-dumpable, so same-user processes cannot open its stdin (the SSH channel's
+        # pipe) through /proc/<pid>/fd; older runtimes ignore it. managed_instances() and the
+        # history repair's open-file scan skip such a process instead of misreading it.
+        env["CODEX_MANAGER_PRIVATE_PROXY"] = "1"
         os.execve(executable, [executable, "app-server", "proxy", "--sock", str(path)], env)
     raise ValueError("unknown managed SSH operation")

@@ -8,6 +8,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import threading
@@ -80,8 +81,8 @@ class Fixture(unittest.TestCase):
         directory = self.root / 'work/control-center/credentials/claude' / (pid or self.pid)
         return sorted(path.name for path in directory.iterdir()) if directory.is_dir() else []
 
-    def lend(self, *, now=NOW + DAY, identity=IDENTITY, rejected=None):
-        return long_lived.lend(self.root, self.pid, identity, rejected, now=now)
+    def lend(self, *, now=NOW + DAY, identity=IDENTITY, excluded=None):
+        return long_lived.lend(self.root, self.pid, identity, excluded, now=now)
 
 
 class FormatTests(unittest.TestCase):
@@ -159,6 +160,45 @@ class SaveTests(Fixture):
             self.save()
         self.assertIsNone(self.meta())
         self.assertEqual(self.blobs(), [])
+
+    def test_the_attested_account_must_be_the_account_logged_in_at_save_time(self):
+        # The dialog showed p***@example.test when the box was ticked, but the login checked
+        # at save time is another account (the browser was signed in to it).
+        other = lambda pid: self.facade.record_status(pid, dict(logged_in=True, account_identity=SECOND,
+                                                                email='other@example.test'))
+        with self.assertRaises(long_lived.LongLivedTokenError) as caught:
+            self.save(attested_account='p***@example.test', refresh=other)
+        self.assertEqual((caught.exception.code, str(caught.exception)),
+                         ('claude_login_changed', long_lived.ATTESTED_ACCOUNT_MESSAGE))
+        self.assertIsNone(self.meta())
+        self.assertEqual(self.blobs(), [])
+        # An attestation made while no account was shown does not cover a shown one either.
+        with self.assertRaises(long_lived.LongLivedTokenError):
+            self.save(attested_account='')
+        for bad in (7, 'x' * 400):
+            with self.assertRaises(long_lived.LongLivedTokenError):
+                self.save(attested_account=bad)
+        self.assertIsNone(self.meta())
+        result = self.save(attested_account='p***@example.test')
+        self.assertTrue(result['saved'])
+        self.assertEqual(self.meta()['account_label'], 'p***@example.test')
+
+    def test_every_action_returns_the_panel_with_its_ssh_usage(self):
+        def bind(data):
+            self.store.profile(self.pid, data)['remote_bindings'] = [
+                dict(alias='h1', prepared=True, claude_credential_sources=1), dict(alias='h2', prepared=True)]
+        self.store.mutate(bind)
+        expected = dict(bindings=2, supported=1)
+        saved = self.save()['long_lived']
+        cid = self.meta()['credential_id']
+        long_lived.record_rejection(self.root, self.pid, cid, now=NOW + DAY)
+        retried = long_lived.retry(self.root, self.pid, now=NOW + DAY)['long_lived']
+        removed = long_lived.delete(self.root, self.pid)['long_lived']
+        for view in (saved, retried, removed):
+            self.assertEqual({key: view['ssh'][key] for key in expected}, expected)
+            self.assertIn('1곳에서 사용', view['ssh']['text'])
+        self.assertEqual((saved['state'], retried['state'], removed['state']), ('active', 'active', 'none'))
+        self.assertEqual(removed['account_label'], 'p***@example.test')
 
     def test_identity_change_during_save_is_refused_and_leaves_no_file(self):
         real, armed = Store.mutate, []
@@ -350,19 +390,49 @@ class LendTests(Fixture):
         self.assertEqual(self.meta()['rejection_kind'], 'expired')
         self.assertEqual(long_lived.state(self.store.profile(self.pid), now=near)['state'], 'expired')
 
-    def test_rejecting_read_records_and_never_returns_that_credential(self):
-        self.assertIsNone(self.lend(rejected=self.cid))
-        self.assertEqual(self.meta()['rejected_credential_id'], self.cid)
-        self.assertIsNone(self.lend(rejected='not-a-uuid'))
-        long_lived.retry(self.root, self.pid)
-        # The rejection names an older generation: the newer token is lent.
+    def test_an_excluding_read_never_returns_that_credential_and_records_nothing(self):
+        self.assertIsNone(self.lend(excluded=self.cid))
+        self.assertIsNone(self.meta()['rejected_credential_id'], 'only the report records a refusal')
+        self.assertIsNone(self.lend(excluded='not-a-uuid'))
+        self.assertEqual(self.lend()['credentialId'], self.cid)
+        # The exclusion names an older generation: the newer token is lent.
         self.save(OTHER)
-        self.assertEqual(self.lend(rejected=self.cid)['accessToken'], OTHER)
+        self.assertEqual(self.lend(excluded=self.cid)['accessToken'], OTHER)
         self.assertIsNone(self.meta()['rejected_credential_id'])
-        # Even if the mark cannot be written, that credential is not returned.
-        current = self.meta()['credential_id']
-        with patch.object(long_lived, 'record_rejection', side_effect=RuntimeError('store busy')):
-            self.assertIsNone(self.lend(rejected=current))
+
+    def test_a_turn_still_running_after_retry_never_marks_the_token_rejected_again(self):
+        # Turn A was lent the token; Claude refused it once and the turn reported it.
+        self.assertEqual(self.lend()['credentialId'], self.cid)
+        self.assertTrue(long_lived.record_rejection(self.root, self.pid, self.cid, now=NOW + DAY))
+        self.assertEqual(self.meta()['rejected_credential_id'], self.cid)
+        # The user presses 다시 시도; turn B is lent the token again.
+        long_lived.retry(self.root, self.pid)
+        self.assertEqual(self.lend(now=NOW + 2 * DAY)['credentialId'], self.cid)
+        # Hours later turn A rotates its Windows login: its reads only exclude the token.
+        for hours in (8, 16):
+            self.assertIsNone(self.lend(now=NOW + 2 * DAY + hours * 3600, excluded=self.cid))
+        meta = self.meta()
+        self.assertEqual((meta['rejected_credential_id'], meta['last_rejected_at']), (None, None))
+        self.assertEqual(long_lived.state(self.store.profile(self.pid), now=NOW + 3 * DAY)['state'], 'active')
+
+    def test_refusal_reason_counts_a_reported_refusal_still_on_its_way(self):
+        # The turn excludes the current token before its report is recorded.
+        self.assertIsNone(long_lived.refusal_reason(self.root, self.pid, now=NOW + DAY))
+        self.assertEqual(long_lived.refusal_reason(self.root, self.pid, now=NOW + DAY, excluded=self.cid),
+                         long_lived.REJECTED_REASON)
+        self.assertEqual(long_lived.refusal_reason(self.root, self.pid, now=NOW + 365 * DAY - 3 * DAY // 2,
+                                                   excluded=self.cid), long_lived.EXPIRED_REASON)
+        self.assertIsNone(long_lived.refusal_reason(self.root, self.pid, now=NOW + DAY, excluded=str(uuid4())))
+
+    def test_a_saved_token_that_waits_for_the_pc_login(self):
+        profile = lambda: self.store.profile(self.pid)
+        self.assertFalse(long_lived.waits_for_pc_login(profile(), IDENTITY))
+        self.login(None, logged_in=False)
+        self.assertTrue(long_lived.waits_for_pc_login(profile(), IDENTITY))
+        self.assertFalse(long_lived.waits_for_pc_login(profile(), SECOND), 'saved for another account')
+        long_lived.delete(self.root, self.pid)
+        self.assertFalse(long_lived.waits_for_pc_login(profile(), IDENTITY))
+        self.assertEqual(long_lived.PC_LOGIN_REASON, 'claude_pc_login_required')
 
     def test_replace_while_lending_rereads_the_metadata_once(self):
         real = long_lived._read_blob
@@ -461,7 +531,12 @@ class PresentationTests(Fixture):
         self.login(None, logged_in=False)
         self.assertIn('Windows 로그인도 필요', self.view(NOW + DAY)['label'])
         long_lived.retry(self.root, self.pid)
-        self.assertEqual(self.view()['state'], 'login_needed')
+        view = self.view()
+        self.assertEqual((view['state'], view['attention']), ('login_needed', False))
+        # Where an SSH binding runs this account, its turns now fail: that needs attention.
+        view = self.view(bindings=1)
+        self.assertEqual((view['state'], view['attention'], view['card_text']), ('login_needed', True, '토큰 확인'))
+        self.assertIn('이 PC의 Claude 로그인이 필요', view['attention_text'])
         self.login(SECOND)
         self.assertEqual(self.view()['state'], 'other_account')
         self.login(IDENTITY)
@@ -470,6 +545,26 @@ class PresentationTests(Fixture):
         for now in (NOW, expires - 10 * DAY, expires - 3600, expires):
             for text in (self.view(now)['attention_text'], self.view(now)['card_text']):
                 self.assertNotIn('@', text)
+
+    def test_states_that_stop_lending_say_where_ssh_turns_get_their_login(self):
+        self.save()
+        expires = NOW + 365 * DAY
+        cid = self.meta()['credential_id']
+        def views():
+            stopped = long_lived.state(self.store.profile(self.pid), now=expires - 3600)
+            expired = long_lived.state(self.store.profile(self.pid), now=expires)
+            long_lived._mark_unreadable(self.store, self.pid, cid, NOW)
+            unreadable = long_lived.state(self.store.profile(self.pid), now=NOW)
+            long_lived._mark_unreadable(self.store, self.pid, cid, None)
+            return dict(stopped=stopped, expired=expired, unreadable=unreadable)
+        for logged_in, fallback in ((True, '지금은 Windows 로그인 토큰 사용'), (False, 'Windows 로그인도 필요')):
+            if not logged_in:
+                self.store.mutate(lambda data: self.store.profile(self.pid, data)['claude_status'].update(logged_in=False))
+            for name, view in views().items():
+                with self.subTest(state=name, logged_in=logged_in):
+                    self.assertEqual((view['state'], view['fallback']), (name, fallback))
+                    self.assertTrue(view['label'].endswith(' · ' + fallback), view['label'])
+                    self.assertIn(fallback, view['attention_text'])
 
     def test_ssh_usage_counts_owned_and_preset_bindings(self):
         other = self.store.add_profile('Codex owner')
@@ -566,8 +661,12 @@ class ControlCenterTests(Fixture):
     def test_commands_drop_the_token_and_return_presentation_only(self):
         control = self.center()
         status = dict(logged_in=True, account_identity=IDENTITY, email='person@example.test')
-        args = dict(profile_id=self.pid, token=TOKEN, attested=True)
+        args = dict(profile_id=self.pid, token=TOKEN, attested=True, attested_account='q***@example.test')
         with patch('manager_core.claude_auth.auth_status', return_value=status):
+            wrong = control.request(dict(id='wrong', command='claude.token.save', args=args))
+            self.assertEqual(wrong['error']['code'], 'claude_login_changed')
+            self.assertIsNone(self.meta())
+            args = dict(profile_id=self.pid, token=TOKEN, attested=True, attested_account='p***@example.test')
             result = control.dispatch('claude.token.save', args)
         self.assertNotIn('token', args)
         self.assertEqual(result['long_lived']['state'], 'active')
@@ -622,7 +721,8 @@ class IssueConsoleTests(unittest.TestCase):
         base = Path(temp.name).resolve()
         pid = str(uuid4())
         environ = dict(LOCALAPPDATA=str(base), PATH='', CLAUDE_CODE_OAUTH_TOKEN='sk-ant-' + 'oat01-' + 'Env' * 20,
-                       ANTHROPIC_API_KEY='fixture-key', CLAUDE_CONFIG_DIR=str(base / 'elsewhere'), KEEP='1')
+                       ANTHROPIC_API_KEY='fixture-key', CLAUDE_CONFIG_DIR=str(base / 'elsewhere'), KEEP='1',
+                       SystemRoot=os.environ.get('SystemRoot', r'C:\Windows'))
         stale = base / 'codex-multi-provider' / 'claude-setup-token' / 'issue-stale'
         stale.mkdir(parents=True)
         os.utime(stale, (time.time() - 3 * DAY, time.time() - 3 * DAY))
@@ -633,8 +733,13 @@ class IssueConsoleTests(unittest.TestCase):
             popen.return_value.pid = 4242
             result = long_lived.launch_issue_console(pid, environ=environ)
         self.assertEqual(result['status'], 'issue_started')
+        self.assertIn('직접 닫으세요', result['message'])
         args, kwargs = popen.call_args
-        self.assertEqual(args[0], [str(cli), 'setup-token'])
+        # The CLI exits half a second after it prints the token; a command prompt keeps the
+        # window open until the user closes it, so the token can be copied.
+        comspec = Path(environ['SystemRoot']) / 'System32' / 'cmd.exe'
+        self.assertEqual(kwargs['executable'], str(comspec))
+        self.assertEqual(args[0], f'"{comspec}" /d /s /k ""{cli}" setup-token"')
         self.assertEqual(kwargs['creationflags'], long_lived.subprocess.CREATE_NEW_CONSOLE)
         self.assertTrue(kwargs['close_fds'])
         for stream in ('stdin', 'stdout', 'stderr'):
@@ -649,6 +754,28 @@ class IssueConsoleTests(unittest.TestCase):
         self.assertNotEqual(config, base / 'codex-multi-provider' / 'claude-profiles' / pid)
         self.assertEqual(list(config.iterdir()), [])
         self.assertFalse(stale.exists())
+        # cmd.exe would expand %NAME% inside the quoted path, so such a path is refused.
+        for odd in (base / '%PATH%' / 'claude.exe', Path('claude.exe')):
+            with self.subTest(cli=str(odd)), self.assertRaises(long_lived.LongLivedTokenError):
+                long_lived.issue_command(odd, environ)
+
+    def test_the_command_prompt_stays_open_after_the_cli_exits(self):
+        # The real cmd.exe without a window: a stand-in CLI in a path with spaces, parentheses and
+        # an ampersand prints and exits; the prompt then still runs what the user types.
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        folder = Path(temp.name) / 'Program Files (x86) & tools'
+        folder.mkdir()
+        cli = folder / 'claude.cmd'
+        cli.write_bytes(b'@echo off\r\necho fixture setup-token %1\r\nexit /b 0\r\n')
+        environ = dict(os.environ)
+        executable, command = long_lived.issue_command(cli, environ)
+        result = subprocess.run(command, executable=executable, input=b'echo STILL_OPEN\r\nexit\r\n',
+                                capture_output=True, timeout=60, creationflags=subprocess.CREATE_NO_WINDOW)
+        output = result.stdout.decode('ascii', 'replace')
+        self.assertIn('fixture setup-token setup-token', output)
+        self.assertIn('STILL_OPEN', output)
+        self.assertLess(output.index('fixture setup-token'), output.index('STILL_OPEN'))
 
 
 @unittest.skipUnless(os.name == 'nt', 'Windows user DPAPI is required')
