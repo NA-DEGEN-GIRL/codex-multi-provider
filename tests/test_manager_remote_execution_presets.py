@@ -417,8 +417,9 @@ class RemoteExecutionPresetTests(unittest.TestCase):
         older = dict(roles={}, main_auth=dict(kind='claude', auth_source='manager_proxy'))
         cases = []
         # A version 1 runtime (never released) has the capability name but not the version 2 marker.
-        for content in (b'\x7fELF claude_pc_login_required', b'\x7fELF executionPresetCredentialSources',
-                        b'\x7fELF without it'):
+        # A release build keeps the refusal message contiguous but splits the bare reason code.
+        for content in (b"\x7fELF This PC's Claude login for this profile is not confirmed",
+                        b'\x7fELF executionPresetCredentialSources', b'\x7fELF claude_pc_login_required'):
             binary.write_bytes(content)
             cases += [RemoteManager._claude_credential_sources(dict(directory=artifact), value)
                       for value in (authority, role_only, older)]

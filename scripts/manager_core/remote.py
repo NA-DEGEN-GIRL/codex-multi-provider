@@ -42,8 +42,9 @@ REMOTE_CAPABILITY_MARKERS = {
 }
 # Optional: a runtime that reports a lent Claude credential's source (initialize capability
 # executionPresetCredentialSources version 2). Version 1 runtimes have that name too, so the
-# marker is a refusal reason only version 2 explains.
-CLAUDE_CREDENTIAL_SOURCES_MARKER = b'claude_pc_login_required'
+# marker is the user message of a refusal reason only version 2 explains. Release builds
+# split short match-arm literals such as the reason code itself; a message stays contiguous.
+CLAUDE_CREDENTIAL_SOURCES_MARKER = b"This PC's Claude login for this profile is not confirmed"
 _CAPABILITY_CACHE = {}
 
 
