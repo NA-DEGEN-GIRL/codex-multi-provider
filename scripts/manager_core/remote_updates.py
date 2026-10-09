@@ -29,6 +29,10 @@ from .updates import UpdateError, _lock_file, _unlock_file
 
 
 ACTIVE = frozenset({'queued', 'waiting', 'applying', 'recovering'})
+# Longest pause (seconds) between passes of a job waiting for SSH work to end,
+# and of one waiting after an unclear observation.
+WAIT_RETRY_CAP = 120
+ERROR_RETRY_CAP = 600
 STOCK_ACTIVE = frozenset({'dispatching', 'pending', 'queued', 'starting', 'applying', 'running', 'unknown'})
 # A reservation is terminal once nothing may be dispatched for its transaction.
 FINISHED = frozenset({'complete', 'cancelled', 'superseded'})
@@ -183,6 +187,7 @@ class RemoteUpdates:
         self.interval, self.check_interval, self.clock = interval, check_interval, clock
         self.mutex = threading.RLock()
         self.busy = set()
+        self.retry_at = {}
         self.stopping, self.wake = threading.Event(), threading.Event()
         self.started = False
 
@@ -775,7 +780,8 @@ class RemoteUpdates:
                 for host in pin['targets']:
                     self._check(profile_id, host)
             else:
-                self._job_state(profile_id, alias, 'waiting', 'SSH 작업 종료가 확인될 때까지 기다립니다. 로컬 작업은 계속할 수 있습니다.')
+                self._job_state(profile_id, alias, 'waiting', 'SSH 작업 종료가 확인될 때까지 기다립니다. 로컬 작업은 계속할 수 있습니다.',
+                                **self._backoff(profile_id, alias, WAIT_RETRY_CAP))
         except Exception as error:
             code = getattr(error, 'code', 'ssh_observation_unavailable')
             if code == 'ssh_update_cancelled':
@@ -788,7 +794,21 @@ class RemoteUpdates:
                 self.hooks.remote_open_failed(profile_id, transaction, code)
             self._job_state(profile_id, alias, 'attention' if fatal else 'waiting',
                 ('SSH 업데이트 결과 확인이 필요합니다. 이전 버전의 연결 정보와 적용 기록을 보존했습니다.'
-                 if fatal else 'SSH 실행 상태를 확인할 때까지 기다립니다. 결과가 불명확한 종료·시작 요청은 반복하지 않습니다.'), code=code)
+                 if fatal else 'SSH 실행 상태를 확인할 때까지 기다립니다. 결과가 불명확한 종료·시작 요청은 반복하지 않습니다.'), code=code,
+                **({} if fatal else self._backoff(profile_id, alias, ERROR_RETRY_CAP)))
+
+    def _backoff(self, profile_id, alias, cap):
+        """When the next scheduler pass may retry a waiting job.
+
+        Automatic updates can keep a job waiting for hours while SSH work runs;
+        each pass inspects every host over SSH, so the pause doubles from one
+        scheduler interval up to ``cap`` seconds for as long as the job waits.
+        """
+        retries = ((self._read(profile_id, alias).get('job') or {}).get('retries') or 0) + 1
+        delay = min(cap, self.interval * 2 ** min(retries - 1, 8))
+        # In memory only: a restarted service takes one prompt pass first.
+        self.retry_at[profile_id + ':' + alias] = self.clock() + delay
+        return dict(retries=retries)
 
     def update_stock(self, profile_id, alias, *, confirmed=False, observation_id=None):
         self._key(profile_id, alias)
@@ -859,6 +879,13 @@ class RemoteUpdates:
                                         code='profile_unavailable')
                     continue
                 if (value.get('job') or {}).get('state') in ACTIVE:
+                    job = value['job']
+                    # Back off between SSH inspections (see _backoff), but never
+                    # delay retiring a reservation a relaunch made stale: it
+                    # holds the profile's SSH gate.
+                    if (job.get('state') == 'waiting' and self.clock() < self.retry_at.get(profile_id + ':' + alias, 0)
+                            and not _stock_pending(value['stock']) and not self._stale(value, profile)):
+                        continue
                     self._launch(profile_id, alias, lambda p=profile_id, a=alias: self._queued_pass(p, a))
                 elif self._stale(value, profile):
                     # A relaunch left a non-active reservation holding the SSH

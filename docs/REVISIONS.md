@@ -35,6 +35,20 @@
 
 ## 최근 수정
 
+### 수정 122 — SSH 이전 런타임 재실행 방지, SSH 자동 업데이트 기본 켜기
+
+- 원인: SSH 서버들이 수정 118의 sqlx 풀 정리 버그 수정(launchbadge/sqlx#3645) 이전 런타임 묶음(`98ad6b88` 등)을 계속 실행했다.
+  자동 업데이트가 꺼져 있어서, 관리자를 열 때마다 각 연결이 기억한 이전 묶음이 다시 시작됐다. 그 프로세스는 약 10분 뒤 CPU 100%로 멈추지 않고,
+  관리 종료(SIGHUP)에도 끝나지 않아 완전 종료와 업데이트가 반복해서 멈췄다(4코어인 호스트에서 특히 드러남).
+  이전 런타임은 작업 상태 확인 지표가 없어서(`remote_idle_diagnostics_unavailable`) 업데이트 작업도 기다리기만 했다.
+- 프로필을 열 때 원격 실행이 멈춰 있는 호스트가 현재 제공 묶음과 다른 묶음에 연결돼 있으면, 이전 묶음을 시작하지 않고 현재 묶음으로 준비해 시작한다.
+  실행 중인 원격 작업은 그대로 둔다. 새 호스트 연결은 다른 프로필이 남긴 이전 묶음을 재사용하지 않는다.
+- SSH 자동 업데이트(작업 종료 후 적용)를 기본으로 켜고, 기존 연결도 한 번 켠다(사용자가 끈 값은 이후 유지).
+  멈춘 호스트의 이전 묶음도 자동 업데이트 대상이다. 대기 중인 작업의 SSH 확인 간격은 15초에서 최대 2분(오류 시 10분)까지 늘린다.
+- 업데이트 상태와 `health_report.py`에 이전 묶음 연결·실행을 표시한다(`stale_bundle`, "이전 버전 SSH 런타임: N건").
+- 운영 조치(코드 외): 2026-10-09 모든 연결(33개)을 `e224215e`로 옮기고, 작업 없이 멈춰 돌던 이전 프로세스를 종료했다.
+  세 호스트에서 쓰이지 않는 이전 런타임 폴더도 지웠다.
+
 ### 수정 121 — SSH Claude 로그인 자동 갱신·계정별 장기 토큰, llm-usage 연동 정리
 
 **Claude 로그인 갱신과 장기 토큰** ([원인·변경·호환·적용 순서](design/claude-login-renewal-121.md))
@@ -407,3 +421,4 @@
 | 119 | [stability-perf-119](design/stability-perf-119.md), [ssh-worktree-project-grouping-96](design/ssh-worktree-project-grouping-96.md) | Claude·SSH 버그, 관리창 속도, 재발 방지 장치 |
 | 120 | [runtime-start-retry-120](design/runtime-start-retry-120.md) | 런타임 시작 실패 재시도, 시작 실패 뒤 오류창, 콘솔 공유 |
 | 121 | [claude-login-renewal-121](design/claude-login-renewal-121.md), [llm-usage-removal-121](design/llm-usage-removal-121.md) | SSH Claude 로그인 자동 갱신·이어 쓰기·실행 중 토큰 교체, 계정별 장기 토큰과 토큰 전달 보호, llm-usage 연동 제거와 기존 프로필·SSH home 호환 |
+| 122 | (REVISIONS 본문) | SSH 이전 런타임 재실행 방지, SSH 자동 업데이트 기본 켜기와 대기 확인 간격 늘림 |

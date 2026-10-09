@@ -99,6 +99,44 @@ class RemoteUpdateTests(unittest.TestCase):
         self.assertEqual(self.fleet.calls, [])
         self.assertEqual(self.pending, [])
 
+    def test_waiting_jobs_back_off_between_ssh_passes(self):
+        now = [4000.0]
+        service = RemoteUpdates(self.root, self.store, self.remote, self.hooks, probe=self.probe,
+            stock_update=self.stock_update, spawn=self.pending.append, clock=lambda: now[0])
+        service._save(self.profile_id, 'fixture-a', job=dict(id='job', state='waiting', message='waiting'),
+                      _job=dict(transaction_id='transaction', generation=None, revision=0,
+                                targets=None, cancel_requested=False))
+        delays = []
+        key = self.profile_id + ':fixture-a'
+        for _ in range(5):
+            extras = service._backoff(self.profile_id, 'fixture-a', 120)
+            service._job_state(self.profile_id, 'fixture-a', 'waiting', 'waiting', **extras)
+            delays.append(service.retry_at[key] - now[0])
+        self.assertEqual(delays, [15, 30, 60, 120, 120])
+        service._job_state(self.profile_id, 'fixture-a', 'waiting', 'waiting',
+                           **service._backoff(self.profile_id, 'fixture-a', 600))
+        self.assertEqual(service.retry_at[key] - now[0], 480)
+        service._backoff(self.profile_id, 'fixture-a', 120)
+        self.store.mutate(lambda data: self.store.profile(self.profile_id, data).update(
+            generation=self.store.profile(self.profile_id)['generation']))
+        service._save(self.profile_id, 'fixture-a', _job=dict(service._read(self.profile_id, 'fixture-a')['_job'],
+            generation=self.store.profile(self.profile_id)['generation'],
+            revision=self.store.profile(self.profile_id)['policy']['desired_revision']))
+        launched = []
+        service._launch = lambda profile_id, alias, fn, checking=False: launched.append((alias, checking)) or True
+        service.tick()
+        self.assertNotIn(('fixture-a', False), launched)
+        now[0] += 121
+        service.tick()
+        self.assertIn(('fixture-a', False), launched)
+        # A restarted service takes one prompt pass before backing off again.
+        restarted = RemoteUpdates(self.root, self.store, self.remote, self.hooks, probe=self.probe,
+            stock_update=self.stock_update, spawn=self.pending.append, clock=lambda: now[0])
+        relaunched = []
+        restarted._launch = lambda profile_id, alias, fn, checking=False: relaunched.append((alias, checking)) or True
+        restarted.tick()
+        self.assertIn(('fixture-a', False), relaunched)
+
     def test_restart_clears_stale_checking_in_one_write_before_the_scheduler(self):
         self.service._save(self.profile_id, 'fixture-a', checking=True)
         self.service._save(self.profile_id, 'fixture-b', checking=False)
