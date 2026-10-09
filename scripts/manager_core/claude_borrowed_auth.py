@@ -19,6 +19,13 @@ _REFRESH_GUARD = threading.Lock()
 _REFRESH_LOCKS = {}
 _REFRESH_ATTEMPTS = {}
 _REFRESH_COOLDOWN = 30
+# The official CLI renews its login only once at most five minutes remain, so a
+# borrowed token below this floor is renewed first. A higher floor would ask for
+# renewals the CLI declines and then refuse; the margin allows for rounding and
+# for the CLI's exact threshold.
+# The runtime (120 s) and the SSH helper (30 s) require less, so a token read
+# here still passes their checks after transit.
+_MINIMUM_VALIDITY = 270
 
 
 class _Expired(Exception):
@@ -43,12 +50,14 @@ def _refresh_with_cli(profile_id):
         query(profile_id, timeout=15)
 
 
-def read_access_token(root, profile_id, expected_account_identity, *, minimum_validity=120):
+def read_access_token(root, profile_id, expected_account_identity, *, minimum_validity=_MINIMUM_VALIDITY):
     """Return access-only JSON with an expiry expressed in Unix seconds.
 
     Remote and delegated Claude turns never run the CLI on this host, so its
     login is not renewed by use. An expired or expiring token is renewed once
     by the official CLI (see _refresh_with_cli) before the read is refused.
+    When another caller renewed the login moments ago, the cooldown skips the
+    CLI run and the re-read below returns that renewed token.
     """
     try:
         return _read_access_token(root, profile_id, expected_account_identity, minimum_validity)

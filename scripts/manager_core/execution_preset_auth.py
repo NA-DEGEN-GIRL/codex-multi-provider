@@ -1,9 +1,10 @@
 """Borrow prepared accounts over one managed SSH connection; never persist tokens."""
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as WaitTimeout
 import copy
 from pathlib import Path
 import re
+import threading
 import time
 from uuid import UUID
 
@@ -13,6 +14,26 @@ METHOD = 'account/executionPresetAuthTokens/read'
 CAPABILITY = 'codex-manager/execution-preset-auth'
 _FIELDS = {'ownerProfileId', 'roleId', 'profileId', 'kind',
            'expectedAccountFingerprint', 'expectedAccountIdentity'}
+_PENDING_LIMIT = 8
+# A read gets this long once a worker starts it; waiting for a worker is not
+# charged. The runtime abandons a request 30 s after sending it, so every answer
+# is also bounded from receipt and never sent after the runtime stopped waiting.
+_READ_TIMEOUT = 25
+_REQUEST_TIMEOUT = 28
+_clock = time.monotonic
+
+
+class _Pending:
+    """One runtime request; the worker records when it actually starts."""
+    __slots__ = ('params', 'received', 'started', 'future')
+
+    def __init__(self, params):
+        self.params, self.received, self.started, self.future = params, _clock(), None, None
+
+    def expired(self, now):
+        started = self.started
+        return (now >= self.received + _REQUEST_TIMEOUT
+                or (started is not None and now >= started + _READ_TIMEOUT))
 
 
 class ExecutionPresetAuthProxy:
@@ -30,8 +51,13 @@ class ExecutionPresetAuthProxy:
         self._initialize_seen = False
         self._consumed = deque(maxlen=512)
         self._closed = False
-        self._workers = ThreadPoolExecutor(max_workers=2, thread_name_prefix='managed-account-read')
+        # One worker per admitted request: a slow renewal of one account never
+        # queues another account's read. Turns of one Claude login wait on a
+        # single shared read instead (see _claude_read).
+        self._workers = ThreadPoolExecutor(max_workers=_PENDING_LIMIT, thread_name_prefix='managed-account-read')
         self._pending = {}
+        self._reads_lock = threading.Lock()
+        self._claude_reads = {}
         self.execution_presets_version = 0
         self._check_binding()
 
@@ -85,7 +111,7 @@ class ExecutionPresetAuthProxy:
             if (source.get('auth_mode') != 'claude_code'
                     or source.get('claude_account_identity') != role.get('expected_account_identity')):
                 raise LoginNeededError('account_mismatch')
-            value = reader(self.store.root, source['id'], role['expected_account_identity'])
+            value = self._claude_read(reader, source['id'], role['expected_account_identity'])
             self._check_binding()
             return dict(kind=kind, accessToken=value['accessToken'], chatgptAccountId=None,
                         expiresAt=value['expiresAt'], accountIdentity=value['accountIdentity'])
@@ -105,6 +131,35 @@ class ExecutionPresetAuthProxy:
         return dict(kind=kind, accessToken=tokens.access_token, chatgptAccountId=tokens.account_id,
                     expiresAt=None, accountIdentity=None)
 
+    def _claude_read(self, reader, profile_id, identity):
+        """Validated requests for one Claude login share the read in flight.
+
+        Several turns starting together then cause one renewal, not one queued
+        read each. A finished read is never reused: a later request reads again.
+        """
+        key = (profile_id, identity)
+        with self._reads_lock:
+            shared = self._claude_reads.get(key)
+            owner = shared is None
+            if owner:
+                shared = self._claude_reads[key] = Future()
+        if owner:
+            try:
+                shared.set_result(reader(self.store.root, profile_id, identity))
+            except BaseException as error:
+                shared.set_exception(error)
+            finally:
+                with self._reads_lock:
+                    del self._claude_reads[key]
+        try:
+            return shared.result(timeout=_REQUEST_TIMEOUT)
+        except WaitTimeout:
+            raise LoginNeededError('managed_account_timeout') from None
+
+    def _run(self, pending):
+        pending.started = _clock()
+        return self._credentials(pending.params)
+
     @staticmethod
     def _rejected(message):
         result = AuthProxyResult()
@@ -119,10 +174,11 @@ class ExecutionPresetAuthProxy:
             if type(request_id) not in (str, int) or request_id in self._consumed:
                 return self._rejected(message)
             self._consumed.append(request_id)
-            if self._closed or len(self._pending) >= 8:
+            if self._closed or len(self._pending) >= _PENDING_LIMIT:
                 return self._rejected(message)
-            params = copy.deepcopy(message.get('params'))
-            self._pending[request_id] = (self._workers.submit(self._credentials, params), time.monotonic() + 25, params)
+            pending = _Pending(copy.deepcopy(message.get('params')))
+            pending.future = self._workers.submit(self._run, pending)
+            self._pending[request_id] = pending
             return AuthProxyResult()
         if direction == 'frontend':
             if method == METHOD:
@@ -148,8 +204,10 @@ class ExecutionPresetAuthProxy:
 
     def poll(self):
         result = self.auth.poll()
-        for request_id, (future, deadline, params) in list(self._pending.items()):
-            if not future.done() and time.monotonic() < deadline:
+        now = _clock()
+        for request_id, pending in list(self._pending.items()):
+            future, params = pending.future, pending.params
+            if not future.done() and not pending.expired(now):
                 continue
             del self._pending[request_id]
             if self._closed:
