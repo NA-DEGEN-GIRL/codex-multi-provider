@@ -694,11 +694,9 @@ class ControlCenterTests(Fixture):
         from control_center import ControlCenter
         self.save(now=int(time.time()))
         with patch('manager_core.usage_refresh.read_quota', side_effect=RuntimeError('fixture: no network')), \
-                patch('pathlib.Path.home', return_value=self.root / 'user-home'), \
-                patch('manager_core.accounts.Accounts.list', return_value=[]):
+                patch('pathlib.Path.home', return_value=self.root / 'user-home'):
             center = ControlCenter(self.root)
             center._remote_reconcile_started = True
-            center._sync_at = time.monotonic()
             center.remote.list_hosts = Mock(return_value=[])
             center.usage_refresh.schedule = Mock()
             center.claude_usage.schedule = Mock()
@@ -800,6 +798,37 @@ class RealDpapiTests(unittest.TestCase):
         with self.assertRaises(providers.ProviderError):
             long_lived._unprotect(blob, other['id'])
         self.assertEqual(json.loads(long_lived._unprotect(blob, profile['id']))['credential_id'], cid)
+
+    def test_concurrent_calls_from_broker_workers_never_fail(self):
+        # Before the prototypes were fixed once, a thread switch between one call's argtypes
+        # assignment and its call failed it with ctypes.ArgumentError (hundreds per run here).
+        entropy = b'fixture-entropy'
+        blob = providers._crypt_secret(b'{"fixture": "dummy"}', True, entropy=entropy)
+        errors, lock = [], threading.Lock()
+
+        def worker():
+            for index in range(60):
+                try:
+                    if index % 2:
+                        providers._crypt_secret(b'dummy', True, entropy=entropy)
+                    else:
+                        self.assertEqual(providers._crypt_secret(blob, False, entropy=entropy),
+                                         b'{"fixture": "dummy"}')
+                except BaseException as error:
+                    with lock:
+                        errors.append(type(error).__name__)
+
+        interval = sys.getswitchinterval()
+        sys.setswitchinterval(1e-6)
+        try:
+            threads = [threading.Thread(target=worker) for _ in range(8)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(60)
+        finally:
+            sys.setswitchinterval(interval)
+        self.assertEqual(errors, [])
 
 
 if __name__ == '__main__':

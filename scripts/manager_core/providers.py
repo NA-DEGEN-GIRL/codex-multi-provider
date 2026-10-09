@@ -16,6 +16,7 @@ import os
 from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 import tempfile
+import threading
 import time
 import tomllib
 import uuid
@@ -179,8 +180,42 @@ def _lock(path):
                 fcntl.flock(handle, fcntl.LOCK_UN)
 
 
+class _DataBlob(ctypes.Structure):
+    _fields_ = [('size', wintypes.DWORD), ('data', ctypes.POINTER(ctypes.c_ubyte))]
+
+
+_dpapi_lock = threading.Lock()
+_dpapi_functions = None
+
+
+def _dpapi():
+    """CryptProtectData, CryptUnprotectData and LocalFree, each prototyped once.
+
+    They come from this module's own library handles. ``ctypes.windll`` shares one
+    function object per process, and setting its ``argtypes`` on every call let a
+    concurrent call check its arguments against another call's types and fail with
+    ctypes.ArgumentError (two SSH broker workers lending saved tokens at once).
+    """
+    global _dpapi_functions
+    with _dpapi_lock:
+        if _dpapi_functions is None:
+            crypt32, kernel32 = ctypes.WinDLL('crypt32'), ctypes.WinDLL('kernel32')
+            blob = ctypes.POINTER(_DataBlob)
+            functions = []
+            for function in (crypt32.CryptProtectData, crypt32.CryptUnprotectData):
+                function.argtypes = [blob, ctypes.c_void_p, blob, ctypes.c_void_p, ctypes.c_void_p,
+                                     wintypes.DWORD, blob]
+                function.restype = wintypes.BOOL
+                functions.append(function)
+            free = kernel32.LocalFree
+            free.argtypes = [ctypes.c_void_p]
+            free.restype = ctypes.c_void_p
+            _dpapi_functions = (*functions, free)
+        return _dpapi_functions
+
+
 def _crypt_secret(value: bytes, protect: bool, *, entropy: bytes | None = None) -> bytes:
-    """Current-user DPAPI with CRYPTPROTECT_UI_FORBIDDEN.
+    """Current-user DPAPI with CRYPTPROTECT_UI_FORBIDDEN; safe to call from several threads.
 
     ``entropy`` binds a blob to one purpose: a blob protected with entropy is
     not unlocked without the same bytes, so it cannot be moved onto another
@@ -190,21 +225,14 @@ def _crypt_secret(value: bytes, protect: bool, *, entropy: bytes | None = None) 
         raise ProviderError('Windows user encryption is required for saved local API keys.')
     if entropy is not None and (not isinstance(entropy, (bytes, bytearray)) or not entropy):
         raise ProviderError('The API key could not be encrypted or unlocked for this Windows user.')
-
-    class Blob(ctypes.Structure):
-        _fields_ = [('size', wintypes.DWORD), ('data', ctypes.POINTER(ctypes.c_ubyte))]
-
+    protect_data, unprotect_data, free = _dpapi()
+    function = protect_data if protect else unprotect_data
     buffer = (ctypes.c_ubyte * len(value)).from_buffer_copy(value)
-    source, target = Blob(len(value), buffer), Blob()
+    source, target = _DataBlob(len(value), buffer), _DataBlob()
     salt = None
     if entropy is not None:
         salt_buffer = (ctypes.c_ubyte * len(entropy)).from_buffer_copy(entropy)
-        salt = Blob(len(entropy), salt_buffer)
-    function = (ctypes.windll.crypt32.CryptProtectData if protect
-                else ctypes.windll.crypt32.CryptUnprotectData)
-    function.argtypes = [ctypes.POINTER(Blob), ctypes.c_void_p, ctypes.POINTER(Blob),
-                         ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(Blob)]
-    function.restype = wintypes.BOOL
+        salt = _DataBlob(len(entropy), salt_buffer)
     try:
         if not function(ctypes.byref(source), None, None if salt is None else ctypes.byref(salt),
                         None, None, 1, ctypes.byref(target)):
@@ -214,9 +242,6 @@ def _crypt_secret(value: bytes, protect: bool, *, entropy: bytes | None = None) 
         ctypes.memset(buffer, 0, len(value))
         if target.data:
             ctypes.memset(target.data, 0, target.size)
-            free = ctypes.windll.kernel32.LocalFree
-            free.argtypes = [ctypes.c_void_p]
-            free.restype = ctypes.c_void_p
             free(ctypes.cast(target.data, ctypes.c_void_p))
 
 

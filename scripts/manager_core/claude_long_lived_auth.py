@@ -497,7 +497,9 @@ def _read_blob(root, profile_id, credential_id):
                 or value['credential_id'] != credential_id):
             raise ValueError()
         return normalize(value['token'])
-    except (providers.ProviderError, ValueError, TypeError, KeyError):
+    except Exception:
+        # Any decrypt or parse failure, including an unexpected ctypes error, only makes this
+        # generation unreadable; the broker then serves the turn with the PC login.
         raise _Unreadable() from None
 
 

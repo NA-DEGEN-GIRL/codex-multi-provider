@@ -480,6 +480,22 @@ class BorrowingTests(unittest.TestCase):
         with patch('manager_core.claude_long_lived_auth.refusal_reason', return_value='claude_long_lived_rejected'):
             self.assertEqual(self.request(params, 'old'), {'id': 'old', 'error': REFUSED})
 
+    def test_an_unexpected_error_falls_back_or_refuses_and_never_escapes_poll(self):
+        import ctypes
+        def broken(*_args):
+            raise ctypes.ArgumentError('fixture: unexpected ctypes failure')
+        # A lender failure of any type still leaves the turn to the PC login.
+        params = self.sources_fixture(long_lived=broken)
+        answer = self.request(params, 'fallback')
+        self.assertEqual(answer['result']['credentialSource'], 'windowsLogin')
+        self.assertEqual(len(self.windows), 1)
+        # An unexpected error on the PC login read becomes a plain refusal ...
+        params = self.sources_fixture(long_lived=lambda count, excluded: None, windows=broken)
+        self.assertEqual(self.request(params, 'refused'), {'id': 'refused', 'error': REFUSED})
+        # ... and the connection keeps answering later reads.
+        params = self.sources_fixture(long_lived=lambda count, excluded: None)
+        self.assertEqual(self.request(params, 'later')['result']['credentialSource'], 'windowsLogin')
+
     def test_request_waiting_for_a_worker_is_still_bounded(self):
         logs = capture_logs(self)
         now, release, reads = self.queued_behind_slow_read()

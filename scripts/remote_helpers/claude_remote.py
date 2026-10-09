@@ -28,7 +28,9 @@ def _hide_process():
     Non-dumpable covers this process only; its CLI child is dumpable again after exec. A hard
     core limit of 0 is inherited by the CLI and everything it starts, and only a privileged
     process can raise it again: otherwise a same-user process could raise the CLI's soft limit
-    (prlimit), signal it and read the token from its core file."""
+    (prlimit), signal it and read the token from its core file. It applies to every lent token,
+    borrowed or saved, so Claude's own tool commands cannot raise `ulimit -c` either
+    (docs/operations/ssh-host-onboarding.md)."""
     if not sys.platform.startswith('linux'):
         return
     try:

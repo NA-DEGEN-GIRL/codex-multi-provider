@@ -15262,7 +15262,7 @@ index 2f08b0fdc..6c6d5e9c9 100644
  [target.'cfg(windows)'.dependencies]
  codex-windows-sandbox = { workspace = true }
 diff --git a/codex-rs/app-server/README.md b/codex-rs/app-server/README.md
-index a0aa92b7f..af60edc3f 100644
+index a0aa92b7f..fcf89b8a3 100644
 --- a/codex-rs/app-server/README.md
 +++ b/codex-rs/app-server/README.md
 @@ -1,5 +1,53 @@
@@ -15323,7 +15323,7 @@ index a0aa92b7f..af60edc3f 100644
  - `thread/metadata/update` — patch stored thread metadata in sqlite; supports updating persisted `gitInfo` fields and experimental `projectId`, then returns the refreshed `thread`. Omit `projectId` to preserve assignment and pass an empty string to clear it.
  - `thread/section/move` — atomically move a thread into the section identified by `sectionId`, before another thread or at the end when `beforeThreadId` is `null`. Reordering within the same section preserves `sectionEnteredAt`; entering a different section resets it. Set `sectionId` to `null` to remove the thread from its section. Returns `{}` on success.
  - `thread/settings/update` — experimental; queue a partial update to a loaded thread’s next-turn settings without starting a turn or adding transcript items. Omitted fields leave settings unchanged; `serviceTier: null` clears the tier; deprecated `multiAgentMode` is ignored, while Ultra reasoning effort enables proactive multi-agent behavior; `sandboxPolicy` and `permissions` cannot be combined. Parent-owned Multi-Agent V2 subagents reject direct settings updates. Returns `{}` when the update is accepted and emits `thread/settings/updated` with the full effective settings only if they actually change. `turn/start` settings overrides emit the same notification when they change the stored settings.
-+  A manager-hosted server additionally accepts `executionPreset: {"id":"<uuid>","revision":1}`; omission preserves the selection and explicit `null` restores the profile policy. The server resolves only identifiers from the launch-time `CODEX_MANAGER_EXECUTION_PRESETS` registry and verifies role/provider/account bindings against its prepared configuration. Unprepared or changed bindings fail with a prepare/reload-required error. The applied selection is returned in `thread/settings/updated.threadSettings.executionPreset`; `{}` remains a queue acknowledgement. A running turn retains its captured policy. Main model selection is unchanged. Cold resume prioritizes a manager task binding (including explicit null), then the newest task-owned durable selection, then the registry default. Native account-bound children borrow access tokens read-only, require the registered account identity, and never refresh or write the owning profile's credentials; different-account delegation uses fresh plaintext context. Such a server's `initialize` result also carries `executionPresetCredentialSources: 1`: the private manager request `account/executionPresetAuthTokens/read` may then answer a Claude account with `credentialSource` (`windowsLogin` or `longLivedToken`) and, for a saved long-lived token, its `credentialId`. After Claude refuses a lent long-lived token the server adds `rejectedCredentialId` to its reads (the field is omitted otherwise) and never accepts that credential again; a refusal whose error `data.reason` is `claude_long_lived_rejected` or `claude_long_lived_expired` is explained to the user.
++  A manager-hosted server additionally accepts `executionPreset: {"id":"<uuid>","revision":1}`; omission preserves the selection and explicit `null` restores the profile policy. The server resolves only identifiers from the launch-time `CODEX_MANAGER_EXECUTION_PRESETS` registry and verifies role/provider/account bindings against its prepared configuration. Unprepared or changed bindings fail with a prepare/reload-required error. The applied selection is returned in `thread/settings/updated.threadSettings.executionPreset`; `{}` remains a queue acknowledgement. A running turn retains its captured policy. Main model selection is unchanged. Cold resume prioritizes a manager task binding (including explicit null), then the newest task-owned durable selection, then the registry default. Native account-bound children borrow access tokens read-only, require the registered account identity, and never refresh or write the owning profile's credentials; different-account delegation uses fresh plaintext context. Such a server's `initialize` result also carries `executionPresetCredentialSources: 2`: the private manager request `account/executionPresetAuthTokens/read` may then answer a Claude account with `credentialSource` (`windowsLogin` or `longLivedToken`) and, for a saved long-lived token, its `credentialId`. After Claude refuses a lent long-lived token the server reports it once, in a read with `rejectedCredentialId` and `reportOnly: true` that lends nothing: the broker records the refusal only for a credential it lent on that connection and answers with error `data.reason` `claude_long_lived_recorded`. Every later read of the turn carries only `rejectedCredentialId`, which excludes that credential without recording it again; both fields are omitted otherwise. A refusal whose error `data.reason` is `claude_long_lived_rejected`, `claude_long_lived_expired` or `claude_pc_login_required` is explained to the user.
  - `thread/memoryMode/set` — experimental; set a thread’s persisted memory eligibility to `"enabled"` or `"disabled"` for either a loaded thread or a stored rollout; returns `{}` on success.
  - `memory/reset` — experimental; clear the current `CODEX_HOME/memories` directory and reset persisted memory stage data in sqlite while preserving existing thread memory modes; returns `{}` on success.
  - `thread/goal/set` — create or update the single persisted goal for a materialized thread; returns the current goal and emits `thread/goal/updated`. Parent-owned Multi-Agent V2 subagents reject goal updates, including while unloaded.
@@ -53590,10 +53590,10 @@ index a75dbe2af..27eb8f8c6 100644
              output.needs_follow_up = true;
 diff --git a/codex-rs/core/src/tasks/claude_code.rs b/codex-rs/core/src/tasks/claude_code.rs
 new file mode 100644
-index 000000000..dd08d787e
+index 000000000..e0333b633
 --- /dev/null
 +++ b/codex-rs/core/src/tasks/claude_code.rs
-@@ -0,0 +1,525 @@
+@@ -0,0 +1,502 @@
 +//! Runs the official installed Claude Code CLI through the manager's authenticated runner.
 +//! All shared history and events still go through the native session recorder.
 +mod auth_refresh;
@@ -53604,11 +53604,9 @@ index 000000000..dd08d787e
 +mod images;
 +mod messages;
 +
-+use std::future::Future;
-+use std::pin::Pin;
++use std::collections::VecDeque;
 +use std::sync::Arc;
 +use std::time::Duration;
-+use std::time::Instant;
 +
 +use codex_history::RolloutItem;
 +use codex_protocol::config_types::ModeKind;
@@ -53925,7 +53923,7 @@ index 000000000..dd08d787e
 +        .as_ref()
 +        .map(|credentials| auth_refresh::credentials(&agent.profile_id, credentials))
 +        .transpose()?;
-+    let mut renewal = if credentials.is_some() {
++    let renewal = if credentials.is_some() {
 +        AuthRefresh::borrowed()
 +    } else {
 +        AuthRefresh::unavailable()
@@ -53999,37 +53997,42 @@ index 000000000..dd08d787e
 +        "exclude_dynamic_sections":agent.exclude_dynamic_sections,"permission_mode":if ctx.mode() == ModeKind::Plan {"plan"} else {"auto"},
 +        "system_prompt":system_prompt,
 +        "permission_prompts":if matches!(ctx.approval_policy(), AskForApproval::Never) {"none"} else {"host"}})).await?;
-+    // At most one renewal is outstanding. It resolves while the runner keeps streaming, so a
-+    // live rotation never stalls the turn; its reply goes out as soon as it is ready.
-+    let mut renewing: Option<
-+        Pin<Box<dyn Future<Output = codex_protocol::error::Result<Value>> + Send + '_>>,
-+    > = None;
++    // Login renewals start on their own task as soon as they are asked for, and their replies
++    // go out as soon as they are ready: between runner messages, and also while a permission
++    // prompt or a delegated agent is awaited. A live rotation then never stalls the turn, and
++    // the user's answer or a sub-agent never holds a renewal back.
++    let mut renewals = auth_refresh::Renewals::new(
++        &agent.profile_id,
++        resolve,
++        cancellation,
++        renewal,
++        lent_sources,
++    );
++    // Runner messages read while a permission prompt or a delegated agent was awaited, in order.
++    let mut deferred = VecDeque::new();
 +    loop {
-+        let event = tokio::select! {
-+            reply = async {
-+                match renewing.as_mut() {
-+                    Some(renewal) => renewal.await,
-+                    None => std::future::pending().await,
++        let event = match deferred.pop_front() {
++            Some(event) => event?,
++            None => tokio::select! {
++                reply = renewals.reply(), if renewals.renewing() => {
++                    renewals.deliver(reply?, bridge).await;
++                    continue;
 +                }
-+            }, if renewing.is_some() => {
-+                renewing = None;
-+                let reply = reply?;
-+                lent_sources.record(&reply);
-+                // A runner that stopped waiting has already queued its terminal message.
-+                if bridge.send(&reply).await.is_err() {
-+                    tracing::debug!("Claude runner closed before its login renewal arrived");
-+                }
-+                continue;
-+            }
-+            event = bridge.receive() => event?,
++                event = bridge.receive() => event?,
++            },
 +        };
++        if renewals.handle(&event, bridge).await? {
++            continue;
++        }
 +        match event["type"].as_str() {
 +            Some("event") => output.handle(session, ctx, &event, &snapshot).await,
 +            // An answer can outlive the runner: one that stopped its CLI (for example on an
 +            // expired login) may exit while the user decides. Its queued terminal message,
 +            // read next, then decides the turn instead of this write's broken pipe.
 +            Some("permission_request") => {
-+                let decision = events::approve(session, ctx, &event).await;
++                let decision = renewals
++                    .serve_while(events::approve(session, ctx, &event), bridge, &mut deferred)
++                    .await?;
 +                if bridge.send(&decision).await.is_err() {
 +                    tracing::debug!("Claude runner closed before its permission decision arrived");
 +                }
@@ -54038,46 +54041,20 @@ index 000000000..dd08d787e
 +                let Some(delegation) = delegation.as_mut() else {
 +                    return Err(failure("native delegation is not enabled for this task"));
 +                };
-+                let response = delegation.dispatch(session, event, cancellation).await?;
++                let response = renewals
++                    .serve_while(
++                        delegation.dispatch(session, event, cancellation),
++                        bridge,
++                        &mut deferred,
++                    )
++                    .await??;
 +                if bridge.send(&response).await.is_err() {
 +                    tracing::debug!("Claude runner closed before its agent response arrived");
 +                }
 +            }
-+            Some("auth_refresh") => {
-+                if renewing.is_some() {
-+                    // Replies are matched to requests by order; never answer one out of turn.
-+                    return Err(failure("runner asked for a second login renewal at once"));
-+                }
-+                let reason = auth_refresh::Reason::of(&event);
-+                if reason.switches()
-+                    && let Some(id) = lent_sources.refuse(&event["rejected_credential_id"])
-+                {
-+                    // Not reported yet (runners report with auth_rejected first): report it once,
-+                    // apart from this read, which only excludes it.
-+                    auth_refresh::report_refusal(resolve(CredentialRead::Report(id)));
-+                }
-+                if renewal.admit(reason, Instant::now()) {
-+                    let renewed = resolve(lent_sources.read());
-+                    renewing = Some(Box::pin(auth_refresh::respond(
-+                        &agent.profile_id,
-+                        renewed,
-+                        cancellation,
-+                    )));
-+                } else if bridge.send(&auth_refresh::unavailable()).await.is_err() {
-+                    tracing::debug!("Claude runner closed before its login renewal arrived");
-+                }
-+            }
-+            // A refused long-lived token: reported to the host at once, never answered.
-+            Some("auth_rejected") => {
-+                if let Some(id) = lent_sources.refuse(&event["credential_id"]) {
-+                    auth_refresh::report_refusal(resolve(CredentialRead::Report(id)));
-+                }
-+            }
 +            Some("done") => {
 +                events::record_usage(session, ctx, &event).await;
-+                if let Some(id) = lent_sources.refuse(&event["error"]["credential_id"]) {
-+                    auth_refresh::report_refusal(resolve(CredentialRead::Report(id)));
-+                }
++                renewals.refuse(&event["error"]["credential_id"]);
 +                if event["status"] != "success" {
 +                    if event["status"] == "error" {
 +                        tracing::warn!(
@@ -54121,16 +54098,18 @@ index 000000000..dd08d787e
 +}
 diff --git a/codex-rs/core/src/tasks/claude_code/auth_refresh.rs b/codex-rs/core/src/tasks/claude_code/auth_refresh.rs
 new file mode 100644
-index 000000000..897d364f3
+index 000000000..75617aa11
 --- /dev/null
 +++ b/codex-rs/core/src/tasks/claude_code/auth_refresh.rs
-@@ -0,0 +1,265 @@
+@@ -0,0 +1,426 @@
 +//! Renews the Claude access token lent for this turn when the runner asks.
 +//!
 +//! The runner asks with `{"type":"auth_refresh","reason":...}` only after the hello
 +//! announced `"auth_refresh":1` (and `"auth_rotate":1` for live rotation), which is sent
 +//! only when this turn lent it a token. Every request gets exactly one `auth_update`, in
-+//! order; the token never reaches logs, events or errors.
++//! order; the token never reaches logs, events or errors. A renewal starts as soon as it is
++//! read, and login messages are read and answered even while a permission prompt or a
++//! delegated agent is awaited (`Renewals::serve_while`).
 +//!
 +//! With `"auth_sources":1` a lent credential also names its source. When Claude refuses a
 +//! saved long-lived token the runner sends `{"type":"auth_rejected","credential_id":...}`
@@ -54138,6 +54117,7 @@ index 000000000..897d364f3
 +//! while its CLI keeps waiting). The refusal is reported to the broker once, in a report-only
 +//! read that lends nothing; every later read of the turn only excludes that credential, so the
 +//! broker lends the PC login instead and never records the refusal again.
++use std::collections::VecDeque;
 +use std::future::Future;
 +use std::time::Duration;
 +use std::time::Instant;
@@ -54149,7 +54129,9 @@ index 000000000..897d364f3
 +use serde_json::Value;
 +use serde_json::json;
 +use tokio_util::sync::CancellationToken;
++use tokio_util::task::AbortOnDropHandle;
 +
++use super::bridge::Bridge;
 +use super::bridge::failure;
 +use crate::thread_manager::CredentialRead;
 +
@@ -54162,6 +54144,13 @@ index 000000000..897d364f3
 +/// per token lifetime, plus retries spaced by the runner and by this interval.
 +const ROTATIONS: u16 = 32;
 +const ROTATION_INTERVAL: Duration = Duration::from_secs(15);
++/// The runner spaces its requests by ROTATION_INTERVAL from sending them, and this host counts
++/// from reading them: a request read a little late must not make the next, correctly spaced
++/// one look early.
++const ROTATION_SLACK: Duration = Duration::from_secs(3);
++/// Runner messages read but not yet handled while a permission prompt or a delegated agent is
++/// awaited. Reading pauses at this many, so the runner's own backpressure applies again.
++const DEFERRED_LIMIT: usize = 64;
 +/// The manager transport answers within 30 seconds; never hold the turn much longer.
 +const RESOLVE_TIMEOUT: Duration = Duration::from_secs(35);
 +
@@ -54248,9 +54237,9 @@ index 000000000..897d364f3
 +            Reason::Expired => take(&mut self.expired, EXPIRY_REQUESTS),
 +            Reason::Switch => take(&mut self.switched, SWITCH_REQUESTS),
 +            Reason::Rotate | Reason::LiveSwitch => {
-+                let early = self
-+                    .last_rotation
-+                    .is_some_and(|last| now.duration_since(last) < ROTATION_INTERVAL);
++                let early = self.last_rotation.is_some_and(|last| {
++                    now.duration_since(last) < ROTATION_INTERVAL.saturating_sub(ROTATION_SLACK)
++                });
 +                if early || self.rotations >= ROTATIONS {
 +                    return false;
 +                }
@@ -54387,15 +54376,164 @@ index 000000000..897d364f3
 +    });
 +}
 +
++/// A renewal running on its own task from the moment it is admitted, so the host read starts
++/// at once; the task is aborted when the turn ends first.
++struct Renewal(AbortOnDropHandle<Result<Value>>);
++
++/// This turn's login traffic with its runner: renewal requests, their replies and refusal
++/// reports. It is served between runner messages and also while a permission prompt or a
++/// delegated agent is awaited (`serve_while`), so a renewal never waits for the user or for a
++/// sub-agent.
++pub(super) struct Renewals<'a, R> {
++    profile_id: &'a str,
++    resolve: R,
++    cancellation: &'a CancellationToken,
++    admission: AuthRefresh,
++    lent: Lent,
++    /// At most one renewal is outstanding: replies are matched to requests by order.
++    renewing: Option<Renewal>,
++}
++
++impl<'a, R, F> Renewals<'a, R>
++where
++    R: Fn(CredentialRead) -> F,
++    F: Future<Output = anyhow::Result<Option<ExecutionPresetAuthTokensReadResponse>>>
++        + Send
++        + 'static,
++{
++    /// `resolve` reads the turn's account again, with the same request as the turn start.
++    pub(super) fn new(
++        profile_id: &'a str,
++        resolve: R,
++        cancellation: &'a CancellationToken,
++        admission: AuthRefresh,
++        lent: Lent,
++    ) -> Self {
++        Self {
++            profile_id,
++            resolve,
++            cancellation,
++            admission,
++            lent,
++            renewing: None,
++        }
++    }
++
++    pub(super) fn renewing(&self) -> bool {
++        self.renewing.is_some()
++    }
++
++    /// Handles a login message and returns `true`; every other message is the caller's.
++    pub(super) async fn handle(&mut self, event: &Value, bridge: &mut Bridge) -> Result<bool> {
++        match event["type"].as_str() {
++            Some("auth_refresh") => {
++                if self.renewing.is_some() {
++                    // Replies are matched to requests by order; never answer one out of turn.
++                    return Err(failure("runner asked for a second login renewal at once"));
++                }
++                let reason = Reason::of(event);
++                if reason.switches() {
++                    // Not reported yet (runners report with auth_rejected first): report it
++                    // once, apart from this read, which only excludes it.
++                    self.refuse(&event["rejected_credential_id"]);
++                }
++                if self.admission.admit(reason, Instant::now()) {
++                    let renewed = (self.resolve)(self.lent.read());
++                    let profile_id = self.profile_id.to_string();
++                    let cancellation = self.cancellation.clone();
++                    self.renewing =
++                        Some(Renewal(AbortOnDropHandle::new(tokio::spawn(async move {
++                            respond(&profile_id, renewed, &cancellation).await
++                        }))));
++                } else if bridge.send(&unavailable()).await.is_err() {
++                    tracing::debug!("Claude runner closed before its login renewal arrived");
++                }
++                Ok(true)
++            }
++            // A refused long-lived token: reported to the host at once, never answered.
++            Some("auth_rejected") => {
++                self.refuse(&event["credential_id"]);
++                Ok(true)
++            }
++            _ => Ok(false),
++        }
++    }
++
++    /// Reports the refused long-lived credential named by `id` once, if this turn lent it.
++    pub(super) fn refuse(&mut self, id: &Value) {
++        if let Some(id) = self.lent.refuse(id) {
++            report_refusal((self.resolve)(CredentialRead::Report(id)));
++        }
++    }
++
++    /// The outstanding renewal's reply; pending while none is outstanding. Cancellation safe.
++    pub(super) async fn reply(&mut self) -> Result<Value> {
++        let Some(renewal) = self.renewing.as_mut() else {
++            return std::future::pending().await;
++        };
++        let reply = (&mut renewal.0).await;
++        self.renewing = None;
++        // Only a renewal task that panicked has no reply of its own.
++        reply.unwrap_or_else(|_| Ok(unavailable()))
++    }
++
++    /// Sends a renewal's reply. A runner that stopped waiting has already queued its terminal
++    /// message, which then decides the turn instead of this write's broken pipe.
++    pub(super) async fn deliver(&mut self, reply: Value, bridge: &mut Bridge) {
++        self.lent.record(&reply);
++        if bridge.send(&reply).await.is_err() {
++            tracing::debug!("Claude runner closed before its login renewal arrived");
++        }
++    }
++
++    /// Awaits `work`, a permission prompt or a delegated agent, while login traffic keeps
++    /// flowing: the outstanding renewal's reply goes out once it is ready, and login messages
++    /// are handled as they arrive. Every other runner message, or a read error, waits in
++    /// `deferred` in order; nothing more is read after a terminal message or an error, or
++    /// while DEFERRED_LIMIT messages wait.
++    pub(super) async fn serve_while<T>(
++        &mut self,
++        work: impl Future<Output = T>,
++        bridge: &mut Bridge,
++        deferred: &mut VecDeque<Result<Value>>,
++    ) -> Result<T> {
++        tokio::pin!(work);
++        loop {
++            let reading = deferred.len() < DEFERRED_LIMIT
++                && deferred.back().is_none_or(|last| {
++                    last.as_ref().is_ok_and(|event| {
++                        !matches!(event["type"].as_str(), Some("done" | "refused"))
++                    })
++                });
++            tokio::select! {
++                biased;
++                output = &mut work => return Ok(output),
++                reply = self.reply(), if self.renewing.is_some() => {
++                    self.deliver(reply?, bridge).await;
++                }
++                event = bridge.receive(), if reading => {
++                    let handled = match &event {
++                        Ok(event) => self.handle(event, bridge).await?,
++                        Err(_) => false,
++                    };
++                    if !handled {
++                        deferred.push_back(event);
++                    }
++                }
++            }
++        }
++    }
++}
++
 +#[cfg(test)]
 +#[path = "auth_refresh_tests.rs"]
 +mod tests;
 diff --git a/codex-rs/core/src/tasks/claude_code/auth_refresh_tests.rs b/codex-rs/core/src/tasks/claude_code/auth_refresh_tests.rs
 new file mode 100644
-index 000000000..5679b5559
+index 000000000..bf996c489
 --- /dev/null
 +++ b/codex-rs/core/src/tasks/claude_code/auth_refresh_tests.rs
-@@ -0,0 +1,248 @@
+@@ -0,0 +1,347 @@
 +use super::*;
 +use crate::thread_manager::CredentialRead;
 +use codex_protocol::error::CodexErrorDetails;
@@ -54623,7 +54761,7 @@ index 000000000..5679b5559
 +    let mut refresh = AuthRefresh::borrowed();
 +    let start = Instant::now();
 +    assert!(refresh.admit(Reason::Rotate, start));
-+    assert!(!refresh.admit(Reason::Rotate, start + Duration::from_secs(14)));
++    assert!(!refresh.admit(Reason::Rotate, start + Duration::from_secs(11)));
 +    let mut admitted: u16 = 1;
 +    for step in 1..=40u32 {
 +        if refresh.admit(Reason::Rotate, start + ROTATION_INTERVAL * step) {
@@ -54633,6 +54771,105 @@ index 000000000..5679b5559
 +    assert_eq!(admitted, ROTATIONS);
 +    assert!(refresh.admit(Reason::Expired, start));
 +    assert!(refresh.admit(Reason::Expired, start));
++}
++
++#[test]
++fn a_rotation_read_late_never_makes_the_next_correctly_spaced_one_early() {
++    let mut refresh = AuthRefresh::borrowed();
++    let sent = Instant::now();
++    let admitted = [
++        // Sent at `sent`, read two seconds late.
++        sent + Duration::from_secs(2),
++        // Sent ROTATION_INTERVAL after the first and read at once.
++        sent + ROTATION_INTERVAL,
++        // Closer than the interval less the slack: still early.
++        sent + ROTATION_INTERVAL + Duration::from_secs(11),
++    ]
++    .into_iter()
++    .map(|read| refresh.admit(Reason::Rotate, read))
++    .collect::<Vec<_>>();
++    assert_eq!(admitted, vec![true, true, false]);
++}
++
++/// Asks for a rotation, streams on and waits for the reply, which it hands back through
++/// `reply.json` while the test's permission prompt is still pending.
++const RENEWING_RUNNER: &str = r#"
++import json, os, sys
++marker = sys.argv[1]
++def emit(value): print(json.dumps(value), flush=True)
++emit({'type':'auth_refresh','reason':'rotate'})
++emit({'type':'event','kind':'text_delta','text':'Streaming'})
++reply = sys.stdin.readline()
++with open(marker + '.part', 'w', encoding='utf-8') as out: out.write(reply)
++os.replace(marker + '.part', marker)
++emit({'type':'event','kind':'text','text':'After the renewal'})
++sys.stdin.readline()
++"#;
++
++#[tokio::test]
++async fn a_renewal_reaches_the_runner_while_a_permission_prompt_is_awaited() {
++    let directory = tempfile::tempdir().expect("directory");
++    let marker = directory.path().join("reply.json");
++    let agent: codex_model_provider_info::AgentProviderInfo = serde_json::from_value(json!({
++        "kind":"claude_code", "command":if cfg!(windows) {"python"} else {"python3"},
++        "args":["-u","-c",RENEWING_RUNNER,marker], "profile_id":"fake-profile"
++    }))
++    .expect("agent fixture");
++    let mut bridge = Bridge::start(&agent, directory.path(), /*credentials*/ None)
++        .await
++        .expect("start");
++    let reads = std::sync::Mutex::new(Vec::new());
++    let resolve = |read: CredentialRead| {
++        reads.lock().expect("reads").push(read);
++        async { renewed("claude") }
++    };
++    let cancellation = CancellationToken::new();
++    let mut renewals = Renewals::new(
++        PROFILE,
++        resolve,
++        &cancellation,
++        AuthRefresh::borrowed(),
++        Lent::default(),
++    );
++    // Stands in for a permission prompt: it ends only once the runner holds the reply.
++    let prompt = async {
++        loop {
++            if let Ok(reply) = std::fs::read_to_string(&marker) {
++                return reply;
++            }
++            tokio::time::sleep(Duration::from_millis(10)).await;
++        }
++    };
++    let mut deferred = VecDeque::new();
++    let reply = tokio::time::timeout(
++        Duration::from_secs(30),
++        renewals.serve_while(prompt, &mut bridge, &mut deferred),
++    )
++    .await
++    .expect("the renewal waited for the prompt")
++    .expect("served");
++    assert_eq!(
++        serde_json::from_str::<Value>(&reply).expect("reply"),
++        json!({"type":"auth_update","available":true,"credentials":{
++            "profileId":PROFILE,"accessToken":"dummy-token-2","expiresAt":2_000_000_000,
++            "accountIdentity":"fixture-identity"}})
++    );
++    assert_eq!(*reads.lock().expect("reads"), vec![CredentialRead::Lend]);
++    // Other messages read meanwhile wait for the caller, in order.
++    let mut rest = deferred
++        .into_iter()
++        .map(|message| message.expect("message"))
++        .collect::<Vec<_>>();
++    while rest.len() < 2 {
++        rest.push(bridge.receive().await.expect("receive"));
++    }
++    assert_eq!(
++        rest,
++        vec![
++            json!({"type":"event","kind":"text_delta","text":"Streaming"}),
++            json!({"type":"event","kind":"text","text":"After the renewal"}),
++        ]
++    );
 +}
 +
 +#[tokio::test]
@@ -65097,16 +65334,21 @@ index ace2f50a7..e65800ce9 100644
          "followup-call",
 diff --git a/codex-rs/core/tests/suite/claude_code.rs b/codex-rs/core/tests/suite/claude_code.rs
 new file mode 100644
-index 000000000..1a3d4e246
+index 000000000..f2d33624c
 --- /dev/null
 +++ b/codex-rs/core/tests/suite/claude_code.rs
-@@ -0,0 +1,248 @@
+@@ -0,0 +1,349 @@
 +//! Native task regression: no paid model or real Claude process is invoked.
 +use codex_core::TurnInputRequest;
++use codex_core::config::Config;
++use codex_core::config::Constrained;
 +use codex_model_provider_info::ModelProviderInfo;
 +use codex_protocol::config_types::TrustLevel;
 +use codex_protocol::models::PermissionProfile;
++use codex_protocol::protocol::AskForApproval;
 +use codex_protocol::protocol::EventMsg;
++use codex_protocol::protocol::Op;
++use codex_protocol::protocol::ReviewDecision;
 +use codex_protocol::user_input::UserInput;
 +use core_test_support::responses;
 +use core_test_support::test_codex::TestCodex;
@@ -65150,6 +65392,16 @@ index 000000000..1a3d4e246
 +    fixture: &std::path::Path,
 +    runner: &str,
 +) -> anyhow::Result<TestCodex> {
++    claude_task_with(server, fixture, runner, |_| {}).await
++}
++
++/// The same, with a further change to the test's configuration.
++async fn claude_task_with(
++    server: &wiremock::MockServer,
++    fixture: &std::path::Path,
++    runner: &str,
++    configure: impl FnOnce(&mut Config) + Send + 'static,
++) -> anyhow::Result<TestCodex> {
 +    let script = fixture.join("runner.py");
 +    std::fs::write(&script, runner)?;
 +    let provider: ModelProviderInfo = serde_json::from_value(serde_json::json!({
@@ -65170,6 +65422,7 @@ index 000000000..1a3d4e246
 +                .permissions
 +                .set_permission_profile(PermissionProfile::Disabled)
 +                .expect("permission profile");
++            configure(config);
 +        })
 +        .build_with_auto_env(server)
 +        .await
@@ -65346,6 +65599,91 @@ index 000000000..1a3d4e246
 +    assert!(
 +        matches!(&stopped, EventMsg::Error(error) if error.message.contains("Claude agent: login expired")),
 +        "unexpected stop: {stopped:?}"
++    );
++    Ok(())
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn claude_login_renewal_is_answered_while_a_permission_prompt_waits() -> anyhow::Result<()> {
++    let server = responses::start_mock_server().await;
++    let fixture = tempfile::tempdir()?;
++    // The runner asks for permission, then for a login renewal while the user has not decided
++    // yet. The renewal is answered at once (nothing was lent here, so it is unavailable); the
++    // permission decision follows when the user answers.
++    let runner = RUNNER.replace(
++        "assert run['type'] == 'run'\n",
++        r#"assert run['type'] == 'run'
++emit({'type':'permission_request','id':'bash-1','tool':'Bash','input':{'command':'true'},'summary':'Run true'})
++emit({'type':'auth_refresh','reason':'rotate'})
++for key in ('first', 'second'):
++    reply = read()
++    with log.open('a', encoding='utf-8') as out: out.write(json.dumps({key: reply}) + '\n')
++"#,
++    );
++    let test = claude_task_with(&server, fixture.path(), &runner, |config| {
++        config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
++    })
++    .await?;
++    test.codex
++        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
++            text: "Request".into(),
++            text_elements: Vec::new(),
++        }]))
++        .await
++        .expect("turn starts");
++    let approval = match wait_for_event(&test.codex, |event| {
++        matches!(
++            event,
++            EventMsg::ExecApprovalRequest(_) | EventMsg::TurnComplete(_) | EventMsg::Error(_)
++        )
++    })
++    .await
++    {
++        EventMsg::ExecApprovalRequest(approval) => approval,
++        event => panic!("expected the permission prompt: {event:?}"),
++    };
++    // A partly written line is skipped; the next poll reads it whole.
++    let replies = || -> Vec<Value> {
++        std::fs::read_to_string(fixture.path().join("requests.jsonl"))
++            .unwrap_or_default()
++            .lines()
++            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
++            .filter(|record| record.get("first").is_some() || record.get("second").is_some())
++            .collect()
++    };
++    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
++    while replies().is_empty() {
++        assert!(
++            tokio::time::Instant::now() < deadline,
++            "the login renewal waited for the permission prompt"
++        );
++        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
++    }
++    test.codex
++        .submit(Op::ExecApproval {
++            id: approval.effective_approval_id(),
++            turn_id: None,
++            decision: ReviewDecision::Approved,
++        })
++        .await?;
++    match wait_for_event(&test.codex, |event| {
++        matches!(event, EventMsg::TurnComplete(_) | EventMsg::Error(_))
++    })
++    .await
++    {
++        EventMsg::TurnComplete(event) => assert_eq!(
++            event.last_agent_message.as_deref(),
++            Some("Native Claude answer")
++        ),
++        event => panic!("unexpected agent task failure: {event:?}"),
++    }
++    assert_eq!(
++        replies(),
++        vec![
++            serde_json::json!({"first":{"type":"auth_update","available":false}}),
++            serde_json::json!({"second":{"type":"permission_decision","id":"bash-1","behavior":"allow",
++                "remember":"once","message":"Approved"}}),
++        ]
 +    );
 +    Ok(())
 +}

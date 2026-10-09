@@ -1590,6 +1590,12 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
     )
     .unwrap();
     let service = service(root.path().into());
+    // Start the fake backend first, so its cold start (slow under parallel tests that start
+    // their own Python) stays outside the timed window below.
+    let warm = service
+        .dispatch(request("profile.show", json!({"profile_id":"warm"})))
+        .await;
+    assert_eq!(warm["ok"], true, "{warm}");
     let slow = tokio::spawn({
         let service = service.clone();
         async move {

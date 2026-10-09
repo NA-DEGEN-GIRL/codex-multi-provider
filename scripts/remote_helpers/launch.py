@@ -449,10 +449,16 @@ def run(profile, revision, argv, *, managed_socket=None):
         if managed_socket is not None:
             from native_controller import process_record
             if lends_saved_tokens(definition):
-                # A saved long-lived Claude token passes through this runtime's memory. A hard core
-                # limit of 0, inherited by everything it starts, keeps it out of a core dump that
-                # a same-user process could otherwise force (prlimit, then a signal). The runtime
-                # stays dumpable: maintenance identifies it through /proc/<pid>/exe.
+                # This runtime relays the Claude credentials lent to its turns: the PC login's
+                # borrowed token, and the account's saved long-lived token as soon as one is saved,
+                # without a new prepare. So the gate is any Claude account (main or preset role) in
+                # the prepared authority, not a saved token. A hard core limit of 0, inherited by
+                # everything the runtime starts, keeps those tokens out of a core dump that a
+                # same-user process could otherwise force (prlimit, then a signal). The cost is
+                # deliberate and documented (docs/operations/ssh-host-onboarding.md): agent commands
+                # of such a profile, GPT turns included, cannot raise `ulimit -c`, and a crashing
+                # program leaves no core file. The runtime stays dumpable: maintenance identifies it
+                # through /proc/<pid>/exe.
                 import resource
                 resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
             # The detached listener publishes its own ownership while it holds the

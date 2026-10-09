@@ -248,8 +248,8 @@ class ExecutionPresetAuthProxy:
             lend = self._long_lived_reader
         try:
             value = lend(root, profile_id, identity, excluded)
-        except (OSError, ValueError, KeyError, TypeError, RuntimeError):
-            value = None  # The PC login still serves the turn.
+        except Exception:
+            value = None  # Whatever failed, the PC login still serves the turn.
         if value is not None and value.get('credentialId') != excluded:
             with self._reads_lock:
                 self._lent.add(value['credentialId'])
@@ -338,7 +338,9 @@ class ExecutionPresetAuthProxy:
                 result.runtime.append({'id': request_id, 'result': value})
             except LongLivedUnavailable as error:
                 result.runtime.extend(self._rejected({'id': request_id}, error.reason).runtime)
-            except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+            except Exception:
+                # A plain refusal for anything else: an unexpected error must never escape into
+                # the connection's poll loop, which would stop answering every later read.
                 result.runtime.extend(self._rejected({'id': request_id}).runtime)
         return result
 
