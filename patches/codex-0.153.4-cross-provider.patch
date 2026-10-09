@@ -53105,12 +53105,13 @@ index a75dbe2af..27eb8f8c6 100644
              output.needs_follow_up = true;
 diff --git a/codex-rs/core/src/tasks/claude_code.rs b/codex-rs/core/src/tasks/claude_code.rs
 new file mode 100644
-index 000000000..a97dab2f4
+index 000000000..65f114c52
 --- /dev/null
 +++ b/codex-rs/core/src/tasks/claude_code.rs
-@@ -0,0 +1,447 @@
+@@ -0,0 +1,473 @@
 +//! Runs the official installed Claude Code CLI through the manager's authenticated runner.
 +//! All shared history and events still go through the native session recorder.
++mod auth_refresh;
 +mod bridge;
 +mod context;
 +mod delegation;
@@ -53145,6 +53146,7 @@ index 000000000..a97dab2f4
 +use crate::session::turn::run_hooks_and_record_inputs;
 +use crate::session::turn_context::TurnContext;
 +use crate::state::TaskKind;
++use auth_refresh::AuthRefresh;
 +use bridge::Bridge;
 +use bridge::failure;
 +
@@ -53425,19 +53427,17 @@ index 000000000..a97dab2f4
 +        .await
 +        .map_err(|_| failure("the selected Claude account is unavailable"))?;
 +    let credential_environment = credentials
++        .as_ref()
 +        .map(|credentials| {
-+            if credentials.kind != "claude" {
-+                return Err(failure("the selected credential is not a Claude account"));
-+            }
-+            serde_json::to_string(&json!({
-+                "profileId": agent.profile_id,
-+                "accessToken": credentials.access_token,
-+                "expiresAt": credentials.expires_at,
-+                "accountIdentity": credentials.account_identity,
-+            }))
-+            .map_err(|_| failure("the selected Claude account is unavailable"))
++            serde_json::to_string(&auth_refresh::credentials(&agent.profile_id, credentials)?)
++                .map_err(|_| failure("the selected Claude account is unavailable"))
 +        })
 +        .transpose()?;
++    let mut renewal = if credentials.is_some() {
++        AuthRefresh::borrowed()
++    } else {
++        AuthRefresh::unavailable()
++    };
 +    *bridge_slot = Some(Bridge::spawn(
 +        agent,
 +        cwd.as_path(),
@@ -53446,12 +53446,17 @@ index 000000000..a97dab2f4
 +    let Some(bridge) = bridge_slot.as_mut() else {
 +        return Err(failure("runner was not initialized"));
 +    };
-+    bridge.send(&json!({"type":"hello","protocol":1,"thread_id":session.thread_id().to_string(),
++    let mut hello = json!({"type":"hello","protocol":1,"thread_id":session.thread_id().to_string(),
 +        "claude_profile_id":agent.profile_id,"cwd":cwd,"trusted_cwd":true,"turn_id":ctx.sub_id,
 +        "snapshot":snapshot,"model":model,"effort":effort,"context_window":agent.context_window,
 +        "auto_compact_percent":agent.auto_compact_percent,"exclude_dynamic_sections":agent.exclude_dynamic_sections,
 +        "system_prompt":system_prompt,"delegation_tools":delegation_tools,
-+        "managed_delegation":ctx.config.execution_preset_selection().is_some()})).await?;
++        "managed_delegation":ctx.config.execution_preset_selection().is_some()});
++    if renewal.announced() {
++        // Older runners ignore unknown hello fields and never ask for a renewal.
++        hello["auth_refresh"] = json!(1);
++    }
++    bridge.send(&hello).await?;
 +    let ready = tokio::time::timeout(Duration::from_secs(60), bridge.receive())
 +        .await
 +        .map_err(|_| failure("runner handshake timed out"))??;
@@ -53519,9 +53524,30 @@ index 000000000..a97dab2f4
 +                let response = delegation.dispatch(session, event, cancellation).await?;
 +                bridge.send(&response).await?;
 +            }
++            Some("auth_refresh") => {
++                // The same account request as the turn start: main profile or this role.
++                let role = ctx.session_source.get_agent_role();
++                let renewed = session
++                    .services
++                    .agent_control
++                    .resolve_execution_preset_credentials(&ctx.config, role.as_deref());
++                let reply = renewal
++                    .respond(&agent.profile_id, renewed, cancellation)
++                    .await?;
++                // A runner that stopped waiting has already queued its terminal message.
++                if bridge.send(&reply).await.is_err() {
++                    tracing::debug!("Claude runner closed before its login renewal arrived");
++                }
++            }
 +            Some("done") => {
 +                events::record_usage(session, ctx, &event).await;
 +                if event["status"] != "success" {
++                    if event["status"] == "error" {
++                        tracing::warn!(
++                            code = event["error"]["code"].as_str().unwrap_or("unknown"),
++                            "Claude runner did not complete the turn"
++                        );
++                    }
 +                    return Err(failure(
 +                        event["error"]["message"]
 +                            .as_str()
@@ -53555,6 +53581,221 @@ index 000000000..a97dab2f4
 +            _ => return Err(failure("runner sent an unexpected protocol message")),
 +        }
 +    }
++}
+diff --git a/codex-rs/core/src/tasks/claude_code/auth_refresh.rs b/codex-rs/core/src/tasks/claude_code/auth_refresh.rs
+new file mode 100644
+index 000000000..c7e884f38
+--- /dev/null
++++ b/codex-rs/core/src/tasks/claude_code/auth_refresh.rs
+@@ -0,0 +1,96 @@
++//! Renews a borrowed Claude access token when the runner reports that it expired mid-turn.
++//!
++//! The runner asks with `{"type":"auth_refresh"}` only after the hello announced
++//! `"auth_refresh":1`, which is sent only when this turn lent it a token. The reply
++//! is always an `auth_update`; the token never reaches logs, events or errors.
++use std::future::Future;
++use std::time::Duration;
++
++use codex_app_server_protocol::ExecutionPresetAuthTokensReadResponse;
++use codex_protocol::error::CodexErr;
++use codex_protocol::error::Result;
++use serde_json::Value;
++use serde_json::json;
++use tokio_util::sync::CancellationToken;
++
++use super::bridge::failure;
++
++/// One expiry per runner, plus one retry while the host is still renewing the login.
++const MAX_REFRESHES: u8 = 2;
++/// The manager transport answers within 30 seconds; never hold the turn much longer.
++const RESOLVE_TIMEOUT: Duration = Duration::from_secs(35);
++
++pub(super) struct AuthRefresh {
++    borrowed: bool,
++    requests: u8,
++}
++
++impl AuthRefresh {
++    pub(super) fn borrowed() -> Self {
++        Self {
++            borrowed: true,
++            requests: 0,
++        }
++    }
++
++    pub(super) fn unavailable() -> Self {
++        Self {
++            borrowed: false,
++            requests: 0,
++        }
++    }
++
++    /// Only a token this turn lent can be renewed; older runners ignore the hello flag.
++    pub(super) fn announced(&self) -> bool {
++        self.borrowed
++    }
++
++    /// Resolves the turn's account again with the same request as the turn start.
++    pub(super) async fn respond(
++        &mut self,
++        profile_id: &str,
++        resolve: impl Future<Output = anyhow::Result<Option<ExecutionPresetAuthTokensReadResponse>>>,
++        cancellation: &CancellationToken,
++    ) -> Result<Value> {
++        let unavailable = json!({"type":"auth_update","available":false});
++        if !self.borrowed || self.requests >= MAX_REFRESHES {
++            return Ok(unavailable);
++        }
++        self.requests += 1;
++        let resolved = tokio::select! {
++            biased;
++            _ = cancellation.cancelled() => return Err(CodexErr::TurnAborted),
++            resolved = tokio::time::timeout(RESOLVE_TIMEOUT, resolve) => resolved,
++        };
++        // A refused, changed or late account is reported by the runner's own error.
++        let Ok(Ok(Some(response))) = resolved else {
++            return Ok(unavailable);
++        };
++        Ok(match credentials(profile_id, &response) {
++            Ok(credentials) => {
++                json!({"type":"auth_update","available":true,"credentials":credentials})
++            }
++            Err(_) => unavailable,
++        })
++    }
++}
++
++/// The access-only credential the runner validates; the refresh token never leaves the host.
++pub(super) fn credentials(
++    profile_id: &str,
++    response: &ExecutionPresetAuthTokensReadResponse,
++) -> Result<Value> {
++    if response.kind != "claude" {
++        return Err(failure("the selected credential is not a Claude account"));
++    }
++    Ok(json!({
++        "profileId": profile_id,
++        "accessToken": response.access_token,
++        "expiresAt": response.expires_at,
++        "accountIdentity": response.account_identity,
++    }))
++}
++
++#[cfg(test)]
++#[path = "auth_refresh_tests.rs"]
++mod tests;
+diff --git a/codex-rs/core/src/tasks/claude_code/auth_refresh_tests.rs b/codex-rs/core/src/tasks/claude_code/auth_refresh_tests.rs
+new file mode 100644
+index 000000000..1d5addf1a
+--- /dev/null
++++ b/codex-rs/core/src/tasks/claude_code/auth_refresh_tests.rs
+@@ -0,0 +1,107 @@
++use super::*;
++use codex_protocol::error::CodexErrorDetails;
++use pretty_assertions::assert_eq;
++
++const PROFILE: &str = "11111111-1111-4111-8111-111111111111";
++
++fn renewed(kind: &str) -> anyhow::Result<Option<ExecutionPresetAuthTokensReadResponse>> {
++    Ok(Some(ExecutionPresetAuthTokensReadResponse {
++        kind: kind.to_string(),
++        access_token: "dummy-token-2".to_string(),
++        chatgpt_account_id: None,
++        expires_at: Some(2_000_000_000),
++        account_identity: Some("fixture-identity".to_string()),
++    }))
++}
++
++fn unavailable() -> Value {
++    json!({"type":"auth_update","available":false})
++}
++
++#[tokio::test]
++async fn borrowed_token_is_renewed_with_the_runner_credential_shape() {
++    let mut refresh = AuthRefresh::borrowed();
++    assert!(refresh.announced());
++    let reply = refresh
++        .respond(
++            PROFILE,
++            async { renewed("claude") },
++            &CancellationToken::new(),
++        )
++        .await
++        .expect("reply");
++    assert_eq!(
++        reply,
++        json!({"type":"auth_update","available":true,"credentials":{
++            "profileId":PROFILE,"accessToken":"dummy-token-2","expiresAt":2_000_000_000,
++            "accountIdentity":"fixture-identity"}})
++    );
++}
++
++#[tokio::test]
++async fn refused_missing_or_foreign_credentials_are_unavailable() {
++    let mut refresh = AuthRefresh::borrowed();
++    let cancellation = CancellationToken::new();
++    let refused = refresh
++        .respond(
++            PROFILE,
++            async { Err(anyhow::anyhow!("account changed")) },
++            &cancellation,
++        )
++        .await
++        .expect("reply");
++    let foreign = refresh
++        .respond(PROFILE, async { renewed("openai") }, &cancellation)
++        .await
++        .expect("reply");
++    assert_eq!((refused, foreign), (unavailable(), unavailable()));
++}
++
++#[tokio::test]
++async fn a_turn_without_a_borrowed_token_never_resolves() {
++    let mut refresh = AuthRefresh::unavailable();
++    assert!(!refresh.announced());
++    let reply = refresh
++        .respond(
++            PROFILE,
++            async { panic!("no borrowed token can be renewed") },
++            &CancellationToken::new(),
++        )
++        .await
++        .expect("reply");
++    assert_eq!(reply, unavailable());
++}
++
++#[tokio::test]
++async fn at_most_two_renewals_are_resolved_per_runner() {
++    let mut refresh = AuthRefresh::borrowed();
++    let cancellation = CancellationToken::new();
++    for _ in 0..2 {
++        let reply = refresh
++            .respond(PROFILE, async { Ok(None) }, &cancellation)
++            .await
++            .expect("reply");
++        assert_eq!(reply, unavailable());
++    }
++    let reply = refresh
++        .respond(
++            PROFILE,
++            async { panic!("the renewal cap was exceeded") },
++            &cancellation,
++        )
++        .await
++        .expect("reply");
++    assert_eq!(reply, unavailable());
++}
++
++#[tokio::test]
++async fn cancellation_stops_a_pending_renewal() {
++    let mut refresh = AuthRefresh::borrowed();
++    let cancellation = CancellationToken::new();
++    cancellation.cancel();
++    let error = refresh
++        .respond(PROFILE, std::future::pending(), &cancellation)
++        .await
++        .expect_err("cancelled");
++    assert!(matches!(error.details(), CodexErrorDetails::TurnAborted));
 +}
 diff --git a/codex-rs/core/src/tasks/claude_code/bridge.rs b/codex-rs/core/src/tasks/claude_code/bridge.rs
 new file mode 100644
@@ -63435,10 +63676,10 @@ index ace2f50a7..e65800ce9 100644
          "followup-call",
 diff --git a/codex-rs/core/tests/suite/claude_code.rs b/codex-rs/core/tests/suite/claude_code.rs
 new file mode 100644
-index 000000000..29461af89
+index 000000000..ff0608458
 --- /dev/null
 +++ b/codex-rs/core/tests/suite/claude_code.rs
-@@ -0,0 +1,110 @@
+@@ -0,0 +1,152 @@
 +//! Native task regression: no paid model or real Claude process is invoked.
 +use codex_core::TurnInputRequest;
 +use codex_model_provider_info::ModelProviderInfo;
@@ -63447,6 +63688,7 @@ index 000000000..29461af89
 +use codex_protocol::protocol::EventMsg;
 +use codex_protocol::user_input::UserInput;
 +use core_test_support::responses;
++use core_test_support::test_codex::TestCodex;
 +use core_test_support::test_codex::test_codex;
 +use core_test_support::wait_for_event;
 +use pretty_assertions::assert_eq;
@@ -63481,20 +63723,20 @@ index 000000000..29461af89
 +# with the native bridge, which waits for the committed runner to exit.
 +"#;
 +
-+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-+async fn claude_native_task_commits_and_resumes_without_replaying_covered_turns()
-+-> anyhow::Result<()> {
-+    let server = responses::start_mock_server().await;
-+    let fixture = tempfile::tempdir()?;
-+    let script = fixture.path().join("runner.py");
-+    let state = fixture.path().join("state.json");
-+    let log = fixture.path().join("requests.jsonl");
-+    std::fs::write(&script, RUNNER)?;
++/// Starts a native Claude task whose runner is the given fake script.
++async fn claude_task(
++    server: &wiremock::MockServer,
++    fixture: &std::path::Path,
++    runner: &str,
++) -> anyhow::Result<TestCodex> {
++    let script = fixture.join("runner.py");
++    std::fs::write(&script, runner)?;
 +    let provider: ModelProviderInfo = serde_json::from_value(serde_json::json!({
 +        "name":"Claude", "agent":{"kind":"claude_code", "command":if cfg!(windows) {"python"} else {"python3"},
-+            "args":["-u",script,state,log], "profile_id":"fake-profile"}
++            "args":["-u",script,fixture.join("state.json"),fixture.join("requests.jsonl")],
++            "profile_id":"fake-profile"}
 +    }))?;
-+    let test = test_codex()
++    test_codex()
 +        .with_config(move |config| {
 +            config.sqlite = codex_state::SqliteConfig::from_sqlite_home(config.codex_home.clone());
 +            config.model_provider_id = "claude_code".into();
@@ -63506,33 +63748,50 @@ index 000000000..29461af89
 +            config
 +                .permissions
 +                .set_permission_profile(PermissionProfile::Disabled)
-+                .unwrap();
++                .expect("permission profile");
 +        })
-+        .build_with_auto_env(&server)
-+        .await?;
-+    for prompt in ["First request", "Next request"] {
-+        test.codex
-+            .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
-+                text: prompt.into(),
-+                text_elements: Vec::new(),
-+            }]))
-+            .await?;
-+        let terminal = wait_for_event(&test.codex, |event| {
-+            matches!(event, EventMsg::TurnComplete(_) | EventMsg::Error(_))
-+        })
-+        .await;
-+        match terminal {
-+            EventMsg::TurnComplete(event) => assert_eq!(
-+                event.last_agent_message.as_deref(),
-+                Some("Native Claude answer")
-+            ),
-+            event => panic!("unexpected agent task failure: {event:?}"),
-+        }
++        .build_with_auto_env(server)
++        .await
++}
++
++async fn complete_turn(test: &TestCodex, prompt: &str) {
++    test.codex
++        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
++            text: prompt.into(),
++            text_elements: Vec::new(),
++        }]))
++        .await
++        .expect("turn starts");
++    let terminal = wait_for_event(&test.codex, |event| {
++        matches!(event, EventMsg::TurnComplete(_) | EventMsg::Error(_))
++    })
++    .await;
++    match terminal {
++        EventMsg::TurnComplete(event) => assert_eq!(
++            event.last_agent_message.as_deref(),
++            Some("Native Claude answer")
++        ),
++        event => panic!("unexpected agent task failure: {event:?}"),
 +    }
-+    let runs: Vec<Value> = std::fs::read_to_string(&log)?
++}
++
++fn logged(fixture: &std::path::Path) -> anyhow::Result<Vec<Value>> {
++    Ok(std::fs::read_to_string(fixture.join("requests.jsonl"))?
 +        .lines()
 +        .map(serde_json::from_str)
-+        .collect::<Result<_, _>>()?;
++        .collect::<Result<_, _>>()?)
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn claude_native_task_commits_and_resumes_without_replaying_covered_turns()
++-> anyhow::Result<()> {
++    let server = responses::start_mock_server().await;
++    let fixture = tempfile::tempdir()?;
++    let test = claude_task(&server, fixture.path(), RUNNER).await?;
++    for prompt in ["First request", "Next request"] {
++        complete_turn(&test, prompt).await;
++    }
++    let runs = logged(fixture.path())?;
 +    assert_eq!(
 +        runs.iter()
 +            .map(|run| run["mode"].as_str().unwrap())
@@ -63546,6 +63805,30 @@ index 000000000..29461af89
 +    assert!(
 +        server.received_requests().await.unwrap().is_empty(),
 +        "agent turns must never use the model HTTP endpoint"
++    );
++    Ok(())
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn claude_renewal_request_without_a_borrowed_token_is_unavailable() -> anyhow::Result<()> {
++    let server = responses::start_mock_server().await;
++    let fixture = tempfile::tempdir()?;
++    // The runner asks for a renewed login mid-turn, then completes normally.
++    let runner = RUNNER.replace(
++        "assert run['type'] == 'run'\n",
++        r#"assert run['type'] == 'run'
++emit({'type':'auth_refresh'})
++reply = read()
++with log.open('a', encoding='utf-8') as out:
++    out.write(json.dumps({'announced':'auth_refresh' in hello,'reply':reply}) + '\n')
++"#,
++    );
++    let test = claude_task(&server, fixture.path(), &runner).await?;
++    complete_turn(&test, "Request").await;
++    let records = logged(fixture.path())?;
++    assert_eq!(
++        records[1],
++        serde_json::json!({"announced":false,"reply":{"type":"auth_update","available":false}})
 +    );
 +    Ok(())
 +}

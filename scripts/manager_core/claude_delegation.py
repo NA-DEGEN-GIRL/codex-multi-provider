@@ -104,6 +104,12 @@ class DelegationBridge:
                 slot['response'] = payload
                 slot['event'].set()
 
+    def release(self):
+        """Answer a stopped CLI process's waiting calls as unavailable; the bridge stays open."""
+        with self.guard:
+            for slot in self.pending.values():
+                slot['event'].set()
+
     def close(self):
         self.stopped.set()
         self.listener.close()

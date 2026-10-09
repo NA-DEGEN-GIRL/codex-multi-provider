@@ -11,7 +11,7 @@ import sys
 import time
 from uuid import UUID
 
-from manager_core.claude_auth import ClaudeError, cli_version, scrub_environment
+from manager_core.claude_auth import ClaudeError, borrowed_credential, cli_version, scrub_environment
 from manager_core.claude_protocol import encode_message
 from manager_core.claude_runner import serve
 from manager_core.claude_skills import prepare_shared_skills
@@ -70,12 +70,7 @@ class RemoteExecution:
         identity = binding.get('expected_account_identity')
         if not isinstance(identity, str) or not re.fullmatch(r'[0-9a-f]{64}', identity):
             raise ValueError('Claude account identity')
-        if (not isinstance(auth, dict) or set(auth) != {'profileId', 'accessToken', 'expiresAt', 'accountIdentity'}
-                or auth['profileId'] != target or auth['accountIdentity'] != identity
-                or type(auth['expiresAt']) is not int or auth['expiresAt'] < int(time.time()) + 30
-                or not isinstance(auth['accessToken'], str) or not 1 <= len(auth['accessToken']) <= 65536
-                or any(ord(char) <= 32 or ord(char) >= 127 for char in auth['accessToken'])):
-            raise ValueError('Claude access credential unavailable')
+        borrowed_credential(auth, target, identity, int(time.time()) + 30)
         self.profile, self.binding, self.auth = profile, binding, auth
         self.root = _private(profile.parent.parent / 'claude')
         self.ledger_directory = _private(self.root / 'state' / owner)
@@ -94,10 +89,13 @@ class RemoteExecution:
         environment['CLAUDE_CODE_OAUTH_TOKEN'] = self.auth['accessToken']
         plugin = prepare_shared_skills(self.root, self.binding['target_profile_id'], cwd,
             config_home=self.profile / 'codex', output_root=self.ledger_directory / 'skill-plugins')
+        # The runner learns who lent the token and when it expires, never the token.
+        borrowed = {key: self.auth[key] for key in ('profileId', 'accountIdentity', 'expiresAt')}
         return dict(settings=self.binding['settings'], configuration_directory=self.configuration_directory,
                     environment=environment, cli=[str(path)], plugins=[plugin] if plugin else [],
                     status=dict(logged_in=True, method='oauth_token', cli_version=version,
-                                account_identity=self.binding['expected_account_identity']))
+                                account_identity=self.binding['expected_account_identity']),
+                    borrowed_auth=borrowed)
 
 
 def main(argv=None):

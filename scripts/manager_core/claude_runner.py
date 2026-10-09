@@ -25,7 +25,7 @@ from multiprocessing.connection import Listener
 if __package__ in (None, ''):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from manager_core.claude_auth import (ClaudeError, auth_status, config_dir,
+from manager_core.claude_auth import (ClaudeError, auth_status, borrowed_credential, config_dir,
                                       discover_cli, scrub_environment)
 from manager_core.claude_protocol import (MAX_LINE_BYTES, ProtocolError, bounded_text, compact_summary_fits,
                                           encode_message, normalize, read_message, usage_fields)
@@ -470,6 +470,12 @@ class PermissionBridge:
                 slot['decision'] = decision
                 slot['event'].set()
 
+    def release(self):
+        """Deny a stopped CLI process's waiting requests; the bridge stays open."""
+        with self.guard:
+            for slot in self.pending.values():
+                slot['event'].set()
+
     def close(self):
         self.stopped.set()
         self.listener.close()
@@ -596,6 +602,121 @@ def checkpoint_command(command):
                      '--mcp-config', '{"mcpServers":{}}', '--max-turns', '1']
 
 
+AUTH_FAILURES = {
+    'claude_auth_expired': ('The borrowed Claude access token expired during this turn. '
+                            'Renew the Windows login for this Claude profile, then send the message again.'),
+    'claude_auth_rejected': ('Claude rejected the borrowed access token before it expired. '
+                             'Sign in to this Claude profile again on Windows, then send the message again.'),
+    'claude_login_required': ("Claude rejected this profile's login. "
+                              'Sign in through Claude CLI for this profile again, then send the message again.'),
+}
+# A borrowed token rejected this close to its expiry has expired, allowing for clock skew.
+AUTH_EXPIRY_MARGIN = 60
+# A renewal must outlive the rejected token and leave room for a long turn.
+AUTH_RENEWAL_MINIMUM = 300
+AUTH_REFRESH_SECONDS = 75
+# Windows renews one login at most every 30 seconds, and the turns of one
+# account usually expire together; a second request waits for that renewal.
+AUTH_REFRESH_RETRY_SECONDS = 20
+AUTH_CONTINUATION = (
+    'The previous attempt of this request stopped because the Claude login expired; the login has been renewed. '
+    'Background shells, agents and workflows that this Claude session started before the stop were terminated; '
+    'restart any that are still needed. Native Codex agents started through the codex_agents tools are separate '
+    'tasks and keep running. Continue the current request from where it stopped, and check the workspace before '
+    'repeating an action whose outcome is unclear.')
+
+
+def auth_failed(message):
+    """The official CLI's markers for a rejected login (2.1.282 stream-json)."""
+    if message.get('type') == 'assistant':
+        return message.get('error') == 'authentication_failed'
+    if message.get('type') == 'result' and message.get('is_error') is True:
+        text = message.get('result')
+        return message.get('api_error_status') == 401 or (
+            isinstance(text, str) and text.startswith('Failed to authenticate.'))
+    return False
+
+
+class BorrowedLogin:
+    """Owner and expiry of the access token lent for this turn; never the token itself."""
+    def __init__(self, value):
+        if (not isinstance(value, dict) or not isinstance(value.get('profileId'), str)
+                or not isinstance(value.get('accountIdentity'), str) or type(value.get('expiresAt')) is not int):
+            raise ClaudeError('protocol', 'Invalid borrowed Claude login metadata.')
+        self.profile_id, self.account_identity = value['profileId'], value['accountIdentity']
+        self.expires_at = value['expiresAt']
+
+    def failure(self):
+        return 'claude_auth_expired' if time.time() >= self.expires_at - AUTH_EXPIRY_MARGIN else 'claude_auth_rejected'
+
+    def renewed(self, credentials):
+        """Return a newer token for the same login, or None; ValueError for any other credential."""
+        value = borrowed_credential(credentials, self.profile_id, self.account_identity, int(time.time()) + 30)
+        if value['expiresAt'] <= self.expires_at or value['expiresAt'] < int(time.time()) + AUTH_RENEWAL_MINIMUM:
+            return None
+        self.expires_at = value['expiresAt']
+        return value['accessToken']
+
+
+def resume_command(command):
+    """The same invocation, continuing the session the previous launch recorded."""
+    return ['--resume' if value == '--session-id' else value for value in command]
+
+
+def host_wait(events, until, bridge, delegation, expect_update=False):
+    """Serve native answers while no CLI runs; return (outcome, auth_update)."""
+    while True:
+        remaining = until - time.monotonic()
+        if remaining <= 0:
+            return 'timeout', None
+        try:
+            source, message = events.get(timeout=min(.2, remaining))
+        except queue.Empty:
+            continue
+        if source == 'fault':
+            if message == 'host':
+                return 'protocol', None
+            continue
+        if source != 'host':
+            continue  # Remaining output of the stopped CLI process.
+        if message is None or message.get('type') == 'interrupt':
+            return 'interrupted', None
+        if message.get('type') == 'permission_decision' and bridge:
+            bridge.decide(message)
+        elif message.get('type') == 'agent_response' and delegation:
+            delegation.respond(message)
+        elif message.get('type') == 'auth_update' and expect_update:
+            return 'update', message
+        else:
+            return 'protocol', None
+
+
+def renew_login(borrowed, events, emit, bridge, delegation):
+    """Ask the native host for the renewed login at most twice; return (token, outcome)."""
+    deadline = time.monotonic() + AUTH_REFRESH_SECONDS
+    for request in range(2):
+        if request:
+            outcome, _ = host_wait(events, min(deadline, time.monotonic() + AUTH_REFRESH_RETRY_SECONDS),
+                                   bridge, delegation)
+            if outcome != 'timeout':
+                return None, outcome
+            if deadline - time.monotonic() < 5:
+                return None, 'unavailable'
+        emit(dict(type='auth_refresh'))
+        outcome, update = host_wait(events, deadline, bridge, delegation, expect_update=True)
+        if outcome != 'update':
+            return None, 'unavailable' if outcome == 'timeout' else outcome
+        if update.get('available') is not True:
+            continue
+        try:
+            token = borrowed.renewed(update.get('credentials'))
+        except ValueError:
+            return None, 'unavailable'  # Another account or a malformed credential.
+        if token is not None:
+            return token, 'renewed'
+    return None, 'unavailable'
+
+
 def sum_usage(*values):
     result = {}
     for value in values:
@@ -653,7 +774,9 @@ independent child comes directly from the existing native-input event queue.
             if message.get('type') == 'control_request':
                 invalid = True
                 break
-            if message.get('type') == 'rate_limit_event' and usage_store is not None:
+            if message.get('type') == 'rate_limit_event':
+                # Reported to the host after this call; the local usage cache is
+                # updated by the primary call only.
                 normalized = normalize(message)
                 limit_event = normalized[0] if normalized else None
                 if limit_event and limit_event.get('errorCode') == 'credits_required':
@@ -699,172 +822,229 @@ independent child comes directly from the existing native-input event queue.
 
 
 def execute(command, cwd, environment, incoming, emit, bridge, stopped, observed, record, ledger, hello,
-            configuration_directory, usage_store, delegation=None):
+            configuration_directory, usage_store, delegation=None, borrowed=None):
     start = time.monotonic()
-    result, problem, interrupted = None, None, False
+    result, problem, interrupted, auth_error = None, None, False, None
     record['dirty'] = True  # A runner crash after launch must never resume blindly.
     ledger.save(record)
     prior_summary = compact_summary(configuration_directory, record['id'])
     options = {'creationflags': subprocess.CREATE_NO_WINDOW} if os.name == 'nt' else {'start_new_session': True}
-    process = subprocess.Popen(command, cwd=cwd, env=environment, stdin=subprocess.PIPE,
-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, **options)
-    tree = None
     events = queue.Queue(maxsize=256)
-    last_usage, model_started, compactions = {}, False, 0
+    last_usage, model_started, compactions, results = {}, False, 0, []
     prior_cost = record.get('cost_total_usd', 0)
-    # Workflows and background agents report back after the turn's first
-    # result; the CLI then starts the next turn by itself. The final result
-    # is the one that arrives while none of them is still running.
-    background, background_seen, settle_deadline, results = set(), False, None, []
+    # Only a host that lent this token and announced auth_refresh can renew it.
+    # Then one expired launch is resumed once in this process; never a third.
+    renewable = borrowed is not None and hello.get('auth_refresh') == 1
+    prompt, channel, process = hello['_prompt'], 'cli', None
+    threading.Thread(target=_reader, args=(incoming, 'host', events), daemon=True).start()
     try:
-        tree = ProcessTree(process)
-        threading.Thread(target=_reader, args=(process.stdout, 'cli', events), daemon=True).start()
-        threading.Thread(target=_reader, args=(incoming, 'host', events), daemon=True).start()
-        threading.Thread(target=_discard_stderr, args=(process.stderr,), daemon=True).start()
-        process.stdin.write(encode_message(hello['_prompt']))
-        if record['settings'].get('effort') == 'ultracode':
-            # The CLI accepts Ultracode silently and applies it only where dynamic
-            # workflows are available; ask which settings it actually applied.
-            process.stdin.write(encode_message({'type': 'control_request', 'request_id': ULTRACODE_CHECK,
-                                                'request': {'subtype': 'get_settings'}}))
-        process.stdin.flush()
         while True:
-            if settle_deadline is not None and time.monotonic() >= settle_deadline:
-                break
+            result, problem, auth_error, relaunch = None, None, None, False
+            prompt_seen, auth_seen, tree = False, False, None
+            # Workflows and background agents report back after the turn's first
+            # result; the CLI then starts the next turn by itself. The final result
+            # is the one that arrives while none of them is still running.
+            background, background_seen, settle_deadline = set(), False, None
+            process = subprocess.Popen(command, cwd=cwd, env=environment, stdin=subprocess.PIPE,
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, **options)
             try:
-                source, message = events.get(timeout=.2)
-            except queue.Empty:
-                if process.poll() is not None:
-                    if result is not None:
+                tree = ProcessTree(process)
+                threading.Thread(target=_reader, args=(process.stdout, channel, events), daemon=True).start()
+                threading.Thread(target=_discard_stderr, args=(process.stderr,), daemon=True).start()
+                process.stdin.write(encode_message(prompt))
+                if channel == 'cli' and record['settings'].get('effort') == 'ultracode':
+                    # The CLI accepts Ultracode silently and applies it only where dynamic
+                    # workflows are available; ask which settings it actually applied.
+                    process.stdin.write(encode_message({'type': 'control_request', 'request_id': ULTRACODE_CHECK,
+                                                        'request': {'subtype': 'get_settings'}}))
+                process.stdin.flush()
+                while True:
+                    if settle_deadline is not None and time.monotonic() >= settle_deadline:
                         break
-                    problem = ('cli_exit', 'Claude exited without a final result.')
-                    break
-                continue
-            if source == 'fault':
-                problem = ('protocol', 'Claude bridge received malformed or oversized output.')
-                break
-            if source == 'host':
-                if message is None or message.get('type') == 'interrupt':
-                    interrupted = True
-                    break
-                if message.get('type') == 'permission_decision' and bridge:
-                    bridge.decide(message)
-                elif message.get('type') == 'agent_response' and delegation:
-                    delegation.respond(message)
-                else:
-                    problem = ('protocol', 'Unexpected native message during a Claude turn.')
-                    break
-                continue
-            if message is None:
-                if result is None:
-                    problem = ('cli_exit', 'Claude exited without a final result.')
-                break
-            if message.get('type') == 'control_request':
-                problem = ('permissions', 'Claude requested an unsupported permission transport; the action was stopped.')
-                break
-            if message.get('type') == 'control_response':
-                response = message.get('response') if isinstance(message.get('response'), dict) else {}
-                applied = (response.get('response') or {}).get('applied') if isinstance(response.get('response'), dict) else None
-                if (response.get('request_id') == ULTRACODE_CHECK and response.get('subtype') == 'success'
-                        and isinstance(applied, dict) and applied.get('ultracode') is False):
-                    emit(dict(type='event', kind='notice', message=(
-                        'Ultracode is not active for this Claude account (dynamic workflows are unavailable); '
-                        'this turn runs at xhigh effort without workflows.')))
-                continue
-            if message.get('type') == 'system' and message.get('subtype') == 'background_tasks_changed':
-                tasks = message.get('tasks') if isinstance(message.get('tasks'), list) else []
-                # REPLACE semantics: the message lists every live background task.
-                background = {task['task_id'] for task in tasks if isinstance(task, dict)
-                              and isinstance(task.get('task_id'), str) and not task.get('ambient')
-                              and task.get('task_type') in ('local_workflow', 'local_agent')}
-                background_seen = background_seen or bool(background)
-            if settle_deadline is not None and message.get('type') in ('assistant', 'stream_event', 'user'):
-                settle_deadline = None  # A background report started the next turn.
-            # Remote (SSH) runs have no manager store; their usage is read on Windows.
-            if message.get('type') == 'rate_limit_event' and usage_store is not None:
-                from manager_core.claude_usage import record_event
+                    try:
+                        source, message = events.get(timeout=.2)
+                    except queue.Empty:
+                        if process.poll() is not None:
+                            if result is None and not auth_seen:
+                                problem = ('cli_exit', 'Claude exited without a final result.')
+                            break
+                        continue
+                    if source == 'fault':
+                        if message not in ('host', channel):
+                            continue  # A stopped launch's reader.
+                        problem = ('protocol', 'Claude bridge received malformed or oversized output.')
+                        break
+                    if source == 'host':
+                        if message is None or message.get('type') == 'interrupt':
+                            interrupted = True
+                            break
+                        if message.get('type') == 'permission_decision' and bridge:
+                            bridge.decide(message)
+                        elif message.get('type') == 'agent_response' and delegation:
+                            delegation.respond(message)
+                        else:
+                            problem = ('protocol', 'Unexpected native message during a Claude turn.')
+                            break
+                        continue
+                    if source != channel:
+                        continue  # Remaining output of a stopped launch.
+                    if message is None:
+                        if result is None and not auth_seen:
+                            problem = ('cli_exit', 'Claude exited without a final result.')
+                        break
+                    if message.get('type') == 'control_request':
+                        problem = ('permissions', 'Claude requested an unsupported permission transport; the action was stopped.')
+                        break
+                    if message.get('type') == 'control_response':
+                        response = message.get('response') if isinstance(message.get('response'), dict) else {}
+                        applied = (response.get('response') or {}).get('applied') if isinstance(response.get('response'), dict) else None
+                        if (response.get('request_id') == ULTRACODE_CHECK and response.get('subtype') == 'success'
+                                and isinstance(applied, dict) and applied.get('ultracode') is False):
+                            emit(dict(type='event', kind='notice', message=(
+                                'Ultracode is not active for this Claude account (dynamic workflows are unavailable); '
+                                'this turn runs at xhigh effort without workflows.')))
+                        continue
+                    if message.get('type') == 'system' and message.get('subtype') == 'background_tasks_changed':
+                        tasks = message.get('tasks') if isinstance(message.get('tasks'), list) else []
+                        # REPLACE semantics: the message lists every live background task.
+                        background = {task['task_id'] for task in tasks if isinstance(task, dict)
+                                      and isinstance(task.get('task_id'), str) and not task.get('ambient')
+                                      and task.get('task_type') in ('local_workflow', 'local_agent')}
+                        background_seen = background_seen or bool(background)
+                    if settle_deadline is not None and message.get('type') in ('assistant', 'stream_event', 'user'):
+                        settle_deadline = None  # A background report started the next turn.
+                    # Remote (SSH) runs have no manager store; their usage is read on Windows.
+                    if message.get('type') == 'rate_limit_event' and usage_store is not None:
+                        from manager_core.claude_usage import record_event
+                        try:
+                            record_event(usage_store, hello['claude_profile_id'],
+                                         record['settings'].get('account_identity'), message)
+                        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                            # A local usage-cache failure must not interrupt this answer.
+                            pass
+                    if message.get('type') == 'system' and message.get('subtype') == 'init':
+                        actual = message.get('session_id')
+                        if actual and actual != record['id']:
+                            problem = ('session_mismatch', 'Claude returned an unexpected session identifier.')
+                            break
+                        if bridge or delegation:
+                            servers = message.get('mcp_servers', [])
+                            if not isinstance(servers, list):
+                                servers = []
+                            required = (['codex_bridge'] if bridge else []) + (['codex_agents'] if delegation else [])
+                            if any(not any(s.get('name') == name and s.get('status') == 'connected'
+                                           for s in servers if isinstance(s, dict)) for name in required):
+                                problem = ('permissions', 'Claude could not connect its required native bridges.')
+                                break
+                    # The replayed request proves this session recorded it.
+                    prompt_seen = prompt_seen or message.get('type') == 'user'
+                    if message.get('type') in ('assistant', 'stream_event'):
+                        model_started = True
+                    # The CLI reports a failed API request as an assistant message. It is
+                    # not model output: no usage, and no text in shared task history.
+                    api_error = (message.get('type') == 'assistant' and isinstance(message.get('error'), str)
+                                 and not message.get('parent_tool_use_id'))
+                    if message.get('type') == 'assistant' and not api_error:
+                        envelope = message.get('message')
+                        if isinstance(envelope, dict):
+                            last_usage = usage_fields(envelope.get('usage')) or last_usage
+                    normalized = normalize(message)
+                    if api_error:
+                        detail = ' '.join(event['text'] for event in normalized if event['kind'] == 'text').strip()
+                        normalized = [event for event in normalized if event['kind'] != 'text']
+                        if auth_failed(message):
+                            auth_seen = True
+                            normalized.append(dict(kind='notice', message='Claude could not authenticate its request.'))
+                        else:
+                            normalized.append(dict(kind='notice', message='Claude API request failed'
+                                                   + (': ' + bounded_text(detail, 1000) if detail else '.')))
+                    for event in normalized:
+                        if event['kind'] == 'tool_start' and isinstance(event.get('id'), str):
+                            with bridge.guard if bridge else nullcontext():
+                                observed[event['id']] = (event['tool'], event['input'])
+                        elif event['kind'] == 'tool_end':
+                            with bridge.guard if bridge else nullcontext():
+                                observed.pop(event.get('id'), None)
+                        elif event['kind'] == 'compact' and not event.get('summary_available'):
+                            compactions += 1
+                        emit(dict(type='event', **event))
+                        if event['kind'] == 'rate_limit' and event.get('errorCode') == 'credits_required':
+                            problem = ('credits_required', 'Claude included usage is exhausted; this turn has stopped.')
+                    if problem:
+                        break
+                    if message.get('type') == 'result':
+                        results.append(message)
+                        result = message
+                        if message.get('is_error') is True and (auth_seen or auth_failed(message)):
+                            auth_seen = True
+                            break  # Nothing in this process can continue without a login.
+                        if background:
+                            if len(results) == 1:
+                                emit(dict(type='event', kind='notice', message=(
+                                    'Claude is waiting for its background workflow; the answer continues when it reports back.')))
+                            continue
+                        if not background_seen:
+                            break
+                        # A report may already be queued; give the CLI a moment to start that turn.
+                        settle_deadline = time.monotonic() + BACKGROUND_SETTLE_SECONDS
+                if auth_seen and not interrupted and not problem and (result is None or result.get('is_error')):
+                    code = borrowed.failure() if borrowed is not None else 'claude_login_required'
+                    auth_error = (code, AUTH_FAILURES[code])
+                    relaunch = code == 'claude_auth_expired' and renewable and channel == 'cli'
+            finally:
+                if not relaunch:
+                    stopped.set()
                 try:
-                    record_event(usage_store, hello['claude_profile_id'],
-                                 record['settings'].get('account_identity'), message)
-                except (OSError, ValueError, KeyError, TypeError, AttributeError):
-                    # A local usage-cache failure must not interrupt this answer.
+                    process.stdin.close()
+                except OSError:
                     pass
-            if message.get('type') == 'system' and message.get('subtype') == 'init':
-                actual = message.get('session_id')
-                if actual and actual != record['id']:
-                    problem = ('session_mismatch', 'Claude returned an unexpected session identifier.')
-                    break
-                if bridge or delegation:
-                    servers = message.get('mcp_servers', [])
-                    if not isinstance(servers, list):
-                        servers = []
-                    required = (['codex_bridge'] if bridge else []) + (['codex_agents'] if delegation else [])
-                    if any(not any(s.get('name') == name and s.get('status') == 'connected'
-                                   for s in servers if isinstance(s, dict)) for name in required):
-                        problem = ('permissions', 'Claude could not connect its required native bridges.')
-                        break
-            if message.get('type') in ('assistant', 'stream_event'):
-                model_started = True
-            if message.get('type') == 'assistant':
-                envelope = message.get('message')
-                if isinstance(envelope, dict):
-                    last_usage = usage_fields(envelope.get('usage')) or last_usage
-            for event in normalize(message):
-                if event['kind'] == 'tool_start' and isinstance(event.get('id'), str):
-                    with bridge.guard if bridge else nullcontext():
-                        observed[event['id']] = (event['tool'], event['input'])
-                elif event['kind'] == 'tool_end':
-                    with bridge.guard if bridge else nullcontext():
-                        observed.pop(event.get('id'), None)
-                elif event['kind'] == 'compact' and not event.get('summary_available'):
-                    compactions += 1
-                emit(dict(type='event', **event))
-                if event['kind'] == 'rate_limit' and event.get('errorCode') == 'credits_required':
-                    problem = ('credits_required', 'Claude included usage is exhausted; this turn has stopped.')
-            if problem:
+                try:
+                    process.wait(timeout=5 if result is not None else 1)
+                except subprocess.TimeoutExpired:
+                    if tree:
+                        tree.close()
+                    else:
+                        process.kill()
+                    process.wait(timeout=5)
+                if tree:
+                    tree.close()
+                process.stdout.close()
+                process.stderr.close()
+            if not relaunch:
                 break
-            if message.get('type') == 'result':
-                results.append(message)
-                result = message
-                if background:
-                    if len(results) == 1:
-                        emit(dict(type='event', kind='notice', message=(
-                            'Claude is waiting for its background workflow; the answer continues when it reports back.')))
-                    continue
-                if not background_seen:
-                    break
-                # A report may already be queued; give the CLI a moment to start that turn.
-                settle_deadline = time.monotonic() + BACKGROUND_SETTLE_SECONDS
+            emit(dict(type='event', kind='notice',
+                      message='Claude access token expired; renewing it and resuming this turn...'))
+            token, outcome = renew_login(borrowed, events, emit, bridge, delegation)
+            if outcome != 'renewed':
+                interrupted = outcome == 'interrupted'
+                if outcome == 'protocol':
+                    problem = ('protocol', 'Unexpected native message during a Claude turn.')
+                break
+            # Only this runner's copy of the CLI environment receives the renewal.
+            environment = dict(environment, CLAUDE_CODE_OAUTH_TOKEN=token)
+            token = None
+            for owner in (bridge, delegation):
+                if owner:
+                    owner.release()  # The stopped process's MCP calls cannot be answered.
+            if prompt_seen:
+                command = resume_command(command)
+                prompt = prompt_message([{'kind': 'request', 'text': AUTH_CONTINUATION}])
+            channel = 'cli-renewed'
     finally:
         stopped.set()
-        try:
-            process.stdin.close()
-        except OSError:
-            pass
-        try:
-            process.wait(timeout=5 if result is not None else 1)
-        except subprocess.TimeoutExpired:
-            if tree:
-                tree.close()
-            else:
-                process.kill()
-            process.wait(timeout=5)
-        if tree:
-            tree.close()
-        process.stdout.close()
-        process.stderr.close()
     if compactions:
         summary = compact_summary(configuration_directory, record['id'])
         if summary and summary != prior_summary:
             emit(dict(type='event', kind='compact', message='Claude supplied a portable compaction summary.',
                       summary=summary, summary_available=True))
     result = result or {}
+    # Only the last launch's own result can complete the turn.
+    success = bool(result) and not result.get('is_error') and not problem and not interrupted and process.returncode == 0
     if len(results) > 1:
-        # Each turn reports its own usage; the session cost stays cumulative.
+        # Each turn and launch reports its own usage; the session cost stays cumulative.
         denials = [denial for item in results for denial in item.get('permission_denials') or []
                    if isinstance(item.get('permission_denials'), list)]
         result = dict(result, usage=sum_usage(*(item.get('usage') for item in results)), permission_denials=denials)
-    success = bool(result) and not result.get('is_error') and not problem and not interrupted and process.returncode == 0
     checkpoint, checkpoint_failed = {}, False
     if success and compactions:
         emit(dict(type='event', kind='notice',
@@ -909,7 +1089,8 @@ def execute(command, cwd, environment, incoming, emit, bridge, stopped, observed
                 turn_cost_usd=turn_cost, permission_denials=result.get('permission_denials', []),
                 duration_ms=int((time.monotonic() - start) * 1000), model_request_started=model_started)
     if not success and not interrupted:
-        code, message = problem or ('claude_error', 'Claude did not complete this turn. Review the CLI account and permission status.')
+        code, message = problem or auth_error or (
+            'claude_error', 'Claude did not complete this turn. Review the CLI account and permission status.')
         done['error'] = dict(code=code, message=message)
     emit(done)
     if success:
@@ -1086,9 +1267,11 @@ def serve(root, profile_id, incoming=None, outgoing=None, cli_path=None, plugin_
             command = build_command(cli, record['id'], resume, settings, mode, prompts,
                                     configuration_directory, root, plugins, mcp_path, system_prompt_path,
                                     managed_delegation=managed_delegation)
+            borrowed = (BorrowedLogin(remote['borrowed_auth'])
+                        if remote is not None and remote.get('borrowed_auth') is not None else None)
             execute(command, cwd, environment, incoming, emit, bridge, stopped, observed,
                     record, ledger, hello, configuration_directory,
-                    None if remote is not None else Store(root), delegation)
+                    None if remote is not None else Store(root), delegation, borrowed)
         return 0
     except (ClaudeError, ProtocolError, OSError, ValueError, KeyError) as error:
         code = error.code if isinstance(error, ClaudeError) else 'runner_error'

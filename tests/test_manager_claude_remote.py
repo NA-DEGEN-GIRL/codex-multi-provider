@@ -180,6 +180,9 @@ class RemoteClaudeContextTests(unittest.TestCase):
                                     'CODEX_MANAGER_CLAUDE_AUTH':'PRIVATE_BROKER'}):
             actual = context.prepare(self.base)
         self.assertEqual(actual['environment']['CLAUDE_CODE_OAUTH_TOKEN'], 'synthetic-access')
+        # The runner learns the lent login's owner and expiry, never its token.
+        self.assertEqual(actual['borrowed_auth'], dict(profileId=self.target, accountIdentity=self.identity,
+                                                       expiresAt=self.auth['expiresAt']))
         self.assertNotIn('ANTHROPIC_API_KEY', actual['environment'])
         self.assertNotIn('CODEX_MANAGER_CLAUDE_AUTH', actual['environment'])
         self.assertEqual(actual['configuration_directory'], self.base / 'claude/accounts' / self.target)
@@ -188,7 +191,7 @@ class RemoteClaudeContextTests(unittest.TestCase):
 
     def test_wrong_account_expiry_host_and_revision_cannot_launch(self):
         for auth in (dict(profileId=str(uuid4())), dict(accountIdentity='f' * 64),
-                     dict(expiresAt=int(time.time()) - 1)):
+                     dict(expiresAt=int(time.time()) - 1), dict(accessToken='synthetic access')):
             with self.subTest(auth=auth), self.assertRaises(ValueError):
                 self.context(**auth)
         with self.assertRaises(ValueError):

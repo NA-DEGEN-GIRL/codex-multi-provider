@@ -6,6 +6,7 @@ from pathlib import Path
 import queue
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 from uuid import uuid4
@@ -18,7 +19,7 @@ from manager_core.claude_protocol import MAX_LINE_BYTES, ProtocolError, normaliz
 from manager_core.claude_profiles import automatic_context_window
 from manager_core.claude_runner import (SessionLedger, compact_summary, digest, run_settings,
                                        serve, session_lock, PermissionBridge, system_prompt_text,
-                                       private_temporary_directory, build_command)
+                                       private_temporary_directory, build_command, AUTH_FAILURES)
 
 
 FAKE = r'''
@@ -30,6 +31,10 @@ scenario = os.environ.get('CLAUDE_FIXTURE_SCENARIO', 'success')
 def emit(value):
     print(json.dumps(value, ensure_ascii=False), flush=True)
 request = json.loads(sys.stdin.readline())
+if os.environ.get('CLAUDE_FIXTURE_TRACE'):
+    with open(os.environ['CLAUDE_FIXTURE_TRACE'], 'a', encoding='utf-8') as trace:
+        trace.write(json.dumps({'token':os.environ.get('CLAUDE_CODE_OAUTH_TOKEN'),'resume':'--resume' in args,
+            'session':session,'request':request,'checkpoint':'CODEX_PORTABLE_CHECKPOINT_V1' in json.dumps(request)})+'\n')
 if 'CODEX_PORTABLE_CHECKPOINT_V1' in json.dumps(request):
     assert '--resume' in args and '--plugin-dir' not in args and '--permission-prompt-tool' not in args
     assert args[args.index('--tools')+1] == '' and args[args.index('--disallowedTools')+1] == '*'
@@ -39,6 +44,8 @@ if 'CODEX_PORTABLE_CHECKPOINT_V1' in json.dumps(request):
     emit({'type':'system','subtype':'init','session_id':session,'model':'fixture','mcp_servers':[]})
     if scenario == 'compact_nested':
         emit({'type':'system','subtype':'compact_boundary','compact_metadata':{'trigger':'auto'}})
+    if scenario == 'compact_rate_limit':
+        emit({'type':'rate_limit_event','rate_limit_info':{'status':'allowed_warning','utilization':0.9}})
     if scenario != 'compact_cancel':
         summary = 'Deliberate complete portable summary: goal, constraints, completed work and next steps.'
         emit({'type':'assistant','message':{'content':[{'type':'text','text':summary}],
@@ -91,6 +98,16 @@ else:
               'total_cost_usd':0.05})
     elif scenario == 'wait':
         emit({'type':'stream_event','event':{'type':'content_block_delta','delta':{'type':'text_delta','text':'waiting'}}})
+    elif scenario == 'api_error' or (scenario.startswith('auth_') and (scenario == 'auth_always'
+            or os.environ.get('CLAUDE_CODE_OAUTH_TOKEN') == 'dummy-token-1')):
+        # The official CLI's shape for a failed API request (2.1.282).
+        text = ('API Error: 529 Overloaded' if scenario == 'api_error'
+                else 'Failed to authenticate. API Error: 401 OAuth access token has expired')
+        emit({'type':'assistant','error':'server_error' if scenario == 'api_error' else 'authentication_failed',
+              'message':{'content':[{'type':'text','text':text}],'usage':{'input_tokens':0,'output_tokens':0}}})
+        emit({'type':'result','subtype':'success','is_error':True,'session_id':session,'result':text,
+              'api_error_status':529 if scenario == 'api_error' else 401,
+              'usage':{'input_tokens':1,'output_tokens':0},'total_cost_usd':0.01})
     else:
         if scenario == 'managed_leaf':
             assert '--mcp-config' not in args
@@ -145,7 +162,7 @@ else:
             helper.stdout.close()
             emit({'type':'user','message':{'content':[{'type':'tool_result','tool_use_id':'tool-1',
                   'content':decision['behavior'],'is_error':decision['behavior'] != 'allow'}]}})
-        if scenario in ('compact','compact_failure','compact_cancel','compact_nested'):
+        if scenario in ('compact','compact_failure','compact_cancel','compact_nested','compact_rate_limit','auth_compact'):
             emit({'type':'system','subtype':'compact_boundary','compact_metadata':{'trigger':'auto','pre_tokens':170000}})
             path = Path(os.environ['CLAUDE_CONFIG_DIR']) / 'projects' / 'fixture' / (session + '.jsonl')
             path.parent.mkdir(parents=True,exist_ok=True)
@@ -181,6 +198,30 @@ class Outgoing(io.BytesIO):
         result = super().write(payload)
         self.callback(json.loads(payload))
         return result
+
+
+class BorrowedContext:
+    """The SSH execution context's shape with a dummy lent token; no host binding."""
+    def __init__(self, root, cli, profile, expires_at):
+        self.ledger_directory = root / 'remote-state'
+        self.configuration_directory = root.parent / 'remote-account'
+        self.cli, self.profile, self.expires_at = cli, profile, expires_at
+        self.identity = digest('remote-account')
+
+    def prepare(self, cwd):
+        self.configuration_directory.mkdir(exist_ok=True)
+        environment = scrub_environment(self.configuration_directory)
+        environment['CLAUDE_CODE_OAUTH_TOKEN'] = 'dummy-token-1'
+        return dict(settings={}, configuration_directory=self.configuration_directory, environment=environment,
+                    cli=self.cli, plugins=[], status=dict(logged_in=True, method='oauth_token',
+                    cli_version='2.1.282', account_identity=self.identity),
+                    borrowed_auth=dict(profileId=self.profile, accountIdentity=self.identity,
+                                       expiresAt=self.expires_at))
+
+    def renewal(self, token='dummy-token-2', expires_in=8 * 3600, **changes):
+        credentials = dict(profileId=self.profile, accessToken=token, accountIdentity=self.identity,
+                           expiresAt=int(time.time()) + expires_in)
+        return dict(type='auth_update', available=True, credentials=dict(credentials, **changes))
 
 
 class ClaudeAuthTests(unittest.TestCase):
@@ -338,6 +379,152 @@ class ClaudeRunnerTests(unittest.TestCase):
                          _test_settings={})
         self.assertNotIn('PRIVATE_', output.getvalue().decode())
         return code, events
+
+    def run_borrowed(self, scenario, expires_in, updates=(), announce=True):
+        """Run with a lent dummy token; `updates` answer each auth_refresh in order."""
+        context = BorrowedContext(self.root, [sys.executable, str(self.fake)], self.profile,
+                                  int(time.time()) + expires_in)
+        incoming, events, replies = Incoming(), [], list(updates)
+        hello = dict(type='hello', protocol=1, thread_id='borrowed-task', turn_id='turn-1',
+                     claude_profile_id=self.profile, cwd=str(self.root), trusted_cwd=True, snapshot=self.snapshot([]))
+        if announce:
+            hello['auth_refresh'] = 1
+        incoming.send(hello)
+        def on_output(message):
+            events.append(message)
+            if message['type'] == 'ready':
+                incoming.send(dict(type='run', mode='fresh', blocks=[{'kind':'request','text':'fixture request'}],
+                                   permission_mode='acceptEdits', permission_prompts='none'))
+            elif message['type'] == 'auth_refresh':
+                reply = replies.pop(0)
+                incoming.send(reply(context) if callable(reply) else reply)
+            elif scenario == 'wait' and message.get('kind') == 'text_delta':
+                incoming.send(dict(type='auth_update', available=False))
+            elif message['type'] == 'done':
+                incoming.send(dict(type='commit', snapshot=self.snapshot(['turn-1']))
+                              if message['status'] == 'success' else None)
+        output = Outgoing(on_output)
+        trace = self.base / ('trace-' + str(uuid4()) + '.jsonl')
+        with patch.dict(os.environ, {'CLAUDE_FIXTURE_SCENARIO': scenario, 'CLAUDE_FIXTURE_TRACE': str(trace)}), \
+             patch('manager_core.claude_runner.AUTH_REFRESH_RETRY_SECONDS', .2):
+            code = serve(self.root, self.profile, incoming, output, execution_context=context)
+        # A lent token never reaches native events, notices or the session ledger.
+        self.assertNotIn('dummy-token', output.getvalue().decode())
+        for path in context.ledger_directory.rglob('*'):
+            if path.is_file():
+                self.assertNotIn(b'dummy-token', path.read_bytes())
+        launches = [json.loads(line) for line in trace.read_text(encoding='utf-8').splitlines()] if trace.exists() else []
+        return code, events, launches
+
+    def test_expired_borrowed_token_is_renewed_and_the_same_session_resumes_once(self):
+        code, events, launches = self.run_borrowed('auth_expired', 45, [lambda context: context.renewal()])
+        self.assertEqual(code, 0, events)
+        done = next(event for event in events if event['type'] == 'done')
+        self.assertEqual((done['status'], done['result_text']), ('success', '안녕하세요'))
+        self.assertEqual(events[-1]['type'], 'committed')
+        self.assertEqual(sum(event['type'] == 'auth_refresh' for event in events), 1)
+        self.assertEqual([(launch['token'], launch['resume']) for launch in launches],
+                         [('dummy-token-1', False), ('dummy-token-2', True)])
+        self.assertEqual(launches[0]['session'], launches[1]['session'])
+        self.assertEqual(launches[1]['session'], done['session_id'])
+        continuation = launches[1]['request']['message']['content'][0]['text']
+        self.assertIn('stopped because the Claude login expired', continuation)
+        self.assertNotIn('fixture request', json.dumps(launches[1]['request']))
+        # The CLI's API-error text is a notice, never shared assistant history.
+        self.assertFalse(any('Failed to authenticate' in event.get('text', '') for event in events), events)
+        notices = [event['message'] for event in events if event.get('kind') == 'notice']
+        self.assertIn('Claude could not authenticate its request.', notices)
+        self.assertTrue(any('renewing it and resuming' in notice for notice in notices), notices)
+        # Usage covers both launches; the session cost stays cumulative.
+        self.assertEqual(done['usage']['input_tokens'], 11)
+        self.assertAlmostEqual(done['turn_cost_usd'], 0.02)
+        ledger = next(self.root.glob('remote-state/sessions/*/*/*.json'))
+        self.assertFalse(json.loads(ledger.read_text(encoding='utf-8'))['dirty'])
+
+    def test_second_auth_failure_ends_the_turn_without_a_third_launch(self):
+        code, events, launches = self.run_borrowed('auth_always', 45, [lambda context: context.renewal()])
+        done = next(event for event in events if event['type'] == 'done')
+        self.assertEqual(done['status'], 'error')
+        # The renewed token was far from its expiry, so Claude rejected it.
+        self.assertEqual(done['error']['code'], 'claude_auth_rejected')
+        self.assertEqual(len(launches), 2)
+        self.assertEqual(sum(event['type'] == 'auth_refresh' for event in events), 1)
+
+    def test_rejected_or_unannounced_renewal_reports_a_specific_auth_error(self):
+        for expires_in, announce, expected in ((3600, True, 'claude_auth_rejected'),
+                                               (45, False, 'claude_auth_expired')):
+            with self.subTest(expires_in=expires_in, announce=announce):
+                code, events, launches = self.run_borrowed('auth_expired', expires_in, announce=announce)
+                done = next(event for event in events if event['type'] == 'done')
+                self.assertEqual((done['status'], done['error']['code']), ('error', expected))
+                self.assertEqual(done['error']['message'], AUTH_FAILURES[expected])
+                self.assertFalse(any(event['type'] == 'auth_refresh' for event in events))
+                self.assertEqual(len(launches), 1)
+
+    def test_local_login_failure_asks_to_sign_in_again(self):
+        code, events = self.run_fake('auth_always')
+        done = next(event for event in events if event['type'] == 'done')
+        self.assertEqual(done['error']['code'], 'claude_login_required')
+        self.assertFalse(any(event['type'] == 'auth_refresh' for event in events))
+        self.assertFalse(any('Failed to authenticate' in event.get('text', '') for event in events), events)
+
+    def test_other_api_errors_become_notices_with_the_generic_error(self):
+        code, events = self.run_fake('api_error')
+        done = next(event for event in events if event['type'] == 'done')
+        self.assertEqual(done['error']['code'], 'claude_error')
+        self.assertFalse(any(event.get('kind') == 'text' for event in events), events)
+        self.assertIn('Claude API request failed: API Error: 529 Overloaded',
+                      [event.get('message') for event in events if event.get('kind') == 'notice'])
+
+    def test_a_token_that_is_not_newer_is_requested_once_more(self):
+        stale = lambda context: context.renewal(expiresAt=context.expires_at)
+        code, events, launches = self.run_borrowed('auth_expired', 45, [stale, stale])
+        done = next(event for event in events if event['type'] == 'done')
+        self.assertEqual(done['error']['code'], 'claude_auth_expired')
+        self.assertEqual(sum(event['type'] == 'auth_refresh' for event in events), 2)
+        self.assertEqual(len(launches), 1)
+        code, events, launches = self.run_borrowed('auth_expired', 45, [
+            dict(type='auth_update', available=False), lambda context: context.renewal()])
+        self.assertEqual(code, 0, events)
+        self.assertEqual(sum(event['type'] == 'auth_refresh' for event in events), 2)
+        self.assertEqual([launch['token'] for launch in launches], ['dummy-token-1', 'dummy-token-2'])
+
+    def test_renewal_for_another_login_or_malformed_token_is_refused(self):
+        for change in (dict(accountIdentity=digest('another-account')), dict(profileId=str(uuid4())),
+                       dict(token='dummy token'), dict(expires_in=120)):
+            with self.subTest(change=change):
+                code, events, launches = self.run_borrowed(
+                    'auth_expired', 45, [lambda context: context.renewal(**change)] * 2)
+                done = next(event for event in events if event['type'] == 'done')
+                self.assertEqual(done['error']['code'], 'claude_auth_expired')
+                self.assertEqual(len(launches), 1)
+
+    def test_interrupt_while_waiting_for_a_renewal_stops_the_turn(self):
+        code, events, launches = self.run_borrowed('auth_expired', 45, [{'type': 'interrupt'}])
+        done = next(event for event in events if event['type'] == 'done')
+        self.assertEqual(done['status'], 'interrupted')
+        self.assertNotIn('error', done)
+        self.assertEqual(len(launches), 1)
+
+    def test_unsolicited_auth_update_is_a_protocol_error(self):
+        code, events, launches = self.run_borrowed('wait', 3600)
+        done = next(event for event in events if event['type'] == 'done')
+        self.assertEqual(done['error']['code'], 'protocol')
+
+    def test_checkpoint_after_a_renewal_uses_the_renewed_login(self):
+        code, events, launches = self.run_borrowed('auth_compact', 45, [lambda context: context.renewal()])
+        self.assertEqual(code, 0, events)
+        self.assertTrue(any(event.get('deliberate_full_context_summary') for event in events), events)
+        self.assertEqual([(launch['token'], launch['checkpoint']) for launch in launches],
+                         [('dummy-token-1', False), ('dummy-token-2', False), ('dummy-token-2', True)])
+
+    def test_rate_limit_event_during_checkpoint_keeps_the_runner_alive(self):
+        code, events = self.run_fake('compact_rate_limit')
+        self.assertEqual(code, 0, events)
+        self.assertEqual(events[-1]['type'], 'committed')
+        self.assertTrue(any(event.get('deliberate_full_context_summary') for event in events), events)
+        self.assertTrue(any(event.get('kind') == 'rate_limit' and event.get('status') == 'allowed_warning'
+                            for event in events), events)
 
     def test_delegation_mcp_roundtrip_is_available_without_host_approval_mode(self):
         from manager_core.claude_delegation import TOOLS

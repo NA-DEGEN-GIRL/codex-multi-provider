@@ -52,6 +52,21 @@ def scrub_environment(directory, environ=None):
     return result
 
 
+def borrowed_credential(value, profile_id, account_identity, minimum_expiry):
+    """Validate an access-only credential lent by the manager.
+
+    The same rules apply at runner start and to a renewal during a turn. The
+    error never repeats the received value, which may contain a token.
+    """
+    if (not isinstance(value, dict) or set(value) != {'profileId', 'accessToken', 'expiresAt', 'accountIdentity'}
+            or value['profileId'] != profile_id or value['accountIdentity'] != account_identity
+            or type(value['expiresAt']) is not int or value['expiresAt'] < minimum_expiry
+            or not isinstance(value['accessToken'], str) or not 1 <= len(value['accessToken']) <= 65536
+            or any(ord(char) <= 32 or ord(char) >= 127 for char in value['accessToken'])):
+        raise ValueError('Claude access credential unavailable')
+    return value
+
+
 def discover_cli(configured=None, environ=None):
     environment = os.environ if environ is None else environ
     candidates = [configured] if configured else []
