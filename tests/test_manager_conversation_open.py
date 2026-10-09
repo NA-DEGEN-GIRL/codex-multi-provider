@@ -68,7 +68,7 @@ class ConversationOpenTests(unittest.TestCase):
         self.projection = str(uuid4())
         self.catalog = self.store.directory / 'catalog/local-records.json'
         self.set_catalog(self.ref)
-        self.launches, self.shown = [], []
+        self.launches, self.shown, self.window_waits = [], [], []
         stack = self.enterContext(ExitStack())
         self.capabilities = {key: True for key in (*CONNECT_CAPABILITIES,
                              'native_record_catalog', 'shared_record_catalog')}
@@ -84,9 +84,10 @@ class ConversationOpenTests(unittest.TestCase):
             projectionThreadId=self.projection, threadId=ref['thread_id'],
             sourceStoreId=ref['source_store_id'], hostId=ref['host_id'])]))
 
-    def show(self, profile_id, *, reopen_existing=True):
+    def show(self, profile_id, *, reopen_existing=True, wait_for_window=True):
         self.assertFalse(reopen_existing, 'thread navigation must not send a separate window reopen')
         self.shown.append(profile_id)
+        self.window_waits.append(wait_for_window)
         return dict(state='existing', profile=self.store.profile(profile_id))
 
     def environment(self, profile):
@@ -163,6 +164,53 @@ class ConversationOpenTests(unittest.TestCase):
         self.assertFalse([e for e in events if e['phase'] == 'conversation_navigate'])
         self.assertNotIn('message', json.dumps(events, ensure_ascii=False))
         self.assertNotIn(self.tid, path.read_text(encoding='utf-8'))
+
+    def shared_execution(self):
+        import json
+        self.capabilities['shared_record_execution'] = True
+        self.center.instances.environment.side_effect = lambda p: dict(
+            CODEX_MANAGER_SHARED_CATALOG=str(self.catalog), CODEX_MANAGER_SHARED_EXECUTION='1')
+        status = self.store.directory / 'instances' / self.b['id'] / 'runtime-state.json'
+        atomic_json(status, {**json.loads(status.read_text()), 'shared_execution_version': 1})
+        return status
+
+    def test_click_on_closed_profile_leads_warmup_and_holds_new_launches_until_spawned(self):
+        self.shared_execution()
+        events = []
+        warmup = self.center.profile_warmup
+        stack = self.enterContext(ExitStack())
+        stack.enter_context(patch.object(warmup, 'status', return_value={'worker_active': True}))
+        stack.enter_context(patch.object(warmup, 'prioritize', side_effect=lambda p: events.append(('prioritize', p))))
+        stack.enter_context(patch.object(warmup, 'hold', side_effect=lambda p: events.append(('hold', p)) or 'token'))
+        stack.enter_context(patch.object(warmup, 'release', side_effect=lambda t: events.append(('release', t))))
+        stack.enter_context(patch.object(self.center.update_hooks, 'prioritize_launch',
+                                         side_effect=lambda p: events.append(('launch_queue', p))))
+        def launched(profile_id, **options):
+            events.append(('show', options.get('wait_for_window')))
+            return dict(state='launched', profile=self.store.profile(profile_id))
+        self.center.instances.show.side_effect = launched
+        self.center.instances.observe.side_effect = lambda p: {'status': 'not_started'}
+        result = self.open()
+        self.assertEqual(result['state'], 'request_sent', result)
+        # Led and held before the launch; released as soon as the process exists,
+        # without the fixed window wait (the reader wait gates the link).
+        self.assertEqual(events[:4], [('prioritize', self.b['id']), ('launch_queue', self.b['id']),
+                                      ('hold', self.b['id']), ('show', False)])
+        self.assertEqual(events[4], ('release', 'token'))
+
+    def test_click_on_running_profile_never_holds_the_warmup(self):
+        self.shared_execution()
+        warmup = self.center.profile_warmup
+        with patch.object(warmup, 'status', return_value={'worker_active': True}), \
+                patch.object(warmup, 'hold') as hold, patch.object(warmup, 'prioritize') as prioritize:
+            self.assertEqual(self.open()['state'], 'request_sent')
+        hold.assert_not_called()
+        prioritize.assert_not_called()
+        self.assertEqual(self.window_waits, [False])
+
+    def test_handoff_mode_keeps_the_window_wait_before_its_immediate_link(self):
+        self.open()
+        self.assertEqual(self.window_waits, [True])
 
     def test_moved_shortcut_rejects_captured_profile_before_any_open_or_handoff(self):
         expected = self.link['profile_id']

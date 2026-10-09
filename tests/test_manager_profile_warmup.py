@@ -4,11 +4,12 @@ from pathlib import Path
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
-from manager_core.profile_warmup import ProfileWarmup, default_workers
+from manager_core.profile_warmup import ProfileWarmup, default_workers, parallel_limit
 from manager_core.store import Store
 
 
@@ -291,6 +292,77 @@ class ProfileWarmupTests(unittest.TestCase):
                 thread.join(2)
         self.assertTrue(all(not thread.is_alive() for thread in workers))
         self.assertEqual(self.warmup.status()['state'], 'stopped')
+
+    def threaded(self, launch, **options):
+        workers = []
+        def spawn(fn):
+            thread = threading.Thread(target=fn)
+            workers.append(thread)
+            thread.start()
+        warmup = ProfileWarmup(self.store, self, launch, spawn=spawn,
+                               health=lambda _: dict(blocks_launch=False), **options)
+        self.addCleanup(lambda: [thread.join(3) for thread in workers])
+        self.addCleanup(warmup.shutdown)
+        return warmup, workers
+
+    def held_pass(self, **options):
+        """A started pass whose worker runs only after the test took its hold."""
+        pending = []
+        warmup = ProfileWarmup(self.store, self, self.launch, spawn=pending.append,
+                               health=lambda _: dict(blocks_launch=False), **options)
+        self.addCleanup(warmup.shutdown)
+        self.assertIsNone(warmup.hold(self.profiles[0]['id']), 'a hold without a running pass')
+        warmup.start()
+        token = warmup.hold(self.profiles[2]['id'])
+        self.assertIsNotNone(token)
+        worker = threading.Thread(target=pending.pop())
+        worker.start()
+        self.addCleanup(worker.join, 3)
+        return warmup, worker, token
+
+    def test_task_click_hold_pauses_new_launches_until_its_launch_started(self):
+        warmup, worker, token = self.held_pass(max_workers=2)
+        time.sleep(.3)
+        self.assertEqual(self.launched, [], 'a warmup launch started during a task click hold')
+        self.assertEqual(warmup.status()['held_for'], self.profiles[2]['id'])
+        warmup.release(token)
+        warmup.release(token)  # Idempotent.
+        warmup.release(None)
+        worker.join(3)
+        self.assertEqual(sorted(self.launched), sorted(p['id'] for p in self.profiles))
+        self.assertNotIn('held_for', warmup.status())
+        self.assertIsNone(warmup.hold(self.profiles[0]['id']), 'a finished pass took a hold')
+
+    def test_hold_expires_after_its_cap(self):
+        began = time.monotonic()
+        warmup, worker, _ = self.held_pass(max_workers=1, hold_cap_seconds=.3)
+        worker.join(3)
+        self.assertGreaterEqual(time.monotonic() - began, .25)
+        self.assertEqual(warmup.status()['counts']['ready'], 3)
+
+    def test_low_free_commit_lowers_launches_at_once(self):
+        self.assertEqual([parallel_limit(8, None), parallel_limit(8, 16 << 30), parallel_limit(8, 11 << 30),
+                          parallel_limit(8, 5 << 30), parallel_limit(2, 11 << 30)], [8, 8, 3, 2, 2])
+        self.profiles += [self.store.add_profile('parallel') for _ in range(3)]
+        for free, expected in ((11 << 30, 3), (5 << 30, 2)):
+            with self.subTest(free=free):
+                gate, active, peak = threading.Lock(), set(), [0]
+                def launch(profile_id):
+                    with gate:
+                        active.add(profile_id)
+                        peak[0] = max(peak[0], len(active))
+                    time.sleep(.15)
+                    with gate:
+                        active.discard(profile_id)
+                    return self.launch(profile_id)
+                warmup, workers = self.threaded(launch, max_workers=6, free_commit=lambda: free)
+                warmup.start()
+                for thread in workers:
+                    thread.join(5)
+                self.assertEqual(peak[0], expected)
+                status = warmup.status()
+                self.assertEqual((status['parallel_limit'], status['counts']['ready']), (expected, 6))
+                self.assertEqual(status['free_commit_mib'], free // (1 << 20))
 
     def test_slow_launch_does_not_block_status_priority_or_shutdown(self):
         entered, release, responsive = threading.Event(), threading.Event(), threading.Event()

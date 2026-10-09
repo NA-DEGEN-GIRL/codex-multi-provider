@@ -1,5 +1,6 @@
 """Prepare account windows once per manager start, without foreground navigation."""
 from copy import deepcopy
+import ctypes
 import os
 import threading
 import time
@@ -21,6 +22,50 @@ LEADER_GATE_CAP_SECONDS = 45.0
 
 _READY = ('ready', 'started')
 _LAUNCHING = ('queued', 'checking', 'opening')
+_TAKEN = ('checking', 'opening')
+
+# Free commit (what the system can still commit: commit limit minus committed
+# memory) below which fewer warmup launches run at once. A starting desktop
+# commits roughly 1-2 GB (browser, renderer, GPU and runtime processes). In the
+# revision 123 analysis a cold start inside the warmup wave took p50 40 s
+# against 8-26 s alone; with little free commit, eight at once also page.
+LOW_COMMIT_BYTES = 12 * 1024 ** 3        # below: at most 3 launches at once
+VERY_LOW_COMMIT_BYTES = 6 * 1024 ** 3    # below: at most 2
+# A task-shortcut click pauses new warmup launches until its own launch has
+# started (hold/release); a hold never lasts longer than this.
+HOLD_CAP_SECONDS = 60.0
+
+
+def available_commit():
+    """Bytes the system can still commit (GlobalMemoryStatusEx ullAvailPageFile), or None."""
+    if os.name != 'nt':
+        return None
+
+    class MemoryStatus(ctypes.Structure):
+        _fields_ = [('dwLength', ctypes.c_uint32), ('dwMemoryLoad', ctypes.c_uint32),
+                    ('ullTotalPhys', ctypes.c_uint64), ('ullAvailPhys', ctypes.c_uint64),
+                    ('ullTotalPageFile', ctypes.c_uint64), ('ullAvailPageFile', ctypes.c_uint64),
+                    ('ullTotalVirtual', ctypes.c_uint64), ('ullAvailVirtual', ctypes.c_uint64),
+                    ('ullAvailExtendedVirtual', ctypes.c_uint64)]
+    status = MemoryStatus()
+    status.dwLength = ctypes.sizeof(MemoryStatus)
+    try:
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return None
+    except (OSError, AttributeError):
+        return None
+    return int(status.ullAvailPageFile)
+
+
+def parallel_limit(maximum, available):
+    """Launches at once for this much free commit (None: unknown, no limit)."""
+    if available is None:
+        return maximum
+    if available < VERY_LOW_COMMIT_BYTES:
+        return min(maximum, 2)
+    if available < LOW_COMMIT_BYTES:
+        return min(maximum, 3)
+    return maximum
 
 
 def default_workers(cpus=None):
@@ -54,17 +99,30 @@ class ProfileWarmup:
     opening at once if that is already spent); with none left the gate
     opens. A held worker has taken no profile and
     holds no admission or fence, only this object's condition.
+
+    A task-shortcut click on a profile that is not running holds the pass
+    (hold/release): no new launch is taken until that profile's own launch
+    has started, or HOLD_CAP_SECONDS. With free commit below LOW_COMMIT_BYTES
+    at most 3 launches run at once (2 below VERY_LOW_COMMIT_BYTES), except the
+    leaders of a waiting gate.
     """
 
     def __init__(self, store, instances, launch, *, spawn=None, health=login_health,
                  max_workers=None, metrics=None, head_start_seconds=LEADER_HEAD_START_SECONDS,
-                 cap_seconds=LEADER_GATE_CAP_SECONDS):
+                 cap_seconds=LEADER_GATE_CAP_SECONDS, free_commit=None, hold_cap_seconds=HOLD_CAP_SECONDS):
         self.store, self.instances, self.launch = store, instances, launch
         self.health = health
         self.spawn = spawn or self._spawn
         self.max_workers = max(1, min(8, int(default_workers() if max_workers is None else max_workers)))
         self.metrics = metrics
         self.head_start_seconds, self.cap_seconds = head_start_seconds, cap_seconds
+        # Callable returning free commit bytes (available_commit); None: no
+        # memory-based limit (tests and non-Windows hosts).
+        self.free_commit = free_commit
+        self.hold_cap_seconds = hold_cap_seconds
+        # Hold token -> (clicked profile, monotonic expiry); see hold().
+        self.holds = {}
+        self.limited_at = None  # The last lowered limit recorded in metrics.
         self.lock = threading.RLock()
         self.changed = threading.Condition(self.lock)
         self.stopping = threading.Event()
@@ -137,6 +195,54 @@ class ProfileWarmup:
                 return False
             self._promote(profile_id)
             return True
+
+    def hold(self, profile_id):
+        """Pause new warmup launches while a clicked task's profile launches.
+
+        Launches already taken continue; no other is taken until release(),
+        or HOLD_CAP_SECONDS. Returns a token for release(), or None when no
+        warmup pass is running.
+        """
+        with self.lock:
+            if self.stopping.is_set() or not self.result['worker_active']:
+                return None
+            token = object()
+            self.holds[token] = (profile_id, time.monotonic() + self.hold_cap_seconds)
+            self.result['held_for'] = profile_id
+            return token
+
+    def release(self, token):
+        """End a hold (idempotent; None is ignored)."""
+        if token is None:
+            return
+        with self.lock:
+            if self.holds.pop(token, None) is not None:
+                if not self.holds:
+                    self.result.pop('held_for', None)
+                self.changed.notify_all()
+
+    def _hold_until(self):
+        """The latest expiry of the holds in force, or None (lock held)."""
+        now = time.monotonic()
+        for token, (_, expires) in list(self.holds.items()):
+            if expires <= now:
+                del self.holds[token]
+        if not self.holds:
+            self.result.pop('held_for', None)
+            return None
+        return max(expires for _, expires in self.holds.values())
+
+    def _parallel_limit(self):
+        """Launches at once now: max_workers, fewer when free commit is low (lock held)."""
+        try:
+            available = self.free_commit() if self.free_commit is not None else None
+        except (OSError, ValueError, TypeError):
+            available = None
+        limit = parallel_limit(self.max_workers, available)
+        self.result['parallel_limit'] = limit
+        if available is not None:
+            self.result['free_commit_mib'] = available // (1024 * 1024)
+        return limit, available
 
     def promote(self, profile_id):
         """Let an account opened outside the warmup pass a waiting gate."""
@@ -349,6 +455,8 @@ class ProfileWarmup:
                     # re-arm it, so a late return never moves an expired one.
                     if profile_id in self.leaders and self._gate_waiting():
                         self._settle()
+                    # A worker held by the parallel limit may take the next one.
+                    self.changed.notify_all()
 
     def _next(self):
         """The next profile and its gate record (lock held); (None, None) when done.
@@ -362,9 +470,26 @@ class ProfileWarmup:
                 return None, None
             leaders = [p for p in self.pending if p in self.leaders]
             waiting = self._gate_waiting()
-            if leaders or not waiting:
+            # A clicked task's own launch goes first; nothing new starts meanwhile.
+            held = self._hold_until()
+            # Leaders of a waiting gate always start; others respect the limit.
+            limit, available = self._parallel_limit()
+            busy = sum(1 for entry in self.entries.values() if entry['state'] in _TAKEN)
+            limited = busy >= limit and not (waiting and leaders)
+            if held is None and (leaders or not waiting) and not limited:
                 break
-            self.changed.wait(max(0.0, self.deadline[0] - time.monotonic()))
+            now = time.monotonic()
+            timeouts = [held - now] if held is not None else []
+            if waiting and not leaders:
+                timeouts.append(self.deadline[0] - now)
+            if limited:
+                # Free commit changes without a signal; finished launches notify.
+                timeouts.append(1.0)
+            self.changed.wait(max(0.0, min(timeouts)))
+        if limit < self.max_workers and self.limited_at != limit and self.metrics is not None:
+            self.limited_at = limit
+            self.metrics.record(None, 'warmup_parallel_limit', time.perf_counter(), limit=limit,
+                                free_commit_mib=(available or 0) // (1024 * 1024))
         choices = leaders if waiting else self.pending
         profile_id = self.priority if self.priority in choices else (leaders or self.pending)[0]
         self.priority = None

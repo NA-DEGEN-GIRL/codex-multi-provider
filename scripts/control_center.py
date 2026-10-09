@@ -87,9 +87,9 @@ class ControlCenter:
         from manager_core.skill_bridge import SkillBridge
         self.skill_bridge=SkillBridge(self.root,self.store,self.personal_skills,self.remote)
         self.shared_plugins=self.instances.shared_plugins
-        from manager_core.profile_warmup import ProfileWarmup
+        from manager_core.profile_warmup import ProfileWarmup, available_commit
         self.profile_warmup=ProfileWarmup(self.store,self.instances,self._open_profile_locally,
-                                          metrics=self.instances.metrics)
+                                          metrics=self.instances.metrics,free_commit=available_commit)
 
     def _open_profile_locally(self, profile_id):
         profile=self.store.profile(profile_id)
@@ -674,8 +674,13 @@ class ControlCenter:
         if command in ('conversation.open','conversation.continue'):
             from manager_core.conversation_open import open_shortcut
             started=time.perf_counter()
-            result=open_shortcut(self,args['shortcut_id'],runtime_build(self.root).get('capabilities',{}),
-                                 expected_profile_id=args.get('expected_profile_id'))
+            hold=self._prioritize_open(args)
+            try:
+                result=open_shortcut(self,args['shortcut_id'],runtime_build(self.root).get('capabilities',{}),
+                                     expected_profile_id=args.get('expected_profile_id'),
+                                     launched=lambda:self.profile_warmup.release(hold))
+            finally:
+                self.profile_warmup.release(hold)
             self._record_navigation(result,'conversation_open',started)
             return result
         if command=='conversation.navigate':
@@ -773,6 +778,31 @@ class ControlCenter:
                 self.store.mutate(bind_remote)
             return result
         raise ValueError('지원하지 않는 관리 명령입니다.')
+
+    def _shortcut_profile(self,args):
+        """The profile a conversation.open targets: the one the shell captured, else the link's."""
+        expected=args.get('expected_profile_id') if isinstance(args,dict) else None
+        if isinstance(expected,str) and expected:return identifier(expected)
+        shortcut=identifier(args.get('shortcut_id')) if isinstance(args,dict) else None
+        link=next((item for item in self.store.read()['shortcuts'] if item['id']==shortcut),None)
+        return link['profile_id'] if link else None
+
+    def _prioritize_open(self,args):
+        """A task click on a closed profile goes ahead of the warmup pass.
+
+        The profile leads the warmup queue (and a waiting leader gate) and the
+        launch queue, and new warmup launches wait until this launch has
+        started (open_shortcut's launched callback). Returns the hold token.
+        """
+        try:
+            profile_id=self._shortcut_profile(args)
+            if not profile_id or not self.profile_warmup.status()['worker_active']:return None
+            if self.instances.observe(self.store.profile(profile_id)).get('status')=='running':return None
+        except (ValueError,KeyError,TypeError,OSError,RuntimeError):
+            return None
+        self.profile_warmup.prioritize(profile_id)
+        self.update_hooks.prioritize_launch(profile_id)
+        return self.profile_warmup.hold(profile_id)
 
     def _record_navigation(self,result,phase,started):
         """profile-launch.performance.jsonl: one task-open outcome as fixed codes only."""

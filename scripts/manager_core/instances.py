@@ -774,6 +774,22 @@ class Instances:
             # sweeps this profile's --user-data-dir.
             pass
 
+    def finish_show_later(self, result):
+        """finish_show off the caller's request: it publishes the new window and
+        distrusts the desktop check if the process exits first. The caller has
+        already returned the launch (its reader wait follows)."""
+        if result.get('state') != 'launched':
+            return None
+        def finish():
+            try:
+                self.finish_show(result)
+            except Exception:
+                # A failed window wait leaves the launch to the state polls.
+                pass
+        worker = threading.Thread(target=finish, name='codex-window-wait', daemon=True)
+        worker.start()
+        return worker
+
     def finish_show(self, result):
         if result.get('state') != 'launched':
             return result

@@ -15,7 +15,20 @@ CONNECT_CAPABILITIES = (
 )
 
 
-def open_shortcut(center, shortcut_id, capabilities, *, expected_profile_id=None):
+def _starts_without_window_wait(profile, capabilities):
+    """Shared execution gates the link on runtime readiness (waiting_for_reader).
+
+    Such an open returns as soon as its desktop process exists; the window
+    publication continues in the background and the reader wait takes over.
+    Other modes send the link right away and keep the window wait first.
+    """
+    managed = (not profile.get('view_only') and (profile.get('runtime_channel') != 'packaged'
+               or profile.get('desired_runtime_channel') == 'managed'))
+    return bool(managed and capabilities.get('shared_record_execution'))
+
+
+def open_shortcut(center, shortcut_id, capabilities, *, expected_profile_id=None, launched=None):
+    """launched: called once this open's profile process exists (or already ran)."""
     link = next((item for item in center.store.read()['shortcuts']
                  if item['id'] == identifier(shortcut_id)), None)
     if link is None:
@@ -35,11 +48,18 @@ def open_shortcut(center, shortcut_id, capabilities, *, expected_profile_id=None
                     message='이 대화의 공통 기록 기능이 아직 준비되지 않았습니다.')
 
     requested = time.perf_counter()
+    early = _starts_without_window_wait(profile, capabilities)
     with center.update_hooks.launch_admission(profile['id']):
         admitted = time.perf_counter()
         # The exact thread link below is already a scoped Electron activation.
         # A separate reopen first can reset an embedded Chromium window's frame.
-        shown = center.instances.show(profile['id'], reopen_existing=False)
+        if early:
+            shown = center.instances.show(profile['id'], reopen_existing=False, wait_for_window=False)
+            center.instances.finish_show_later(shown)
+        else:
+            shown = center.instances.show(profile['id'], reopen_existing=False)
+        if launched is not None:
+            launched()
         profile = shown['profile']
         # Phases of this click for the shell's per-click record (milliseconds).
         launch = dict(state=shown.get('state', 'existing'),
