@@ -248,6 +248,33 @@ class ConversationOpenTests(unittest.TestCase):
         self.assertEqual(len(self.launches), 2)
         self.assertEqual(self.shown.count(self.b['id']), 2)
 
+    def test_a_profile_click_supersedes_a_task_open_that_has_not_sent_its_link(self):
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+        entered, release = threading.Event(), threading.Event()
+        def show(profile_id, **_):
+            self.shown.append(profile_id)
+            entered.set()
+            self.assertTrue(release.wait(5))
+            return dict(state='existing', profile=self.store.profile(profile_id))
+        self.center.instances.show.side_effect = show
+        with patch('manager_core.rust_service.enabled', return_value=True), ThreadPoolExecutor(2) as pool:
+            opening = pool.submit(self.center.request, dict(id='open', command='conversation.open',
+                                                            args={'shortcut_id': self.link['id']}))
+            self.assertTrue(entered.wait(5))
+            card = pool.submit(self.center.request, dict(id='card', command='profile.show',
+                                                         args={'profile_id': self.b['id']}))
+            time.sleep(.2)
+            release.set()
+            replaced, shown = opening.result(timeout=10)['result'], card.result(timeout=10)
+        self.assertEqual(replaced['state'], 'superseded')
+        self.assertTrue(shown['ok'], shown)
+        self.assertFalse(self.launches, 'the replaced task open still sent its link')
+        # A waiting open of that profile is dropped by the profile click as well.
+        token = self.warmup()
+        self.center.dispatch('profile.show', dict(profile_id=self.b['id']))
+        self.assertEqual(self.navigate(token)['reason'], 'navigation_expired')
+
     def test_a_new_wait_for_a_profile_drops_its_earlier_wait(self):
         first = self.warmup()
         self.assertEqual(self.center.navigations.profile_of(first), self.b['id'])

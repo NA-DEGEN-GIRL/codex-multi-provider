@@ -29,9 +29,10 @@ from manager_core.remote_updates import RemoteUpdates
 ROOT=Path(__file__).resolve().parents[1]
 INTERNAL_ERROR='관리 요청을 처리하지 못했습니다. 잠시 후 다시 시도해 주세요.'
 OPEN_COMMANDS=('conversation.open','conversation.continue','conversation.navigate')
-# The user stops, restarts or signs into a profile again: a task open still
-# waiting for it is dropped (it would otherwise relaunch an app that exits).
-ENDS_WAITING_OPENS=('profile.recover','profile.login','profile.remove','profile.restart',
+# The user opens the profile itself, stops, restarts or signs into it again: a
+# task open still waiting for it is dropped (latest click wins, and it would
+# otherwise relaunch an app that exits).
+ENDS_WAITING_OPENS=('profile.show','profile.recover','profile.login','profile.remove','profile.restart',
                     'profile.remote_restart','profile.remote_stop','profile.cleanup')
 
 
@@ -800,13 +801,22 @@ class ControlCenter:
             return None
 
     def _open_arrived(self,command,args):
-        """Count a task open (not a continuation) for its profile: (profile, number)."""
-        if command not in ('conversation.open','conversation.continue'):return None
-        profile_id=self._open_profile(command,args)
+        """Count a user's open of a profile on arrival; a task open gets (profile, number).
+
+        A profile open (profile.show) counts too: it supersedes a task open of
+        that profile that has not sent its link yet (latest click wins).
+        """
+        arrivals=getattr(self,'_open_arrivals',None)
+        if arrivals is None or command not in ('conversation.open','conversation.continue','profile.show'):return None
+        if command=='profile.show':
+            try:profile_id=identifier(args.get('profile_id'))
+            except (ValueError,AttributeError):return None
+        else:
+            profile_id=self._open_profile(command,args)
         if not profile_id:return None
         with self._request_gate_lock:
-            number=self._open_arrivals[profile_id]=self._open_arrivals.get(profile_id,0)+1
-        return profile_id,number
+            number=arrivals[profile_id]=arrivals.get(profile_id,0)+1
+        return (profile_id,number) if command!='profile.show' else None
 
     def _open_superseded(self,arrival):
         """True once a later task open arrived for the same profile (latest click wins)."""
