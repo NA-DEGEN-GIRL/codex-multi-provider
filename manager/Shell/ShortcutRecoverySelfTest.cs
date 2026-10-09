@@ -54,6 +54,15 @@ internal static class ShortcutRecoverySelfTest
                 ms => { clock += ms; if (sent > 0 && clock >= 15000) selected = true; return Task.CompletedTask; }, remote: true)
             == ShortcutRecoveryResult.Recovered && sent == 1, "An SSH task selected 10 s after its direct send was reported unverified.");
         checks.Add("SSH tasks get a longer ordinary chance and settle wait before a selection counts as unverified.");
+        // While attached, a selection check waits for the selected-task file's
+        // change event (at most 1 s) instead of re-reading it every 200 ms.
+        sent = 0; selected = false; clock = 0; var waits = new List<int>(); int reads = 0;
+        var evented = await ShortcutNavigationRecovery.RunAsync(() => true, () => true,
+            () => { reads++; return Task.FromResult(selected); }, Send, Delay, () => clock,
+            selectionWait: ms => { waits.Add(ms); clock += 30; selected = waits.Count == 2; return Task.CompletedTask; });
+        Require(evented == ShortcutRecoveryResult.Selected && sent == 0 && reads == 3 && waits.All(ms => ms is > 0 and <= 1000),
+            "A selection check polled instead of waiting for the selected-task change.");
+        checks.Add("Selection checks wait for the selected-task change event (bounded at 1 s) instead of 200 ms polling.");
         selected = false;
 
         sent = 0; clock = 0; current = true;

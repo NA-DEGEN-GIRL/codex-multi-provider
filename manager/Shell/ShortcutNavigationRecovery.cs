@@ -46,14 +46,19 @@ internal static class ShortcutNavigationRecovery
     // ordinary chance and the wait after a direct send are longer.
     internal const int LocalChance = 2000, RemoteChance = 5000, LocalSettle = 6000, RemoteSettle = 20000;
 
+    // selectionWait(ms): while attached, wait for the desktop's selected-task
+    // file to change (TaskContextWatcher) or ms at most (never over 1 s), instead
+    // of re-reading it every 200 ms. Defaults to delay.
     internal static async Task<ShortcutRecoveryResult> RunAsync(Func<bool> current, Func<bool> attached,
         Func<Task<bool>> selected, Func<CancellationToken, Task> send,
-        Func<int, Task>? delay = null, Func<long>? now = null, bool remote = false)
+        Func<int, Task>? delay = null, Func<long>? now = null, bool remote = false, Func<int, Task>? selectionWait = null)
     {
         delay ??= ms => Task.Delay(ms);
+        selectionWait ??= delay;
         now ??= () => Environment.TickCount64;
         var start = now();
         int chance = remote ? RemoteChance : LocalChance, settle = remote ? RemoteSettle : LocalSettle;
+        int Left(long until) => (int)Math.Clamp(until - now(), 1, 1000);
         // Give the ordinary deep link a short chance; a cold window gets a
         // bounded attachment wait without launching or polling the service again.
         while (current())
@@ -62,6 +67,8 @@ internal static class ShortcutNavigationRecovery
             {
                 if (await selected()) return current() ? ShortcutRecoveryResult.Selected : ShortcutRecoveryResult.Cancelled;
                 if (now() - start >= chance) break;
+                await selectionWait(Left(start + chance));
+                continue;
             }
             if (now() - start >= 25000) return ShortcutRecoveryResult.Unverified;
             await delay(200);
@@ -76,7 +83,7 @@ internal static class ShortcutNavigationRecovery
         {
             while (!sending.IsCompleted && current() && attached() && now() < deadline)
             {
-                await Task.WhenAny(sending, delay(200));
+                await Task.WhenAny(sending, selectionWait(Left(deadline)));
                 if (current() && attached() && await selected())
                     return current() ? ShortcutRecoveryResult.Recovered : ShortcutRecoveryResult.Cancelled;
             }
@@ -96,7 +103,7 @@ internal static class ShortcutNavigationRecovery
         {
             if (await selected()) return current() ? ShortcutRecoveryResult.Recovered : ShortcutRecoveryResult.Cancelled;
             if (now() >= deadline) return ShortcutRecoveryResult.Unverified;
-            await delay(200);
+            await selectionWait(Left(deadline));
         }
         return ShortcutRecoveryResult.Cancelled;
     }

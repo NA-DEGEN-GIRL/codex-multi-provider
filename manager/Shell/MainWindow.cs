@@ -82,6 +82,18 @@ public sealed partial class MainWindow : Window
     // its cancellation (a later click stops it at once: latest click wins).
     private sealed record ShortcutOpen(string Id, int Ticket, ShortcutOpenTrace Trace, CancellationTokenSource Cancel);
     private readonly Dictionary<string, ShortcutOpen> _shortcutOpens = [];
+    // Completed (and replaced) whenever a desktop's selected-task file changes.
+    private TaskCompletionSource _activeTaskChanged = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private void SignalActiveTask()
+    {
+        var changed = _activeTaskChanged;
+        _activeTaskChanged = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        changed.TrySetResult();
+    }
+    // A selection check waits for that change, or ms at most (fixtures: ms).
+    private Task ActiveTaskChangedAsync(int ms, CancellationToken cancellation) => _taskContext is null
+        ? Task.Delay(ms, cancellation)
+        : Task.WhenAny(_activeTaskChanged.Task, Task.Delay(ms, cancellation));
     private bool OpenInFlight(string? profileId) =>
         profileId is not null && _shortcutOpens.TryGetValue(profileId, out var open) && !open.Trace.Finished;
     private string? OpenProgress(string shortcutId) =>
@@ -502,6 +514,7 @@ public sealed partial class MainWindow : Window
             _ = RefreshTaskPresetAsync();
             RefreshCacheLines();
         });
+        if (_taskContext is not null) _taskContext.Touched += SignalActiveTask;
         if (!fixture) Loaded += async (_, _) => await Safe(async () => {
             await InitializeAsync(); _initialized = true;
             if (_pendingNotification is { } ticket) { _pendingNotification = null; await OpenNotificationAsync(ticket); }
@@ -2652,6 +2665,8 @@ public sealed partial class MainWindow : Window
             var waiting = result.Message("Codex가 준비되면 선택한 대화로 자동 이동합니다.");
             Log("대화 열기 대기 · " + waiting);
             ShowOpenProgress();
+            var backoff = new ReadyPollBackoff();
+            backoff.Observe(result.S("reason"));
             JsonElement? completed;
             try
             {
@@ -2661,6 +2676,7 @@ public sealed partial class MainWindow : Window
                     {
                         var next = await Request("conversation.navigate", new { navigation_id = token }, cancellation);
                         trace.Observe(next);
+                        backoff.Observe(next.S("reason"));
                         // The wait can move from the local runtime to an SSH task's connection.
                         if (next.S("state") == "waiting_for_reader" && ticket == _navigation && !_closing)
                         {
@@ -2669,7 +2685,7 @@ public sealed partial class MainWindow : Window
                         }
                         return next;
                     },
-                    () => Task.Delay(750, cancellation));
+                    () => Task.Delay(backoff.Next(), cancellation));
             }
             // The ready wait of a replaced or abandoned open fails silently too.
             // Request does not log this untracked command, so it is logged here.

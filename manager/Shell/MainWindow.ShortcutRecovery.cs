@@ -50,7 +50,8 @@ public sealed partial class MainWindow
         try
         {
             var outcome = await ShortcutNavigationRecovery.RunAsync(Current, Attached, Selected,
-                token => host.NavigateAsync(target, token), ms => Task.Delay(ms, cancellation), remote: remote);
+                token => host.NavigateAsync(target, token), ms => Task.Delay(ms, cancellation), remote: remote,
+                selectionWait: ms => ActiveTaskChangedAsync(ms, cancellation));
             if (outcome == ShortcutRecoveryResult.Cancelled)
             {
                 var code = CancelCode();

@@ -153,6 +153,52 @@ class TransportTests(unittest.TestCase):
         self.assertFalse(opened['readonly_projection'])
         self.assertEqual(len(self.calls), 1)
 
+    def test_running_app_takes_a_local_link_over_its_own_pipe_without_a_second_instance(self):
+        home = self.root / 'original'
+        home.mkdir()
+        with closing(sqlite3.connect(home / 'state_5.sqlite')) as db, db:
+            db.execute('CREATE TABLE threads (id TEXT PRIMARY KEY)')
+            db.execute('INSERT INTO threads VALUES (?)', (self.shortcut['thread_id'],))
+        shortcut = {**self.shortcut, 'source_store_id': 'original:local'}
+        gating = {'CODEX_RECORD_HOME': str(home), 'CODEX_MANAGER_SHARED_EXECUTION': '1'}
+        ready = dict(initialized=True, connected=True, canonical_storage=dict(enabled=True), shared_execution_version=1)
+        directed, built = [], []
+        def spawn_environment():
+            built.append({'FULL_LAUNCH': '1'})
+            return built[-1]
+        def accept(thread_id):
+            directed.append(thread_id)
+            return True
+        with patch.object(self.transport, 'observe', return_value=ready):
+            opened = self.transport.open_conversation(self.profile, shortcut, str(self.executable), gating,
+                                                      spawn_environment=spawn_environment, direct=accept)
+        self.assertEqual((opened['state'], opened['delivery']), ('request_sent', 'app_bridge'))
+        self.assertEqual(opened['uri'], 'codex://threads/' + self.shortcut['thread_id'])
+        self.assertEqual(directed, [self.shortcut['thread_id']])
+        self.assertEqual((self.calls, built), ([], []), 'a second ChatGPT.exe or the full launch environment was used')
+        # A refused or unavailable pipe falls back to the ordinary link, built only then.
+        from manager_core.native_app_bridge import AppBridgeError
+        for failure in (lambda _: False, lambda _: (_ for _ in ()).throw(AppBridgeError('app_pipe_unavailable', 'x')),
+                        lambda _: (_ for _ in ()).throw(FileNotFoundError('no descriptor'))):
+            with self.subTest(failure=failure), patch.object(self.transport, 'observe', return_value=ready):
+                self.calls.clear(); built.clear()
+                opened = self.transport.open_conversation(self.profile, shortcut, str(self.executable), gating,
+                                                          spawn_environment=spawn_environment, direct=failure)
+                self.assertEqual((opened['state'], opened['delivery']), ('request_sent', 'second_instance'))
+                self.assertEqual(len(self.calls), 1)
+                self.assertEqual(self.calls[0][1]['env']['FULL_LAUNCH'], '1')
+                self.assertEqual(len(built), 1)
+
+    def test_ssh_link_never_uses_the_app_pipe(self):
+        _, _, shortcut, environment = self.remote_fixture()
+        ready = dict(initialized=True, connected=True, canonical_storage=dict(enabled=True), shared_execution_version=1)
+        self.ssh_activity('server')
+        with patch.object(self.transport, 'observe', return_value=ready):
+            opened = self.transport.open_conversation(self.profile, shortcut, str(self.executable), environment,
+                                                      direct=lambda _: self.fail('the app pipe has no host id'))
+        self.assertEqual(opened['delivery'], 'second_instance')
+        self.assertTrue(opened['uri'].endswith('?hostId=remote-ssh-discovered%3Aserver'))
+
     def test_original_ui_home_cannot_be_targeted_by_forged_profile(self):
         with self.assertRaises(ValueError):
             self.transport.open_conversation({**self.profile, 'ui_home': str(self.root)},

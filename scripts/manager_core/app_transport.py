@@ -66,7 +66,15 @@ class AppTransport:
         return profile_id, home, ui_home
 
     def open_conversation(self, profile: dict, shortcut: dict, app_executable: str,
-                          environment: dict | None = None, *, read_only: bool = False) -> dict:
+                          environment: dict | None = None, *, read_only: bool = False,
+                          spawn_environment=None, direct=None) -> dict:
+        """Authorize a task link from environment's record keys, then deliver it.
+
+        direct(thread_id) -> bool: the running app's own navigation pipe (local
+        tasks only); True means the app accepted it. Otherwise a second
+        ChatGPT.exe carries the link, with spawn_environment() (the full launch
+        environment, built only then) or environment.
+        """
         profile_id, home, ui_home = self._profile(profile)
         thread_id = str(UUID(str(shortcut['thread_id'])))
         request_id = str(uuid4())
@@ -124,25 +132,38 @@ class AppTransport:
         readiness = self.remote_navigation_readiness(profile, shortcut)
         if readiness is not None:
             return {**result, **readiness}
+        uri = 'codex://threads/' + native_thread_id
+        if desktop_host is not None:
+            uri += '?hostId=' + quote(desktop_host, safe='')
+        if direct is not None and desktop_host is None:
+            # The app's own navigation (its app-tools pipe, identity-checked):
+            # no second Electron process. Navigating to the same task again is
+            # harmless, so any failure falls back to the ordinary link below.
+            try:
+                delivered = direct(native_thread_id) is True
+            except (OSError, ValueError, RuntimeError, KeyError, TypeError, AttributeError):
+                delivered = False
+            if delivered:
+                return {**result, 'state': 'request_sent', 'uri': uri, 'delivery': 'app_bridge',
+                        'requested_at': utc_now(),
+                        'message': '지정 프로필에 작업 열기를 요청했습니다. 화면 선택 확인은 아직 대기 중입니다.'}
         executable = Path(app_executable)
         if not executable.is_absolute() or not executable.is_file() or executable.name.lower() != 'chatgpt.exe':
             raise ValueError('Expected an installed absolute ChatGPT.exe path.')
         # Preserve the supplied launch environment (including provider keys in memory),
         # but overwrite isolation identity and never serialize environment values.
-        env = dict(environment if environment is not None else os.environ)
+        supplied = spawn_environment() if spawn_environment is not None else environment
+        env = dict(supplied if supplied is not None else os.environ)
         env['CODEX_HOME'] = str(home)
         env['CODEX_ELECTRON_USER_DATA_PATH'] = str(ui_home)
         from .desktop_bundle import pipe_name
         env['CODEX_MANAGER_DESKTOP_PIPE'] = pipe_name(profile_id)
         env.pop('ELECTRON_RUN_AS_NODE', None)
-        uri = 'codex://threads/' + native_thread_id
-        if desktop_host is not None:
-            uri += '?hostId=' + quote(desktop_host, safe='')
         process = self._popen([str(executable), '--user-data-dir=' + str(ui_home), uri],
                               env=env, cwd=str(self.root), stdin=subprocess.DEVNULL,
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                               creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
-        return {**result, 'state': 'request_sent', 'uri': uri,
+        return {**result, 'state': 'request_sent', 'uri': uri, 'delivery': 'second_instance',
                 'launcher_process_id': process.pid, 'requested_at': utc_now(),
                 'message': '지정 프로필에 작업 열기를 요청했습니다. 화면 선택 확인은 아직 대기 중입니다.'}
 

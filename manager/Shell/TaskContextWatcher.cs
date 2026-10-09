@@ -40,9 +40,13 @@ internal sealed class TaskContextWatcher : IDisposable
         if (selection != identity) { selection = identity; current = null; changed(null); }
         _ = ReadAsync(++ticket);
     }
+    // Any profile's selected task changed (a task open waits for this instead of polling).
+    internal event Action? Touched;
     private void OnChanged(object? sender, FileSystemEventArgs e) => dispatcher.BeginInvoke(new Action(() =>
     {
-        if (!disposed && Path.GetFileName(Path.GetDirectoryName(e.FullPath)) == profile.S("id")) _ = ReadAsync(++ticket);
+        if (disposed) return;
+        Touched?.Invoke();
+        if (Path.GetFileName(Path.GetDirectoryName(e.FullPath)) == profile.S("id")) _ = ReadAsync(++ticket);
     }));
     private async Task ReadAsync(long request)
     {

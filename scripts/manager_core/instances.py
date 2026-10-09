@@ -510,33 +510,7 @@ class Instances:
         env.setdefault('CODEX_REQUEST_COMPRESSION', 'auto')
         env.setdefault('CODEX_MAX_REQUEST_BYTES', str(40 * 1024 * 1024))
         env.setdefault('CODEX_MAX_INLINE_IMAGE_BYTES', str(8 * 1024 * 1024))
-        if profile.get('record_catalog_path'):
-            if not runtime_info.get('capabilities',{}).get('native_record_catalog'):
-                raise RuntimeError('전체 기록 조회 런타임이 아직 검증·배포되지 않았습니다.')
-            env['CODEX_MANAGER_RECORD_CATALOG']=profile['record_catalog_path']
-        from .shared_catalog import environment as shared_environment
-        env.update(shared_environment(self.store,profile,runtime_info.get('capabilities',{}),
-                                      self.catalog_refresh,self.source_catalog_refresh))
-        if (not profile.get('record_catalog_path') and not env.get('CODEX_RECORD_HOME')
-                and runtime_info.get('capabilities',{}).get('managed_store_binding')):
-            # Canonical navigation needs no per-profile authority manifest.
-            # Building one enumerates every peer's records and writes a file
-            # that the canonical branch below would immediately discard.
-            from .managed_sources import manifest as source_manifest
-            env['CODEX_MANAGER_MANAGED_SOURCES']=str(source_manifest(self.store,profile))
-        if env.get('CODEX_RECORD_HOME'):
-            env.pop('CODEX_MANAGER_MANAGED_SOURCES', None)
-            env.pop('CODEX_MANAGER_PROJECT_ALIASES', None)
-            env['CODEX_MANAGER_SHARED_WRITER_ID'] = profile['id']
-        if env.get('CODEX_MANAGER_SHARED_CATALOG') and runtime_info.get('capabilities', {}).get('shared_record_execution'):
-            env.pop('CODEX_MANAGER_MANAGED_SOURCES', None)
-            env['CODEX_MANAGER_SHARED_EXECUTION'] = '1'
-            env['CODEX_MANAGER_SHARED_WRITER_ID'] = profile['id']
-            if runtime_info.get('capabilities', {}).get('shared_new_task_storage'):
-                original = Path.home() / '.codex'
-                sources = self.store.read()['sources']
-                if any(s.get('host_id') == 'local' and Path(s['home']) == original for s in sources):
-                    env['CODEX_MANAGER_NEW_THREAD_HOME'] = str(original)
+        self._record_environment(profile, runtime_info.get('capabilities', {}), env)
         from .remote import supports_remote_claude
         if ((profile.get('auth_mode') != 'claude_code' or supports_remote_claude(self.root)) and manifest.is_file()
                 and json.loads(manifest.read_text(encoding='utf-8-sig')).get('ssh_proxy')):
@@ -557,6 +531,52 @@ class Instances:
                 if not frozen_shim.is_file():raise RuntimeError('배포된 SSH 구성요소가 없습니다.')
                 env['CODEX_MANAGER_SSH_SCRIPT'] = str(frozen_shim)
         return env
+
+    def _record_environment(self, profile, capabilities, env):
+        """The record-store keys of a launch, in place: the catalog, canonical
+        history, authority manifest and shared execution. Task links are
+        authorized from exactly these (AppTransport.open_conversation)."""
+        if profile.get('record_catalog_path'):
+            if not capabilities.get('native_record_catalog'):
+                raise RuntimeError('전체 기록 조회 런타임이 아직 검증·배포되지 않았습니다.')
+            env['CODEX_MANAGER_RECORD_CATALOG']=profile['record_catalog_path']
+        from .shared_catalog import environment as shared_environment
+        env.update(shared_environment(self.store,profile,capabilities,
+                                      self.catalog_refresh,self.source_catalog_refresh))
+        if (not profile.get('record_catalog_path') and not env.get('CODEX_RECORD_HOME')
+                and capabilities.get('managed_store_binding')):
+            # Canonical navigation needs no per-profile authority manifest.
+            # Building one enumerates every peer's records and writes a file
+            # that the canonical branch below would immediately discard.
+            from .managed_sources import manifest as source_manifest
+            env['CODEX_MANAGER_MANAGED_SOURCES']=str(source_manifest(self.store,profile))
+        if env.get('CODEX_RECORD_HOME'):
+            env.pop('CODEX_MANAGER_MANAGED_SOURCES', None)
+            env.pop('CODEX_MANAGER_PROJECT_ALIASES', None)
+            env['CODEX_MANAGER_SHARED_WRITER_ID'] = profile['id']
+        if env.get('CODEX_MANAGER_SHARED_CATALOG') and capabilities.get('shared_record_execution'):
+            env.pop('CODEX_MANAGER_MANAGED_SOURCES', None)
+            env['CODEX_MANAGER_SHARED_EXECUTION'] = '1'
+            env['CODEX_MANAGER_SHARED_WRITER_ID'] = profile['id']
+            if capabilities.get('shared_new_task_storage'):
+                original = Path.home() / '.codex'
+                sources = self.store.read()['sources']
+                if any(s.get('host_id') == 'local' and Path(s['home']) == original for s in sources):
+                    env['CODEX_MANAGER_NEW_THREAD_HOME'] = str(original)
+        return env
+
+    def navigation_environment(self, profile):
+        """What authorizing a task link reads, without rebuilding the launch.
+
+        The record-store keys of environment() only: no provider keys, SSH
+        shims, execution presets, package lookup or desktop pipe. A running
+        app needs nothing else unless a second ChatGPT.exe carries the link,
+        and that spawn builds the full environment itself.
+        """
+        if profile.get('runtime_channel') == 'packaged':
+            return {}
+        from .runtime_build import resolve
+        return self._record_environment(profile, resolve(self.root).get('capabilities', {}), {})
 
     def launch_requires_exclusive(self):
         """True while a launch may still run the one-time history migration.

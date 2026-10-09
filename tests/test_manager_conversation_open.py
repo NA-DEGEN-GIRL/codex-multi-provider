@@ -76,6 +76,9 @@ class ConversationOpenTests(unittest.TestCase):
         stack.enter_context(patch.object(self.center.instances, 'show', side_effect=self.show))
         stack.enter_context(patch.object(self.center.instances, 'observe', side_effect=lambda p: {'status': 'running'}))
         stack.enter_context(patch.object(self.center.instances, 'environment', side_effect=self.environment))
+        # Authorization reads the same record keys as the fixture's launch environment.
+        stack.enter_context(patch.object(self.center.instances, 'navigation_environment',
+                                         side_effect=lambda p: self.center.instances.environment(p)))
         stack.enter_context(patch.object(self.center, '_wait_runtime'))
         stack.enter_context(patch('manager_core.app_transport.subprocess.Popen', side_effect=self.launch))
 
@@ -254,6 +257,45 @@ class ConversationOpenTests(unittest.TestCase):
         self.assertEqual(self.navigate(first)['reason'], 'navigation_expired')
         self.assertEqual(self.navigate(second['navigation_id'])['state'], 'waiting_for_reader')
         self.assertIsNone(self.center.navigations.profile_of('not-a-token'))
+
+    def test_running_app_opens_a_local_task_over_its_own_pipe_without_rebuilding_the_launch(self):
+        self.shared_execution()
+        self.store.mutate(lambda data: self.store.profile(self.b['id'], data).update(process_created=4242))
+        profile = self.store.profile(self.b['id'])
+        identity = {k: profile[k] for k in ('process_id', 'process_created', 'executable_path')}
+        atomic_json(self.store.directory / 'instances' / self.b['id'] / 'native-app-bridge.json', dict(
+            version=1, profile_id=self.b['id'], generation=profile['generation'],
+            pipe_path=r'\\.\pipe\codex-browser-use-fixture', app=identity))
+        calls = []
+        class Pipe:
+            def __init__(self, path, *, expected_identity, timeout):
+                calls.append(('connect', expected_identity, timeout))
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def request(self, method, params, *, timeout):
+                calls.append((params['tool'], params['arguments'], params['threadId']))
+                return {'success': True, 'contentItems': [{'type': 'inputText', 'text': '{"navigated":true}'}]}
+        gating = dict(CODEX_MANAGER_SHARED_CATALOG=str(self.catalog), CODEX_MANAGER_SHARED_EXECUTION='1')
+        self.center.instances.navigation_environment.side_effect = lambda p: dict(gating)
+        self.center.instances.environment.reset_mock()
+        with patch('manager_core.native_app_bridge.NativePipe', Pipe):
+            result = self.open()
+        self.assertEqual((result['state'], result['delivery']), ('request_sent', 'app_bridge'), result)
+        self.assertEqual(result['uri'], 'codex://threads/' + self.tid)
+        self.assertEqual(calls[0], ('connect', identity, 1))
+        self.assertEqual(calls[1], ('navigate_to_codex_page', {'threadId': self.tid}, self.tid))
+        self.assertFalse(self.launches, 'a second ChatGPT.exe carried the link')
+        self.center.instances.environment.assert_not_called()
+        # A descriptor of another launch is refused; the ordinary link follows.
+        atomic_json(self.store.directory / 'instances' / self.b['id'] / 'native-app-bridge.json', dict(
+            version=1, profile_id=self.b['id'], generation='an older launch',
+            pipe_path=r'\\.\pipe\codex-browser-use-fixture', app=identity))
+        calls.clear()
+        with patch('manager_core.native_app_bridge.NativePipe', Pipe):
+            result = self.open()
+        self.assertEqual(result['delivery'], 'second_instance')
+        self.assertEqual((calls, len(self.launches)), ([], 1))
+        self.center.instances.environment.assert_called_once()
 
     def test_moved_shortcut_rejects_captured_profile_before_any_open_or_handoff(self):
         expected = self.link['profile_id']

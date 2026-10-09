@@ -112,14 +112,43 @@ class PendingNavigations:
         return result
 
     def _attempt(self, plan):
+        """Authorize from the record keys only; build the full launch environment
+        only if a second ChatGPT.exe must carry the link (never for a running
+        app that takes a local task over its own navigation pipe)."""
         profile = plan['profile']
-        environment = self.center.instances.environment(profile)
+        instances = self.center.instances
+        environment = instances.navigation_environment(profile)
+        spawned = []
+        def spawn_environment():
+            spawned.append(instances.environment(profile))
+            return spawned[-1]
         try:
             result = self.transport.open_conversation(profile, plan['link'], profile['executable_path'],
-                                                      environment, read_only=plan['read_only'])
+                                                      environment, read_only=plan['read_only'],
+                                                      spawn_environment=spawn_environment,
+                                                      direct=self._direct(plan))
         finally:
             environment.clear()
+            for env in spawned:
+                env.clear()
         return self._describe(result, plan)
+
+    def _direct(self, plan):
+        """navigate_to_codex_page over this exact launch's app-tools pipe, for a
+        local task; None for an SSH task (the tool takes no host id)."""
+        if plan['link'].get('host_id', 'local') != 'local':
+            return None
+        profile, root = plan['profile'], self.center.root
+
+        def navigate(thread_id):
+            from .native_app_bridge import AppBridge, NativePipe
+            # The descriptor must name this profile, generation and app
+            # process; the pipe server's own PID and birth time are checked too.
+            bridge = AppBridge(root, profile, pipe_factory=lambda path, expected_identity: NativePipe(
+                path, expected_identity=expected_identity, timeout=1))
+            bridge.call('navigate_to_codex_page', {'threadId': thread_id}, thread_id, timeout=4)
+            return True
+        return navigate
 
     @staticmethod
     def _describe(result, plan):
