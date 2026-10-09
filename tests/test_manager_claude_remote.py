@@ -4,6 +4,7 @@ import os
 from pathlib import Path, PurePosixPath
 import sys
 import tempfile
+import threading
 import time
 import tomllib
 import unittest
@@ -11,6 +12,8 @@ from unittest.mock import patch
 from uuid import uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from test_manager_execution_preset_auth import capture_logs
 from manager_core.claude_auth import ClaudeError
 from manager_core.claude_borrowed_auth import read_access_token
 from manager_core.claude_profiles import render_for_host, render_execution_role_for_host
@@ -96,6 +99,78 @@ class BorrowedClaudeTests(unittest.TestCase):
                     self.read()
         self.assertEqual(len(calls), 1)
         self.refresh_patch.start()
+
+    def write(self, token, expires):
+        self.credentials['claudeAiOauth'].update(accessToken=token, expiresAt=expires * 1000)
+        atomic_json(self.directory / '.credentials.json', self.credentials)
+
+    def test_token_inside_the_cli_renewal_window_is_renewed_before_it_is_lent(self):
+        logs = capture_logs(self)
+        renewed = int(time.time()) + 8 * 3600
+        # Four minutes left: the official CLI renews below five, and a token lent
+        # as it is would expire during the remote turn that borrowed it.
+        self.write('dummy-token-1', int(time.time()) + 240)
+        self.refresh_mock.side_effect = lambda profile_id: self.write('dummy-token-2', renewed)
+        self.assertEqual(self.read(), dict(accessToken='dummy-token-2', expiresAt=renewed,
+                                         accountIdentity=self.identity))
+        self.assertEqual(self.refresh_mock.call_count, 1)
+        # Above the floor the token is lent unchanged, and it still clears the
+        # runtime's 120 s and the SSH helper's 30 s checks.
+        self.refresh_mock.reset_mock()
+        expires = int(time.time()) + 290
+        self.write('dummy-token-3', expires)
+        self.assertEqual(self.read(), dict(accessToken='dummy-token-3', expiresAt=expires,
+                                         accountIdentity=self.identity))
+        self.refresh_mock.assert_not_called()
+        self.assertGreater(expires, int(time.time()) + 120)
+        # Inside the window with a renewal the CLI declined: refused, not lent.
+        self.refresh_mock.side_effect = None
+        self.write('dummy-token-4', int(time.time()) + 240)
+        with self.assertRaises(ClaudeError) as caught:
+            self.read()
+        self.assertNotIn('dummy-token', repr((caught.exception, caught.exception.args)))
+        self.assertNotIn('dummy-token', repr([record.getMessage() for record in logs]))
+
+    def test_turn_that_waited_for_another_renewal_reads_the_renewed_token(self):
+        from manager_core import claude_borrowed_auth as borrowed
+        logs = capture_logs(self)
+        renewed = int(time.time()) + 8 * 3600
+        self.write('dummy-token-1', int(time.time()) - 60)
+        entered, release, queries, results = threading.Event(), threading.Event(), [], {}
+        self.addCleanup(release.set)
+        def query(*args, **kwargs):
+            queries.append(args)
+            entered.set()
+            release.wait(5)
+            self.write('dummy-token-2', renewed)
+            return None, None
+        self.refresh_patch.stop()
+        renew = borrowed._refresh_with_cli
+        def read(name):
+            results[name] = self.read()
+        with patch('manager_core.claude_usage_terminal.query', side_effect=query), \
+                patch.dict(borrowed._REFRESH_ATTEMPTS, clear=True), \
+                patch.object(borrowed, '_refresh_with_cli', side_effect=renew) as refresh:
+            first = threading.Thread(target=read, args=('first',))
+            first.start()
+            self.assertTrue(entered.wait(2))
+            # The second turn also found the expired token and asks for a
+            # renewal while the first one is still running.
+            second = threading.Thread(target=read, args=('second',))
+            second.start()
+            deadline = time.monotonic() + 2
+            while refresh.call_count < 2 and time.monotonic() < deadline:
+                time.sleep(.005)
+            self.assertEqual(refresh.call_count, 2)
+            release.set()
+            first.join(5)
+            second.join(5)
+        self.refresh_patch.start()
+        # The cooldown skipped a second CLI run; the re-read found its result.
+        self.assertEqual(len(queries), 1)
+        expected = dict(accessToken='dummy-token-2', expiresAt=renewed, accountIdentity=self.identity)
+        self.assertEqual(results, dict(first=expected, second=expected))
+        self.assertNotIn('dummy-token', repr([record.getMessage() for record in logs]))
 
     def test_credential_rotation_during_status_check_fails_closed(self):
         def status(*args):
