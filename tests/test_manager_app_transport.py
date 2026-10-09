@@ -6,6 +6,7 @@ from contextlib import closing
 from pathlib import Path
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 from types import SimpleNamespace
@@ -56,15 +57,30 @@ class TransportTests(unittest.TestCase):
             self.assertEqual(result['reason'], reason)
         self.assertFalse(self.calls)
 
-    def test_ssh_shortcut_opens_the_exact_desktop_host(self):
+    def ssh_activity(self, alias, *, generation=None, age=0.0, pid=4242):
+        """The file the native SSH proxy of this launch writes while it runs."""
+        path = self.root / 'work/control-center/instances' / self.profile_id / f'ssh-activity-{alias}-{pid}.json'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({'schema': 1, 'generation': generation or self.profile['generation'],
+                                    'observed_at': time.time() - age, 'thread_activity': {}}),
+                        encoding='utf-8')
+        return path
+
+    def remote_fixture(self):
+        self.profile['generation'] = str(uuid4())
         state = Path(self.profile['home']) / '.codex-global-state.json'
         state.parent.mkdir(parents=True, exist_ok=True)
         connections = [{'hostId': 'remote-ssh-discovered:server', 'alias': 'server'},
                        {'hostId': 'remote-ssh-discovered:other', 'alias': 'other'}]
         state.write_text(json.dumps({'codex-managed-remote-connections': connections}), encoding='utf-8')
         shortcut = {**self.shortcut, 'host_id': 'ssh:server', 'source_store_id': 'remote-fixture'}
-        ready = dict(initialized=True, connected=True, canonical_storage=dict(enabled=True), shared_execution_version=1)
         environment = {'CODEX_RECORD_HOME': str(self.root / 'no-local-copy'), 'CODEX_MANAGER_SHARED_EXECUTION': '1'}
+        return state, connections, shortcut, environment
+
+    def test_ssh_shortcut_opens_the_exact_desktop_host(self):
+        state, connections, shortcut, environment = self.remote_fixture()
+        ready = dict(initialized=True, connected=True, canonical_storage=dict(enabled=True), shared_execution_version=1)
+        self.ssh_activity('server')
         with patch.object(self.transport, 'observe', return_value=ready):
             opened = self.transport.open_conversation(self.profile, shortcut, str(self.executable), environment)
         self.assertEqual(opened['state'], 'request_sent')
@@ -80,6 +96,42 @@ class TransportTests(unittest.TestCase):
         blocked = self.transport.open_conversation(self.profile, shortcut, str(self.executable), environment)
         self.assertEqual(blocked['reason'], 'remote_host_not_connected')
         self.assertFalse(self.calls)
+
+    def test_ssh_link_waits_for_this_launchs_connection_to_its_host(self):
+        # A starting desktop registers its SSH connections after the local
+        # runtime; a link for an unregistered host must not be sent yet.
+        _, _, shortcut, environment = self.remote_fixture()
+        ready = dict(initialized=True, connected=True, canonical_storage=dict(enabled=True), shared_execution_version=1)
+        not_yet = {
+            'no connection': lambda: None,
+            'previous launch': lambda: self.ssh_activity('server', generation=str(uuid4())),
+            'stale proxy': lambda: self.ssh_activity('server', age=31),
+            'other host': lambda: self.ssh_activity('other'),
+            'host with a longer alias': lambda: self.ssh_activity('server-2'),
+        }
+        directory = self.root / 'work/control-center/instances' / self.profile_id
+        for label, arrange in not_yet.items():
+            with self.subTest(label):
+                for stale in directory.glob('ssh-activity-*.json') if directory.is_dir() else ():
+                    stale.unlink()
+                arrange()
+                with patch.object(self.transport, 'observe', return_value=ready):
+                    waiting = self.transport.open_conversation(self.profile, shortcut, str(self.executable), environment)
+                self.assertEqual(waiting['state'], 'waiting_for_reader')
+                self.assertEqual(waiting['reason'], 'remote_connection_starting')
+                self.assertNotIn('uri', waiting)
+                self.assertFalse(self.calls)
+        self.ssh_activity('server', pid=777)
+        self.assertTrue(self.transport.remote_connection_ready(self.profile, 'server'))
+        self.assertFalse(self.transport.remote_connection_ready({**self.profile, 'generation': None}, 'server'))
+        self.assertFalse(self.transport.remote_connection_ready(self.profile, '../server'))
+        with patch.object(self.transport, 'observe', return_value=ready):
+            opened = self.transport.open_conversation(self.profile, shortcut, str(self.executable), environment)
+        self.assertEqual(opened['state'], 'request_sent')
+        self.assertTrue(opened['uri'].endswith('?hostId=remote-ssh-discovered%3Aserver'))
+        self.assertEqual(len(self.calls), 1)
+        # Local tasks never wait for an SSH connection.
+        self.assertIsNone(self.transport.remote_navigation_readiness(self.profile, self.shortcut))
 
     def test_canonical_shortcut_waits_then_opens_without_projection_manifest(self):
         home = self.root / 'original'

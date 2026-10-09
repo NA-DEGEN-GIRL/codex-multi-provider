@@ -100,6 +100,53 @@ _CONTEXT_VARIANTS = {_CONTEXT_MAIN: _CONTEXT_MAIN_REPLACEMENT,
 _BROWSER_RUNTIME_VARIANTS = {_BROWSER_RUNTIME: _BROWSER_RUNTIME_REPLACEMENT,
     _BROWSER_RUNTIME.replace(b':a}', b':i}'): _BROWSER_RUNTIME_REPLACEMENT.replace(b':a}', b':i}')}  # 26.930
 
+# A thread link (codex://threads/<id>?hostId=...) that reaches a starting
+# desktop waits in its link queue; runMainAppStartup flushes that queue last
+# and awaits it unguarded. Remote SSH connections are registered a few seconds
+# after the local runtime is up, so the lookup of a link for such a host threw
+# "Connection for host ID ... not found" synchronously, before the lookup's own
+# .catch was attached. The rejection ended startup: every window destroyed and
+# "<app> failed to start." with only Quit. The lookup becomes async (its native
+# catch logs local_conversation_deep_link_lookup_failed and keeps the current
+# view) and the startup flush gets the non-fatal handling that every later
+# flush already has. Required from 26.930 on; both anchors survive renames.
+_DEEP_LINK_FLUSH = re.compile(rb'(await [A-Za-z_$][\w$]*\.deepLinks\.flushPendingDeepLinks\(\))(?=,)')
+_DEEP_LINK_FLUSH_GUARD = b'.catch(e=>console.warn(`Codex manager: pending link failed during startup`,e?.message??e))'
+_DEEP_LINK_LOOKUP = re.compile(
+    rb'(readThread:[A-Za-z_$][\w$]*\.kind===`localConversation`\?)(\(([A-Za-z_$][\w$]*),([A-Za-z_$][\w$]*)\)=>'
+    rb'[A-Za-z_$][\w$]*\([A-Za-z_$][\w$]*\?\?`local`\)\.readThread\(\3,\4\):void 0)')
+_DEEP_LINK_LOOKUP_DONE = re.compile(rb'readThread:[A-Za-z_$][\w$]*\.kind===`localConversation`\?async\(')
+
+
+def _from_930(version):
+    found = re.fullmatch(r'(\d+)\.(\d+)\.\d+(?:\.\d+)?', version) if isinstance(version, str) else None
+    return found is not None and (int(found[1]), int(found[2])) >= (26, 930)
+
+
+def deep_link_guard_patches(modules, version):
+    """{module: {before: after}} that keep a failed startup link non-fatal.
+
+    modules is [(name, data)] of the main-process bundles. Each anchor must
+    occur exactly once over all modules (or already be patched); a missing
+    anchor is refused from 26.930 on and skipped for older or unknown builds.
+    """
+    patches = {}
+    for label, pattern, done, replace in (
+            ('flush', _DEEP_LINK_FLUSH, lambda data: data.count(b'.deepLinks.flushPendingDeepLinks()' + _DEEP_LINK_FLUSH_GUARD),
+             lambda match: match[1] + _DEEP_LINK_FLUSH_GUARD),
+            ('lookup', _DEEP_LINK_LOOKUP, lambda data: len(_DEEP_LINK_LOOKUP_DONE.findall(data)),
+             lambda match: match[1] + b'async' + match[2])):
+        found = [(name, match) for name, data in modules for match in pattern.finditer(data)]
+        patched = sum(done(data) for _, data in modules)
+        if len(found) + patched > 1:
+            raise ValueError('Ambiguous desktop startup link ' + label + '.')
+        if not found and not patched and _from_930(version):
+            raise ValueError(f'이 Codex 버전({version})의 시작 중 작업 링크 처리 위치를 확인하지 못했습니다. '
+                             '관리 앱 호환성 업데이트가 필요합니다.')
+        for name, match in found:
+            patches.setdefault(name, {})[match[0]] = replace(match)
+    return patches
+
 
 def _matching_variant(data, variants):
     found = [key for key in variants if key in data]
@@ -367,8 +414,17 @@ def patch_archive(source, destination):
                 changed[filter_name] = (entries_by_name[filter_name], filter_data)
         # 26.930 refuses to publish without all three grouping patches (see
         # require_project_grouping); other versions keep the native fallback.
-        require_project_grouping(archive_version(src, base, entries),
-                                 [webview_data(chunk) for chunk in grouping_chunks])
+        version = archive_version(src, base, entries)
+        require_project_grouping(version, [webview_data(chunk) for chunk in grouping_chunks])
+        # A failed link during startup must not end the app (_DEEP_LINK_FLUSH).
+        for guard_name, guard_patches in deep_link_guard_patches(
+                [(module, data) for module, _, data in main_modules], version).items():
+            guard_data = webview_data(guard_name)
+            for before, after in guard_patches.items():
+                if guard_data.count(before) != 1:
+                    raise ValueError('Desktop startup link guard anchor changed while patching.')
+                guard_data = guard_data.replace(before, after)
+            changed[guard_name] = (entries_by_name[guard_name], guard_data)
         plan = main_sync_plan([(module, data) for module, _, data in main_modules])
         if plan is None:
             # A previously sync-patched archive is used by the isolated desktop

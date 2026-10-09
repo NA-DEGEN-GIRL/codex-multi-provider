@@ -7,6 +7,7 @@ from contextlib import ExitStack
 from pathlib import Path
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -317,6 +318,55 @@ class ConversationOpenTests(unittest.TestCase):
         self.assertEqual(result['reason'], 'exact_remote_navigation_unverified')
         self.assertFalse(self.launches)
         self.assertFalse(any(a.calls for a in self.admins.values()))
+
+    def shared_ssh_shortcut(self):
+        """A shared-execution SSH task of profile b whose desktop declares the host."""
+        import json
+        self.capabilities['shared_record_execution'] = True
+        self.center.instances.environment.side_effect = lambda p: dict(
+            CODEX_MANAGER_SHARED_CATALOG=str(self.catalog), CODEX_MANAGER_SHARED_EXECUTION='1')
+        status = self.store.directory / 'instances' / self.b['id'] / 'runtime-state.json'
+        atomic_json(status, {**json.loads(status.read_text()), 'shared_execution_version': 1})
+        atomic_json(Path(self.b['home']) / '.codex-global-state.json', {'codex-managed-remote-connections': [
+            {'hostId': 'remote-ssh-discovered:remote-dev', 'alias': 'remote-dev'}]})
+        remote_ref = {**self.ref, 'host_id': 'ssh:remote-dev', 'source_store_id': 'remote-fixture'}
+        self.store.mutate(lambda data: data['sources'].append(dict(
+            id=remote_ref['source_store_id'], host_id=remote_ref['host_id'],
+            home='/home/fixture/.codex', alias='SSH fixture')))
+        self.link = self.store.shortcut_add('remote work', self.b['id'], **remote_ref)
+        return self.store.directory / 'instances' / self.b['id'] / 'ssh-activity-remote-dev-4242.json'
+
+    def test_ssh_task_link_waits_for_the_desktops_connection_to_that_host(self):
+        # Incident: the link reached a starting desktop before it registered
+        # the SSH host and 26.930 quit with "Connection for host ID ... not found".
+        activity = self.shared_ssh_shortcut()
+        result = self.open()
+        self.assertEqual(result['state'], 'waiting_for_reader')
+        self.assertEqual(result['reason'], 'remote_connection_starting')
+        self.assertEqual(result['access_mode'], 'preparing')
+        token = result['navigation_id']
+        # SSH preparation can follow the local runtime by more than the local wait.
+        self.assertGreater(self.center.navigations.pending[token]['expires'] - self.center.navigations.clock(), 60)
+        for _ in range(3):
+            self.assertEqual(self.navigate(token)['reason'], 'remote_connection_starting')
+        self.assertFalse(self.launches)
+        # The native SSH proxy of this launch runs the desktop's connection.
+        atomic_json(activity, {'schema': 1, 'generation': self.b['generation'],
+                               'observed_at': time.time(), 'thread_activity': {}})
+        result = self.navigate(token)
+        self.assertEqual(result['state'], 'request_sent', result)
+        self.assertEqual(result['uri'], 'codex://threads/' + self.tid + '?hostId=remote-ssh-discovered%3Aremote-dev')
+        self.assertEqual(len(self.launches), 1)
+        self.assertFalse(any(a.calls for a in self.admins.values()))
+
+    def test_ssh_task_link_is_not_sent_when_the_connection_never_starts(self):
+        self.shared_ssh_shortcut()
+        token = self.open()['navigation_id']
+        self.center.navigations.pending[token]['expires'] = 0
+        result = self.navigate(token)
+        self.assertEqual(result['state'], 'blocked')
+        self.assertEqual(result['reason'], 'remote_connection_timeout')
+        self.assertFalse(self.launches)
 
     def test_packaged_profile_keeps_ordinary_own_conversation_open(self):
         self.store.mutate(lambda data: self.store.profile(self.a['id'], data).update(runtime_channel='packaged'))

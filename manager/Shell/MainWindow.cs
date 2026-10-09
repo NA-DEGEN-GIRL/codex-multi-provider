@@ -2490,13 +2490,25 @@ public sealed partial class MainWindow : Window
         if (result.S("state") == "waiting_for_reader")
         {
             PresentShortcutResult(result, item, profileId);
-            SetStatus(result.Message("Codex가 준비되면 선택한 대화로 자동 이동합니다."));
+            var waiting = result.Message("Codex가 준비되면 선택한 대화로 자동 이동합니다.");
+            SetStatus(waiting);
             JsonElement? completed;
             try
             {
                 completed = await ConversationReadyWait.CompleteAsync(result,
                     () => ticket == _navigation && _selectedProfile == profileId && !_closing,
-                    token => Request("conversation.navigate", new { navigation_id = token }),
+                    async token =>
+                    {
+                        var next = await Request("conversation.navigate", new { navigation_id = token });
+                        // The wait can move from the local runtime to an SSH task's connection.
+                        if (next.S("state") == "waiting_for_reader" && ticket == _navigation && !_closing
+                            && next.Message(waiting) != waiting)
+                        {
+                            waiting = next.Message(waiting);
+                            SetStatus(waiting);
+                        }
+                        return next;
+                    },
                     () => Task.Delay(750));
             }
             // The ready wait of a replaced or abandoned open fails silently too.

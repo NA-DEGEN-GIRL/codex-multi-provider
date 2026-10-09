@@ -121,6 +121,9 @@ class AppTransport:
             readiness = self.navigation_readiness(profile, require_execution=shared_execution)
             if readiness is not None:
                 return {**result, **readiness}
+        readiness = self.remote_navigation_readiness(profile, shortcut)
+        if readiness is not None:
+            return {**result, **readiness}
         executable = Path(app_executable)
         if not executable.is_absolute() or not executable.is_file() or executable.name.lower() != 'chatgpt.exe':
             raise ValueError('Expected an installed absolute ChatGPT.exe path.')
@@ -177,6 +180,53 @@ class AppTransport:
             return dict(state='blocked', reason='shared_execution_pending',
                         message='이 창은 이전 조회용 실행입니다. 관리용 Codex를 다시 열면 선택한 계정으로 작업할 수 있습니다.')
         return None
+
+    def remote_navigation_readiness(self, profile, shortcut):
+        """Hold an SSH task link until this launch's desktop runs that host's connection.
+
+        The desktop registers its SSH connections only after the local runtime
+        is up, and a starting desktop handles a queued link last in startup.
+        A link for a host it has not registered yet cannot be opened (and made
+        26.930 quit at startup). Local tasks never wait here.
+        """
+        host_id = shortcut.get('host_id', 'local')
+        if host_id == 'local':
+            return None
+        if isinstance(host_id, str) and host_id.startswith('ssh:') and self.remote_connection_ready(profile, host_id[4:]):
+            return None
+        return dict(state='waiting_for_reader', reason='remote_connection_starting',
+                    message='SSH 연결을 준비하고 있습니다. 연결되면 선택한 대화로 자동 이동합니다.')
+
+    def remote_connection_ready(self, profile, alias, *, wall=time.time):
+        """True while the desktop of this launch generation pumps its SSH connection to alias.
+
+        The native SSH proxy is the transport of the desktop's own connection
+        object; it writes ssh-activity-<alias>-<pid>.json (thread_activity) as
+        soon as it runs and refreshes it at least every 10 seconds.
+        """
+        from .thread_activity import MAX_AGE_SECONDS
+        generation = profile.get('generation')
+        if (not isinstance(alias, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', alias)
+                or not isinstance(generation, str) or not generation):
+            return False
+        try:
+            directory = self.root / 'work/control-center/instances' / str(UUID(str(profile['id'])))
+            names = [path for path in directory.iterdir()
+                     if re.fullmatch(r'ssh-activity-' + re.escape(alias) + r'-\d{1,10}\.json', path.name)]
+        except (OSError, ValueError, KeyError):
+            return False
+        for path in names[:16]:
+            try:
+                if path.stat().st_size > 65536:
+                    continue
+                value = json.loads(path.read_text(encoding='utf-8'))
+            except (OSError, ValueError):
+                continue
+            observed = value.get('observed_at') if isinstance(value, dict) else None
+            if (value.get('generation') == generation and isinstance(observed, (int, float))
+                    and -5 <= wall() - observed <= MAX_AGE_SECONDS):
+                return True
+        return False
 
     @staticmethod
     def _safe_object(path: Path, limit: int) -> dict:

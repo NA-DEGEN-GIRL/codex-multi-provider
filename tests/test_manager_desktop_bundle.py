@@ -15,8 +15,8 @@ from manager_core import desktop_bundle as bundle
 from manager_core.original_sync_bundle import PATCHES, RENDERER_PATCHES
 
 
-def archive(path, source=None, notification=None, composer=None):
-    body = b'function s9(){' + (source if source is not None else bundle._ORIGINAL) + b'return "posix";}'
+def archive(path, source=None, notification=None, composer=None, links=b'', version=None):
+    body = b'function s9(){' + (source if source is not None else bundle._ORIGINAL) + b'return "posix";}' + links
     notice = notification if notification is not None else (bundle._NOTIFICATION_CLICK + b'originalCallback();})' +
         bundle._NOTIFICATION_SHOW + bundle._WINDOW_MESSAGE)
     chunks = [('.vite/build/before.bin', b'FIRST'), ('.vite/build/main.js', body),
@@ -27,6 +27,8 @@ def archive(path, source=None, notification=None, composer=None):
               ('webview/assets/app-initial-fixture.js', bundle._CONTEXT_RENDERER + b';' + b';'.join(RENDERER_PATCHES))]
     if composer is not None:
         chunks.append(('webview/assets/app-primary-fixture.js', composer))
+    if version is not None:
+        chunks.append(('package.json', json.dumps({'version': version}).encode()))
     tree = {'files': {}}
     offset = 0
     for name, data in chunks:
@@ -56,6 +58,32 @@ def entry(path, name):
 CLICK_917 = bundle._NOTIFICATION_CLICK.replace(b'l.on', b'd.on')
 NOTICES = {'26.915': bundle._NOTIFICATION_CLICK + b'originalCallback();})' + bundle._NOTIFICATION_SHOW + bundle._WINDOW_MESSAGE,
            '26.917': CLICK_917 + b'originalCallback();})' + bundle._NOTIFICATION_STAGED_SHOW + b'}' + bundle._WINDOW_MESSAGE}
+
+# 26.930.7945 main bundle, verbatim (3930 and 4958 are identical here): the
+# deep-link thread lookup of navigateToRoute and the end of runMainAppStartup.
+LOOKUP_930 = b'readThread:t.kind===`localConversation`?(e,t)=>c(r??`local`).readThread(e,t):void 0'
+FLUSH_930 = b'await We.deepLinks.flushPendingDeepLinks(),I(`pending deep links flushed`,B),I(`startup complete`,e)}'
+# 26.917 keeps the flush (bound to Le, M, L) and has no such lookup wrapper.
+FLUSH_917 = b'await Le.deepLinks.flushPendingDeepLinks(),M(`pending deep links flushed`,L),M(`startup complete`,e)}'
+LINKS_930 = b'let k={navigateToRoute:async(e,t)=>XJe({' + LOOKUP_930 + b'})};async function NQe(){' + FLUSH_930
+VERSION_7945 = '26.930.61225'  # package.json version of the 26.930.7945 desktop
+# A starting desktop with a queued link for an SSH host it has not registered
+# yet: the shape of navigateToRoute, its lookup (XJe) and the connection
+# registry, with the anchors above verbatim. Prints the startup outcome.
+STARTUP_PROGRAM = b'''const out={phases:[],navigated:[],warnings:[]};
+const y7={warning:m=>out.warnings.push(m)};
+const registry={connections:new Map([[`local`,{readThread:async()=>({thread:{}})}]]),
+ getMaybeConnection(e){return this.connections.get(e)??null},
+ getConnection(e){let t=this.getMaybeConnection(e);if(!t)throw Error(`Connection for host ID ${e} not found`);return t}};
+const c=e=>registry.getConnection(e),D=(e,t)=>out.navigated.push(t);
+async function XJe({window:e,route:t,readThread:s,navigateToRoute:u}){switch(t.kind){case`other`:throw Error(`unrelated link failure`);
+case`localConversation`:{if(s==null||await s(t.conversationId,{includeTurns:!1}).catch(e=>(y7.warning(`local_conversation_deep_link_lookup_failed`,{sensitive:{error:e}}),null))==null)return;u(e,`/local/${t.conversationId}`);return}}}
+const navigateToRoute=async(e,t)=>{let r=t.hostId;return XJe({window:e,route:t,LOOKUP,navigateToRoute:D})};
+const pending=[JSON.parse(process.argv[2])];
+const We={deepLinks:{flushPendingDeepLinks:async()=>{for(const t of pending.splice(0))await navigateToRoute({},t)}}};
+async function NQe(){let e=0,B=0;const I=t=>out.phases.push(t);B=Date.now(),FLUSH
+NQe().then(()=>console.log(JSON.stringify({started:true,...out})),t=>console.log(JSON.stringify({started:false,error:t.message,...out})));
+'''.replace(b'LOOKUP', LOOKUP_930).replace(b'FLUSH', FLUSH_930)
 
 
 class DesktopBundleTests(unittest.TestCase):
@@ -401,6 +429,111 @@ console.log(JSON.stringify({result,refused}));'''.replace('SOURCE', json.dumps(r
         recovered = bundle.prepare(self.root, self.app)
         self.assertEqual(first['executable'], recovered['executable'])
         self.assertTrue(stage.is_dir())
+
+
+class StartupLinkGuardTests(unittest.TestCase):
+    """A queued thread link of an unregistered SSH host must not end startup."""
+
+    LOOKUP_ASYNC = LOOKUP_930.replace(b'?(e,t)=>', b'?async(e,t)=>')
+    FLUSH_GUARDED = FLUSH_930.replace(b'flushPendingDeepLinks()', b'flushPendingDeepLinks()' + bundle._DEEP_LINK_FLUSH_GUARD)
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    @staticmethod
+    def apply(modules, version):
+        patches = bundle.deep_link_guard_patches(list(modules.items()), version)
+        result = dict(modules)
+        for name, replacements in patches.items():
+            for before, after in replacements.items():
+                result[name] = result[name].replace(before, after)
+        return result
+
+    def test_both_anchors_are_patched_once_across_main_modules(self):
+        modules = {'.vite/build/bootstrap.js': b'boot();', '.vite/build/main.js': LINKS_930}
+        for version in (VERSION_7945, '26.930.31730', None, '26.917.71314'):
+            with self.subTest(version):
+                patched = self.apply(modules, version)
+                self.assertEqual(patched['.vite/build/bootstrap.js'], b'boot();')
+                self.assertEqual(patched['.vite/build/main.js'].count(self.LOOKUP_ASYNC), 1)
+                self.assertEqual(patched['.vite/build/main.js'].count(self.FLUSH_GUARDED), 1)
+                self.assertNotIn(LOOKUP_930, patched['.vite/build/main.js'])
+                # Patching an already patched module changes nothing.
+                self.assertEqual(bundle.deep_link_guard_patches(list(patched.items()), version), {})
+        # Renamed bindings keep matching; the flush of 26.917 is guarded too.
+        renamed = LINKS_930.replace(b'We.deepLinks', b'Xe.deepLinks').replace(b'c(r??', b'g(n??')
+        self.assertEqual(self.apply({'m.js': renamed}, VERSION_7945)['m.js'].count(b'?async(e,t)=>g(n??'), 1)
+        old = self.apply({'m.js': FLUSH_917}, '26.917.71314')['m.js']
+        self.assertEqual(old, FLUSH_917.replace(b'flushPendingDeepLinks()', b'flushPendingDeepLinks()' + bundle._DEEP_LINK_FLUSH_GUARD))
+
+    def test_missing_anchor_is_refused_from_26_930_and_skipped_before(self):
+        cases = {'no lookup': LINKS_930.replace(LOOKUP_930, b'readThread:void 0'),
+                 'no flush': LINKS_930.replace(FLUSH_930, b'}'),
+                 'changed lookup': LINKS_930.replace(b'.readThread(e,t):void 0', b'.readThread(t,e):void 0'),
+                 'flush not in the startup sequence': LINKS_930.replace(b'flushPendingDeepLinks(),', b'flushPendingDeepLinks();')}
+        for label, data in cases.items():
+            for version in (VERSION_7945, '26.930.41038', '26.1015.1'):
+                with self.subTest(label, version=version), self.assertRaisesRegex(ValueError, '작업 링크'):
+                    bundle.deep_link_guard_patches([('main.js', data)], version)
+            for version in (None, '26.917.71314', 'unknown'):
+                with self.subTest(label, version=version):
+                    bundle.deep_link_guard_patches([('main.js', data)], version)
+
+    def test_ambiguous_anchor_is_refused_for_every_version(self):
+        for version in (VERSION_7945, None):
+            for modules in ([('a.js', LINKS_930), ('b.js', LINKS_930)], [('a.js', LINKS_930 + FLUSH_930)],
+                            [('a.js', LINKS_930), ('b.js', self.FLUSH_GUARDED)]):
+                with self.subTest(version=version, modules=[name for name, _ in modules]), \
+                        self.assertRaisesRegex(ValueError, 'Ambiguous desktop startup link'):
+                    bundle.deep_link_guard_patches(modules, version)
+
+    # This fixture has no SSH worktree grouping; that 26.930 requirement has its own tests.
+    @patch('manager_core.original_sync_bundle.require_project_grouping')
+    def test_managed_copy_carries_the_guard_and_refuses_26_930_without_it(self, _grouping):
+        source, target = self.root / 'source.asar', self.root / 'patched.asar'
+        archive(source, links=LINKS_930, version=VERSION_7945)
+        bundle.patch_archive(source, target)
+        main = entry(target, '.vite/build/main.js')
+        self.assertEqual(main.count(self.LOOKUP_ASYNC), 1)
+        self.assertEqual(main.count(self.FLUSH_GUARDED), 1)
+        self.assertIn(bundle._REPLACEMENT, main)  # with the profile pipe patch of the same module
+        target.unlink()
+        archive(source, links=LINKS_930.replace(LOOKUP_930, b'readThread:void 0'), version=VERSION_7945)
+        with self.assertRaisesRegex(ValueError, '작업 링크'):
+            bundle.patch_archive(source, target)
+        self.assertFalse(target.exists())
+        # Fixtures without a package version keep the native code (older builds).
+        archive(source)
+        bundle.patch_archive(source, target)
+        self.assertNotIn(b'flushPendingDeepLinks', entry(target, '.vite/build/main.js'))
+
+    @unittest.skipUnless(shutil.which('node'), 'Node.js required for startup link behavior')
+    def test_queued_link_of_an_unregistered_ssh_host_no_longer_ends_startup(self):
+        def run(program, route):
+            path = self.root / 'startup.cjs'
+            path.write_bytes(program)
+            result = subprocess.run([shutil.which('node'), str(path), json.dumps(route)],
+                                    capture_output=True, text=True, check=True, timeout=20)
+            return json.loads(result.stdout)
+        remote = {'kind': 'localConversation', 'conversationId': 'x', 'hostId': 'remote-ssh-discovered:remote-dev'}
+        # Native 26.930: the incident ("<app> failed to start", Quit only).
+        native = run(STARTUP_PROGRAM, remote)
+        self.assertFalse(native['started'])
+        self.assertEqual(native['error'], 'Connection for host ID remote-ssh-discovered:remote-dev not found')
+        self.assertEqual(native['warnings'], [])
+        patched = self.apply({'main.js': STARTUP_PROGRAM}, VERSION_7945)['main.js']
+        guarded = run(patched, remote)
+        self.assertTrue(guarded['started'], guarded)
+        self.assertEqual(guarded['phases'], ['pending deep links flushed', 'startup complete'])
+        self.assertEqual(guarded['warnings'], ['local_conversation_deep_link_lookup_failed'])
+        self.assertEqual(guarded['navigated'], [])  # stays on the current (local) view
+        # A registered host still navigates, and any other link failure stays non-fatal.
+        self.assertEqual(run(patched, {**remote, 'hostId': 'local'})['navigated'], ['/local/x'])
+        other = run(patched, {'kind': 'other'})
+        self.assertTrue(other['started'])
+        self.assertFalse(run(STARTUP_PROGRAM, {'kind': 'other'})['started'])
 
 
 if __name__ == '__main__': unittest.main()

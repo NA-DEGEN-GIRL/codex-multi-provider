@@ -37,6 +37,9 @@ sys.path.insert(0, str(ROOT / 'scripts'))
 from manager_core import desktop_bundle, original_sync_bundle
 from manager_core.original_sync_bundle import (project_grouping_patched, renderer_remote_order_patches,
                                                 renderer_remote_root_patches, renderer_summary_dir_patches)
+sys.path.insert(0, str(ROOT / 'tests'))
+# A managed 26.930 copy also requires the startup link guard of its main bundle.
+from test_manager_desktop_bundle import LINKS_930
 
 
 def managed_archives(pattern):
@@ -319,7 +322,7 @@ def copies(grouping, version=None):
     package = [] if version is None else [('package.json', json.dumps({'version': version}).encode())]
     return {
         'managed': (desktop_bundle.patch_archive, [
-            ('.vite/build/main.js', b'function s9(){' + desktop_bundle._ORIGINAL + b'return "posix";}'),
+            ('.vite/build/main.js', b'function s9(){' + desktop_bundle._ORIGINAL + b'return "posix";}' + LINKS_930),
             ('.vite/build/notifications.js', desktop_bundle._NOTIFICATION_CLICK + b'originalCallback();})' +
              desktop_bundle._NOTIFICATION_SHOW + desktop_bundle._WINDOW_MESSAGE),
             ('.vite/build/browser-runtime.js', b'Qr({' + desktop_bundle._BROWSER_RUNTIME + b');'),

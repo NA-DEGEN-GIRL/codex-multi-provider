@@ -12,8 +12,10 @@ from .store import identifier
 
 
 class PendingNavigations:
-    def __init__(self, center, *, clock=time.monotonic, timeout=45):
-        self.center, self.clock, self.timeout = center, clock, timeout
+    # An SSH task also waits for this launch's connection to its host, which
+    # follows the local runtime (and may update a remote runtime first).
+    def __init__(self, center, *, clock=time.monotonic, timeout=45, remote_timeout=90):
+        self.center, self.clock, self.timeout, self.remote_timeout = center, clock, timeout, remote_timeout
         self.pending = {}
 
     @property
@@ -37,12 +39,15 @@ class PendingNavigations:
         self.pending = {k: v for k, v in self.pending.items() if v['expires'] > self.clock()}
         if len(self.pending) >= 64:
             return self._blocked('navigation_limit', '대기 중인 대화 열기가 많습니다. 잠시 후 다시 시도하세요.')
+        remote = target_link.get('host_id', 'local') != 'local'
         plan = dict(original=deepcopy(original_link), profile=deepcopy(profile),
                     link=deepcopy(target_link), read_only=read_only,
-                    annotations=deepcopy(annotations or {}), expires=self.clock() + self.timeout)
+                    annotations=deepcopy(annotations or {}),
+                    expires=self.clock() + (self.remote_timeout if remote else self.timeout))
         result = self._attempt(plan)
         if result.get('state') == 'waiting_for_reader':
             token = str(uuid4())
+            plan['waiting_reason'] = result.get('reason')
             self.pending[token] = plan
             result['navigation_id'] = token
         return result
@@ -51,6 +56,9 @@ class PendingNavigations:
         # Consume before attempting a send. Exceptions and uncertain launches
         # cannot be replayed with this ID; only a no-send readiness wait retains it.
         plan = self.pending.pop(identifier(token), None)
+        if plan is not None and plan['expires'] <= self.clock() and plan.get('waiting_reason') == 'remote_connection_starting':
+            return self._blocked('remote_connection_timeout', 'SSH 연결이 준비되지 않아 대화 이동 요청은 보내지 않았습니다. '
+                                 '로컬 창은 그대로 쓸 수 있습니다. SSH 연결이 끝난 뒤 다시 여세요.')
         if plan is None or plan['expires'] <= self.clock():
             return self._blocked('navigation_expired', 'Codex 준비 대기 시간이 지났습니다. 대화 이동 요청은 보내지 않았습니다.')
         with self.center.update_hooks.launch_admission(plan['profile']['id']):
@@ -64,13 +72,15 @@ class PendingNavigations:
                 return self._blocked('profile_not_running', 'Codex가 종료되어 대화 이동을 취소했습니다.')
             # A cheap file read while warming; do not rebuild the environment or
             # start another Electron process on each poll.
-            readiness = self.transport.navigation_readiness(current)
+            readiness = (self.transport.navigation_readiness(current)
+                         or self.transport.remote_navigation_readiness(current, plan['link']))
             if readiness is not None:
                 result = self._describe({**readiness, 'profile_id': current['id']}, plan)
             else:
                 plan['profile'] = {**current, **observed}
                 result = self._attempt(plan)
         if result.get('state') == 'waiting_for_reader':
+            plan['waiting_reason'] = result.get('reason')
             self.pending[token] = plan
             result['navigation_id'] = token
         return result
