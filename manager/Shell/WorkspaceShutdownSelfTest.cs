@@ -1,3 +1,5 @@
+using System.Diagnostics;
+using System.IO;
 using System.Text.Json;
 using Codex.ControlCenter.Shared;
 
@@ -164,5 +166,55 @@ internal static class WorkspaceShutdownSelfTest
         await retry.FinishAsync(LegacyRequest, _ => { }, CancellationToken.None);
         Require(!calls.Contains("state"), "Retry restarted backend after EOF.");
         checks.Add("A timed-out drain reports its blocker and retries cleanup without relaunching profiles or backend.");
+
+        await CheckGracefulExitWaitAsync(checks);
     }).GetAwaiter().GetResult();
+
+    private static async Task CheckGracefulExitWaitAsync(List<string> checks)
+    {
+        void Require(bool value, string message) { if (!value) throw new InvalidOperationException(message); }
+        foreach (var (apps, seconds) in new[] { (0, 60), (1, 60), (3, 60), (4, 70), (11, 140), (15, 180), (40, 180) })
+            Require(NativeWindowShutdown.GracefulWait(apps) == TimeSpan.FromSeconds(seconds),
+                $"Full-exit wait for {apps} apps is not {seconds} s.");
+        Require(NativeWindowShutdown.QuitGrace >= TimeSpan.FromSeconds(20),
+            "A closed window is reaped sooner than a second 완전 종료 press would.");
+        checks.Add("Full exit waits 60 s for up to three apps, 10 s more for each further app and at most 3 minutes (11 apps: 140 s); a closed window gets 20 s more.");
+
+        Require(NativeWindowShutdown.Progress(9, 11, TimeSpan.FromSeconds(75.6), TimeSpan.FromSeconds(140)) ==
+            "관리 중인 Codex 종료를 기다리고 있습니다 · 9/11 종료됨 · 75초 (최대 140초)", "Full-exit progress omits N/M or elapsed seconds.");
+        Require(NativeWindowShutdown.Progress(10, 11, TimeSpan.FromSeconds(150), TimeSpan.FromSeconds(140)) ==
+            "창을 닫은 Codex의 종료 정리를 기다리고 있습니다 · 10/11 종료됨 · 150초", "Grace progress still promised the expired limit.");
+
+        var exited = new List<string>();
+        var ticks = new List<int>();
+        var watch = Stopwatch.StartNew();
+        var results = await NativeWindowShutdown.WaitAllAsync(new[] { "exits", "quitting", "open", "changed" }, TimeSpan.FromMilliseconds(400),
+            async (target, deadline) =>
+            {
+                if (target == "changed") throw new InvalidOperationException("Codex process identity changed before shutdown.");
+                if (target == "exits") { await Task.Delay(50, CancellationToken.None); return NativeExitOutcome.Exited; }
+                try { await Task.Delay(Timeout.Infinite, deadline); }
+                catch (OperationCanceledException) when (deadline.IsCancellationRequested) { }
+                return target == "quitting" ? NativeExitOutcome.Quitting : NativeExitOutcome.Unresponsive;
+            },
+            target => { lock (exited) exited.Add(target); },
+            (count, _) => { lock (ticks) ticks.Add(count); }, TimeSpan.FromMilliseconds(20));
+        Require(watch.Elapsed >= TimeSpan.FromMilliseconds(350) && watch.Elapsed < TimeSpan.FromSeconds(10),
+            "Quit requests did not share the full-exit deadline.");
+        var outcome = results.ToDictionary(r => r.Target);
+        Require(exited.SequenceEqual(new[] { "exits" }) && outcome["exits"] is { Outcome: NativeExitOutcome.Exited, Error: null } &&
+            outcome["quitting"] is { Outcome: NativeExitOutcome.Quitting, Error: null } &&
+            outcome["open"] is { Outcome: NativeExitOutcome.Unresponsive, Error: null } &&
+            outcome["changed"].Error is InvalidOperationException && results.Count == 4,
+            "Full-exit wait lost an outcome, counted a failed request as exited or hid an identity change.");
+        lock (ticks) Require(ticks.Count > 2 && ticks[0] == 0 && ticks[^1] == 1 && ticks.SequenceEqual(ticks.Order()),
+            "Full-exit progress did not report confirmed exits while waiting.");
+        Require((await NativeWindowShutdown.WaitAllAsync(Array.Empty<string>(), TimeSpan.FromSeconds(1),
+                (_, _) => throw new InvalidOperationException("No request expected."), _ => { }, (_, _) => { })).Count == 0,
+            "An exit with no managed apps waited or requested a quit.");
+        var root = Path.Combine(Path.GetTempPath(), "codex-exit-selftest-" + Guid.NewGuid().ToString("N"));
+        Require(await NativeWindowShutdown.RequestAsync(root, int.MaxValue, 0, "", 0, CancellationToken.None, TimeSpan.Zero) ==
+            NativeExitOutcome.Exited && !Directory.Exists(root), "A process that is already gone was not treated as exited.");
+        checks.Add("All quit requests share one deadline with N/M progress; exited, still quitting (window closed), open-window and identity-change outcomes stay distinct.");
+    }
 }

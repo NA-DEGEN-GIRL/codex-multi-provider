@@ -9,7 +9,7 @@ namespace Codex.ControlCenter.Shell;
 internal static class WorkspaceBuild
 {
     internal const int Revision = 122;
-    internal const string Description = "SSH 이전 런타임 재실행 방지·자동 업데이트 기본 켜기";
+    internal const string Description = "SSH 이전 런타임 재실행 방지·자동 업데이트 기본 켜기·완전 종료 대기 자동화";
     internal static string Label => $"수정 {Revision}";
     internal static string Title => "Codex 작업 공간";
     internal static string BuildId { get; } = RunningBuildId();

@@ -35,6 +35,9 @@ internal static class ShutdownScenario
                 if (!SetPropW(hwnd, marker, 1)) throw new Exception("Cannot mark fixture HWND");
                 identityType.GetProperty("Marked")!.SetValue(identity, true);
                 ((IDictionary)typeof(MainWindow).GetField("_parked", flags)!.GetValue(manager)!).Add(hwnd, identity);
+                // A plain close only releases windows; 완전 종료 sets this flag
+                // after its confirmation dialog.
+                typeof(MainWindow).GetField("_exitAllRequested", flags)!.SetValue(manager, true);
                 using var process = Process.GetProcessById(pid);
                 _ = process.Handle;
                 watch.Restart(); manager.Close();
