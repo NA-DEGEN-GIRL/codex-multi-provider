@@ -45,7 +45,7 @@ def build(root,sources,max_entries=4096,*,include_paginated=False):
             directory=home/directory_name
             if not directory.is_dir():continue
             actual=directory.resolve()
-            # llm-usage can link sessions to an already registered canonical store.
+            # An imported home can link sessions to an already registered canonical store.
             canonical_home=actual.parent
             canonical_source=registered.get(str(canonical_home).casefold())
             if not canonical_source or actual.name!=directory_name:

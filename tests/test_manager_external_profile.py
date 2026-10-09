@@ -25,8 +25,7 @@ class ExternalProfileTests(unittest.TestCase):
         self.providers.path.write_text(json.dumps(state))
         self.control=ControlCenter.__new__(ControlCenter)
         self.control.store=self.store;self.control.providers=self.providers
-        self.control.native_login=Mock();self.control.remote_accounts=Mock()
-        self.control.remote_accounts.sync.side_effect=AssertionError('llm-usage must not be consulted')
+        self.control.native_login=Mock()
 
     def test_add_requires_key_before_creating_external_profile(self):
         with patch.object(self.providers,'environment',side_effect=RuntimeError('missing key')):
@@ -60,14 +59,14 @@ class ExternalProfileTests(unittest.TestCase):
             else:self.assertEqual(result['params']['modelProvider'],'provider-test')
         self.assertIs(ExternalProfile({}).request(original),original)
 
-    def test_ssh_prepare_and_rename_do_not_require_llm_usage(self):
+    def test_ssh_prepare_and_rename_need_no_external_account_tool(self):
         profile=self.store.add_profile('Account')
         self.store.mutate(lambda d:self.store.profile(profile['id'],d).update(auth_mode='native',remote_bindings=[{'alias':'fixture-host'}]))
         self.control.remote=Mock();self.control.remote.prepare.return_value={'prepared':False,'status':'fixture'}
         result=self.control.dispatch('remote.prepare',dict(profile_id=profile['id'],alias='fixture-host'))
         self.assertEqual(result['status'],'fixture');self.control.remote.prepare.assert_called_once()
         self.control.dispatch('profile.rename',dict(profile_id=profile['id'],alias='Changed'))
-        self.control.remote_accounts.sync.assert_not_called()
+        self.assertEqual(self.store.profile(profile['id'])['alias'],'Changed')
 
     def test_claude_automatic_context_clears_foreign_overrides_and_keeps_ultracode(self):
         binding = dict(model='cc-opus', model_provider='claude_code', agent_kind='claude_code',
@@ -156,7 +155,7 @@ class ExternalProfileTests(unittest.TestCase):
         result = adapter.request({'method': 'turn/start', 'params': {'model': 'cc-sonnet', 'effort': 'ultracode'}})
         self.assertEqual(result['params'], {'model': 'cc-sonnet', 'effort': 'high'})
 
-    def test_remote_api_bridge_routes_without_chatgpt_or_llm_usage(self):
+    def test_remote_api_bridge_routes_without_chatgpt_login(self):
         from manager_core.proxy_auth import AuthProxy
         binding={'model':'external-test','model_provider':'provider-test','reasoning_effort':'high'}
         auth=ExternalProfile({'CODEX_MANAGER_PRIMARY_MODEL':json.dumps(binding)}).bind_auth(AuthProxy())

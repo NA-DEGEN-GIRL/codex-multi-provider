@@ -621,7 +621,7 @@ class Instances:
         if profile.get('removed_at'):
             raise ValueError('목록에서 제거한 계정입니다. 계정 복원 후 열 수 있습니다.')
         if profile.get('account_missing') and profile.get('auth_mode')!='native':
-            raise RuntimeError('llm-usage에서 삭제된 계정입니다. 다른 계정에 자동 연결하지 않았습니다.')
+            raise RuntimeError('연결 계정을 더 이상 찾을 수 없습니다. 다른 계정에 자동 연결하지 않았습니다.')
         from .login_health import require as require_login
         active=self.observe(profile)
         if active['status']=='running':

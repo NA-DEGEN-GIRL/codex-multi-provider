@@ -210,7 +210,7 @@ class Store:
             usage_account_id = identifier(usage_account_id)
         def add(data):
             if usage_account_id and any(p.get('usage_account_id') == usage_account_id for p in data['profiles']):
-                # Periodic llm-usage sync re-adds every account; a known one is a no-op.
+                # A known account id is a no-op; it never restores or duplicates a profile.
                 return Unchanged(next(p for p in data['profiles'] if p.get('usage_account_id') == usage_account_id))
             pid = str(uuid4())
             directory = self.directory / 'profiles' / pid

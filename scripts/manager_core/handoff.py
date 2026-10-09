@@ -111,7 +111,7 @@ class HandoffManager:
         thread_id = _id(reference.get('thread_id'))
         source = reference.get('source_store_id')
         if reference.get('host_id') != 'local' or not isinstance(source, str) or not source.startswith('manager:'):
-            raise HandoffError('source_not_writable', '현재는 이 Windows의 관리 프로필 기록만 인계할 수 있습니다. 기존·llm-usage 기록은 보존합니다.')
+            raise HandoffError('source_not_writable', '현재는 이 Windows의 관리 프로필 기록만 인계할 수 있습니다. 기존 기록은 보존합니다.')
         # The canonical storage profile can outlive its old login account.
         # Only the current owner and target need usable execution accounts.
         source_profile = self._profile(_id(source[8:]), require_account=False)

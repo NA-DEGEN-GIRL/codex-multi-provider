@@ -338,7 +338,6 @@ fn allowed(command: &str) -> bool {
         "profile.register_current",
         "profile.remove",
         "profile.restore",
-        "profile.bind",
         "profile.rename",
         "profile.move",
         "skills.personal.list",

@@ -785,8 +785,8 @@ class UpdateHooks:
         binding = value.get("auth_binding", {})
         if profile.get("auth_mode") == "native":
             # A directly signed-in profile uses its own Codex authentication.
-            # Its credential proxy is deliberately disabled even if llm-usage
-            # has registered a source/account entry for displaying usage.
+            # Its credential proxy is deliberately disabled even if an older
+            # import left a source/account entry on the profile.
             return binding.get("bound") is False and binding.get("state") == "disabled"
         if profile.get("source_home") or profile.get("usage_account_id"):
             expected = profile.get("account_fingerprint")

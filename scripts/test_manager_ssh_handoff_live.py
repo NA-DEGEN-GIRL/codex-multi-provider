@@ -15,7 +15,6 @@ import time
 from uuid import uuid4
 
 from desktop_launch import find_app
-from manager_core.accounts import Accounts
 from manager_core.providers import ProviderRegistry
 from manager_core.proxy_auth import account_fingerprint, read_existing_tokens
 from manager_core.remote import RemoteManager
@@ -33,7 +32,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def selected_accounts(root, progress):
-    available = Accounts(root).list()
+    available = []
     profiles = Store(root).read()['profiles']
     for alias in ('02', '04'):
         native = [p for p in profiles if p.get('auth_mode') == 'native' and p.get('alias') == alias and not p.get('removed_at')]
@@ -41,7 +40,6 @@ def selected_accounts(root, progress):
             if len(native) != 1 or native[0].get('login_state') != 'signed_in':
                 raise RuntimeError('A test account has not finished Windows login.')
             p = native[0]
-            available = [a for a in available if a['alias'] != alias]
             available.append(dict(id=p['id'], alias=alias, home=p['home'], expected_fingerprint=p['account_fingerprint']))
     result = select_accounts(available)
     for account in result:
