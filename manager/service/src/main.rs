@@ -356,6 +356,12 @@ fn allowed(command: &str) -> bool {
         "claude.usage",
         "claude.setup",
         "claude.settings",
+        // `claude.token.save` carries a long-lived token in its arguments, like
+        // `providers.key`: forwarded to the backend only, never logged or kept.
+        "claude.token.save",
+        "claude.token.remove",
+        "claude.token.retry",
+        "claude.token.issue",
         "shortcut.add",
         "shortcut.move",
         "shortcut.rename",

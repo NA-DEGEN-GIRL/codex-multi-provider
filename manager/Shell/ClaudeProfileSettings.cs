@@ -81,12 +81,13 @@ internal static partial class Dialogs
     }
 
     internal static Dictionary<string, object>? ClaudeProfileSettings(Window owner, JsonElement profile = default,
-        Func<string, Task<JsonElement>>? authenticate = null)
+        Func<string, Task<JsonElement>>? authenticate = null, Func<string, object, Task<JsonElement>>? request = null)
     {
         var window = Create(owner, "Claude 프로필 · 로그인과 기본 설정", 610, 840);
         var body = Body(window);
         body.Children.Add(new TextBlock { Text = profile.S("alias", "Claude 프로필"), FontSize = 22, Margin = new Thickness(0, 0, 0, 16) });
         body.Children.Add(Note("이 PC에 설치된 Claude Code CLI로 실행합니다. 로그인은 Claude Code가 여는 콘솔과 브라우저에서 완료합니다."));
+        ClaudeLongLivedTokenPanel? longLived = null;
         if (authenticate is not null)
         {
             var status = Note(""); body.Children.Add(status);
@@ -94,6 +95,7 @@ internal static partial class Dialogs
             {
                 status.Text = string.Join("\n", new[] { ClaudeProfilePresentation.Label(value), ClaudeProfilePresentation.Account(value),
                     value.Message(""), value.S("cli_version") is { Length: > 0 } version ? "Claude Code CLI " + version : "" }.Where(value => value.Length > 0));
+                longLived?.UpdateLogin(value);
             }
             Present(ClaudeProfilePresentation.Status(profile));
             var actions = new StackPanel { Orientation = Orientation.Horizontal }; body.Children.Add(actions);
@@ -110,6 +112,7 @@ internal static partial class Dialogs
                 usage.Text = ClaudeUsagePresentation.Read(JsonSerializer.SerializeToElement(new { usage = updated })).Summary;
                 setup.Visibility = updated.Get("error").S("code") == "onboarding_required" ? Visibility.Visible : Visibility.Collapsed;
             });
+            if (request is not null) longLived = new ClaudeLongLivedTokenPanel(window, body, profile, request);
         }
         var fields = AddClaudeSettingsEditor(body, profile.Get("claude_settings"));
         body.Children.Add(Note("같은 계정에서 Claude 모델·추론 강도를 바꿔도 기존 세션을 이어갑니다. 계정마다 세션은 분리되며, 다른 제공자로 전환할 때는 공유 기록과 요약을 전달합니다. 계정 사이의 서버 캐시는 공유되지 않습니다."));
@@ -117,10 +120,15 @@ internal static partial class Dialogs
         Dictionary<string, object>? result = null;
         Button(body, authenticate is null ? "이 설정으로 계속" : "기본 설정 저장", () =>
         {
+            if (longLived is not null && !longLived.ConfirmDiscard()) return;
             result = fields.Read();
             if (result is not null) window.DialogResult = true;
         });
-        Button(body, "닫기", window.Close);
-        window.ShowDialog(); return result;
+        Button(body, "닫기", () => { if (longLived is null || longLived.ConfirmDiscard()) window.Close(); });
+        // The title bar close button gets the same unsaved-token check.
+        window.Closing += (_, e) => { if (longLived is not null && !longLived.ConfirmDiscard()) e.Cancel = true; };
+        window.ShowDialog();
+        longLived?.Token.Clear();
+        return result;
     }
 }

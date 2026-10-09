@@ -33,4 +33,36 @@ internal static class ClaudeProfilePresentation
             status.S("cli_version") is { Length: > 0 } version ? "CLI " + version : "" }.Where(value => value.Length > 0));
     }
     internal const string UsageHint = "Claude 구독 사용량 미확인 · 사용량 새로 확인";
+
+    // Long-lived `claude setup-token` tokens for SSH turns. The backend repeats
+    // every check; this only gives instant feedback and never displays the value.
+    internal const int TokenMinLength = 40, TokenMaxLength = 4096;
+    internal const string TokenFormatMessage = "장기 토큰 형식이 아닙니다. claude setup-token이 출력한 sk-ant-oat… 토큰 전체를 붙여넣으세요.";
+    internal const string RefreshTokenMessage = "갱신 토큰(sk-ant-ort…)은 저장하지 않습니다. claude setup-token이 출력한 sk-ant-oat… 토큰을 붙여넣으세요.";
+    internal const string ApiKeyMessage = "API 키(sk-ant-api…)는 여기에 저장하지 않습니다. claude setup-token이 출력한 sk-ant-oat… 토큰을 붙여넣으세요.";
+    internal const string TokenLengthMessage = "토큰 길이가 올바르지 않습니다. 일부만 복사되었을 수 있으니 터미널에서 토큰 전체를 다시 복사하세요.";
+    // A console copy wraps the token over several lines; a single-line field
+    // would keep only the first one. Every whitespace and zero-width mark goes.
+    internal static string NormalizeToken(string? text)
+    {
+        if (string.IsNullOrEmpty(text)) return "";
+        var builder = new System.Text.StringBuilder(Math.Min(text.Length, 16384));
+        foreach (var c in text)
+            if (!char.IsWhiteSpace(c) && c is not ('​' or '‌' or '‍' or '⁠' or '﻿')) builder.Append(c);
+        return builder.ToString();
+    }
+    // Prefix and character set only, like the CLI: an 8-hour access token has
+    // the same prefix and cannot be told apart locally.
+    internal static string? TokenFormatError(string token)
+    {
+        if (token.StartsWith("sk-ant-ort", StringComparison.Ordinal)) return RefreshTokenMessage;
+        if (token.StartsWith("sk-ant-api", StringComparison.Ordinal)) return ApiKeyMessage;
+        if (!token.StartsWith("sk-ant-oat", StringComparison.Ordinal)
+            || token.Any(c => c is not (>= 'A' and <= 'Z' or >= 'a' and <= 'z' or >= '0' and <= '9' or '_' or '-'))) return TokenFormatMessage;
+        return token.Length is < TokenMinLength or > TokenMaxLength ? TokenLengthMessage : null;
+    }
+    internal static JsonElement LongLived(JsonElement profile) => profile.Get("claude_long_lived");
+    // Profile card and selected-profile attention only; never the settings badge.
+    internal static string LongLivedAttention(JsonElement profile) =>
+        IsClaude(profile) && LongLived(profile).B("attention") ? LongLived(profile).S("attention_text") : "";
 }

@@ -30,8 +30,14 @@ class ProfileLifecycle:
             if data.get('representative_profile_id') == profile_id:
                 data['representative_profile_id'] = next((p['id'] for p in data['profiles']
                     if p['id'] != profile_id and not p.get('removed_at') and not p.get('view_only')), None)
+            message = '계정을 목록에서 제거했습니다. 로그인과 대화는 보존되며 계정 복원으로 다시 표시할 수 있습니다.'
+            # Like the login, a saved long-lived Claude token stays on this PC.
+            kept = 'claude_long_lived_token' in current
+            if kept:
+                message += (' 저장한 Claude 장기 토큰도 이 PC에 남아 있습니다. 삭제하려면 계정을 복원한 뒤 '
+                            'Claude 로그인·설정에서 삭제하세요.')
             return dict(id=profile_id, removed=True, records_deleted=False, credentials_deleted=False,
-                        message='계정을 목록에서 제거했습니다. 로그인과 대화는 보존되며 계정 복원으로 다시 표시할 수 있습니다.')
+                        long_lived_token_kept=kept, message=message)
         return self.store.mutate(remove)
 
     def restore(self, profile_id, alias=None):

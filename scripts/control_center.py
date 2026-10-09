@@ -264,6 +264,7 @@ class ControlCenter:
         state['providers']=registry.get('providers',[]);state['models']=registry.get('models',[])
         state['removed_profiles']=[dict(id=p['id'],alias=p['alias'],removed_at=p['removed_at']) for p in state['profiles'] if p.get('removed_at')]
         state['profiles']=[p for p in state['profiles'] if not p.get('removed_at')]
+        preset_users=None  # Read at most once per poll, and only for Claude profiles.
         for p in state['profiles']:
             p['restart']=state['profile_restarts'].get(p['id'],{})
             p.update(self.instances.observe(p))
@@ -289,6 +290,12 @@ class ControlCenter:
                 status = p.get('claude_status', {})
                 p['status_message'] = 'Claude · ' + ('로그인됨' if status.get('logged_in') else '로그인 필요')
                 p['account_verification'] = 'claude_ready' if status.get('logged_in') else 'claude_login_needed'
+                # Presentation only: the raw long-lived token metadata stays in the store.
+                from manager_core import claude_long_lived_auth as long_lived
+                if preset_users is None:preset_users=long_lived.preset_users(self.root)
+                p[long_lived.PRESENTATION_KEY]=long_lived.state(
+                    p,ssh=long_lived.ssh_usage(saved_profiles,p['id'],preset_users))
+                p.pop(long_lived.METADATA_KEY,None)
             elif p.get('auth_mode')=='external':
                 model=next((m for m in registry['models'] if m['id']==p.get('external_model_id')), {})
                 provider=next((item for item in registry['providers'] if item['id']==model.get('provider_id')), {})
@@ -468,6 +475,24 @@ class ControlCenter:
                 return self.store.add_profile(account_alias(args['alias'],self.store.read()['profiles']), external_model_id=model_id, external_settings=settings)
             profile=self.store.add_profile(account_alias(args['alias'],self.store.read()['profiles']))
             return self.native_login.prepare(profile['id'])
+        if command in ('claude.token.save', 'claude.token.remove', 'claude.token.retry', 'claude.token.issue'):
+            from manager_core import claude_long_lived_auth as long_lived
+            if command == 'claude.token.save':
+                # The only request that carries the token. Drop every reference
+                # we hold as soon as it is encrypted; it is never echoed back.
+                token = args.pop('token', None)
+                try:
+                    return long_lived.save(self.root, args['profile_id'], token, attested=args.get('attested'),
+                                           minted_on=args.get('minted_on'), validity_days=args.get('validity_days'))
+                finally:
+                    token = None
+            if command == 'claude.token.remove':
+                return long_lived.delete(self.root, args['profile_id'])
+            if command == 'claude.token.retry':
+                return long_lived.retry(self.root, args['profile_id'])
+            from manager_core.claude_profiles import ClaudeProfiles
+            ClaudeProfiles(self.store).profile(args['profile_id'])
+            return long_lived.launch_issue_console(args['profile_id'])
         if command in ('claude.login', 'claude.status', 'claude.settings', 'claude.usage', 'claude.setup'):
             from manager_core.claude_profiles import ClaudeProfiles
             claude = ClaudeProfiles(self.store)

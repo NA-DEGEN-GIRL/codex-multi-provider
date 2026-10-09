@@ -3,6 +3,7 @@ using System.Reflection;
 using System.Text.Json;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
@@ -141,6 +142,76 @@ internal static class ClaudeProfileSelfTest
         Require(ClaudeProfilePresentation.Model(JsonSerializer.SerializeToElement(new
             { claude_settings = new { model = "claude-opus-5-5" } })) == "Opus 5.5", "Explicit Opus 5.5 was not presented with its display name.");
         checks.Add("Native defaults and custom context values are preserved; Opus 5.5 and UltraCode round-trip without resetting saved effort.");
+
+        // Long-lived token: dummy value built at run time; it must never be displayed or sent twice.
+        var dummy = "sk-ant-" + "oat01-" + string.Concat(Enumerable.Repeat("Fixture", 12));
+        Require(ClaudeProfilePresentation.NormalizeToken("  " + dummy[..30] + "\r\n" + dummy[30..60] + "\n\t" + dummy[60..] + " ​") == dummy
+            && ClaudeProfilePresentation.TokenFormatError(dummy) is null
+            && ClaudeProfilePresentation.TokenFormatError("sk-ant-" + "ort01-" + dummy[13..]) == ClaudeProfilePresentation.RefreshTokenMessage
+            && ClaudeProfilePresentation.TokenFormatError("sk-ant-" + "api03-" + dummy[13..]) == ClaudeProfilePresentation.ApiKeyMessage
+            && ClaudeProfilePresentation.TokenFormatError(dummy[..39]) == ClaudeProfilePresentation.TokenLengthMessage
+            && ClaudeProfilePresentation.TokenFormatError(dummy + "é") == ClaudeProfilePresentation.TokenFormatMessage
+            && ClaudeProfilePresentation.TokenFormatError("Bearer" + dummy) == ClaudeProfilePresentation.TokenFormatMessage,
+            "Long-lived token format checks or paste normalisation changed.");
+        static JsonElement LongLivedProfile(bool loggedIn, object longLived) => JsonSerializer.SerializeToElement(new
+        {
+            id = "claude-fixture", alias = "Claude 계정", auth_mode = "claude_code",
+            claude_status = new { state = loggedIn ? "ready" : "login_needed", logged_in = loggedIn, masked_email = "c***@example.test" },
+            claude_long_lived = longLived
+        });
+        static object TokenView(bool saved, string state, string label, bool attention = false) => new
+        {
+            saved, state, label, tone = attention ? "warning" : "ready", attention, card_text = attention ? "토큰 확인" : "",
+            attention_text = attention ? "Claude 장기 토큰 만료 임박 · 2027-01-01 · Claude 로그인·설정에서 교체하세요" : "",
+            retry_available = false, expanded = saved, ssh = new { bindings = 0, supported = 0, text = "SSH 런타임 업데이트·재준비 후 사용됩니다." }
+        };
+        var tokenRequests = new List<(string Command, string Args)>();
+        var noToken = TokenView(false, "none", "장기 토큰 · 없음");
+        var savedToken = TokenView(true, "active", "설정됨 · c***@example.test · 만료 2027-10-01");
+        Task<JsonElement> TokenRequest(string command, object args)
+        {
+            tokenRequests.Add((command, JsonSerializer.Serialize(args)));
+            return Task.FromResult(JsonSerializer.SerializeToElement(command switch
+            {
+                "claude.token.save" => (object)new { saved = true, long_lived = savedToken, message = "장기 토큰을 이 Windows 사용자용으로 암호화해 저장했습니다." },
+                "claude.token.remove" => new { removed = true, long_lived = noToken, message = "이 PC에서 장기 토큰을 삭제했습니다." },
+                _ => new { message = "fixture" }
+            }));
+        }
+        var tokenOwner = new Window();
+        var signedOut = new ClaudeLongLivedTokenPanel(tokenOwner, new StackPanel(), LongLivedProfile(false, noToken), TokenRequest);
+        signedOut.ApplyPaste(dummy); signedOut.Attested.IsChecked = true;
+        Require(!signedOut.Save.IsEnabled && !signedOut.Section.IsExpanded, "Saving a long-lived token was offered before the profile was logged in.");
+        signedOut.Token.Clear();
+        var tokenPanel = new ClaudeLongLivedTokenPanel(tokenOwner, new StackPanel(), LongLivedProfile(true, noToken), TokenRequest);
+        var clipboard = new List<bool>();
+        tokenPanel.ReadClipboard = () => dummy[..40] + "\r\n" + dummy[40..] + "\r\n";
+        tokenPanel.ClearClipboardIfHolds = value => { clipboard.Add(value == dummy); return true; };
+        tokenPanel.Paste.RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent));
+        Require(tokenPanel.Token.Password == dummy && tokenPanel.Format.Text == $"형식 확인됨 · {dummy.Length}자",
+            "A wrapped multi-line paste was not joined into the whole token.");
+        Require(!tokenPanel.Save.IsEnabled, "Saving was offered before the account attestation was checked.");
+        tokenPanel.Attested.IsChecked = true;
+        Require(tokenPanel.Save.IsEnabled && Equals(tokenPanel.Attested.Content, "이 토큰은 c***@example.test 계정으로 발급했습니다")
+            && tokenPanel.Status.Text == "장기 토큰 · 없음", "The attestation did not name the masked account or the empty state was mislabelled.");
+        await tokenPanel.SaveAsync();
+        Require(tokenPanel.Token.Password == "" && !tokenPanel.HasUnsavedToken && clipboard.SequenceEqual(new[] { true })
+            && tokenPanel.Status.Text == "설정됨 · c***@example.test · 만료 2027-10-01" && Equals(tokenPanel.Save.Content, "교체")
+            && tokenPanel.Remove.Visibility == Visibility.Visible && !tokenPanel.Result.Text.Contains("Fixture"),
+            "The token field or clipboard was not cleared, or the saved state was not shown.");
+        tokenPanel.Confirm = message => message.Contains("이 PC에서만") && message.Contains("claude.ai") && message.Contains("진행 중인 SSH 작업");
+        await tokenPanel.RemoveAsync();
+        Require(tokenRequests.Select(r => r.Command).SequenceEqual(new[] { "claude.token.save", "claude.token.remove" })
+            && tokenRequests.Count(r => r.Args.Contains(dummy)) == 1 && tokenRequests[0].Args.Contains(dummy)
+            && tokenPanel.Status.Text == "장기 토큰 · 없음",
+            "A request other than claude.token.save carried the token, or removal did not state where to revoke.");
+        var warned = LongLivedProfile(true, TokenView(true, "expiring", "만료 임박 · c***@example.test · 2027-01-01 (10일 남음)", attention: true));
+        Require(ClaudeProfilePresentation.LongLivedAttention(warned).StartsWith("Claude 장기 토큰 만료 임박", StringComparison.Ordinal)
+            && !ClaudeProfilePresentation.LongLivedAttention(warned).Contains('@')
+            && ClaudeProfilePresentation.LongLivedAttention(LongLivedProfile(true, savedToken)) == "",
+            "Long-lived token warnings were not limited to attention states or exposed the account email.");
+        tokenOwner.Close();
+        checks.Add("Long-lived Claude token: format checks, wrapped paste joined, save needs login and attestation, field and clipboard cleared, only claude.token.save carries the token, removal states where to revoke.");
 
         var state = JsonSerializer.SerializeToElement(new { profiles = new[] { profile } });
         var commands = new List<string>();

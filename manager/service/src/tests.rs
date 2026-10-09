@@ -1653,6 +1653,64 @@ async fn pipe_acl_and_broker_auth_and_protocol_guard() {
     );
 }
 
+#[tokio::test]
+async fn long_lived_claude_token_is_forwarded_but_never_logged_or_kept() {
+    for command in [
+        "claude.token.save",
+        "claude.token.remove",
+        "claude.token.retry",
+        "claude.token.issue",
+    ] {
+        assert!(allowed(command), "{command}");
+    }
+    let root = tempdir().unwrap();
+    std::fs::create_dir(root.path().join("scripts")).unwrap();
+    // The adapter proves it received the token without ever echoing it.
+    std::fs::write(
+        root.path().join("scripts/control_center.py"),
+        r#"
+import sys,json
+for line in sys.stdin:
+    r=json.loads(line)
+    token=r['args'].get('token','')
+    result={'saved':token.startswith('sk-ant-oat01-'),'length':len(token)}
+    if r['command']=='state': result={'profiles':[]}
+    print(json.dumps({'id':r['id'],'ok':True,'result':result}),flush=True)
+"#,
+    )
+    .unwrap();
+    let service = service(root.path().into());
+    // Built at run time so no token-shaped literal sits in the source.
+    let token = format!("sk-ant-{}-{}", "oat01", "DUMMY".repeat(20));
+    let profile = new_id();
+    let saved = service
+        .dispatch(request(
+            "claude.token.save",
+            json!({"profile_id":profile,"token":token,"attested":true}),
+        ))
+        .await;
+    assert_eq!(saved["ok"], true, "{saved}");
+    assert_eq!(saved["result"]["saved"], true);
+    assert!(!saved.to_string().contains(&token));
+    assert!(service.operations.lock().unwrap().is_empty());
+    let removed = service
+        .dispatch(request("claude.token.remove", json!({"profile_id":profile})))
+        .await;
+    assert_eq!(removed["ok"], true);
+    let log = root
+        .path()
+        .join("work/control-center/logs/rust-service.jsonl");
+    let text = std::fs::read_to_string(log).unwrap();
+    assert!(text.contains("claude.token.save"), "{text}");
+    assert!(!text.contains(&token) && !text.contains("DUMMY"), "{text}");
+    assert_eq!(
+        service
+            .dispatch(request("supervisor.retire", json!({})))
+            .await["ok"],
+        true
+    );
+}
+
 // Cross-profile record hub. Writer files and journals live in temp roots only.
 
 fn signal_file(root: &std::path::Path, name: &str, bytes: &[u8]) {

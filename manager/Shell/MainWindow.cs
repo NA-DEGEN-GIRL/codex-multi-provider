@@ -827,6 +827,8 @@ public sealed partial class MainWindow : Window
         "profile.show" => "Codex 프로필 열기", "profile.prepare" => "프로필 준비", "accounts.refresh" => "계정·사용량 확인",
         "profile.login" => "프로필 로그인 화면 열기", "profile.login_status" => "로그인 계정 상태 확인",
         "profile.email" => "계정 이메일 확인",
+        "claude.token.save" => "Claude 장기 토큰 저장", "claude.token.remove" => "Claude 장기 토큰 삭제",
+        "claude.token.retry" => "Claude 장기 토큰 다시 시도", "claude.token.issue" => "Claude 장기 토큰 발급 창 열기",
         "profile.restart" => "설정 적용 · 정상 종료 후 다시 열기",
         "profile.remote_restart" => "프로필 SSH 설정 적용", "profile.remote_stop" => "프로필 SSH 종료",
         "profile.recover" => "선택한 관리용 Codex 종료",
@@ -928,6 +930,9 @@ public sealed partial class MainWindow : Window
                     if (prepared.S("state") is "checking" or "opening") { suffix = "\n백그라운드에서 여는 중"; (noticeTone, noticeShort) = ("transient", "여는 중"); }
                     else if (prepared.S("state") == "queued") { suffix = "\n미리 열기 대기"; (noticeTone, noticeShort) = ("transient", "열기 대기"); }
                 }
+                // Lowest priority: a long-lived Claude token that expires soon or stopped working.
+                if (suffix.Length == 0 && ClaudeProfilePresentation.LongLivedAttention(p) is { Length: > 0 } tokenNotice)
+                { suffix = "\n" + tokenNotice; (noticeTone, noticeShort) = ("warning", "토큰 확인"); }
                 var label = ClaudeProfilePresentation.IsClaude(p) ? "[Claude] " + p.S("alias")
                     : LocalModelPresentation.IsLocalProfile(p) ? "[로컬] " + p.S("alias")
                     : p.S("auth_mode") == "external" ? "[API] " + p.S("alias") : p.S("alias", "이름 없는 프로필");
@@ -997,6 +1002,7 @@ public sealed partial class MainWindow : Window
             if (automatic.S("phase") == "attention") warnings.Add(automatic.S("message"));
             else if (selection.B("restart_required") || p.B("sidebar_cache_pending")) warnings.Add(_runtimeVersion.Text);
             if (p.S("status") is "failed" or "error" or "blocked") warnings.Add(p.S("status_message", "프로필 상태를 확인해 주세요."));
+            if (ClaudeProfilePresentation.LongLivedAttention(p) is { Length: > 0 } longLived) warnings.Add(longLived);
             _attention.Text = string.Join("\n", warnings.Where(message => message != "").Distinct());
             _attention.Visibility = _attention.Text.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
             var update = _state.Get("updates");
@@ -2266,6 +2272,12 @@ public sealed partial class MainWindow : Window
         {
             var result = await Request(command, new { profile_id = id });
             await RefreshAsync();
+            return result;
+        }, async (command, args) =>
+        {
+            // Only claude.token.save carries the token; Request logs the command name, never arguments.
+            var result = await Request(command, args);
+            if (command.StartsWith("claude.token.", StringComparison.Ordinal)) await RefreshAsync();
             return result;
         });
         if (settings is null) return;

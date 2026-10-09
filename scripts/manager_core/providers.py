@@ -179,22 +179,35 @@ def _lock(path):
                 fcntl.flock(handle, fcntl.LOCK_UN)
 
 
-def _crypt_secret(value: bytes, protect: bool) -> bytes:
+def _crypt_secret(value: bytes, protect: bool, *, entropy: bytes | None = None) -> bytes:
+    """Current-user DPAPI with CRYPTPROTECT_UI_FORBIDDEN.
+
+    ``entropy`` binds a blob to one purpose: a blob protected with entropy is
+    not unlocked without the same bytes, so it cannot be moved onto another
+    owner or read through a caller that passes none (the provider keys).
+    """
     if os.name != 'nt':
         raise ProviderError('Windows user encryption is required for saved local API keys.')
+    if entropy is not None and (not isinstance(entropy, (bytes, bytearray)) or not entropy):
+        raise ProviderError('The API key could not be encrypted or unlocked for this Windows user.')
 
     class Blob(ctypes.Structure):
         _fields_ = [('size', wintypes.DWORD), ('data', ctypes.POINTER(ctypes.c_ubyte))]
 
     buffer = (ctypes.c_ubyte * len(value)).from_buffer_copy(value)
     source, target = Blob(len(value), buffer), Blob()
+    salt = None
+    if entropy is not None:
+        salt_buffer = (ctypes.c_ubyte * len(entropy)).from_buffer_copy(entropy)
+        salt = Blob(len(entropy), salt_buffer)
     function = (ctypes.windll.crypt32.CryptProtectData if protect
                 else ctypes.windll.crypt32.CryptUnprotectData)
-    function.argtypes = [ctypes.POINTER(Blob), ctypes.c_void_p, ctypes.c_void_p,
+    function.argtypes = [ctypes.POINTER(Blob), ctypes.c_void_p, ctypes.POINTER(Blob),
                          ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(Blob)]
     function.restype = wintypes.BOOL
     try:
-        if not function(ctypes.byref(source), None, None, None, None, 1, ctypes.byref(target)):
+        if not function(ctypes.byref(source), None, None if salt is None else ctypes.byref(salt),
+                        None, None, 1, ctypes.byref(target)):
             raise ProviderError('The API key could not be encrypted or unlocked for this Windows user.')
         return ctypes.string_at(target.data, target.size)
     finally:
