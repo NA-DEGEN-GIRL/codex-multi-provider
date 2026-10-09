@@ -17,6 +17,17 @@ from manager_core.instances import Instances
 from control_center import ControlCenter
 
 
+def legacy_linked_profile(store,alias,source_home):
+    """A profile imported from the retired account tool, as older releases saved it."""
+    profile=store.add_profile(alias);uid=str(uuid4())
+    def link(data):
+        item=store.profile(profile['id'],data)
+        item.update(usage_account_id=uid,source_home=source_home)
+        Store._source(data,source_home,'usage:'+uid,alias)
+        return item
+    return store.mutate(link)
+
+
 class ControlCenterTests(unittest.TestCase):
     def test_navigation_reuses_live_instance_without_touching_its_window(self):
         instance = Instances(self.root, self.store, None)
@@ -109,15 +120,6 @@ class ControlCenterTests(unittest.TestCase):
         with self.assertRaises(ValueError):self.store.shortcut_add('x',self.one['id'],self.thread,'ssh:other','manager:'+self.one['id'])
         with self.assertRaises(ValueError):self.store.profile('../../escape')
         with self.assertRaises(ValueError):self.store.shortcut_delete('not-a-uuid')
-    def test_same_alias_new_account_never_rebinds(self):
-        first=str(uuid4());second=str(uuid4())
-        a=self.store.add_profile('동일 이름',first,str(self.root/'sourceA'))
-        b=self.store.add_profile('동일 이름',second,str(self.root/'sourceB'))
-        self.assertNotEqual(a['id'],b['id']);self.assertNotEqual(a['source_home'],b['source_home'])
-    def test_duplicate_account_keeps_stable_profile_id(self):
-        uid=str(uuid4())
-        a=self.store.add_profile('A',uid);b=self.store.add_profile('Renamed',uid)
-        self.assertEqual(a['id'],b['id'])
 
     def test_remote_source_keeps_linux_path_and_separate_host_identity(self):
         pid=self.one['id'];base='/home/test/.local/share/codex-control-center/profiles/'+pid
@@ -176,8 +178,9 @@ class ControlCenterTests(unittest.TestCase):
                 self.assertEqual(result['error'],dict(code='request_failed',message='지원하지 않는 관리 명령입니다.'))
         self.assertEqual(before,self.store.read())
     def test_legacy_linked_profile_alias_is_renamed_by_the_manager(self):
-        legacy=self.store.add_profile('legacy',str(uuid4()),str(self.root/'imported-home'))
+        legacy=legacy_linked_profile(self.store,'legacy',str(self.root/'imported-home'))
         self.assertNotIn('alias_authority',legacy)
+        sources=self.store.read()['sources']
         c=ControlCenter(self.root)
         result=c.dispatch('profile.rename',dict(profile_id=legacy['id'],alias='renamed'))
         self.assertEqual(result['alias'],'renamed')
@@ -188,6 +191,25 @@ class ControlCenterTests(unittest.TestCase):
         self.assertEqual(saved['home'],legacy['home'])
         source=next(s for s in self.store.read()['sources'] if s['id']=='manager:'+legacy['id'])
         self.assertEqual(source['alias'],'renamed')
+        imported='usage:'+legacy['usage_account_id']
+        self.assertEqual([s for s in self.store.read()['sources'] if s['id']==imported],
+                         [s for s in sources if s['id']==imported])
+    def test_unrefreshed_imported_usage_is_shown_as_stale(self):
+        # Never launched with a bound login, so no fingerprint: no background
+        # probe refreshes this imported snapshot, and the view must not call it current.
+        legacy=legacy_linked_profile(self.store,'legacy',str(self.root/'imported-home'))
+        usage=dict(windows=[dict(label='5시간',used_percent=10,remaining_percent=90,resets_at=None)],
+                   observed_at='2026-01-01T00:00:00+00:00',freshness='cached',error=None)
+        self.store.mutate(lambda data:self.store.profile(legacy['id'],data).update(usage=usage))
+        c=ControlCenter(self.root)
+        with patch.object(c.remote,'list_hosts',return_value=[]),patch('manager_core.note_forks.refresh'):
+            c._remote_reconcile_started=True
+            state=c.state()
+        shown=next(p for p in state['profiles'] if p['id']==legacy['id'])
+        self.assertEqual(shown['usage']['freshness'],'stale')
+        self.assertEqual(shown['usage']['windows'],usage['windows'])
+        self.assertEqual(shown['status_message'],'기존 연결 계정')
+        self.assertFalse(c.usage_refresh.active(legacy['id']))
     def test_backend_never_loads_an_external_account_tool(self):
         import importlib.util
         before=list(sys.path)
@@ -275,6 +297,30 @@ class ControlCenterTests(unittest.TestCase):
                     viewer=next(p for p in self.store.read()['profiles']
                                 if p.get('view_only') and p.get('representative_profile_id')==profile['id'])
                     self.assertEqual(viewer['source_home'],expected)
+    def test_existing_record_viewer_drops_the_imported_home_of_a_native_parent(self):
+        from uuid import uuid5,UUID
+        stale=str(self.root/'imported-home')
+        self.store.mutate(lambda data:self.store.profile(self.one['id'],data).update(
+            auth_mode='native',source_home=stale,usage_account_id=str(uuid4())))
+        vid=str(uuid5(UUID(self.one['id']),'codex-control-center-record-viewer-v1'))
+        directory=self.store.directory/'profiles'/vid
+        def older_viewer(data):
+            data['profiles'].append(dict(id=vid,alias='전체 기록 · 01',usage_account_id=None,
+                home=str(directory/'codex'),ui_home=str(directory/'ui'),status='not_started',process_id=None,
+                source_home=stale,policy=dict(enabled=False,model_ids=[],desired_revision=0,effective_revision=None),
+                view_only=True,representative_profile_id=self.one['id'],record_catalog_path=str(self.root/'catalog.json')))
+        self.store.mutate(older_viewer)
+        c=ControlCenter(self.root)
+        catalog=Mock();catalog.ensure.return_value=dict(path=str(self.root/'catalog.json'),entries=0)
+        with patch('control_center.runtime_build',return_value={'capabilities':{'native_record_catalog':True}}),\
+             patch.object(c,'current_catalog_refresh',return_value=catalog),\
+             patch.object(c.instances,'show',return_value={'state':'fixture'}) as show:
+            c.dispatch('catalog.show',dict(profile_id=self.one['id']))
+        show.assert_called_once_with(vid)
+        viewers=[p for p in self.store.read()['profiles'] if p['id']==vid]
+        self.assertEqual(len(viewers),1)
+        self.assertEqual(viewers[0]['source_home'],self.one['home'])
+        self.assertEqual(viewers[0]['home'],str(directory/'codex'))
 
 
 if __name__=='__main__':unittest.main()

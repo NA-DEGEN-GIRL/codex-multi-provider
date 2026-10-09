@@ -21,7 +21,7 @@ def register(store, alias, source):
             return existing
         pid = str(uuid4())
         folder = store.directory / 'profiles' / pid
-        profile = dict(id=pid, alias=name, alias_authority='manager', auth_mode='source',
+        profile = dict(id=pid, alias=name, auth_mode='source',
                        source_home=str(source), account_fingerprint=fingerprint,
                        home=str(folder / 'codex'), ui_home=str(folder / 'ui'),
                        runtime_channel='managed', desired_runtime_channel='managed',

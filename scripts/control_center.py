@@ -634,6 +634,9 @@ class ControlCenter:
                                  view_only=True,representative_profile_id=parent_id,record_catalog_path=catalog['path'])
                     data['profiles'].append(profile)
                 profile['alias']='전체 기록 · '+parent['alias']
+                # A viewer created by an older release may still name the
+                # parent's imported-account home as its credential source.
+                profile['source_home']=viewer_source
                 if parent.get('account_fingerprint'):
                     profile['account_fingerprint']=parent['account_fingerprint']
                 profile['catalog_status']={k:v for k,v in catalog.items() if k not in ('mapping','path')}

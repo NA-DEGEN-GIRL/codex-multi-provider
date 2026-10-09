@@ -37,7 +37,7 @@ internal sealed class SupervisorHost(string root, string pipeName)
     {
         "manager.startup",
         "manager.recover_legacy",
-        "state", "accounts.refresh", "profile.add", "profile.register_current", "profile.remove", "profile.restore", "profile.bind", "profile.rename", "profile.show", "profile.prepare", "profile.login", "profile.login_status",
+        "state", "accounts.refresh", "profile.add", "profile.register_current", "profile.remove", "profile.restore", "profile.rename", "profile.show", "profile.prepare", "profile.login", "profile.login_status",
         "shortcut.add", "shortcut.move", "shortcut.rename", "shortcut.delete", "shortcut.undo", "conversation.open", "conversation.continue", "conversation.navigate", "handoff.preview", "catalog.list", "catalog.show", "catalog.resolve",
         "policy.set", "profile.model_settings", "profile.restart", "profile.recover", "providers.list", "providers.save", "providers.key", "providers.verify", "updates.check", "updates.prepare", "updates.apply",
         "remote.list", "remote.inspect", "remote.prepare",

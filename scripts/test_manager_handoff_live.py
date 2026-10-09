@@ -117,10 +117,9 @@ def record_snapshot(home):
 
 
 def prepare_profile(store, account, fingerprint, registry, model_id, *, viewer=False):
-    # Deliberately omit source_home from add_profile: it would register the real
-    # account's existing conversation store. This fixture catalogs only new homes.
-    profile = store.add_profile('test-' + account['alias'] + ('-viewer' if viewer else ''),
-                                None if viewer else account['id'])
+    # source_home is set below without registering a source: the real account's
+    # existing conversation store stays out. This fixture catalogs only new homes.
+    profile = store.add_profile('test-' + account['alias'] + ('-viewer' if viewer else ''))
     home = Path(profile['home'])
     home.mkdir(parents=True)
     config = ('model = "gpt-6-astra"\nmodel_reasoning_effort = "low"\n'

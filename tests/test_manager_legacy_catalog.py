@@ -39,8 +39,19 @@ class LegacyDiscoveryTests(unittest.TestCase):
         self.imported = self.root / 'imported/profile'
         self.imported.mkdir(parents=True)
 
-    def discover(self, environ=None):
-        return legacy.discover(self.root, [self.managed], environ=environ if environ is not None else {})
+    def discover(self):
+        return legacy.discover(self.root, [self.managed])
+
+    def enroll(self, *homes):
+        """Write the host's mixed catalog as a helper of an older release left it."""
+        entries = []
+        for home in homes:
+            item = legacy.source(home, 'unused')
+            entries.append(dict(hostId='local', sourceStoreId=item['id'], codexHome=item['home']))
+        path = self.root / legacy.ENROLLED_CATALOG
+        atomic_json(path, dict(version=3, hostId='local', sources=[], legacySources=entries,
+                               managedSourcesPath=str(path.parent / 'catalog-sources.json')))
+        return path
 
     def test_stock_home_is_found_without_opening_any_file(self):
         def open_path(path, *args, **kwargs):
@@ -60,17 +71,49 @@ class LegacyDiscoveryTests(unittest.TestCase):
         # never adds a home and never reports a discovery error.
         valid = dict(schema_version=3, accounts=[
             dict(id=str(uuid4()), provider='codex', alias='04', profile_dir=str(self.imported))])
-        for config_root, environ in ((self.root / '.config', {}),
-                                     (self.root / 'custom', {'XDG_CONFIG_HOME': str(self.root / 'custom')})):
+        for config_root in (self.root / '.config', self.root / 'custom'):
             registry = config_root / 'llm-usage/config.json'
             for content in (json.dumps(valid).encode(), json.dumps({'schema_version': 99}).encode(),
                             b'not json', b' ' * (1024 * 1024 + 1)):
-                with self.subTest(root=config_root.name, size=len(content)):
+                with self.subTest(root=config_root.name, size=len(content)), \
+                        patch.dict('os.environ', {'XDG_CONFIG_HOME': str(config_root)}):
                     registry.parent.mkdir(parents=True, exist_ok=True)
                     registry.write_bytes(content)
-                    result = self.discover(environ)
+                    result = self.discover()
                     self.assertEqual(result['errors'], [])
                     self.assertEqual([s['home'] for s in result['sources']], [str(self.stock)])
+
+    def test_homes_an_older_release_enrolled_stay_while_their_folders_exist(self):
+        gone = self.root / 'imported/removed'
+        gone.mkdir()
+        self.enroll(self.stock, self.imported, gone)
+        gone.rmdir()
+        result = self.discover()
+        self.assertEqual(result['errors'], [])
+        self.assertEqual([(s['home'], s['alias']) for s in result['sources']],
+                         [(str(self.stock), '기존 Codex'), (str(self.imported), '이전 연결 Codex · profile')])
+        self.assertEqual(result['sources'][1]['id'], legacy.source(self.imported, '')['id'])
+        # An enrolled home that is now a managed home is not listed again.
+        managed = dict(id='manager:' + str(uuid4()), home=str(self.imported))
+        self.assertEqual([s['home'] for s in legacy.discover(self.root, [managed])['sources']], [str(self.stock)])
+
+    def test_unreadable_enrollment_is_reported_and_keeps_the_stock_home(self):
+        path = self.enroll(self.imported)
+        valid = json.loads(path.read_text(encoding='utf-8'))
+        entry = valid['legacySources'][0]
+        for name, content in (
+                ('not json', b'not json'),
+                ('version', json.dumps({**valid, 'version': 2}).encode()),
+                ('host', json.dumps({**valid, 'hostId': 'other'}).encode()),
+                ('identity', json.dumps({**valid, 'legacySources': [{**entry, 'sourceStoreId': 'legacy:' + '0' * 64}]}).encode()),
+                ('relative', json.dumps({**valid, 'legacySources': [{**entry, 'codexHome': 'relative/home'}]}).encode()),
+                ('extra field', json.dumps({**valid, 'legacySources': [{**entry, 'alias': 'x'}]}).encode()),
+                ('oversize', b' ' * (legacy.MAX_ENROLLED_BYTES + 1))):
+            with self.subTest(name):
+                path.write_bytes(content)
+                result = self.discover()
+                self.assertEqual(result['errors'], ['llm_usage'])
+                self.assertEqual([s['home'] for s in result['sources']], [str(self.stock)])
 
     def test_managed_stock_home_is_not_reenrolled(self):
         managed = dict(id='manager:' + str(uuid4()), home=str(self.stock))
@@ -121,12 +164,31 @@ class LegacyDiscoveryTests(unittest.TestCase):
         index.write_text(json.dumps(dict(id=tid, title='Existing work', updated_at=1789300000)) + '\n', encoding='utf-8')
         before = {str(p): p.read_bytes() for p in self.root.rglob('*') if p.is_file()}
         result = helper.read(dict(host_identity='a' * 64, sources=[managed], discover_legacy=True),
-                             user_home=self.root, identity='a' * 64, environ={})
+                             user_home=self.root, identity='a' * 64)
         self.assertFalse(result['errors'])
         self.assertFalse(result['discovery_errors'])
         self.assertEqual(result['conversations'][0]['thread_id'], tid)
         self.assertEqual(result['conversations'][0]['source_store_id'], legacy.source(self.stock, '')['id'])
         self.assertEqual(before, {str(p): p.read_bytes() for p in self.root.rglob('*') if p.is_file()})
+
+    def test_helper_lists_rows_of_a_home_an_older_release_enrolled(self):
+        # The manager's list and the runtime's mixed catalog name the same homes.
+        profile_id = str(uuid4())
+        managed_home = self.root / '.local/share/codex-control-center/profiles' / profile_id / 'codex'
+        managed_home.mkdir(parents=True)
+        managed = dict(id='manager:' + profile_id, home=str(managed_home))
+        atomic_json(managed_home / 'managed-source.json', dict(host_id='local', store_id=managed['id']))
+        self.enroll(self.stock, self.imported)
+        tid = str(uuid4())
+        (self.imported / 'session_index.jsonl').write_text(
+            json.dumps(dict(id=tid, title='Imported work', updated_at=1789300000)) + '\n', encoding='utf-8')
+        result = helper.read(dict(host_identity='a' * 64, sources=[managed], discover_legacy=True),
+                             user_home=self.root, identity='a' * 64)
+        imported = legacy.source(self.imported, '')['id']
+        self.assertFalse(result['errors'])
+        self.assertFalse(result['discovery_errors'])
+        self.assertIn(imported, {s['id'] for s in result['discovered_sources']})
+        self.assertEqual([(r['thread_id'], r['source_store_id']) for r in result['conversations']], [(tid, imported)])
 
 
 class LegacyCacheTests(unittest.TestCase):

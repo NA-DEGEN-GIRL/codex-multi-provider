@@ -1,6 +1,13 @@
 """Discover existing Codex homes from metadata only; never load account auth."""
 import hashlib
+import json
 from pathlib import Path
+
+# The host's mixed source catalog, which managed_sources.py rewrites at each
+# managed start. Before revision 121 that scan also enrolled the Codex homes
+# listed in the llm-usage account registry.
+ENROLLED_CATALOG = '.local/share/codex-control-center/catalog-mixed-sources.json'
+MAX_ENROLLED_BYTES = 4 * 1024 * 1024
 
 
 def source(home, alias):
@@ -8,13 +15,54 @@ def source(home, alias):
     return dict(id='legacy:' + hashlib.sha256(home.encode()).hexdigest(), home=home, alias=alias[:160])
 
 
-def discover(user_home, managed, *, environ=None):
+def enrolled(path):
+    """Homes an earlier managed start already published in the mixed catalog.
+
+    A missing catalog enrolls nothing. A home that no longer exists, or now
+    resolves elsewhere, is dropped, as an earlier scan would have dropped it.
+    """
+    path = Path(path)
+    if path.is_symlink():
+        raise ValueError('Enrolled catalog path changed')
+    try:
+        metadata = path.stat()
+    except FileNotFoundError:
+        return []
+    if not path.is_file() or metadata.st_size > MAX_ENROLLED_BYTES:
+        raise ValueError('Enrolled catalog size limit')
+    with path.open(encoding='utf-8') as stream:
+        content = stream.read(MAX_ENROLLED_BYTES + 1)
+    if len(content) > MAX_ENROLLED_BYTES:
+        raise ValueError('Enrolled catalog size limit')
+    value = json.loads(content)
+    entries = value['legacySources']
+    if (value.get('version') != 3 or value.get('hostId') != 'local'
+            or not isinstance(entries, list) or len(entries) > 256):
+        raise ValueError('Invalid enrolled catalog')
+    homes = []
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != {'hostId', 'sourceStoreId', 'codexHome'}:
+            raise ValueError('Invalid enrolled source')
+        home = entry['codexHome']
+        if (entry['hostId'] != 'local' or not isinstance(home, str) or not 1 <= len(home) <= 4096
+                or any(ord(c) < 32 for c in home) or not Path(home).is_absolute()
+                or entry['sourceStoreId'] != 'legacy:' + hashlib.sha256(home.encode()).hexdigest()):
+            raise ValueError('Invalid enrolled source')
+        if Path(home).is_dir() and str(Path(home).resolve()) == home:
+            homes.append(Path(home))
+    return homes
+
+
+def discover(user_home, managed, *, enrolled_catalog=None):
     """Return read-only catalog homes. A changed home has a different identity.
 
-    Only the stock ``$HOME/.codex`` is discovered; no account registry is read.
-    ``environ`` is accepted for older callers and ignored.
+    Finds the stock ``$HOME/.codex`` and keeps the homes an earlier managed
+    start already enrolled in the host's mixed catalog, so helpers of
+    different releases on one host publish the same homes. No account
+    registry is read.
     """
     user_home = Path(user_home)
+    enrolled_catalog = Path(enrolled_catalog) if enrolled_catalog is not None else user_home / ENROLLED_CATALOG
     seen = {str(Path(item['home']).resolve()) for item in managed}
     found, errors = [], []
 
@@ -36,6 +84,13 @@ def discover(user_home, managed, *, environ=None):
             add(stock, '기존 Codex')
     except (OSError, ValueError, RuntimeError):
         errors.append('stock')
+    try:
+        for home in enrolled(enrolled_catalog):
+            add(home, '기존 Codex' if home == user_home / '.codex' else '이전 연결 Codex · ' + home.name)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, RuntimeError):
+        # The code names where these homes came from: the llm-usage registry
+        # scan of releases before revision 121.
+        errors.append('llm_usage')
     return dict(sources=found, errors=errors)
 
 

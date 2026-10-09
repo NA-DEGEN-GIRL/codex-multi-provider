@@ -83,14 +83,16 @@ class StoreNoChangeTests(unittest.TestCase):
         self.store.mutate(lambda data: data.update(marker=True))
         self.assertEqual(self.store.read()['revision'], revision + 1)
 
-    def test_existing_usage_account_is_returned_without_a_rewrite(self):
-        account = str(uuid4())
-        added = self.store.add_profile('usage', account, str(self.store.root / 'source'))
-        before, revision = self.store.path.read_bytes(), self.store.read()['revision']
-        again = self.store.add_profile('renamed elsewhere', account, str(self.store.root / 'source'))
-        self.assertEqual(again, added)
+    def test_new_profiles_get_no_imported_account_fields_or_sources(self):
+        before = self.store.path.read_bytes()
+        with self.assertRaises(TypeError):
+            self.store.add_profile('usage', str(uuid4()), str(self.store.root / 'source'))
         self.assertEqual(self.store.path.read_bytes(), before)
-        self.assertEqual(self.store.read()['revision'], revision)
+        added = self.store.add_profile('plain')
+        self.assertIsNone(added['usage_account_id'])
+        self.assertIsNone(added['source_home'])
+        self.assertEqual({s['id'] for s in self.store.read()['sources']},
+                         {'manager:' + self.profile['id'], 'manager:' + added['id']})
 
 
 class StoreReadCacheTests(unittest.TestCase):
