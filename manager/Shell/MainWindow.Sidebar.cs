@@ -479,9 +479,12 @@ public sealed partial class MainWindow
         var items = shortcuts.Select(s =>
         {
             var owner = owners.FirstOrDefault(p => p.S("id") == s.S("profile_id"));
+            var card = ShortcutCardData.Create(s, owner, activity, models, now);
+            // A task being opened shows its phase and seconds instead of its state.
+            if (OpenProgress(s.S("id")) is { } progress) card = card with { State = "opening", StateText = progress };
             return new Choice(s.S("id"), s.S("alias", "이름 없는 작업") + "\n" + owner.S("alias", "계정 지정 필요") +
                 " 계정에서 열기 · " + (s.S("host_id", "local") == "local" ? "Windows" : s.S("host_id")), s)
-                { Shortcut = ShortcutCardData.Create(s, owner, activity, models, now) };
+                { Shortcut = card };
         }).Where(choice => MatchesShortcut(choice, query)).ToArray();
         Fill(_shortcuts, items, SelectedShortcutId(shortcuts));
         _shortcutCount.Text = query.Length == 0 ? shortcuts.Length.ToString() : $"{items.Length} / {shortcuts.Length}";

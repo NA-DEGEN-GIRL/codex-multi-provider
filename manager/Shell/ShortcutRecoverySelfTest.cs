@@ -36,8 +36,8 @@ internal static class ShortcutRecoverySelfTest
         long clock = 0; int sent = 0; bool current = true, selected = true;
         Task Delay(int ms) { clock += ms; return Task.CompletedTask; }
         Task Send(CancellationToken _) { sent++; selected = true; return Task.CompletedTask; }
-        async Task<ShortcutRecoveryResult> Run(Func<CancellationToken, Task>? send = null, Func<int, Task>? delay = null, Func<bool>? attached = null) =>
-            await ShortcutNavigationRecovery.RunAsync(() => current, attached ?? (() => true), () => Task.FromResult(selected), send ?? Send, delay ?? Delay, () => clock);
+        async Task<ShortcutRecoveryResult> Run(Func<CancellationToken, Task>? send = null, Func<int, Task>? delay = null, Func<bool>? attached = null, bool remote = false) =>
+            await ShortcutNavigationRecovery.RunAsync(() => current, attached ?? (() => true), () => Task.FromResult(selected), send ?? Send, delay ?? Delay, () => clock, remote);
         Require(await Run() == ShortcutRecoveryResult.Selected && sent == 0, "Already selected task was navigated twice.");
         selected = false;
         Require(await Run() == ShortcutRecoveryResult.Recovered && sent == 1, "Stalled open was not recovered exactly once.");
@@ -45,6 +45,16 @@ internal static class ShortcutRecoverySelfTest
         Require(await Run(_ => { sent++; return Task.CompletedTask; }) == ShortcutRecoveryResult.Unverified && sent == 1,
             "An acknowledgement without selected-route evidence was reported as success or retried.");
         checks.Add("Normal opens send no recovery; stalled opens send once; acknowledgement alone never counts as success.");
+        sent = 0; selected = false; clock = 0;
+        Require(await Run(_ => { sent++; return Task.CompletedTask; }, remote: true) == ShortcutRecoveryResult.Unverified && sent == 1
+            && clock >= ShortcutNavigationRecovery.RemoteChance + ShortcutNavigationRecovery.RemoteSettle,
+            "An SSH task was given up before its host could load the task.");
+        sent = 0; selected = false; clock = 0;
+        Require(await Run(token => { sent++; if (clock >= 9000) selected = true; return Task.CompletedTask; },
+                ms => { clock += ms; if (sent > 0 && clock >= 15000) selected = true; return Task.CompletedTask; }, remote: true)
+            == ShortcutRecoveryResult.Recovered && sent == 1, "An SSH task selected 10 s after its direct send was reported unverified.");
+        checks.Add("SSH tasks get a longer ordinary chance and settle wait before a selection counts as unverified.");
+        selected = false;
 
         sent = 0; clock = 0; current = true;
         Require(await Run(delay: ms => { clock += ms; current = false; return Task.CompletedTask; }) == ShortcutRecoveryResult.Cancelled && sent == 0,

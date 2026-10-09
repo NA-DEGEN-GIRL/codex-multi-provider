@@ -45,10 +45,11 @@ public sealed partial class MainWindow
             }
             catch (Exception error) when (error is IOException or UnauthorizedAccessException or JsonException) { return false; }
         }
+        var remote = target.HostId != "local";
         try
         {
             var outcome = await ShortcutNavigationRecovery.RunAsync(Current, Attached, Selected,
-                token => host.NavigateAsync(target, token));
+                token => host.NavigateAsync(target, token), remote: remote);
             if (outcome == ShortcutRecoveryResult.Cancelled)
             {
                 var code = CancelCode();
@@ -67,7 +68,10 @@ public sealed partial class MainWindow
             }
             else if (outcome == ShortcutRecoveryResult.Unverified)
             {
-                SetStatus("작업 화면 이동을 확인하지 못했습니다. 앱을 재시작하지 않았으며 진행 중인 작업은 유지됩니다.", true);
+                // The SSH link was sent with its connection up; the desktop may
+                // still be loading that task from the host. Not an error.
+                if (remote) SetStatus("SSH 작업 화면 전환을 아직 확인하지 못했습니다. 호스트에서 작업을 불러오면 표시됩니다. 앱을 재시작하지 않았습니다.");
+                else SetStatus("작업 화면 이동을 확인하지 못했습니다. 앱을 재시작하지 않았으며 진행 중인 작업은 유지됩니다.", true);
                 Log("대화 이동 · 화면 선택 미확인 · 자동 재시도 종료");
                 FinishShortcutTrace(trace, "unverified");
             }

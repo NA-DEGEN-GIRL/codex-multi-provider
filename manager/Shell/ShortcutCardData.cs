@@ -25,17 +25,20 @@ internal sealed record ShortcutCardData(string Title, string Account, string Acc
     public Brush OuterBrush => QuotaBrush(Outer, Plenty);
     public Brush InnerBrush => QuotaBrush(Inner, PlentyInner);
     public Visibility InnerVisibility => double.IsFinite(Inner) ? Visibility.Visible : Visibility.Collapsed;
+    // "opening": this card's task is being opened (MainWindow.RenderShortcuts
+    // sets the phase and elapsed seconds as StateText).
     public Brush StateBrush => State switch
     {
-        "working" => Working, "waiting_approval" or "waiting_input" => Waiting, _ => Muted
+        "working" => Working, "waiting_approval" or "waiting_input" => Waiting, "opening" => Opening, _ => Muted
     };
     public Brush PillBrush => State switch
     {
-        "working" => WorkingPill, "waiting_approval" or "waiting_input" => WaitingPill, _ => MutedPill
+        "working" => WorkingPill, "waiting_approval" or "waiting_input" => WaitingPill, "opening" => OpeningPill, _ => MutedPill
     };
 
     private static readonly Brush Working = Freeze("#77C6A0"), Waiting = Freeze("#E5B773"), Muted = Freeze("#8E9BB2"),
         WorkingPill = Freeze("#1E3A2E"), WaitingPill = Freeze("#3A3020"), MutedPill = Freeze("#262B34"),
+        Opening = Freeze("#94A9F8"), OpeningPill = Freeze("#232B45"),
         Plenty = Freeze("#94A9F8"), PlentyInner = Freeze("#77C6A0"), Low = Freeze("#E5B773"),
         Critical = Freeze("#E57B73"), Api = Freeze("#6F7A8E");
 

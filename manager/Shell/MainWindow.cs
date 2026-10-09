@@ -77,8 +77,14 @@ public sealed partial class MainWindow : Window
     private readonly Dictionary<Guid, (string Label, DateTime Started)> _pendingActions = [];
     private readonly ProfileActionGate _profileActions = new();
     private const string ShortcutOpenAction = "대화 열기";
-    // Per account: the task its latest shortcut open is for and that open's ticket.
-    private readonly Dictionary<string, (string Id, int Ticket)> _shortcutOpens = [];
+    // Per account: the task its latest shortcut open is for, that open's ticket
+    // and its trace (the phase its card and the status line show until it ends).
+    private sealed record ShortcutOpen(string Id, int Ticket, ShortcutOpenTrace Trace);
+    private readonly Dictionary<string, ShortcutOpen> _shortcutOpens = [];
+    private bool OpenInFlight(string? profileId) =>
+        profileId is not null && _shortcutOpens.TryGetValue(profileId, out var open) && !open.Trace.Finished;
+    private string? OpenProgress(string shortcutId) =>
+        _shortcutOpens.Values.FirstOrDefault(open => open.Id == shortcutId && !open.Trace.Finished)?.Trace.Text;
     private bool _logFlushPending;
     private readonly List<string> _events = [];
     private readonly DiagnosticLog _diagnostics;
@@ -806,7 +812,10 @@ public sealed partial class MainWindow : Window
         {
             using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(command switch
             {
-                "profile.show" or "profile.login" or "conversation.open" or "conversation.navigate" or "catalog.show" => 45,
+                // A cold task open waits for launch admission behind other
+                // launches; it must not be reported failed while still in progress.
+                "conversation.open" => 90,
+                "profile.show" or "profile.login" or "conversation.navigate" or "catalog.show" => 45,
                 "profile.restart" or "manager.startup" or "manager.recover_legacy" => 15,
                 _ => 180
             }));
@@ -840,12 +849,23 @@ public sealed partial class MainWindow : Window
         "remote.updates.settings" => "SSH 업데이트 설정", "remote.updates.schedule" => "SSH 업데이트 예약",
         "remote.updates.cancel" => "SSH 업데이트 예약 취소", "remote.updates.stock_update" => "기본 Codex 수동 업데이트", _ => "관리 요청 처리"
     };
+    // Task opens are part of the activity too: their phase and seconds tick on
+    // the card and in the status line; the header banner (which would resize
+    // the native viewport) only counts them beside another request.
     private void RenderActivity()
     {
-        if (_pendingActions.Count == 0) { _operation.Visibility = Visibility.Collapsed; _activityTimer.Stop(); return; }
+        var opens = _shortcutOpens.Values.Count(open => !open.Trace.Finished);
+        if (opens > 0) ShowOpenProgress();
+        if (_pendingActions.Count == 0)
+        {
+            _operation.Visibility = Visibility.Collapsed;
+            if (opens == 0) _activityTimer.Stop();
+            return;
+        }
         var operation = _pendingActions.Values.First();
         _operation.Visibility = Visibility.Visible;
-        _operation.Text = $"진행 중 · {operation.Label} · {(int)(DateTime.UtcNow - operation.Started).TotalSeconds}초 경과" + (_pendingActions.Count > 1 ? $" · 추가 요청 {_pendingActions.Count - 1}개 대기" : "");
+        _operation.Text = $"진행 중 · {operation.Label} · {(int)(DateTime.UtcNow - operation.Started).TotalSeconds}초 경과" + (_pendingActions.Count > 1 ? $" · 추가 요청 {_pendingActions.Count - 1}개 대기" : "")
+            + (opens > 0 ? $" · 작업 열기 {opens}개 진행 중" : "");
     }
     private async Task RefreshAsync()
     {
@@ -1710,9 +1730,12 @@ public sealed partial class MainWindow : Window
             _empty.Text = "업데이트 적용 후 새 Codex 창을 연결합니다…";
             return;
         }
+        // A task open in flight reports its own outcome within bounded waits;
+        // until then a missing window is progress, never an attach error.
+        var opening = OpenInFlight(profile.S("id"));
         if (_expectedWindowLaunch is not null && !_expectedWindowLaunch.Matches(profile))
         {
-            if (DateTime.UtcNow >= _attachDeadline)
+            if (DateTime.UtcNow >= _attachDeadline && !opening)
                 AttachFailure("새 실행의 창 정보가 아직 확인되지 않았습니다. ‘관리창 안에 표시’로 다시 연결할 수 있습니다.");
             return;
         }
@@ -1744,8 +1767,8 @@ public sealed partial class MainWindow : Window
         {
             // While the service still reports this launch in progress, the 25 s
             // budget extends by LaunchProgressGrace (90 s in all).
-            var starting = LaunchInProgress(_state, profile);
-            if (AttachOverdue(DateTime.UtcNow, _attachDeadline, starting))
+            var starting = LaunchInProgress(_state, profile) || opening;
+            if (AttachOverdue(DateTime.UtcNow, _attachDeadline, starting) && !opening)
                 AttachFailure(starting ? "90초 안에 Codex 기본 창을 찾지 못했습니다. 프로필을 다시 선택해 주세요."
                     : "25초 안에 Codex 기본 창을 찾지 못했습니다. 프로필을 다시 선택해 주세요.");
             else
@@ -2519,6 +2542,9 @@ public sealed partial class MainWindow : Window
                 .Get("current_task").S("thread_id"));
             _shortcuts.SelectedItem = _shortcuts.Items.OfType<Choice>().FirstOrDefault(c => c.Id == id);
         }
+        // The card and the status line show this click's phase from now on.
+        var trace = new ShortcutOpenTrace(id, profileId, item.S("host_id", "local"),
+            Latest(profileId, _state.Arr("profiles").FirstOrDefault(p => p.S("id") == profileId)).S("status") == "running");
         // Task opens of one account do not reject each other: a re-click of the
         // task being opened joins it, and another task replaces it. The newer
         // ticket discards the open in flight and this one follows once that
@@ -2527,19 +2553,17 @@ public sealed partial class MainWindow : Window
         {
             if (_shortcutOpens.TryGetValue(profileId, out var opening) && opening.Id == id && opening.Ticket == _navigation) return;
             var queued = ++_navigation;
-            _shortcutOpens[profileId] = (id, queued);
-            SelectCard();
-            SetStatus("앞선 대화 열기를 정리한 뒤 선택한 작업으로 이동합니다…");
+            _shortcutOpens[profileId] = new(id, queued, trace);
+            SelectCard(); ShowOpenProgress();
             Log($"대화 열기 교체 대기 · {id}");
             await inFlight;
-            if (queued != _navigation || _closing) return;
+            if (queued != _navigation || _closing) { FinishShortcutTrace(trace, "replaced"); return; }
         }
         using var action = _profileActions.Enter(profileId, ShortcutOpenAction);
         SelectCard();
         var ticket = ++_navigation; if (_selectedProfile != profileId || _viewingCatalog) ParkCurrent(); _viewingCatalog = false; _selectedProfile = profileId;
-        _shortcutOpens[profileId] = (id, ticket);
-        var trace = new ShortcutOpenTrace(id, profileId, item.S("host_id", "local"),
-            Latest(profileId, _state.Arr("profiles").FirstOrDefault(p => p.S("id") == profileId)).S("status") == "running");
+        _shortcutOpens[profileId] = new(id, ticket, trace);
+        ShowOpenProgress();
         try { await OpenShortcutCoreAsync(id, item, profileId, ticket, trace, action); }
         // The filter only records this click's failure; the error still reaches Safe.
         catch (Exception error) when (TraceFailure(trace, ticket, error)) { throw; }
@@ -2559,9 +2583,9 @@ public sealed partial class MainWindow : Window
         // Synchronize it now, as profile selection does, without waiting for state.
         var retained = Latest(profileId, Profile());
         if (_host.HasLiveAttachment) TryAttach(retained);
-        SetStatus("선택한 계정에서 작업으로 이동하고 있습니다…");
         JsonElement result;
         trace.Mark("request_sent");
+        ShowOpenProgress();
         try { result = await Request("conversation.open", new { shortcut_id = id, expected_profile_id = profileId }); }
         // A replaced open's failure is logged by Request; it must not overwrite the newer open's status.
         catch (Exception) when (ticket != _navigation || _closing) { FinishShortcutTrace(trace, "replaced"); return; }
@@ -2571,8 +2595,11 @@ public sealed partial class MainWindow : Window
         if (result.S("state") == "waiting_for_reader")
         {
             PresentShortcutResult(result, item, profileId);
+            // While the service reports progress the status line shows the phase
+            // (ShowOpenProgress), never an error; its own message goes to the log.
             var waiting = result.Message("Codex가 준비되면 선택한 대화로 자동 이동합니다.");
-            SetStatus(waiting);
+            Log("대화 열기 대기 · " + waiting);
+            ShowOpenProgress();
             JsonElement? completed;
             try
             {
@@ -2583,11 +2610,10 @@ public sealed partial class MainWindow : Window
                         var next = await Request("conversation.navigate", new { navigation_id = token });
                         trace.Observe(next);
                         // The wait can move from the local runtime to an SSH task's connection.
-                        if (next.S("state") == "waiting_for_reader" && ticket == _navigation && !_closing
-                            && next.Message(waiting) != waiting)
+                        if (next.S("state") == "waiting_for_reader" && ticket == _navigation && !_closing)
                         {
-                            waiting = next.Message(waiting);
-                            SetStatus(waiting);
+                            if (next.Message(waiting) != waiting) { waiting = next.Message(waiting); Log("대화 열기 대기 · " + waiting); }
+                            ShowOpenProgress();
                         }
                         return next;
                     },
@@ -2620,6 +2646,22 @@ public sealed partial class MainWindow : Window
         if (trace.Finish(outcome, string.IsNullOrEmpty(reason) ? null : reason) is not { } record) return;
         _responsiveness?.Record("shortcut_open", record);
         Log(trace.Summary(reason));
+        // The card returns to the task's own state.
+        if (!_closing && !_shortcutOrdering.IsInteracting) RenderShortcuts();
+    }
+    // An open in flight: its phase and seconds on its card, and for the selected
+    // account in the status line. That bar has a fixed height, so the native
+    // viewport never resizes for it (the header banner is for other requests).
+    private void ShowOpenProgress()
+    {
+        if (_closing) return;
+        if (!_shortcutOrdering.IsInteracting) RenderShortcuts();
+        if (_selectedProfile is { } selected && _shortcutOpens.TryGetValue(selected, out var open) && !open.Trace.Finished)
+        {
+            _profileOpenNoticeProfile = null;
+            _status.Text = open.Trace.Text; _status.ToolTip = open.Trace.Text; _status.Foreground = Muted;
+        }
+        if (_shortcutOpens.Values.Any(o => !o.Trace.Finished)) _activityTimer.Start();
     }
     private void PresentShortcutResult(JsonElement result, JsonElement item, string profileId)
     {

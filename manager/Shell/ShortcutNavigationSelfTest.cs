@@ -50,8 +50,13 @@ internal static class ShortcutNavigationSelfTest
             window.UpdateLayout();
             Require(Field<TextBlock>(window, "_operation").Visibility == Visibility.Collapsed && surface.ActualHeight == height,
                 "Opening a shortcut resized the native viewport with an activity banner.");
+            ShortcutCardData? Card() => Field<ListBox>(window, "_shortcuts").Items.OfType<Choice>().FirstOrDefault(c => c.Id == "shortcut")?.Shortcut;
+            Require(Card() is { State: "opening" } opening && opening.StateText.StartsWith("대화 여는 중", StringComparison.Ordinal)
+                && Field<TextBlock>(window, "_status").Text.StartsWith("대화 여는 중", StringComparison.Ordinal),
+                "The clicked card and the status line did not show the open's phase.");
             openReply.SetResult(ready);
             await navigation.WaitAsync(TimeSpan.FromSeconds(3));
+            Require(Card() is { State: "idle" }, "The card kept the open's progress after the open ended.");
             var shown = Field<Dictionary<string, JsonElement>>(window, "_shownProfiles");
             Require(shown["profile"].S("generation") == "new"
                 && Field<WindowLaunchIdentity>(window, "_expectedWindowLaunch").Generation == "new",
@@ -61,7 +66,7 @@ internal static class ShortcutNavigationSelfTest
             using (Field<ProfileActionGate>(window, "_profileActions").Enter("profile", "fixture")) { }
             stateReply.SetResult(state); await stalePoll;
             Require(shown["profile"].S("generation") == "new", "A pre-navigation state poll replaced the newly returned launch.");
-            checks.Add("Shortcut navigation keeps viewport height stable, pins its returned launch, ignores old state and releases its gate without waiting for a global refresh.");
+            checks.Add("Shortcut navigation keeps viewport height stable, shows its phase on the card and in the status line, pins its returned launch, ignores old state and releases its gate without waiting for a global refresh.");
         }
         finally { stateReply.TrySetResult(state); openReply.TrySetResult(ready); window.Close(); }
 

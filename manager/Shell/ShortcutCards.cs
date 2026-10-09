@@ -6,7 +6,8 @@ using System.Windows.Markup;
 namespace Codex.ControlCenter.Shell;
 
 // Task shortcut card, two lines. The title wraps to two lines; the second line
-// says whether the task is working or waiting right now, which account opens
+// says whether the task is working or waiting right now (or, while a click
+// opens it, that open's phase and seconds), which account opens
 // it, the account's subagent models and when it was last used. The SSH host is
 // in the card tooltip (and the search), not on every card.
 // The leading ring is the owning account's remaining usage (outer: weekly,
@@ -145,6 +146,24 @@ internal static class ShortcutCards
               </MultiDataTrigger.EnterActions>
               <MultiDataTrigger.ExitActions>
                 <StopStoryboard BeginStoryboardName="Pulse"/>
+              </MultiDataTrigger.ExitActions>
+            </MultiDataTrigger>
+            <!-- A task being opened breathes the same way while its phase and seconds count up. -->
+            <MultiDataTrigger>
+              <MultiDataTrigger.Conditions>
+                <Condition Binding="{Binding Shortcut.State}" Value="opening"/>
+                <Condition Binding="{Binding Tag, RelativeSource={RelativeSource AncestorType=ListBox}}" Value="pulse"/>
+              </MultiDataTrigger.Conditions>
+              <MultiDataTrigger.EnterActions>
+                <BeginStoryboard x:Name="OpeningPulse">
+                  <Storyboard Timeline.DesiredFrameRate="8">
+                    <DoubleAnimation Storyboard.TargetName="Dot" Storyboard.TargetProperty="Opacity"
+                                     From="1" To="0.25" Duration="0:0:0.6" AutoReverse="True" RepeatBehavior="Forever"/>
+                  </Storyboard>
+                </BeginStoryboard>
+              </MultiDataTrigger.EnterActions>
+              <MultiDataTrigger.ExitActions>
+                <StopStoryboard BeginStoryboardName="OpeningPulse"/>
               </MultiDataTrigger.ExitActions>
             </MultiDataTrigger>
           </DataTemplate.Triggers>

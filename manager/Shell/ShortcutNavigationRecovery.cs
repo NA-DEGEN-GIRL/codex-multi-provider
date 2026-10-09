@@ -41,13 +41,19 @@ internal static class ShortcutNavigationRecovery
     internal static bool Matches(JsonElement value, WindowLaunchIdentity launch, long hwnd, NoteTask task) =>
         SameWindow(value, launch, hwnd) && value.S("thread_id") == task.ThreadId && value.S("host_id", "local") == task.HostId;
 
+    // An SSH task's desktop still loads the thread from its host after the
+    // link arrives (the service sent it only once the connection was up): its
+    // ordinary chance and the wait after a direct send are longer.
+    internal const int LocalChance = 2000, RemoteChance = 5000, LocalSettle = 6000, RemoteSettle = 20000;
+
     internal static async Task<ShortcutRecoveryResult> RunAsync(Func<bool> current, Func<bool> attached,
         Func<Task<bool>> selected, Func<CancellationToken, Task> send,
-        Func<int, Task>? delay = null, Func<long>? now = null)
+        Func<int, Task>? delay = null, Func<long>? now = null, bool remote = false)
     {
         delay ??= ms => Task.Delay(ms);
         now ??= () => Environment.TickCount64;
         var start = now();
+        int chance = remote ? RemoteChance : LocalChance, settle = remote ? RemoteSettle : LocalSettle;
         // Give the ordinary deep link a short chance; a cold window gets a
         // bounded attachment wait without launching or polling the service again.
         while (current())
@@ -55,7 +61,7 @@ internal static class ShortcutNavigationRecovery
             if (attached())
             {
                 if (await selected()) return current() ? ShortcutRecoveryResult.Selected : ShortcutRecoveryResult.Cancelled;
-                if (now() - start >= 2000) break;
+                if (now() - start >= chance) break;
             }
             if (now() - start >= 25000) return ShortcutRecoveryResult.Unverified;
             await delay(200);
@@ -85,7 +91,7 @@ internal static class ShortcutNavigationRecovery
             // retaining the UI action gate or awaiting an unresponsive pipe.
             _ = ObserveAsync(sending);
         }
-        deadline = now() + 6000;
+        deadline = now() + settle;
         while (current() && attached())
         {
             if (await selected()) return current() ? ShortcutRecoveryResult.Recovered : ShortcutRecoveryResult.Cancelled;
