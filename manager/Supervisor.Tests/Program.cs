@@ -223,7 +223,9 @@ internal static partial class Program
         Check(!log.Text.Contains("private-"), "support logs redact credential-shaped values");
         for (var i = 0; i < 310; i++) log.Add("entry " + i);
         Check(log.Text.Split(Environment.NewLine).Length == 300, "support logs retain a bounded rolling window");
-        Check(File.ReadAllText(log.Path) == log.Text, "copyable support log matches the saved file");
+        var saved = File.ReadAllText(log.Path);
+        Check(saved.TrimEnd().EndsWith(log.Text, StringComparison.Ordinal) && saved.Contains("entry 0") && !saved.Contains("private-"),
+            "the saved file keeps the whole day while the window keeps the latest lines");
         log.Add("창 연결 완료 · Bearer private-lifecycle");
         log.Add("03 · Codex windowsSandbox/setupCompleted · Windows 설정 완료");
         for (var i = 0; i < 310; i++) log.Add("03 · Codex thread/list · 완료");
@@ -231,11 +233,54 @@ internal static partial class Program
         Check(log.LifecycleText.Contains("창 연결 완료") && !log.LifecycleText.Contains("private-lifecycle"),
             "window lifecycle survives RPC polling with secrets redacted");
         Check(log.CopyText.Contains("Windows 설정 완료"), "copied feedback includes Windows setup lifecycle");
-        Check(File.ReadAllText(log.LifecyclePath) == log.LifecycleText, "window diagnostics are saved separately");
+        Check(File.ReadAllText(log.LifecyclePath).TrimEnd().EndsWith(log.LifecycleText, StringComparison.Ordinal)
+            && File.ReadAllText(log.Path).Contains("창 연결 완료"), "window diagnostics are saved separately and the day keeps evicted lines");
+        TestSupportLogRotation();
         var exported=log.Export();
         Check(File.ReadAllText(exported)==log.CopyText,"export contains the same nonempty support snapshot as copy");
         var snapshot=log.CopyText; log.Add("later event"); log.Export(snapshot);
         Check(File.ReadAllText(exported)==snapshot,"clipboard failure fallback preserves the exact snapshot");
+    }
+
+    private static void TestSupportLogRotation()
+    {
+        var root = FixtureRoot();
+        var now = new DateTime(2026, 10, 9, 23, 59, 58);
+        var log = new Codex.ControlCenter.Shell.DiagnosticLog(root, () => now, prune: false);
+        log.Add("before midnight");
+        var first = log.Path;
+        now = now.AddSeconds(5);
+        log.Add("after midnight");
+        Check(log.Path != first && File.ReadAllText(first).Contains("before midnight") && !File.ReadAllText(first).Contains("after midnight")
+            && File.ReadAllText(log.Path).Contains("after midnight") && Path.GetFileName(log.Path).StartsWith("shell-20261010-", StringComparison.Ordinal),
+            "a new day starts a new shell log and keeps the previous day's file whole");
+        var logs = Path.GetDirectoryName(first)!;
+        string Write(string name, int bytes, int ageDays)
+        {
+            var path = Path.Combine(logs, name);
+            File.WriteAllText(path, new string('x', bytes));
+            File.SetLastWriteTime(path, now.AddDays(-ageDays));
+            return path;
+        }
+        var expired = Write("shell-20260901-000000-1.log", 10, 8);
+        var recent = Write("shell-20261008-000000-2.log", 10, 1);
+        var overBudget = Write("shell-20261007-000000-3.log", 400, 2);
+        var oldTrace = Write("shell-20261007-000000-3.performance.jsonl.2", 400, 2);
+        var newTrace = Write("shell-20261008-000000-2.performance.jsonl", 400, 1);
+        var backend = Write("profile-launch.performance.jsonl", 10, 30);
+        var deleted = Codex.ControlCenter.Shell.DiagnosticLog.Prune(logs, now, [first, log.Path], textBudget: 300, performanceBudget: 500);
+        Check(!File.Exists(expired) && File.Exists(recent) && !File.Exists(overBudget) && File.Exists(first) && File.Exists(log.Path),
+            "text logs older than the retention or past the budget are pruned, newest and current kept");
+        Check(File.Exists(newTrace) && !File.Exists(oldTrace) && File.Exists(backend) && deleted == 3,
+            "performance traces have their own budget and other log families are never pruned");
+        var trace = Path.Combine(logs, "rotation.performance.jsonl");
+        foreach (var round in new[] { "a", "b", "c", "d", "e" })
+        {
+            File.WriteAllText(trace, round + new string('x', 20));
+            Codex.ControlCenter.Shell.DiagnosticLog.Rotate(trace, 10, 3);
+        }
+        Check(!File.Exists(trace) && File.ReadAllText(trace + ".1").StartsWith('e') && File.ReadAllText(trace + ".3").StartsWith('c')
+            && !File.Exists(trace + ".4"), "performance traces keep three rotations, newest first");
     }
 
     private static async Task TestLogCopyAsync()

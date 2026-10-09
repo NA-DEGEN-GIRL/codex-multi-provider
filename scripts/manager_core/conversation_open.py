@@ -4,6 +4,8 @@ Shared execution opens the canonical task without transferring ownership or
 stopping another profile. Older runtimes retain their original handoff/viewer
 fallback until the managed instance is reopened with the new runtime.
 """
+import time
+
 from .store import identifier
 
 
@@ -32,11 +34,17 @@ def open_shortcut(center, shortcut_id, capabilities, *, expected_profile_id=None
         return dict(state='blocked', access_mode='unavailable', profile_id=profile['id'],
                     message='이 대화의 공통 기록 기능이 아직 준비되지 않았습니다.')
 
+    requested = time.perf_counter()
     with center.update_hooks.launch_admission(profile['id']):
+        admitted = time.perf_counter()
         # The exact thread link below is already a scoped Electron activation.
         # A separate reopen first can reset an embedded Chromium window's frame.
         shown = center.instances.show(profile['id'], reopen_existing=False)
         profile = shown['profile']
+        # Phases of this click for the shell's per-click record (milliseconds).
+        launch = dict(state=shown.get('state', 'existing'),
+                      admission_ms=round((admitted - requested) * 1000),
+                      launch_ms=round((time.perf_counter() - admitted) * 1000))
         if capabilities.get('canonical_record_storage'):
             # The first launch may import old stores and update shortcut sources.
             link = next(item for item in center.store.read()['shortcuts'] if item['id'] == link['id'])
@@ -46,11 +54,11 @@ def open_shortcut(center, shortcut_id, capabilities, *, expected_profile_id=None
         if managed and capabilities.get('shared_record_execution'):
             # The user chooses the account directly. This mode does not transfer
             # ownership, wait for another profile, or close its running actors.
-            return center.navigations.begin(link, profile, link, False)
+            return center.navigations.begin(link, profile, link, False, annotations=dict(launch=launch))
         if remote:
             # Handoff and read-only viewers only know local stores.
             return dict(state='blocked', access_mode='unavailable', profile_id=profile['id'],
-                        reason='exact_remote_navigation_unverified',
+                        reason='exact_remote_navigation_unverified', launch=launch,
                         message='SSH 작업은 공유 실행이 적용된 관리용 Codex에서 열 수 있습니다. 이 프로필을 다시 열어 주세요.')
         if (managed and link['source_store_id'].startswith('manager:')
                 and all(capabilities.get(key) for key in CONNECT_CAPABILITIES)):
@@ -73,7 +81,7 @@ def open_shortcut(center, shortcut_id, capabilities, *, expected_profile_id=None
                 return result
             return center.navigations.begin(link, viewer, {**link, 'profile_id': viewer['id']}, True,
                 annotations=dict(readonly_viewer=True, representative_profile_id=profile['id'],
-                                 account_connection=connection))
+                                 account_connection=connection, launch=launch))
         else:
             # Viewing a catalog needs the connected reader, not a complete idle
             # proof for stopping writers. AppTransport verifies that reader's
@@ -82,4 +90,4 @@ def open_shortcut(center, shortcut_id, capabilities, *, expected_profile_id=None
             if read_only and not shared:
                 center._wait_runtime(profile['id'])
             return center.navigations.begin(link, profile, link, read_only,
-                annotations=dict(account_connection=connection))
+                annotations=dict(account_connection=connection, launch=launch))

@@ -150,11 +150,16 @@ internal sealed class ResponsivenessMonitor : IDisposable
         finally { Interlocked.Exchange(ref sampling, 0); }
     }
 
+    // A trace rolls at RotateBytes and keeps Rotations older parts (.1 newest),
+    // about six hours of samples at the usual rate; DiagnosticLog prunes old processes' traces.
+    internal const long RotateBytes = 4_000_000;
+    internal const int Rotations = 3;
+
     private void Flush()
     {
         if (records.IsEmpty) return;
         Directory.CreateDirectory(System.IO.Path.GetDirectoryName(Path)!);
-        if (new FileInfo(Path) is { Exists: true, Length: > 4_000_000 }) File.Move(Path, Path + ".previous", true);
+        DiagnosticLog.Rotate(Path, RotateBytes, Rotations);
         using var writer = new StreamWriter(Path, append: true);
         while (records.TryDequeue(out var record))
         {

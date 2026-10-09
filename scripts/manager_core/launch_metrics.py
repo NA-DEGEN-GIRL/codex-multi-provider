@@ -2,6 +2,7 @@
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import json
+import re
 import threading
 import time
 
@@ -24,7 +25,7 @@ class LaunchMetrics:
         finally:
             self.record(profile_id, name, started, error is None, error=error)
 
-    def record(self, profile_id, name, started, success=True, *, error=None, released_by=None):
+    def record(self, profile_id, name, started, success=True, *, error=None, released_by=None, code=None, **numbers):
         event = dict(at=datetime.now(timezone.utc).isoformat(), profile_id=profile_id,
                      phase=name, elapsed_ms=round((time.perf_counter()-started)*1000, 2),
                      success=success)
@@ -33,6 +34,13 @@ class LaunchMetrics:
         if released_by:
             # A fixed code from profile_warmup (warmup_gate), never free text.
             event['released_by'] = released_by
+        if isinstance(code, str) and re.fullmatch(r'[a-z_:]{1,80}', code):
+            # A fixed state/reason code (conversation opens), never a message.
+            event['code'] = code
+        for key, value in numbers.items():
+            # Counts and limits only (warmup parallelism, free commit in MiB).
+            if re.fullmatch(r'[a-z_]{1,40}', key) and type(value) in (int, float):
+                event[key] = value
         try:
             with self._lock:
                 self.path.parent.mkdir(parents=True, exist_ok=True)

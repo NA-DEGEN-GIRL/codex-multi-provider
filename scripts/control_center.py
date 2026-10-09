@@ -673,10 +673,18 @@ class ControlCenter:
                     'catalog':{k:v for k,v in catalog.items() if k not in ('mapping','path')}}
         if command in ('conversation.open','conversation.continue'):
             from manager_core.conversation_open import open_shortcut
-            return open_shortcut(self,args['shortcut_id'],runtime_build(self.root).get('capabilities',{}),
+            started=time.perf_counter()
+            result=open_shortcut(self,args['shortcut_id'],runtime_build(self.root).get('capabilities',{}),
                                  expected_profile_id=args.get('expected_profile_id'))
+            self._record_navigation(result,'conversation_open',started)
+            return result
         if command=='conversation.navigate':
-            return self.navigations.resume(args['navigation_id'])
+            started=time.perf_counter()
+            result=self.navigations.resume(args['navigation_id'])
+            # One record per outcome; a readiness poll that keeps waiting is not one.
+            if result.get('state')!='waiting_for_reader':
+                self._record_navigation(result,'conversation_navigate',started)
+            return result
         if command=='profile.model_settings':
             from manager_core.model_settings import resolve, render_options
             target=self.store.profile(args['profile_id'])
@@ -765,6 +773,18 @@ class ControlCenter:
                 self.store.mutate(bind_remote)
             return result
         raise ValueError('지원하지 않는 관리 명령입니다.')
+
+    def _record_navigation(self,result,phase,started):
+        """profile-launch.performance.jsonl: one task-open outcome as fixed codes only."""
+        metrics=getattr(self.instances,'metrics',None)
+        profile=result.get('profile') if isinstance(result.get('profile'),dict) else {}
+        profile_id=result.get('profile_id') or profile.get('id')
+        if metrics is None or not isinstance(profile_id,str):return
+        state,reason=result.get('state'),result.get('reason')
+        code=':'.join(part for part in (state,reason) if isinstance(part,str) and part)
+        launch=result.get('launch') if isinstance(result.get('launch'),dict) else {}
+        numbers={key:launch[key] for key in ('admission_ms','launch_ms') if type(launch.get(key)) is int}
+        metrics.record(profile_id,phase,started,state!='blocked',code=code or None,**numbers)
 
     def _shared_state(self):
         """Serve concurrent state polls from one computation.

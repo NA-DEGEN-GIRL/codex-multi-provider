@@ -45,6 +45,8 @@ public sealed class NativeWindowHost : HwndHost
     public bool HasLiveAttachment => _attachment is { } attached && IsAlive(attached) && IsIndependent(attached);
     public bool IsLayoutReady => _container != 0 && GetClientRect(_container, out var rect) && rect.Right > 1 && rect.Bottom > 1;
     public string LastError { get; private set; } = "";
+    /// <summary>The exit watch of the last attached app whose window closed (null when its parent changed).</summary>
+    internal AppExit? LastExit { get; private set; }
     public string DpiSummary { get; private set; } = "";
     public event EventHandler? AttachmentChanged;
     public event Action<nint, bool>? AttachmentLost;
@@ -592,6 +594,8 @@ public sealed class NativeWindowHost : HwndHost
         if (!IsAlive(a) || !IsIndependent(a))
         {
             bool changed = IsAlive(a);
+            // Opened while this attachment still holds the process lifetime.
+            LastExit = changed ? null : AppExit.Watch(a.Pid, a.Process);
             ForgetAttachment(changed ? "The native window changed its parent or owner." : "The external window closed.");
             AttachmentLost?.Invoke(a.Hwnd, changed);
             return;
@@ -804,6 +808,7 @@ public sealed class NativeWindowHost : HwndHost
                 "Codex 표시 영역을 복구하지 못해 원래 창으로 돌려보냈습니다. ‘관리창 안에 표시’로 다시 연결할 수 있습니다." :
                 "Codex 표시 영역 복구와 원래 창 복원이 지연되었습니다. ‘관리창 안에 표시’로 다시 시도해 주세요. " + LastError;
             Diagnostic?.Invoke(LastError);
+            LastExit = null; // Returned to its own window; the app keeps running.
             AttachmentLost?.Invoke(a.Hwnd, false);
             ViewportRecoveryFailed?.Invoke(LastError);
         }));

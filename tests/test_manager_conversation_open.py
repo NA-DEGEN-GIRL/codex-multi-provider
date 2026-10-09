@@ -140,6 +140,30 @@ class ConversationOpenTests(unittest.TestCase):
         self.assertEqual(len(self.launches), 1)
         self.assertFalse(any(a.calls for a in self.admins.values()))
 
+    def test_open_reports_its_launch_phases_and_records_one_outcome_without_text(self):
+        import json
+        def launched(profile_id, **_):
+            self.shown.append(profile_id)
+            return dict(state='launched', profile=self.store.profile(profile_id))
+        self.center.instances.show.side_effect = launched
+        result = self.open()
+        self.assertEqual(result['state'], 'request_sent')
+        self.assertEqual(result['launch']['state'], 'launched')
+        self.assertIsInstance(result['launch']['admission_ms'], int)
+        self.assertIsInstance(result['launch']['launch_ms'], int)
+        self.launches.clear()
+        token = self.warmup()
+        self.assertEqual(self.navigate(token)['launch']['state'], 'launched')
+        path = self.store.directory / 'logs' / 'profile-launch.performance.jsonl'
+        events = [json.loads(line) for line in path.read_text(encoding='utf-8').splitlines()]
+        opens = [e for e in events if e['phase'] == 'conversation_open']
+        self.assertEqual([e['code'] for e in opens], ['request_sent', 'waiting_for_reader:runtime_starting'])
+        self.assertTrue(all(isinstance(e['launch_ms'], int) and e['profile_id'] == self.b['id'] for e in opens))
+        # A poll that keeps waiting is not an outcome; nothing but fixed codes and numbers is kept.
+        self.assertFalse([e for e in events if e['phase'] == 'conversation_navigate'])
+        self.assertNotIn('message', json.dumps(events, ensure_ascii=False))
+        self.assertNotIn(self.tid, path.read_text(encoding='utf-8'))
+
     def test_moved_shortcut_rejects_captured_profile_before_any_open_or_handoff(self):
         expected = self.link['profile_id']
         self.store.shortcut_move(self.link['id'], self.a['id'])

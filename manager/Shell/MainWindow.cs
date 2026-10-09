@@ -1628,6 +1628,7 @@ public sealed partial class MainWindow : Window
     }
     private void OnAttachmentLost(NativeWindowHost host, nint hwnd, bool parentChanged)
     {
+        if (!parentChanged && host.LastExit is { } exit) _ = LogAppExitAsync(host, exit);
         if (_attachedWindows.TryGetValue(host, out var attached) && attached.Handle == hwnd)
         {
             // Keep ownership of the hidden window for reattachment and cleanup
@@ -1655,6 +1656,22 @@ public sealed partial class MainWindow : Window
             _empty.Text = "Codex 창이 종료되거나 교체되었습니다. 새 창을 기다리고 있습니다…";
             Log("창 연결 · 이전 창 종료 확인 · 새 창 연결 대기");
         }
+    }
+    // A managed app's window closed: once its process has ended (or still runs
+    // after AppExit.Wait), log its exit code, what it usually means, and
+    // whether the manager itself was closing or reopening that profile.
+    private async Task LogAppExitAsync(NativeWindowHost host, AppExit exit)
+    {
+        var profile = _state.Arr("profiles").Concat(_state.Arr("view_instances")).FirstOrDefault(p => _hostDeck.Find(p.S("id")) == host);
+        var initiated = _closing || _serviceShutdown.DrainStarted ? "완전 종료 중"
+            : profile.Get("restart").S("phase") is "acquiring" or "closing" or "releasing" or "recovering" ? "관리 앱이 다시 여는 중" : "";
+        uint? code;
+        try { code = await exit.Code; }
+        catch (Exception error) when (error is ObjectDisposedException or InvalidOperationException) { code = null; }
+        var cause = AppExit.Format(code) + (initiated.Length > 0 ? " · " + initiated : "");
+        _responsiveness?.Record("app_exit", new { profile_id = profile.S("id"), pid = exit.Pid, exit_code = code,
+            cause = AppExit.Describe(code), initiated = initiated.Length > 0 });
+        if (!_closing) Log($"{profile.S("alias", "프로필")} · Codex 앱 종료 · PID {exit.Pid} · {cause}");
     }
     // Eight desktops starting together created their windows 40-48 s after
     // spawn (revision 94); 25 s + 65 s still bounds a launch that never shows.
@@ -2521,6 +2538,20 @@ public sealed partial class MainWindow : Window
         SelectCard();
         var ticket = ++_navigation; if (_selectedProfile != profileId || _viewingCatalog) ParkCurrent(); _viewingCatalog = false; _selectedProfile = profileId;
         _shortcutOpens[profileId] = (id, ticket);
+        var trace = new ShortcutOpenTrace(id, profileId, item.S("host_id", "local"),
+            Latest(profileId, _state.Arr("profiles").FirstOrDefault(p => p.S("id") == profileId)).S("status") == "running");
+        try { await OpenShortcutCoreAsync(id, item, profileId, ticket, trace, action); }
+        // The filter only records this click's failure; the error still reaches Safe.
+        catch (Exception error) when (TraceFailure(trace, ticket, error)) { throw; }
+    }
+    private bool TraceFailure(ShortcutOpenTrace trace, int ticket, Exception error)
+    {
+        FinishShortcutTrace(trace, ticket != _navigation || _closing ? "replaced" : "failed", FailureCode(error));
+        return false;
+    }
+    private async Task OpenShortcutCoreAsync(string id, JsonElement item, string profileId, int ticket,
+        ShortcutOpenTrace trace, IDisposable action)
+    {
         _expectedConversation = null; _expectedCanonicalThread = null;
         _hostDeck.Select(profileId); BeginAttach(); _profileRequestTicket = ticket;
         Render();
@@ -2530,11 +2561,13 @@ public sealed partial class MainWindow : Window
         if (_host.HasLiveAttachment) TryAttach(retained);
         SetStatus("선택한 계정에서 작업으로 이동하고 있습니다…");
         JsonElement result;
+        trace.Mark("request_sent");
         try { result = await Request("conversation.open", new { shortcut_id = id, expected_profile_id = profileId }); }
         // A replaced open's failure is logged by Request; it must not overwrite the newer open's status.
-        catch (Exception) when (ticket != _navigation || _closing) { return; }
+        catch (Exception) when (ticket != _navigation || _closing) { FinishShortcutTrace(trace, "replaced"); return; }
         finally { if (_profileRequestTicket == ticket) _profileRequestTicket = null; }
-        if (ticket != _navigation || _closing) return;
+        trace.Observe(result);
+        if (ticket != _navigation || _closing) { FinishShortcutTrace(trace, "replaced"); return; }
         if (result.S("state") == "waiting_for_reader")
         {
             PresentShortcutResult(result, item, profileId);
@@ -2548,6 +2581,7 @@ public sealed partial class MainWindow : Window
                     async token =>
                     {
                         var next = await Request("conversation.navigate", new { navigation_id = token });
+                        trace.Observe(next);
                         // The wait can move from the local runtime to an SSH task's connection.
                         if (next.S("state") == "waiting_for_reader" && ticket == _navigation && !_closing
                             && next.Message(waiting) != waiting)
@@ -2564,9 +2598,10 @@ public sealed partial class MainWindow : Window
             catch (Exception error) when (ticket != _navigation || _closing)
             {
                 Log($"대화 이동 대기 정리 · {error.Message}");
+                FinishShortcutTrace(trace, "replaced");
                 return;
             }
-            if (completed is null) return;
+            if (completed is null) { FinishShortcutTrace(trace, "replaced"); return; }
             result = completed.Value;
             Log($"{Profile().S("alias")} · 준비 후 대화 이동 · {result.S("state")}");
         }
@@ -2575,7 +2610,16 @@ public sealed partial class MainWindow : Window
         // delay the attached task or keep this account's action gate occupied.
         action.Dispose();
         SetStatus(result.Message("대화 열기 요청을 보냈습니다."), result.S("state") == "blocked");
-        _ = VerifyShortcutNavigationAsync(ticket, result, item);
+        if (result.S("state") != "request_sent") { FinishShortcutTrace(trace, result.S("state", "blocked"), result.S("reason")); return; }
+        _ = VerifyShortcutNavigationAsync(ticket, result, item, trace);
+    }
+    private static string FailureCode(Exception error) => error is ManagerException manager ? manager.Code : error.GetType().Name;
+    // One structured record per click in the performance trace, and one line in the log.
+    private void FinishShortcutTrace(ShortcutOpenTrace trace, string outcome, string? reason = null)
+    {
+        if (trace.Finish(outcome, string.IsNullOrEmpty(reason) ? null : reason) is not { } record) return;
+        _responsiveness?.Record("shortcut_open", record);
+        Log(trace.Summary(reason));
     }
     private void PresentShortcutResult(JsonElement result, JsonElement item, string profileId)
     {
