@@ -319,6 +319,8 @@ DRAIN_MARKERS = (
 #   without the sqlx reaper task) passed the same audit. Evidence: work/validation/release-118.
 #   version 0.153.4-managed-ccc7fae566c2323d (codex 4e91610c..., revision 119: Claude handoff keeps
 #   later portable summaries) passed the same audit. Evidence: work/validation/release-119.
+#   version 0.153.4-managed-e224215ee1edf310 (codex d54ddec5..., revision 121: Claude login
+#   renewal and lent long-lived tokens) passed the same audit. Evidence: work/validation/release-121.
 # The manager may pass the digest from its own verified manifest; that digest
 # must still be in this allowlist, so an unknown bundle always refuses.
 DRAIN_AUDITED_SHA256 = frozenset({
@@ -333,6 +335,7 @@ DRAIN_AUDITED_SHA256 = frozenset({
     "ddfbc527c820cc5abad3e38f19bc296675982bb404d7689303006784da6a6643",
     "02b5eda30561e2673a8f393f86205fa220d6b7863888103483d93614783901e6",
     "4e91610c7644b93bdd0d2a2c736a376f98dc55ab083b0bc12734a1eb670431e7",
+    "d54ddec5a7b310fb5b7cad95ce90df530b200188863f40177d5f3e412b708a5e",
 })
 # Unstripped revision 94-96 builds are ~1.3 GB; a smaller bound refused them.
 DRAIN_HASH_BYTES = 2 * 1024 * 1024 * 1024
