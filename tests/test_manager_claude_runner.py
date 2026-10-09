@@ -19,7 +19,8 @@ from manager_core.claude_protocol import MAX_LINE_BYTES, ProtocolError, normaliz
 from manager_core.claude_profiles import automatic_context_window
 from manager_core.claude_runner import (SessionLedger, compact_summary, digest, run_settings,
                                        serve, session_lock, PermissionBridge, system_prompt_text,
-                                       private_temporary_directory, build_command, AUTH_FAILURES)
+                                       private_temporary_directory, build_command, AUTH_FAILURES,
+                                       AUTH_STOP_NOTE)
 
 
 FAKE = r'''
@@ -105,6 +106,8 @@ else:
                 else 'Failed to authenticate. API Error: 401 OAuth access token has expired')
         emit({'type':'assistant','error':'server_error' if scenario == 'api_error' else 'authentication_failed',
               'message':{'content':[{'type':'text','text':text}],'usage':{'input_tokens':0,'output_tokens':0}}})
+        if scenario == 'auth_no_result':
+            sys.exit(1)  # A crash after the failed request, before the final result.
         emit({'type':'result','subtype':'success','is_error':True,'session_id':session,'result':text,
               'api_error_status':529 if scenario == 'api_error' else 401,
               'usage':{'input_tokens':1,'output_tokens':0},'total_cost_usd':0.01})
@@ -380,20 +383,25 @@ class ClaudeRunnerTests(unittest.TestCase):
         self.assertNotIn('PRIVATE_', output.getvalue().decode())
         return code, events
 
-    def run_borrowed(self, scenario, expires_in, updates=(), announce=True):
+    def run_borrowed(self, scenario, expires_in, updates=(), announce=True, turn='turn-1', prior=(),
+                     auth_resume=False):
         """Run with a lent dummy token; `updates` answer each auth_refresh in order."""
         context = BorrowedContext(self.root, [sys.executable, str(self.fake)], self.profile,
                                   int(time.time()) + expires_in)
         incoming, events, replies = Incoming(), [], list(updates)
-        hello = dict(type='hello', protocol=1, thread_id='borrowed-task', turn_id='turn-1',
-                     claude_profile_id=self.profile, cwd=str(self.root), trusted_cwd=True, snapshot=self.snapshot([]))
+        hello = dict(type='hello', protocol=1, thread_id='borrowed-task', turn_id=turn,
+                     claude_profile_id=self.profile, cwd=str(self.root), trusted_cwd=True,
+                     snapshot=self.snapshot(list(prior)))
         if announce:
             hello['auth_refresh'] = 1
+        if auth_resume:
+            hello['auth_resume'] = 1
         incoming.send(hello)
         def on_output(message):
             events.append(message)
             if message['type'] == 'ready':
-                incoming.send(dict(type='run', mode='fresh', blocks=[{'kind':'request','text':'fixture request'}],
+                incoming.send(dict(type='run', mode='resume' if message['session'] else 'fresh',
+                                   blocks=[{'kind':'request','text':'fixture request'}],
                                    permission_mode='acceptEdits', permission_prompts='none'))
             elif message['type'] == 'auth_refresh':
                 reply = replies.pop(0)
@@ -401,7 +409,7 @@ class ClaudeRunnerTests(unittest.TestCase):
             elif scenario == 'wait' and message.get('kind') == 'text_delta':
                 incoming.send(dict(type='auth_update', available=False))
             elif message['type'] == 'done':
-                incoming.send(dict(type='commit', snapshot=self.snapshot(['turn-1']))
+                incoming.send(dict(type='commit', snapshot=self.snapshot(list(prior) + [turn]))
                               if message['status'] == 'success' else None)
         output = Outgoing(on_output)
         trace = self.base / ('trace-' + str(uuid4()) + '.jsonl')
@@ -517,6 +525,78 @@ class ClaudeRunnerTests(unittest.TestCase):
         self.assertTrue(any(event.get('deliberate_full_context_summary') for event in events), events)
         self.assertEqual([(launch['token'], launch['checkpoint']) for launch in launches],
                          [('dummy-token-1', False), ('dummy-token-2', False), ('dummy-token-2', True)])
+
+    def borrowed_record(self):
+        return json.loads(next(self.root.glob('remote-state/sessions/*/*/*.json')).read_text(encoding='utf-8'))
+
+    def test_a_clean_login_stop_resumes_the_same_session_with_a_note(self):
+        code, events, stopped = self.run_borrowed('auth_expired', 45, announce=False, auth_resume=True)
+        done = next(event for event in events if event['type'] == 'done')
+        self.assertEqual((done['status'], done['error']['code']), ('error', 'claude_auth_expired'))
+        record = self.borrowed_record()
+        self.assertTrue(record['dirty'])
+        self.assertEqual(record['auth_stop'], {'turn_id': 'turn-1', 'turn_fingerprints': {}})
+        self.assertAlmostEqual(record['cost_total_usd'], 0.01)
+        code, events, resumed = self.run_borrowed('success', 3600, turn='turn-2', prior=['turn-1'], auth_resume=True)
+        self.assertEqual(code, 0, events)
+        self.assertEqual(events[0]['session']['auth_stop']['turn_id'], 'turn-1')
+        self.assertEqual([(launch['resume'], launch['session']) for launch in resumed],
+                         [(True, stopped[0]['session'])])
+        content = resumed[0]['request']['message']['content']
+        self.assertEqual([block['text'] for block in content], [AUTH_STOP_NOTE, 'fixture request'])
+        done = next(event for event in events if event['type'] == 'done')
+        self.assertAlmostEqual(done['turn_cost_usd'], 0.01)
+        # The commit covers the stopped turn by its fingerprint and clears the marker.
+        record = self.borrowed_record()
+        self.assertEqual((record['dirty'], record['covered'], 'auth_stop' in record), (False, ['turn-1', 'turn-2'], False))
+        self.assertEqual(record['turn_fingerprints'], {'turn-1': digest('turn-1'), 'turn-2': digest('turn-2')})
+        code, events, later = self.run_borrowed('success', 3600, turn='turn-3', prior=['turn-1', 'turn-2'],
+                                                auth_resume=True)
+        self.assertEqual(events[0]['session']['covered'], ['turn-1', 'turn-2'])
+        self.assertNotEqual(later[0]['request']['message']['content'][0]['text'], AUTH_STOP_NOTE)
+
+    def test_only_a_clean_login_stop_on_an_announcing_host_can_be_resumed(self):
+        for scenario, options in (('auth_expired', dict(announce=False)),
+                                  ('auth_no_result', dict(announce=False, auth_resume=True)),
+                                  ('auth_expired', dict(updates=[{'type': 'interrupt'}], auth_resume=True))):
+            with self.subTest(scenario=scenario, options=options):
+                self.run_borrowed(scenario, 45, **options)
+                record = self.borrowed_record()
+                self.assertTrue(record['dirty'])
+                self.assertNotIn('auth_stop', record)
+        # A rejected token stops cleanly too; an older runtime still gets a fresh session.
+        code, events, stopped = self.run_borrowed('auth_always', 3600, auth_resume=True)
+        self.assertEqual(next(event for event in events if event['type'] == 'done')['error']['code'],
+                         'claude_auth_rejected')
+        self.assertEqual(self.borrowed_record()['auth_stop']['turn_id'], 'turn-1')
+        code, events, fresh = self.run_borrowed('success', 3600, turn='turn-2', prior=['turn-1'])
+        self.assertIsNone(events[0]['session'])
+        self.assertFalse(fresh[0]['resume'])
+        self.assertNotEqual(fresh[0]['session'], stopped[0]['session'])
+
+    def test_ledger_resumes_a_login_stop_only_when_nothing_it_saw_changed(self):
+        settings = dict(run_settings({}), account_identity='account-a')
+        ledger = SessionLedger(self.root, self.profile, 'task', settings, self.root)
+        stop = dict(turn_id='stopped', turn_fingerprints={'a': digest('a'), 'b': digest('b')})
+        record = dict(id=str(uuid4()), covered=['a'], fingerprint=None, turn_fingerprints={'a': digest('a')},
+                      dirty=True, settings=settings, auth_stop=stop)
+        later = self.snapshot(['a', 'b', 'stopped', 'c'])
+        ledger.save(record)
+        self.assertEqual(ledger.load(later, 'next'), record)
+        edited = self.snapshot(['a', 'b', 'stopped', 'c'])
+        edited['turn_fingerprints']['b'] = digest('edited after the stop')
+        for snapshot, current in ((later, None), (later, 'stopped'), (self.snapshot(['a', 'b', 'c']), 'next'),
+                                  (self.snapshot(['b', 'stopped']), 'next'), (edited, 'next')):
+            with self.subTest(turns=snapshot['turn_ids'], current=current):
+                self.assertIsNone(ledger.load(snapshot, current))
+        for change in (dict(auth_stop=None), dict(auth_stop='stopped'), dict(auth_stop=dict(stop, turn_id=1)),
+                       dict(auth_stop=dict(stop, turn_fingerprints=['a', 'b'])),
+                       dict(auth_stop=dict(stop, turn_fingerprints={'b': digest('b')})),
+                       dict(turn_fingerprints={'a': digest('old answer')}),
+                       dict(settings=dict(settings, account_identity='account-b')), dict(settings=None)):
+            with self.subTest(change=change):
+                ledger.save(dict(record, **change))
+                self.assertIsNone(ledger.load(later, 'next'))
 
     def test_rate_limit_event_during_checkpoint_keeps_the_runner_alive(self):
         code, events = self.run_fake('compact_rate_limit')

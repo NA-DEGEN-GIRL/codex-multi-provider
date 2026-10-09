@@ -227,7 +227,12 @@ class SessionLedger:
         # One profile/task lock across settings prevents two buckets editing the same task together.
         self.lock_path = self.directory / 'run.lock'
 
-    def load(self, snapshot):
+    def load(self, snapshot, current_turn=None):
+        """A clean committed session, or one stopped by an expired login.
+
+        The second kind is offered only with the current turn's ID, for a host that
+        announced auth_resume and treats the stopped turn as already held by Claude.
+        """
         try:
             path = self.path
             if not path.exists():
@@ -264,16 +269,33 @@ class SessionLedger:
                 return None
             record = json.loads(path.read_text(encoding='utf-8'))
             UUID(record['id'])
-            if record.get('dirty') or not set(record['covered']).issubset(snapshot['turn_ids']):
+            if not set(record['covered']).issubset(snapshot['turn_ids']):
                 return None
             old, current = record.get('turn_fingerprints', {}), snapshot.get('turn_fingerprints', {})
+            if record.get('dirty'):
+                # Claude's transcript after a clean login stop holds every turn the stopped
+                # request saw and its partial work. Any change since then, a rollback of the
+                # stopped turn, or another account restarts with the full history.
+                stop, settings = record.get('auth_stop'), record.get('settings')
+                if (current_turn is None or not isinstance(stop, dict) or not isinstance(settings, dict)
+                        or not isinstance(stop.get('turn_fingerprints'), dict)
+                        or not isinstance(stop.get('turn_id'), str) or stop['turn_id'] == current_turn
+                        or stop['turn_id'] not in snapshot['turn_ids']
+                        or not set(record['covered']).issubset(stop['turn_fingerprints'])
+                        or not settings.get('account_identity')
+                        or settings['account_identity'] != self.identity.get('account_identity')):
+                    return None
+                if any(current.get(turn) != fingerprint for fingerprints in (old, stop['turn_fingerprints'])
+                       for turn, fingerprint in fingerprints.items()):
+                    return None
+                return record
             if old:
                 if any(current.get(turn) != fingerprint for turn, fingerprint in old.items()):
                     return None
             elif record.get('fingerprint') != snapshot.get('fingerprint'):
                 return None
             return record
-        except (OSError, ValueError, TypeError, KeyError):
+        except (OSError, ValueError, TypeError, KeyError, AttributeError):
             return None
 
     def save(self, record):
@@ -520,10 +542,10 @@ def build_command(cli, session, resume, settings, mode, prompts, directory, mana
     return args
 
 
-def prompt_message(blocks):
+def prompt_message(blocks, note=None):
     if not isinstance(blocks, list) or not blocks:
         raise ClaudeError('protocol', 'Claude requires context blocks and a current request.')
-    content = []
+    content = [{'type': 'text', 'text': note}] if note else []
     requests = 0
     for block in blocks:
         if not isinstance(block, dict) or block.get('kind') not in ('context', 'update', 'request') or not isinstance(block.get('text'), str):
@@ -624,6 +646,13 @@ AUTH_CONTINUATION = (
     'restart any that are still needed. Native Codex agents started through the codex_agents tools are separate '
     'tasks and keep running. Continue the current request from where it stopped, and check the workspace before '
     'repeating an action whose outcome is unclear.')
+# Prepended to the next request when a session stopped by its login is resumed.
+AUTH_STOP_NOTE = (
+    'Note: the previous request in this session stopped before it finished because the Claude login expired. '
+    'Background shells, agents and workflows that this Claude session started were terminated with it; native Codex '
+    'agents started through the codex_agents tools are separate tasks. Check the workspace before relying on the '
+    'outcome of the stopped work.')
+AUTH_STOP_CODES = ('claude_auth_expired', 'claude_auth_rejected')
 
 
 def auth_failed(message):
@@ -826,6 +855,7 @@ def execute(command, cwd, environment, incoming, emit, bridge, stopped, observed
     start = time.monotonic()
     result, problem, interrupted, auth_error = None, None, False, None
     record['dirty'] = True  # A runner crash after launch must never resume blindly.
+    record.pop('auth_stop', None)
     ledger.save(record)
     prior_summary = compact_summary(configuration_directory, record['id'])
     options = {'creationflags': subprocess.CREATE_NO_WINDOW} if os.name == 'nt' else {'start_new_session': True}
@@ -840,7 +870,7 @@ def execute(command, cwd, environment, incoming, emit, bridge, stopped, observed
     try:
         while True:
             result, problem, auth_error, relaunch = None, None, None, False
-            prompt_seen, auth_seen, tree = False, False, None
+            prompt_seen, auth_seen, forced, tree = False, False, False, None
             # Workflows and background agents report back after the turn's first
             # result; the CLI then starts the next turn by itself. The final result
             # is the one that arrives while none of them is still running.
@@ -1001,6 +1031,7 @@ def execute(command, cwd, environment, incoming, emit, bridge, stopped, observed
                 try:
                     process.wait(timeout=5 if result is not None else 1)
                 except subprocess.TimeoutExpired:
+                    forced = True
                     if tree:
                         tree.close()
                     else:
@@ -1078,6 +1109,16 @@ def execute(command, cwd, environment, incoming, emit, bridge, stopped, observed
     turn_cost = total_cost - prior_cost if total_cost is not None and total_cost >= prior_cost else None
     if checkpoint and 'total_cost_usd' not in checkpoint.get('result', {}):
         turn_cost = None  # A failed maintenance call may have consumed unreported usage.
+    # The CLI stopped by itself on the borrowed login after writing its final result and
+    # recording this request. Its session stays dirty, but a host announcing auth_resume may
+    # continue it next turn when nothing it saw has changed.
+    if (auth_error and auth_error[0] in AUTH_STOP_CODES and not problem and not interrupted
+            and result.get('is_error') and prompt_seen and not forced and hello.get('auth_resume') == 1):
+        seen = {turn: value for turn, value in hello['snapshot'].get('turn_fingerprints', {}).items()
+                if turn != hello['turn_id']}
+        if set(record.get('covered', [])).issubset(seen):
+            record['auth_stop'] = dict(turn_id=hello['turn_id'], turn_fingerprints=seen)
+            record['cost_total_usd'] = total_cost if total_cost is not None else prior_cost
     record['compactions'] = record.get('compactions', 0) + compactions
     ledger.save(record)
     done = dict(type='done', status='success' if success else 'interrupted' if interrupted else 'error',
@@ -1220,7 +1261,9 @@ def serve(root, profile_id, incoming=None, outgoing=None, cli_path=None, plugin_
         settings['system_prompt_hash'] = hashlib.sha256(effective_system_prompt.encode('utf-8')).hexdigest()
         ledger = SessionLedger(directory, profile_id, hello['thread_id'], settings, cwd)
         with session_lock(ledger.lock_path):
-            previous = ledger.load(hello['snapshot']) if settings['account_identity'] else None
+            # Only a host that announced auth_resume is offered a session stopped by its login.
+            previous = (ledger.load(hello['snapshot'], hello['turn_id'] if hello.get('auth_resume') == 1 else None)
+                        if settings['account_identity'] else None)
             emit(dict(type='ready', protocol=1, cli_version=status.get('cli_version', 'unknown'),
                       login={key: status[key] for key in ('logged_in', 'method') if key in status}, session=previous))
             request = read_message(incoming)
@@ -1239,7 +1282,8 @@ def serve(root, profile_id, incoming=None, outgoing=None, cli_path=None, plugin_
                 raise ClaudeError('session_changed', 'Claude needs a fresh session with the complete task history.')
             if resume and any(block.get('kind') == 'context' for block in request.get('blocks', []) if isinstance(block, dict)):
                 raise ClaudeError('duplicate_context', 'A resumed Claude session accepts only unseen history updates.')
-            hello['_prompt'] = prompt_message(request.get('blocks'))
+            hello['_prompt'] = prompt_message(request.get('blocks'),
+                                              AUTH_STOP_NOTE if resume and previous.get('auth_stop') else None)
             record = dict(previous) if resume else dict(id=str(uuid4()), covered=[], fingerprint=None,
                          turn_fingerprints={}, model=settings['model'], effort=settings['effort'],
                          dirty=False, compactions=0, cost_total_usd=0, settings=settings)

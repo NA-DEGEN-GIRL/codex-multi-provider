@@ -53105,10 +53105,10 @@ index a75dbe2af..27eb8f8c6 100644
              output.needs_follow_up = true;
 diff --git a/codex-rs/core/src/tasks/claude_code.rs b/codex-rs/core/src/tasks/claude_code.rs
 new file mode 100644
-index 000000000..65f114c52
+index 000000000..b5c2c084c
 --- /dev/null
 +++ b/codex-rs/core/src/tasks/claude_code.rs
-@@ -0,0 +1,473 @@
+@@ -0,0 +1,465 @@
 +//! Runs the official installed Claude Code CLI through the manager's authenticated runner.
 +//! All shared history and events still go through the native session recorder.
 +mod auth_refresh;
@@ -53119,7 +53119,6 @@ index 000000000..65f114c52
 +mod images;
 +mod messages;
 +
-+use std::collections::HashSet;
 +use std::sync::Arc;
 +use std::time::Duration;
 +
@@ -53451,7 +53450,9 @@ index 000000000..65f114c52
 +        "snapshot":snapshot,"model":model,"effort":effort,"context_window":agent.context_window,
 +        "auto_compact_percent":agent.auto_compact_percent,"exclude_dynamic_sections":agent.exclude_dynamic_sections,
 +        "system_prompt":system_prompt,"delegation_tools":delegation_tools,
-+        "managed_delegation":ctx.config.execution_preset_selection().is_some()});
++        "managed_delegation":ctx.config.execution_preset_selection().is_some(),
++        // Older runners ignore this; newer ones offer a session stopped by an expired login.
++        "auth_resume":1});
 +    if renewal.announced() {
 +        // Older runners ignore unknown hello fields and never ask for a renewal.
 +        hello["auth_refresh"] = json!(1);
@@ -53467,18 +53468,9 @@ index 000000000..65f114c52
 +                .unwrap_or("runner refused or uses an unsupported protocol"),
 +        ));
 +    }
-+    let resume = context::resumable(&ready, &snapshot, &ctx.sub_id);
-+    let covered: HashSet<String> = if resume {
-+        ready["session"]["covered"]
-+            .as_array()
-+            .into_iter()
-+            .flatten()
-+            .filter_map(Value::as_str)
-+            .map(str::to_string)
-+            .collect()
-+    } else {
-+        HashSet::new()
-+    };
++    let covered = context::resumable(&ready, &transcript, &snapshot, &ctx.sub_id);
++    let resume = covered.is_some();
++    let covered = covered.unwrap_or_default();
 +    let mut history = transcript;
 +    history.items.retain(|item| {
 +        item.turn_id.as_deref() != Some(ctx.sub_id.as_str()) || item.position < request_start
@@ -53939,10 +53931,10 @@ index 000000000..64333cba1
 +}
 diff --git a/codex-rs/core/src/tasks/claude_code/context.rs b/codex-rs/core/src/tasks/claude_code/context.rs
 new file mode 100644
-index 000000000..debaa7893
+index 000000000..1929bd897
 --- /dev/null
 +++ b/codex-rs/core/src/tasks/claude_code/context.rs
-@@ -0,0 +1,267 @@
+@@ -0,0 +1,303 @@
 +//! Claude sessions receive only portable history, with exact committed-turn fingerprints.
 +use std::collections::BTreeMap;
 +use std::collections::HashSet;
@@ -54028,23 +54020,59 @@ index 000000000..debaa7893
 +    result
 +}
 +
-+pub(super) fn resumable(ready: &Value, snapshot: &Snapshot, current_turn: &str) -> bool {
++/// The turns the runner's Claude session already holds, or `None` when it must start fresh.
++pub(super) fn resumable(
++    ready: &Value,
++    transcript: &ModelTranscript,
++    snapshot: &Snapshot,
++    current_turn: &str,
++) -> Option<HashSet<String>> {
 +    let session = &ready["session"];
-+    if session.is_null() || session["dirty"].as_bool().unwrap_or(true) {
-+        return false;
++    if session.is_null() {
++        return None;
 +    }
-+    let Some(covered) = session["covered"].as_array() else {
-+        return false;
-+    };
-+    covered.iter().all(|id| {
-+        let Some(id) = id.as_str() else {
-+            return false;
-+        };
++    let unchanged = |id: &str, recorded: &Value| {
 +        id != current_turn
-+            && snapshot.turn_fingerprints.get(id).is_some_and(|hash| {
-+                session["turn_fingerprints"][id].as_str() == Some(hash.as_str())
-+            })
-+    })
++            && snapshot
++                .turn_fingerprints
++                .get(id)
++                .is_some_and(|hash| recorded.as_str() == Some(hash.as_str()))
++    };
++    let mut covered = HashSet::new();
++    for id in session["covered"].as_array()? {
++        let id = id.as_str()?;
++        if !unchanged(id, &session["turn_fingerprints"][id]) {
++            return None;
++        }
++        covered.insert(id.to_string());
++    }
++    if !session["dirty"].as_bool().unwrap_or(true) {
++        return Some(covered);
++    }
++    // A request stopped by an expired login (hello "auth_resume") left Claude's transcript
++    // holding every turn it saw plus its own partial work. Input queued during that request
++    // is recorded after Claude's last output and was never seen, so it forces a fresh session.
++    let stop = &session["auth_stop"];
++    let stopped = stop["turn_id"].as_str()?;
++    let prior = stop["turn_fingerprints"].as_object()?;
++    let ends_with_claude_output = transcript
++        .items
++        .iter()
++        .filter(|item| item.turn_id.as_deref() == Some(stopped))
++        .max_by_key(|item| item.position)
++        .is_some_and(|item| {
++            matches!(&item.item.item, ResponseItem::Message { role, .. } if role == "assistant")
++        });
++    if stopped == current_turn
++        || !snapshot.turn_fingerprints.contains_key(stopped)
++        || !ends_with_claude_output
++        || !prior.iter().all(|(id, hash)| unchanged(id, hash))
++    {
++        return None;
++    }
++    covered.extend(prior.keys().cloned());
++    covered.insert(stopped.to_string());
++    Some(covered)
 +}
 +
 +/// Keeps completed items Claude has not seen, with checkpoint offsets recounted to match.
@@ -54212,10 +54240,10 @@ index 000000000..debaa7893
 +}
 diff --git a/codex-rs/core/src/tasks/claude_code/context_tests.rs b/codex-rs/core/src/tasks/claude_code/context_tests.rs
 new file mode 100644
-index 000000000..b6f3ca8ce
+index 000000000..0bf00cdcf
 --- /dev/null
 +++ b/codex-rs/core/src/tasks/claude_code/context_tests.rs
-@@ -0,0 +1,178 @@
+@@ -0,0 +1,300 @@
 +use super::*;
 +use codex_history::ResponseItemEnvelope;
 +use codex_rollout::TranscriptCompleteness;
@@ -54259,31 +54287,37 @@ index 000000000..b6f3ca8ce
 +    let before = snapshot(&transcript, "claude-current");
 +    assert_eq!(before.turn_ids, vec!["gpt-1", "claude-current"]);
 +    let ready = json!({"session":{"dirty":false,"covered":["gpt-1"],"turn_fingerprints":before.turn_fingerprints}});
-+    assert!(resumable(&ready, &before, "claude-current"));
++    assert_eq!(
++        resumable(&ready, &transcript, &before, "claude-current"),
++        Some(HashSet::from(["gpt-1".to_string()]))
++    );
 +    transcript.items[0] = item("gpt-1", true, "edited answer");
 +    let after = snapshot(&transcript, "claude-current");
-+    assert!(!resumable(&ready, &after, "claude-current"));
++    assert_eq!(
++        resumable(&ready, &transcript, &after, "claude-current"),
++        None
++    );
 +}
 +
 +#[test]
 +fn dirty_or_rolled_back_sessions_restart_without_reusing_private_state() {
 +    let transcript = transcript();
 +    let snapshot = snapshot(&transcript, "claude-current");
-+    assert!(!resumable(
-+        &json!({"session":{"dirty":true,"covered":[]}}),
-+        &snapshot,
-+        "claude-current"
-+    ));
-+    assert!(!resumable(
-+        &json!({"session":{"dirty":false,"covered":["removed"],"turn_fingerprints":{"removed":"old"}}}),
-+        &snapshot,
-+        "claude-current"
-+    ));
-+    assert!(!resumable(
-+        &json!({"session":{"dirty":false,"covered":["claude-current"],"turn_fingerprints":snapshot.turn_fingerprints}}),
-+        &snapshot,
-+        "claude-current"
-+    ));
++    for session in [
++        json!({"dirty":true,"covered":[]}),
++        json!({"dirty":false,"covered":["removed"],"turn_fingerprints":{"removed":"old"}}),
++        json!({"dirty":false,"covered":["claude-current"],"turn_fingerprints":snapshot.turn_fingerprints}),
++    ] {
++        assert_eq!(
++            resumable(
++                &json!({ "session": session }),
++                &transcript,
++                &snapshot,
++                "claude-current"
++            ),
++            None
++        );
++    }
 +}
 +
 +fn checkpoint_before(items_before: usize) -> codex_rollout::TranscriptCheckpoint {
@@ -54392,6 +54426,122 @@ index 000000000..b6f3ca8ce
 +            .map(|checkpoint| checkpoint.items_before)
 +            .collect::<Vec<_>>(),
 +        vec![0, 2]
++    );
++}
++
++fn reply(turn: &str, text: &str) -> TranscriptItem {
++    TranscriptItem {
++        turn_id: Some(turn.into()),
++        completed: true,
++        position: 0,
++        producer: None,
++        item: ResponseItemEnvelope::new(ResponseItem::Message {
++            id: None,
++            role: "assistant".into(),
++            content: vec![ContentItem::OutputText { text: text.into() }],
++            phase: None,
++            internal_chat_message_metadata_passthrough: None,
++        }),
++    }
++}
++
++/// A task whose previous Claude request stopped on an expired login, then another provider ran.
++fn stopped_task(mut items: Vec<TranscriptItem>) -> ModelTranscript {
++    for (position, item) in items.iter_mut().enumerate() {
++        item.position = position as u64;
++    }
++    ModelTranscript {
++        items,
++        checkpoints: Vec::new(),
++        completeness: TranscriptCompleteness::Complete,
++        rejected_checkpoints: 0,
++        producers: Vec::new(),
++    }
++}
++
++fn stopped_items() -> Vec<TranscriptItem> {
++    vec![
++        item("seen", true, "committed by an earlier Claude request"),
++        item("handed", true, "handed over to the stopped request"),
++        item("stopped", true, "request that hit the expired login"),
++        reply("stopped", "partial work before the login expired"),
++        item("gpt-after", true, "another provider's later turn"),
++        item("claude-current", false, "current request"),
++    ]
++}
++
++/// The runner's ledger record after the stop: still dirty, with the hello's prior fingerprints.
++fn login_stop(snapshot: &Snapshot) -> Value {
++    let fingerprint = |id: &str| snapshot.turn_fingerprints[id].clone();
++    json!({"session":{"dirty":true,"covered":["seen"],"turn_fingerprints":{"seen":fingerprint("seen")},
++        "auth_stop":{"turn_id":"stopped","turn_fingerprints":{"seen":fingerprint("seen"),"handed":fingerprint("handed")}}}})
++}
++
++#[test]
++fn a_login_stop_resumes_and_leaves_the_stopped_turn_out_of_the_handoff() {
++    let mut transcript = stopped_task(stopped_items());
++    let snapshot = snapshot(&transcript, "claude-current");
++    let covered = resumable(
++        &login_stop(&snapshot),
++        &transcript,
++        &snapshot,
++        "claude-current",
++    )
++    .expect("a clean login stop resumes");
++    assert_eq!(
++        covered,
++        HashSet::from(["seen", "handed", "stopped"].map(String::from))
++    );
++    unseen_completed(&mut transcript, &covered, /*budget_tokens*/ i64::MAX);
++    let handed: Vec<_> = transcript
++        .items
++        .iter()
++        .map(|item| item.turn_id.clone().unwrap_or_default())
++        .collect();
++    assert_eq!(handed, vec!["gpt-after"]);
++}
++
++#[test]
++fn a_login_stop_restarts_fresh_after_queued_input_rollback_or_edits() {
++    let queued = {
++        let mut items = stopped_items();
++        items.insert(
++            4,
++            item("stopped", true, "steering queued while the request ran"),
++        );
++        items
++    };
++    let silent = {
++        let mut items = stopped_items();
++        items.remove(3);
++        items
++    };
++    let rolled_back = stopped_items()
++        .into_iter()
++        .filter(|item| item.turn_id.as_deref() != Some("stopped"))
++        .collect();
++    let mut edited = stopped_items();
++    edited[1] = item("handed", true, "edited after the stop");
++    let original = snapshot(&stopped_task(stopped_items()), "claude-current");
++    for items in [queued, silent, rolled_back, edited] {
++        let transcript = stopped_task(items);
++        let snapshot = snapshot(&transcript, "claude-current");
++        assert_eq!(
++            resumable(
++                &login_stop(&original),
++                &transcript,
++                &snapshot,
++                "claude-current"
++            ),
++            None
++        );
++    }
++    // The stopped request itself is never resumed as a new turn.
++    let transcript = stopped_task(stopped_items());
++    let snapshot = snapshot(&transcript, "stopped");
++    assert_eq!(
++        resumable(&login_stop(&original), &transcript, &snapshot, "stopped"),
++        None
 +    );
 +}
 diff --git a/codex-rs/core/src/tasks/claude_code/delegation.rs b/codex-rs/core/src/tasks/claude_code/delegation.rs
@@ -63676,10 +63826,10 @@ index ace2f50a7..e65800ce9 100644
          "followup-call",
 diff --git a/codex-rs/core/tests/suite/claude_code.rs b/codex-rs/core/tests/suite/claude_code.rs
 new file mode 100644
-index 000000000..ff0608458
+index 000000000..cd6bec675
 --- /dev/null
 +++ b/codex-rs/core/tests/suite/claude_code.rs
-@@ -0,0 +1,152 @@
+@@ -0,0 +1,204 @@
 +//! Native task regression: no paid model or real Claude process is invoked.
 +use codex_core::TurnInputRequest;
 +use codex_model_provider_info::ModelProviderInfo;
@@ -63805,6 +63955,58 @@ index 000000000..ff0608458
 +    assert!(
 +        server.received_requests().await.unwrap().is_empty(),
 +        "agent turns must never use the model HTTP endpoint"
++    );
++    Ok(())
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn claude_session_stopped_by_an_expired_login_resumes_without_replaying_that_turn()
++-> anyhow::Result<()> {
++    let server = responses::start_mock_server().await;
++    let fixture = tempfile::tempdir()?;
++    // The first request stops on an expired login after partial work; the runner keeps its
++    // session dirty with a login-stop marker, as the manager runner does after a clean stop.
++    let runner = RUNNER.replace(
++        "assert run['type'] == 'run'\n",
++        r#"assert run['type'] == 'run' and hello['auth_resume'] == 1
++if prior is None:
++    emit({'type':'event','kind':'text','text':'Partial work before the login expired'})
++    seen = {turn: value for turn, value in hello['snapshot']['turn_fingerprints'].items() if turn != hello['turn_id']}
++    state.write_text(json.dumps({'id':'fake-session','dirty':True,'covered':[],'turn_fingerprints':{},
++        'auth_stop':{'turn_id':hello['turn_id'],'turn_fingerprints':seen}}))
++    emit({'type':'done','status':'error','error':{'code':'claude_auth_expired','message':'login expired'}})
++    sys.exit(0)
++"#,
++    );
++    let test = claude_task(&server, fixture.path(), &runner).await?;
++    test.codex
++        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
++            text: "First request".into(),
++            text_elements: Vec::new(),
++        }]))
++        .await
++        .expect("turn starts");
++    let stopped = wait_for_event(&test.codex, |event| matches!(event, EventMsg::Error(_))).await;
++    assert!(
++        matches!(&stopped, EventMsg::Error(error) if error.message.contains("login expired")),
++        "unexpected stop: {stopped:?}"
++    );
++    wait_for_event(&test.codex, |event| {
++        matches!(event, EventMsg::TurnComplete(_))
++    })
++    .await;
++    complete_turn(&test, "Next request").await;
++    let runs = logged(fixture.path())?;
++    assert_eq!(
++        runs.iter()
++            .map(|run| run["mode"].as_str().unwrap())
++            .collect::<Vec<_>>(),
++        vec!["fresh", "resume"]
++    );
++    // Claude's own session holds the stopped request and its partial work.
++    assert_eq!(
++        runs[1]["blocks"],
++        serde_json::json!([{"kind":"request","text":"Next request\n"}])
 +    );
 +    Ok(())
 +}
