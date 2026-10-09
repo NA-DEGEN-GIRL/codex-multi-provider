@@ -111,7 +111,11 @@ class RemoteCrossHarnessTests(unittest.TestCase):
         fake = self.base / 'official-fake-claude'
         source = ('#!' + sys.executable + '\nimport os,sys\n'
                   'if sys.argv[1:]==["--version"]:\n print("2.1.282 (Claude Code)"); raise SystemExit(0)\n'
-                  'assert os.environ["CLAUDE_CODE_OAUTH_TOKEN"]=="synthetic-claude-access"\n'
+                  # The lent token arrives through an inherited pipe, never this environment.
+                  'with open("/proc/self/fd/"+os.environ["CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR"]) as _pipe:\n'
+                  ' assert _pipe.read()=="synthetic-claude-access"\n'
+                  'assert not any("synthetic-claude-access" in _value for _value in os.environ.values())\n'
+                  'assert os.environ["CLAUDE_CODE_OAUTH_SCOPES"]=="user:inference"\n'
                   'assert "CODEX_MANAGER_CLAUDE_AUTH" not in os.environ\n' + cross_native.FAKE_CLAUDE)
         source = source.replace('TRACE_PATH', repr(str(self.trace))).replace('CHILD_ROLE', repr(role)).replace(
             '__CANCEL_PATH__', repr(str(self.cancel_marker)))

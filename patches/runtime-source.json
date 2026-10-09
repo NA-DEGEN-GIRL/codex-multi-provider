@@ -2,9 +2,9 @@
   "upstream": "https://github.com/openai/codex.git",
   "base_commit": "3d2ee51ca2d5db578f328aa75e20aa22c0197c9a",
   "patch": "codex-0.153.4-cross-provider.patch",
-  "patch_sha256": "1f41651b2c074a4312215288a9485c7a6fc8e61c2658ddde1843ce9102253670",
-  "result_tree": "9770ada6b9523d8e5e5163108cdc3f61dd99534a",
-  "changed_files": 418,
+  "patch_sha256": "eb67bb59b8a9d216caf79dc02c6fb22aaa1d141bc0627fb95d12731d2d20bbf2",
+  "result_tree": "da79f3a215f872b44509b968628ff69e7fe2d47d",
+  "changed_files": 419,
   "excluded_test_artifacts": [
     "*.snap.new",
     "*.pending-snap"

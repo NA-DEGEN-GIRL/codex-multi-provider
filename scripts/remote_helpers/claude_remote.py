@@ -13,11 +13,24 @@ from uuid import UUID
 
 from manager_core.claude_auth import ClaudeError, borrowed_credential, cli_version, scrub_environment
 from manager_core.claude_protocol import encode_message
-from manager_core.claude_runner import serve
+from manager_core.claude_runner import AUTH_CHANNEL_ENV, StdinLines, receive_lent_credentials, serve
 from manager_core.claude_skills import prepare_shared_skills
 
 
+# Only runtimes without the stdin channel put the lent credential here.
 AUTH_ENV = 'CODEX_MANAGER_CLAUDE_AUTH'
+
+
+def _hide_process():
+    """Keep same-user processes, the agent's own tools included, out of this process's /proc
+    files and memory while it holds a lent token. Its CLI child is unaffected."""
+    if not sys.platform.startswith('linux'):
+        return
+    try:
+        import ctypes
+        ctypes.CDLL(None, use_errno=True).prctl(4, 0, 0, 0, 0)  # PR_SET_DUMPABLE, 0
+    except (OSError, AttributeError):
+        pass
 
 
 def _read(path, limit=65536):
@@ -86,32 +99,43 @@ class RemoteExecution:
         version = cli_version(path, environment)
         if version != self.binding['cli_version']:
             raise ClaudeError('cli_changed', 'The Linux Claude CLI changed. Prepare this SSH profile again.')
-        environment['CLAUDE_CODE_OAUTH_TOKEN'] = self.auth['accessToken']
         plugin = prepare_shared_skills(self.root, self.binding['target_profile_id'], cwd,
             config_home=self.profile / 'codex', output_root=self.ledger_directory / 'skill-plugins')
-        # The runner learns who lent the token and when it expires, never the token.
+        # The runner keeps who lent the token and when it expires apart from the token, which
+        # reaches each CLI launch by pipe and never enters an environment or the ledger.
         borrowed = {key: self.auth[key] for key in ('profileId', 'accountIdentity', 'expiresAt')}
         return dict(settings=self.binding['settings'], configuration_directory=self.configuration_directory,
                     environment=environment, cli=[str(path)], plugins=[plugin] if plugin else [],
                     status=dict(logged_in=True, method='oauth_token', cli_version=version,
                                 account_identity=self.binding['expected_account_identity']),
-                    borrowed_auth=borrowed)
+                    borrowed_auth=borrowed, lent_token=self.auth['accessToken'])
 
 
 def main(argv=None):
-    # Pop before constructing the official CLI/MCP environments. This value is
-    # injected only by the native task's selected-account resolver, never config.
+    _hide_process()
+    # Pop before constructing the official CLI/MCP environments. Both values are set only
+    # by the native task's selected-account resolver, never config. A current runtime asks
+    # for the stdin channel instead, so the credential is never in /proc/<pid>/environ.
     raw_auth = os.environ.pop(AUTH_ENV, '')
+    channel = os.environ.pop(AUTH_CHANNEL_ENV, '')
+    incoming = StdinLines(sys.stdin.fileno())
     try:
         parser = argparse.ArgumentParser(description=__doc__)
         parser.add_argument('command', choices=['claude-runner'])
         parser.add_argument('--binding', required=True)
         args = parser.parse_args(argv)
-        if len(raw_auth.encode('utf-8')) > 70000:
-            raise ValueError('Claude auth size')
+        if channel == 'stdin' and not raw_auth:
+            auth = receive_lent_credentials(incoming, sys.stdout.buffer)
+        else:
+            if len(raw_auth.encode('utf-8')) > 70000:
+                raise ValueError('Claude auth size')
+            auth = json.loads(raw_auth)
+        raw_auth = None
         context = RemoteExecution(Path(os.environ['CODEX_MANAGER_PROFILE_DIR']),
-            os.environ.get('CODEX_MANAGER_DEFINITION_REVISION'), args.binding, json.loads(raw_auth))
-        return serve(context.root, context.binding['target_profile_id'], execution_context=context)
+            os.environ.get('CODEX_MANAGER_DEFINITION_REVISION'), args.binding, auth)
+        auth = None
+        return serve(context.root, context.binding['target_profile_id'], incoming=incoming,
+                     execution_context=context)
     except (OSError, ValueError, KeyError, TypeError):
         sys.stdout.buffer.write(encode_message(dict(type='refused', code='remote_claude_unavailable',
             message='The SSH Claude account or installed CLI binding is unavailable. Prepare this profile again.')))

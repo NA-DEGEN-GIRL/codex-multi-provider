@@ -661,6 +661,88 @@ AUTH_STOP_NOTE = (
     'agents started through the codex_agents tools are separate tasks. Check the workspace before relying on the '
     'outcome of the stopped work.')
 AUTH_STOP_CODES = ('claude_auth_expired', 'claude_auth_rejected')
+# A runtime that delivers the lent credential over stdin sets this to "stdin"; it never
+# carries the credential itself.
+AUTH_CHANNEL_ENV = 'CODEX_MANAGER_CLAUDE_AUTH_CHANNEL'
+AUTH_INIT_LIMIT = 70000
+# On Linux a lent token reaches each CLI launch through an inherited pipe, never through the
+# CLI's environment: 2.1.282 drains the pipe at start, before any hook, MCP server or tool,
+# keeps the descriptor variable out of their environments, and /proc/<pid>/environ of the CLI
+# holds no token. Verified with the binding CLI, a local fake API and dummy tokens.
+CLI_TOKEN_DESCRIPTOR = sys.platform.startswith('linux')
+# A descriptor token would otherwise claim more than inference; a lent token keeps exactly the
+# scope a token in CLAUDE_CODE_OAUTH_TOKEN has.
+LENT_TOKEN_SCOPES = 'user:inference'
+# With live rotation a refused request makes the CLI wait this long for a rotated token,
+# polling every 2 s, instead of failing the turn after one retry.
+AUTH_401_WAIT_MS = '60000'
+# Rotate this long before the running CLI's token expires; the host lends only tokens with
+# more than 270 s left, so asking at 240 s makes it renew the login first.
+AUTH_ROTATE_MARGIN = 240
+# The runtime answers at most one rotation per 15 s; reactive requests wait that long, and
+# proactive retries wait out the host's 30 s renewal cooldown (AUTH_REFRESH_RETRY_SECONDS).
+AUTH_ROTATE_SPACING = 15
+AUTH_ROTATE_ATTEMPTS = 4
+AUTH_ROTATE_RECOVERIES = 3
+AUTH_ROTATE_ACK_SECONDS = 30
+
+
+def receive_lent_credentials(incoming, outgoing):
+    """Ask the runtime for the lent credential on stdin, before the hello.
+
+    The credential never enters this process's environment, the hello or the ledger. Errors
+    never repeat what was received.
+    """
+    outgoing.write(encode_message(dict(type='auth_channel', protocol=1)))
+    outgoing.flush()
+    line = incoming.readline(AUTH_INIT_LIMIT + 1)
+    if len(line) > AUTH_INIT_LIMIT or not line.endswith(b'\n'):
+        raise ValueError('Claude auth size')
+    message = json.loads(line)
+    if not isinstance(message, dict) or set(message) != {'type', 'credentials'} or message['type'] != 'auth_init':
+        raise ValueError('Claude auth message')
+    return message['credentials']
+
+
+def _token_pipe(token):
+    """A pipe that holds only the token, write end closed; None if it cannot hold it whole."""
+    reader, writer = os.pipe()
+    try:
+        os.set_blocking(writer, False)
+        data = token.encode('ascii')
+        if os.write(writer, data) == len(data):
+            return reader
+    except (OSError, UnicodeError):
+        pass
+    finally:
+        os.close(writer)
+    os.close(reader)
+    return None
+
+
+def start_cli(command, cwd, environment, token, options):
+    """Start one CLI process. A lent token goes through a drained pipe where supported."""
+    environment, reader, descriptors = dict(environment), None, ()
+    if token is not None:
+        environment['CLAUDE_CODE_OAUTH_SCOPES'] = LENT_TOKEN_SCOPES
+        reader = _token_pipe(token) if CLI_TOKEN_DESCRIPTOR else None
+        if reader is None:
+            environment['CLAUDE_CODE_OAUTH_TOKEN'] = token
+        else:
+            environment['CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR'] = str(reader)
+            descriptors = (reader,)
+    try:
+        return subprocess.Popen(command, cwd=cwd, env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, pass_fds=descriptors, **options)
+    finally:
+        if reader is not None:
+            os.close(reader)
+
+
+def auth_retry(message):
+    """The CLI waits for a rotated token after the API refused the lent one (2.1.282)."""
+    return (message.get('type') == 'system' and message.get('subtype') == 'api_retry'
+            and message.get('error_status') in (401, 403) and message.get('error') == 'authentication_failed')
 
 
 def auth_failed(message):
@@ -681,26 +763,133 @@ def token_expired(message, text):
 
 
 class BorrowedLogin:
-    """Owner and expiry of the access token lent for this turn; never the token itself."""
-    def __init__(self, value):
+    """Owner, expiry and token of the newest login lent for this turn.
+
+    The token is handed only to a CLI launch or a rotation; it never appears in repr, events,
+    notices or the ledger.
+    """
+    def __init__(self, value, token=None):
         if (not isinstance(value, dict) or not isinstance(value.get('profileId'), str)
                 or not isinstance(value.get('accountIdentity'), str) or type(value.get('expiresAt')) is not int):
             raise ClaudeError('protocol', 'Invalid borrowed Claude login metadata.')
         self.profile_id, self.account_identity = value['profileId'], value['accountIdentity']
-        self.expires_at = value['expiresAt']
+        self.expires_at, self.token = value['expiresAt'], token
 
-    def failure(self, reported_expired=False):
-        if reported_expired or time.time() >= self.expires_at - AUTH_EXPIRY_MARGIN:
+    def __repr__(self):
+        return 'BorrowedLogin(expires_at=%r)' % self.expires_at
+
+    def failure(self, reported_expired=False, expires_at=None):
+        """Classify a refused request made with the token that expires at `expires_at`."""
+        expiry = self.expires_at if expires_at is None else expires_at
+        if reported_expired or time.time() >= expiry - AUTH_EXPIRY_MARGIN:
             return 'claude_auth_expired'
         return 'claude_auth_rejected'
 
     def renewed(self, credentials):
-        """Return a newer token for the same login, or None; ValueError for any other credential."""
+        """Keep a newer token for the same login: True, or False when it is not newer.
+
+        ValueError for any other credential."""
         value = borrowed_credential(credentials, self.profile_id, self.account_identity, int(time.time()) + 30)
         if value['expiresAt'] <= self.expires_at or value['expiresAt'] < int(time.time()) + AUTH_RENEWAL_MINIMUM:
-            return None
-        self.expires_at = value['expiresAt']
-        return value['accessToken']
+            return False
+        self.expires_at, self.token = value['expiresAt'], value['accessToken']
+        return True
+
+
+class Rotation:
+    """Live renewal of one CLI process's lent token, for a host that announced auth_rotate.
+
+    At most one auth_refresh is outstanding and the host answers in order. A newer token is
+    pushed with update_environment_variables and counts once the CLI acknowledges it.
+    Without that acknowledgement this process keeps its token, rotation stops for it, and the
+    relaunch path handles its next failure with the newer token.
+    """
+    def __init__(self, borrowed, emit, enabled):
+        self.borrowed, self.emit, self.enabled = borrowed, emit, enabled
+        self.outstanding, self.requested_at, self.process = False, None, None
+        self.expires_at = borrowed.expires_at if borrowed is not None else None
+
+    def launch(self, process):
+        """A CLI process started with the newest token."""
+        self.process, self.expires_at = process, self.borrowed.expires_at if self.borrowed else None
+        self.failed, self.ack, self.urgent, self.attempts, self.recoveries = False, None, False, 0, 0
+
+    def stop(self):
+        self.process, self.ack, self.urgent = None, None, False
+
+    def _active(self):
+        return self.enabled and self.process is not None and not self.failed
+
+    def _request(self):
+        self.emit(dict(type='auth_refresh', reason='rotate'))
+        self.outstanding, self.requested_at = True, time.monotonic()
+
+    def tick(self):
+        """Send a due request or give up on a missing acknowledgement."""
+        if not self._active():
+            return
+        if self.ack is not None and time.monotonic() >= self.ack[1]:
+            self.failed, self.ack = True, None
+            return
+        if self.outstanding or self.ack is not None:
+            return
+        since = float('inf') if self.requested_at is None else time.monotonic() - self.requested_at
+        if self.urgent and since >= AUTH_ROTATE_SPACING:
+            self.urgent, self.recoveries = False, self.recoveries + 1
+            self._request()
+        elif (self.attempts < AUTH_ROTATE_ATTEMPTS and since >= AUTH_REFRESH_RETRY_SECONDS
+              and time.time() >= self.expires_at - AUTH_ROTATE_MARGIN):
+            self.attempts += 1
+            self._request()
+
+    def recover(self):
+        """The API refused this process's token and the CLI waits for a rotated one."""
+        if (self._active() and not self.outstanding and self.ack is None
+                and self.recoveries < AUTH_ROTATE_RECOVERIES):
+            self.urgent = True
+            self.tick()
+
+    def answered(self, update):
+        """The host's reply to the outstanding request; a newer token goes to a live CLI."""
+        self.outstanding = False
+        if update.get('available') is not True:
+            return
+        try:
+            if not self.borrowed.renewed(update.get('credentials')):
+                return
+        except ValueError:
+            self.failed = True  # Another account or a malformed credential is never applied.
+            return
+        if not self._active():
+            return  # Kept for the next launch or the checkpoint.
+        request_id = 'codex-auth-' + uuid4().hex
+        try:
+            self.process.stdin.write(encode_message({'type': 'update_environment_variables', 'variables': {
+                'CLAUDE_CODE_OAUTH_TOKEN': self.borrowed.token}, 'request_id': request_id}))
+            self.process.stdin.flush()
+        except (OSError, ValueError):
+            self.failed = True
+            return
+        self.ack = (request_id, time.monotonic() + AUTH_ROTATE_ACK_SECONDS, self.borrowed.expires_at)
+
+    def acknowledged(self, message):
+        """Consume the CLI's answer to a pushed token; False for any other control response."""
+        response = message.get('response') if isinstance(message.get('response'), dict) else {}
+        if self.ack is None or response.get('request_id') != self.ack[0]:
+            return False
+        if response.get('subtype') == 'success':
+            self.expires_at, self.attempts, self.recoveries = self.ack[2], 0, 0
+        else:
+            self.failed = True
+        self.ack = None
+        return True
+
+    def late(self, message):
+        """Consume the reply to a request that outlived its CLI process."""
+        if self.outstanding and isinstance(message, dict) and message.get('type') == 'auth_update':
+            self.answered(message)
+            return True
+        return False
 
 
 def resume_command(command):
@@ -736,8 +925,23 @@ def host_wait(events, until, bridge, delegation, expect_update=False):
             return 'protocol', None
 
 
-def renew_login(borrowed, events, emit, bridge, delegation):
-    """Ask the native host for the renewed login at most twice; return (token, outcome)."""
+def renew_login(borrowed, events, emit, bridge, delegation, rotation=None):
+    """Ask the native host for the renewed login at most twice; return the outcome.
+
+    The renewed token is kept in `borrowed`. A rotation request still unanswered when the CLI
+    stopped is awaited first, and a newer token in its reply needs no further request.
+    """
+    if rotation is not None and rotation.outstanding:
+        outcome, update = host_wait(events, time.monotonic() + AUTH_REFRESH_SECONDS, bridge, delegation,
+                                    expect_update=True)
+        if outcome != 'update':
+            return 'unavailable' if outcome == 'timeout' else outcome
+        rotation.outstanding = False
+        try:
+            if update.get('available') is True and borrowed.renewed(update.get('credentials')):
+                return 'renewed'
+        except ValueError:
+            return 'unavailable'  # Another account or a malformed credential.
     started = time.monotonic()
     deadline = started + AUTH_REFRESH_SECONDS
     for request in range(2):
@@ -745,22 +949,21 @@ def renew_login(borrowed, events, emit, bridge, delegation):
             outcome, _ = host_wait(events, min(deadline, started + AUTH_REFRESH_RETRY_SECONDS),
                                    bridge, delegation)
             if outcome != 'timeout':
-                return None, outcome
+                return outcome
             if deadline - time.monotonic() < 5:
-                return None, 'unavailable'
+                return 'unavailable'
         emit(dict(type='auth_refresh'))
         outcome, update = host_wait(events, deadline, bridge, delegation, expect_update=True)
         if outcome != 'update':
-            return None, 'unavailable' if outcome == 'timeout' else outcome
+            return 'unavailable' if outcome == 'timeout' else outcome
         if update.get('available') is not True:
             continue
         try:
-            token = borrowed.renewed(update.get('credentials'))
+            if borrowed.renewed(update.get('credentials')):
+                return 'renewed'
         except ValueError:
-            return None, 'unavailable'  # Another account or a malformed credential.
-        if token is not None:
-            return token, 'renewed'
-    return None, 'unavailable'
+            return 'unavailable'  # Another account or a malformed credential.
+    return 'unavailable'
 
 
 def sum_usage(*values):
@@ -776,16 +979,17 @@ def sum_usage(*values):
     return result
 
 
-def generate_checkpoint(command, cwd, environment, events, session_id, channel='checkpoint'):
+def generate_checkpoint(command, cwd, environment, events, session_id, channel='checkpoint', token=None,
+                        rotation=None):
     """One bounded maintenance call; never recursively summarizes itself.
 
 The primary call's permission stop event is already set. Cancellation for this
 independent child comes directly from the existing native-input event queue.
 A retry reads its own channel, so the previous call's late EOF cannot end it.
+A rotation reply that outlived the primary call is consumed here.
 """
     options = {'creationflags': subprocess.CREATE_NO_WINDOW} if os.name == 'nt' else {'start_new_session': True}
-    process = subprocess.Popen(checkpoint_command(command), cwd=cwd, env=environment, stdin=subprocess.PIPE,
-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, **options)
+    process = start_cli(checkpoint_command(command), cwd, environment, token, options)
     tree, result, cancelled, invalid = None, {}, False, False
     compactions, last_usage, limit_event = 0, {}, None
     try:
@@ -806,6 +1010,8 @@ A retry reads its own channel, so the previous call's late EOF cannot end it.
                 if message is None or message.get('type') == 'interrupt':
                     cancelled = True
                     break
+                if rotation is not None and rotation.late(message):
+                    continue
                 # No permission request can originate from this tool-free call.
                 if message.get('type') != 'permission_decision':
                     invalid = True
@@ -882,10 +1088,15 @@ def execute(command, cwd, environment, incoming, emit, bridge, stopped, observed
     events = queue.Queue(maxsize=256)
     last_usage, model_started, compactions, results = {}, False, 0, []
     prior_cost = record.get('cost_total_usd', 0)
-    # Only a host that lent this token and announced auth_refresh can renew it.
-    # Then one expired launch is resumed once in this process; never a third.
+    # Only a host that lent this token and announced auth_refresh can renew it. Each relaunch
+    # reason has its own budget of one, so an expired launch is resumed at most once.
     renewable = borrowed is not None and hello.get('auth_refresh') == 1
-    prompt, channel, process = hello['_prompt'], 'cli', None
+    relaunches = dict(expired=0)
+    # A host that also announced auth_rotate renews the token of a running CLI without stopping it.
+    rotation = Rotation(borrowed, emit, renewable and hello.get('auth_rotate') == 1)
+    launch_environment = (dict(environment, CLAUDE_CODE_OAUTH_401_WAIT_MS=AUTH_401_WAIT_MS) if rotation.enabled
+                          else environment)
+    prompt, launch, channel, process, renewal_requested = hello['_prompt'], 0, 'cli', None, False
     threading.Thread(target=_reader, args=(incoming, 'host', events), daemon=True).start()
     try:
         while True:
@@ -896,14 +1107,14 @@ def execute(command, cwd, environment, incoming, emit, bridge, stopped, observed
             # result; the CLI then starts the next turn by itself. The final result
             # is the one that arrives while none of them is still running.
             background, background_seen, settle_deadline = set(), False, None
-            process = subprocess.Popen(command, cwd=cwd, env=environment, stdin=subprocess.PIPE,
-                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, **options)
+            process = start_cli(command, cwd, launch_environment, borrowed.token if borrowed else None, options)
+            rotation.launch(process)
             try:
                 tree = ProcessTree(process)
                 threading.Thread(target=_reader, args=(process.stdout, channel, events), daemon=True).start()
                 threading.Thread(target=_discard_stderr, args=(process.stderr,), daemon=True).start()
                 process.stdin.write(encode_message(prompt))
-                if channel == 'cli' and record['settings'].get('effort') == 'ultracode':
+                if launch == 0 and record['settings'].get('effort') == 'ultracode':
                     # The CLI accepts Ultracode silently and applies it only where dynamic
                     # workflows are available; ask which settings it actually applied.
                     process.stdin.write(encode_message({'type': 'control_request', 'request_id': ULTRACODE_CHECK,
@@ -912,6 +1123,7 @@ def execute(command, cwd, environment, incoming, emit, bridge, stopped, observed
                 while True:
                     if settle_deadline is not None and time.monotonic() >= settle_deadline:
                         break
+                    rotation.tick()
                     try:
                         source, message = events.get(timeout=.2)
                     except queue.Empty:
@@ -933,6 +1145,8 @@ def execute(command, cwd, environment, incoming, emit, bridge, stopped, observed
                             bridge.decide(message)
                         elif message.get('type') == 'agent_response' and delegation:
                             delegation.respond(message)
+                        elif message.get('type') == 'auth_update' and rotation.outstanding:
+                            rotation.answered(message)
                         else:
                             problem = ('protocol', 'Unexpected native message during a Claude turn.')
                             break
@@ -947,6 +1161,8 @@ def execute(command, cwd, environment, incoming, emit, bridge, stopped, observed
                         problem = ('permissions', 'Claude requested an unsupported permission transport; the action was stopped.')
                         break
                     if message.get('type') == 'control_response':
+                        if rotation.acknowledged(message):
+                            continue
                         response = message.get('response') if isinstance(message.get('response'), dict) else {}
                         applied = (response.get('response') or {}).get('applied') if isinstance(response.get('response'), dict) else None
                         if (response.get('request_id') == ULTRACODE_CHECK and response.get('subtype') == 'success'
@@ -962,6 +1178,8 @@ def execute(command, cwd, environment, incoming, emit, bridge, stopped, observed
                                       and isinstance(task.get('task_id'), str) and not task.get('ambient')
                                       and task.get('task_type') in ('local_workflow', 'local_agent')}
                         background_seen = background_seen or bool(background)
+                    if auth_retry(message):
+                        rotation.recover()  # The CLI polls for a rotated token before it gives up.
                     if settle_deadline is not None and message.get('type') in ('assistant', 'stream_event', 'user'):
                         settle_deadline = None  # A background report started the next turn.
                     # Remote (SSH) runs have no manager store; their usage is read on Windows.
@@ -1041,10 +1259,12 @@ def execute(command, cwd, environment, incoming, emit, bridge, stopped, observed
                         # A report may already be queued; give the CLI a moment to start that turn.
                         settle_deadline = time.monotonic() + BACKGROUND_SETTLE_SECONDS
                 if auth_seen and not interrupted and not problem and (result is None or result.get('is_error')):
-                    code = borrowed.failure(expired_reported) if borrowed is not None else 'claude_login_required'
+                    code = (borrowed.failure(expired_reported, rotation.expires_at) if borrowed is not None
+                            else 'claude_login_required')
                     auth_error = (code, AUTH_FAILURES[code])
-                    relaunch = code == 'claude_auth_expired' and renewable and channel == 'cli'
+                    relaunch = code == 'claude_auth_expired' and renewable and not relaunches['expired']
             finally:
+                rotation.stop()
                 if not relaunch:
                     stopped.set()
                 try:
@@ -1075,22 +1295,26 @@ def execute(command, cwd, environment, incoming, emit, bridge, stopped, observed
                 emit(dict(type='event', kind='tool_end', id=tool_id, output=AUTH_TOOL_STOPPED, is_error=True))
             emit(dict(type='event', kind='notice',
                       message='Claude access token expired; renewing it and resuming this turn...'))
-            token, outcome = renew_login(borrowed, events, emit, bridge, delegation)
+            relaunches['expired'] += 1
+            if borrowed.expires_at > rotation.expires_at and borrowed.expires_at >= time.time() + AUTH_RENEWAL_MINIMUM:
+                outcome = 'renewed'  # This launch received a newer token it could not apply.
+            else:
+                renewal_requested = True
+                outcome = renew_login(borrowed, events, emit, bridge, delegation, rotation)
             if outcome != 'renewed':
                 interrupted = outcome == 'interrupted'
                 if outcome == 'protocol':
                     problem = ('protocol', 'Unexpected native message during a Claude turn.')
                 break
-            # Only this runner's copy of the CLI environment receives the renewal.
-            environment = dict(environment, CLAUDE_CODE_OAUTH_TOKEN=token)
-            token = None
             for owner in (bridge, delegation):
                 if owner:
                     owner.release()  # The stopped process's MCP calls cannot be answered.
             if prompt_seen:
                 command = resume_command(command)
                 prompt = prompt_message([{'kind': 'request', 'text': AUTH_CONTINUATION}])
-            channel = 'cli-renewed'
+            # The next launch receives the renewed token; a stopped launch's output stays on its channel.
+            launch += 1
+            channel = 'cli-%d' % launch
     finally:
         stopped.set()
     if compactions:
@@ -1112,7 +1336,8 @@ def execute(command, cwd, environment, incoming, emit, bridge, stopped, observed
                   message='Generating a portable task checkpoint with one additional Claude response; tools are disabled.'))
         for checkpoint_channel in ('checkpoint', 'checkpoint-renewed'):
             try:
-                checkpoint = generate_checkpoint(command, cwd, environment, events, record['id'], checkpoint_channel)
+                checkpoint = generate_checkpoint(command, cwd, environment, events, record['id'], checkpoint_channel,
+                                                 borrowed.token if borrowed else None, rotation)
             except (ClaudeError, OSError, ProtocolError):
                 checkpoint = {'success':False, 'cancelled':False, 'result':{}}
             compactions += checkpoint.get('compactions', 0)
@@ -1120,19 +1345,18 @@ def execute(command, cwd, environment, incoming, emit, bridge, stopped, observed
                 emit(dict(type='event', **checkpoint['limit_event']))
             answer = checkpoint['result']
             # The lent token can expire after the turn's last request. Renew it once for this call
-            # unless the turn already did; the host answers two renewal requests per runner.
+            # unless the turn already asked; the host answers two expiry requests per runner.
             if (checkpoint['success'] or checkpoint['cancelled'] or checkpoint_channel != 'checkpoint'
-                    or not renewable or channel != 'cli' or not auth_failed(answer)
+                    or not renewable or renewal_requested or not auth_failed(answer)
                     or borrowed.failure(token_expired(answer, answer.get('result'))) != 'claude_auth_expired'):
                 break
             emit(dict(type='event', kind='notice',
                       message='Claude access token expired; renewing it to finish the portable checkpoint...'))
-            token, outcome = renew_login(borrowed, events, emit, bridge, delegation)
+            renewal_requested = True
+            outcome = renew_login(borrowed, events, emit, bridge, delegation, rotation)
             if outcome != 'renewed':
                 checkpoint['cancelled'] = outcome == 'interrupted'
                 break
-            environment = dict(environment, CLAUDE_CODE_OAUTH_TOKEN=token)
-            token = None
         checkpoint_failed = not checkpoint['success']
         if checkpoint['cancelled']:
             interrupted, success = True, False
@@ -1189,7 +1413,7 @@ def execute(command, cwd, environment, incoming, emit, bridge, stopped, observed
                 source, commit = events.get(timeout=min(1, deadline - time.monotonic()))
             except queue.Empty:
                 continue
-            if source != 'host':
+            if source != 'host' or rotation.late(commit):
                 continue
             if commit is None or commit.get('type') != 'commit':
                 raise ClaudeError('commit_missing', 'Claude result was not committed to canonical task history.')
@@ -1357,8 +1581,11 @@ def serve(root, profile_id, incoming=None, outgoing=None, cli_path=None, plugin_
             command = build_command(cli, record['id'], resume, settings, mode, prompts,
                                     configuration_directory, root, plugins, mcp_path, system_prompt_path,
                                     managed_delegation=managed_delegation)
-            borrowed = (BorrowedLogin(remote['borrowed_auth'])
-                        if remote is not None and remote.get('borrowed_auth') is not None else None)
+            borrowed = None
+            if remote is not None and remote.get('borrowed_auth') is not None:
+                # The lent token stays out of the CLI environment; each launch receives it by pipe.
+                borrowed = BorrowedLogin(remote['borrowed_auth'], remote.get('lent_token')
+                                         or environment.pop('CLAUDE_CODE_OAUTH_TOKEN', None))
             execute(command, cwd, environment, incoming, emit, bridge, stopped, observed,
                     record, ledger, hello, configuration_directory,
                     None if remote is not None else Store(root), delegation, borrowed)
@@ -1385,7 +1612,17 @@ def main(argv=None):
     parser.add_argument('--cli')
     parser.add_argument('--plugin-dir', action='append')
     args = parser.parse_args(argv)
-    return serve(args.root, args.profile, cli_path=args.cli, plugin_dirs=args.plugin_dir)
+    incoming = StdinLines(sys.stdin.fileno())
+    if os.environ.pop(AUTH_CHANNEL_ENV, '') == 'stdin':
+        # A local runner uses its profile's own login; a lent credential is read and dropped.
+        try:
+            receive_lent_credentials(incoming, sys.stdout.buffer)
+        except ValueError:
+            sys.stdout.buffer.write(encode_message(dict(type='refused', code='protocol',
+                                                        message='Claude runner received an invalid credential message.')))
+            sys.stdout.buffer.flush()
+            return 1
+    return serve(args.root, args.profile, incoming=incoming, cli_path=args.cli, plugin_dirs=args.plugin_dir)
 
 
 if __name__ == '__main__':

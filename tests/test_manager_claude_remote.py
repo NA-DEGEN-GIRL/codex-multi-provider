@@ -1,7 +1,9 @@
 """Offline SSH Claude account, packaging and runner boundaries; no provider calls."""
+import io
 import json
 import os
 from pathlib import Path, PurePosixPath
+import subprocess
 import sys
 import tempfile
 import threading
@@ -19,7 +21,9 @@ from manager_core.claude_borrowed_auth import read_access_token
 from manager_core.claude_profiles import render_for_host, render_execution_role_for_host
 from manager_core.providers import ProviderRegistry
 from manager_core.store import Store, atomic_json
+from manager_core.claude_protocol import read_message
 from manager_core.claude_runner import digest, serve
+from remote_helpers import claude_remote
 from remote_helpers.claude_remote import RemoteExecution
 
 
@@ -254,8 +258,10 @@ class RemoteClaudeContextTests(unittest.TestCase):
              patch.dict(os.environ, {'ANTHROPIC_API_KEY':'PRIVATE_AMBIENT',
                                     'CODEX_MANAGER_CLAUDE_AUTH':'PRIVATE_BROKER'}):
             actual = context.prepare(self.base)
-        self.assertEqual(actual['environment']['CLAUDE_CODE_OAUTH_TOKEN'], 'synthetic-access')
-        # The runner learns the lent login's owner and expiry, never its token.
+        # The token travels apart from the CLI environment; the runner hands it to each launch by pipe.
+        self.assertEqual(actual['lent_token'], 'synthetic-access')
+        self.assertNotIn('synthetic-access', json.dumps(actual['environment']))
+        # The runner's login metadata names the lent login's owner and expiry, never its token.
         self.assertEqual(actual['borrowed_auth'], dict(profileId=self.target, accountIdentity=self.identity,
                                                        expiresAt=self.auth['expiresAt']))
         self.assertNotIn('ANTHROPIC_API_KEY', actual['environment'])
@@ -281,8 +287,7 @@ class RemoteClaudeContextTests(unittest.TestCase):
     def test_production_context_runs_fake_cli_and_resumes_same_session_without_auth_files(self):
         from test_manager_claude_runner import FAKE, Incoming, Outgoing
         fake = self.base / 'fake_claude.py'
-        fake.write_text("import os\nassert os.environ['CLAUDE_CODE_OAUTH_TOKEN']=='synthetic-access'\n"
-                        "assert 'CODEX_MANAGER_CLAUDE_AUTH' not in os.environ\n" + FAKE, encoding='utf-8')
+        fake.write_text("import os\nassert 'CODEX_MANAGER_CLAUDE_AUTH' not in os.environ\n" + FAKE, encoding='utf-8')
         context = self.context()
         original = context.prepare
         def prepare(cwd):
@@ -311,7 +316,8 @@ class RemoteClaudeContextTests(unittest.TestCase):
             with patch.object(context, 'prepare', side_effect=prepare), \
                  patch('remote_helpers.claude_remote.cli_version', return_value='2.1.282'), \
                  patch('remote_helpers.claude_remote.prepare_shared_skills', return_value=None), \
-                 patch.dict(os.environ, {'CLAUDE_FIXTURE_SCENARIO':'managed_leaf'}):
+                 patch.dict(os.environ, {'CLAUDE_FIXTURE_SCENARIO':'managed_leaf',
+                                         'CLAUDE_FIXTURE_TOKEN':'synthetic-access'}):
                 self.assertEqual(serve(context.root, self.target, incoming, outgoing,
                                        execution_context=context), 0, events)
             self.assertEqual(events[-1]['type'], 'committed')
@@ -320,6 +326,84 @@ class RemoteClaudeContextTests(unittest.TestCase):
         self.assertEqual(sessions[0], sessions[1])
         self.assertFalse(list(self.base.rglob('.credentials.json')))
         self.assertEqual(len(list(context.ledger_directory.rglob('*.json'))), 1)
+
+
+class RemoteRunnerEntryTests(unittest.TestCase):
+    """How the lent credential reaches the SSH runner entry point; nothing is launched."""
+    credentials = dict(profileId=str(uuid4()), accessToken='dummy-token-1', expiresAt=2000000000,
+                       accountIdentity='e' * 64)
+    hello = dict(type='hello', protocol=1)
+
+    def run_main(self, stdin, environment):
+        # A file, not a pipe: an oversized message must not block the writer.
+        source = tempfile.TemporaryFile()
+        self.addCleanup(source.close)
+        source.write(stdin)
+        source.seek(0)
+        reader = source.fileno()
+        output, seen = io.BytesIO(), {}
+        class Execution:
+            def __init__(self, profile, revision, binding, auth):
+                seen['auth'] = auth
+                self.root, self.binding = Path(profile), dict(target_profile_id='target')
+        def serve(root, profile_id, incoming=None, execution_context=None):
+            # The runner continues with the very next message on the same stream.
+            seen['next'] = read_message(incoming)
+            seen['environment'] = [os.environ.get(name) for name in
+                                   ('CODEX_MANAGER_CLAUDE_AUTH', 'CODEX_MANAGER_CLAUDE_AUTH_CHANNEL')]
+            return 0
+        with patch.dict(os.environ, dict(environment, CODEX_MANAGER_PROFILE_DIR=str(Path.cwd()))), \
+             patch.object(claude_remote, 'RemoteExecution', Execution), patch.object(claude_remote, 'serve', serve), \
+             patch.object(claude_remote, '_hide_process') as hide, \
+             patch('sys.stdin', type('Stdin', (), {'fileno': lambda self: reader})()), \
+             patch('sys.stdout', type('Stdout', (), {'buffer': output})()):
+            code = claude_remote.main(['claude-runner', '--binding', 'binding.json'])
+        self.assertEqual(hide.call_count, 1)
+        return code, [json.loads(line) for line in output.getvalue().splitlines()], seen
+
+    def line(self, value):
+        return json.dumps(value).encode() + b'\n'
+
+    def test_current_runtime_sends_the_credential_on_stdin_before_the_hello(self):
+        code, output, seen = self.run_main(
+            self.line(dict(type='auth_init', credentials=self.credentials)) + self.line(self.hello),
+            {'CODEX_MANAGER_CLAUDE_AUTH_CHANNEL': 'stdin'})
+        self.assertEqual(code, 0)
+        self.assertEqual(output, [dict(type='auth_channel', protocol=1)])
+        self.assertEqual((seen['auth'], seen['next'], seen['environment']), (self.credentials, self.hello, [None, None]))
+
+    def test_older_runtime_still_lends_through_the_environment(self):
+        code, output, seen = self.run_main(self.line(self.hello),
+                                           {'CODEX_MANAGER_CLAUDE_AUTH': json.dumps(self.credentials)})
+        self.assertEqual((code, output), (0, []))
+        self.assertEqual((seen['auth'], seen['next'], seen['environment']), (self.credentials, self.hello, [None, None]))
+
+    def test_malformed_or_oversized_credential_messages_are_refused_without_echo(self):
+        for stdin in (self.line(dict(type='auth_init', credentials=self.credentials, extra=1)),
+                      self.line(dict(type='hello', credentials=self.credentials)),
+                      self.line(dict(type='auth_init', credentials=self.credentials))[:-1],
+                      b'{"type":"auth_init","credentials":"' + b'x' * 70000 + b'"}\n',
+                      b'not json dummy-token-1\n', b''):
+            with self.subTest(stdin=stdin[:40]):
+                code, output, seen = self.run_main(stdin, {'CODEX_MANAGER_CLAUDE_AUTH_CHANNEL': 'stdin'})
+                self.assertEqual(code, 1)
+                self.assertEqual([message['type'] for message in output], ['auth_channel', 'refused'])
+                self.assertNotIn('dummy-token', json.dumps(output))
+                self.assertNotIn('auth', seen)
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux /proc semantics.')
+    def test_runner_process_files_are_hidden_from_same_user_processes(self):
+        helpers = Path(__file__).resolve().parents[1] / 'scripts'
+        script = ('import os, subprocess, sys\n'
+                  'sys.path[:0] = [%r, %r]\n'
+                  'from remote_helpers.claude_remote import _hide_process\n'
+                  'probe = "import sys; open(\'/proc/%%s/environ\' %% sys.argv[1], \'rb\').read()"\n'
+                  'before = subprocess.run([sys.executable, "-c", probe, str(os.getpid())]).returncode\n'
+                  '_hide_process()\n'
+                  'after = subprocess.run([sys.executable, "-c", probe, str(os.getpid())], stderr=subprocess.DEVNULL).returncode\n'
+                  'print(before, after)\n') % (str(helpers), str(helpers / 'remote_helpers'))
+        result = subprocess.run([sys.executable, '-c', script], capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.stdout.split(), ['0', '1'], result.stderr)
 
 
 if __name__ == '__main__':
