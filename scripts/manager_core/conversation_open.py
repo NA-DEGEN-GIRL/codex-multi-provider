@@ -27,8 +27,19 @@ def _starts_without_window_wait(profile, capabilities):
     return bool(managed and capabilities.get('shared_record_execution'))
 
 
-def open_shortcut(center, shortcut_id, capabilities, *, expected_profile_id=None, launched=None):
-    """launched: called once this open's profile process exists (or already ran)."""
+def _superseded(profile):
+    return dict(state='superseded', access_mode='unavailable', reason='open_superseded',
+                profile_id=profile['id'], profile=profile,
+                message='같은 프로필의 새 작업 열기 요청으로 대체했습니다. 이전 대화 이동은 보내지 않았습니다.')
+
+
+def open_shortcut(center, shortcut_id, capabilities, *, expected_profile_id=None, launched=None, superseded=None):
+    """launched: called once this open's profile process exists (or already ran).
+
+    superseded: true once a later open for the same profile arrived. Such an
+    open still finishes a launch it started (the later one joins it) but
+    never sends its own task link.
+    """
     link = next((item for item in center.store.read()['shortcuts']
                  if item['id'] == identifier(shortcut_id)), None)
     if link is None:
@@ -47,6 +58,8 @@ def open_shortcut(center, shortcut_id, capabilities, *, expected_profile_id=None
         return dict(state='blocked', access_mode='unavailable', profile_id=profile['id'],
                     message='이 대화의 공통 기록 기능이 아직 준비되지 않았습니다.')
 
+    if superseded is not None and superseded():
+        return _superseded(profile)
     requested = time.perf_counter()
     early = _starts_without_window_wait(profile, capabilities)
     with center.update_hooks.launch_admission(profile['id']):
@@ -65,6 +78,8 @@ def open_shortcut(center, shortcut_id, capabilities, *, expected_profile_id=None
         launch = dict(state=shown.get('state', 'existing'),
                       admission_ms=round((admitted - requested) * 1000),
                       launch_ms=round((time.perf_counter() - admitted) * 1000))
+        if superseded is not None and superseded():
+            return {**_superseded(profile), 'launch': launch}
         if capabilities.get('canonical_record_storage'):
             # The first launch may import old stores and update shortcut sources.
             link = next(item for item in center.store.read()['shortcuts'] if item['id'] == link['id'])

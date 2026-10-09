@@ -5,6 +5,7 @@ launch environment or credentials. Readiness polls release the request channel
 and launch-admission lock so other profiles stay usable.
 """
 from copy import deepcopy
+import threading
 import time
 from uuid import uuid4
 from .app_transport import AppTransport
@@ -17,6 +18,26 @@ class PendingNavigations:
     def __init__(self, center, *, clock=time.monotonic, timeout=45, remote_timeout=90):
         self.center, self.clock, self.timeout, self.remote_timeout = center, clock, timeout, remote_timeout
         self.pending = {}
+        # Opens of different profiles run concurrently (per-profile gates).
+        self.lock = threading.Lock()
+
+    def profile_of(self, token):
+        """The profile a pending navigation waits for (request gating), or None."""
+        try:
+            key = identifier(token)
+        except ValueError:
+            return None
+        with self.lock:
+            plan = self.pending.get(key)
+        return plan['profile']['id'] if plan else None
+
+    def _keep(self, token, plan):
+        with self.lock:
+            self.pending[token] = plan
+
+    def _take(self, token):
+        with self.lock:
+            return self.pending.pop(identifier(token), None)
 
     @property
     def transport(self):
@@ -36,8 +57,12 @@ class PendingNavigations:
         return dict(state='blocked', access_mode='unavailable', reason=reason, message=message)
 
     def begin(self, original_link, profile, target_link, read_only, *, annotations=None):
-        self.pending = {k: v for k, v in self.pending.items() if v['expires'] > self.clock()}
-        if len(self.pending) >= 64:
+        with self.lock:
+            # Latest open wins: an earlier wait for this profile never resumes.
+            self.pending = {k: v for k, v in self.pending.items()
+                            if v['expires'] > self.clock() and v['profile']['id'] != profile['id']}
+            full = len(self.pending) >= 64
+        if full:
             return self._blocked('navigation_limit', '대기 중인 대화 열기가 많습니다. 잠시 후 다시 시도하세요.')
         remote = target_link.get('host_id', 'local') != 'local'
         plan = dict(original=deepcopy(original_link), profile=deepcopy(profile),
@@ -48,14 +73,15 @@ class PendingNavigations:
         if result.get('state') == 'waiting_for_reader':
             token = str(uuid4())
             plan['waiting_reason'] = result.get('reason')
-            self.pending[token] = plan
+            self._keep(token, plan)
             result['navigation_id'] = token
         return result
 
     def resume(self, token):
         # Consume before attempting a send. Exceptions and uncertain launches
         # cannot be replayed with this ID; only a no-send readiness wait retains it.
-        plan = self.pending.pop(identifier(token), None)
+        plan = self._take(token)
+        token = identifier(token)
         if plan is not None and plan['expires'] <= self.clock() and plan.get('waiting_reason') == 'remote_connection_starting':
             return self._blocked('remote_connection_timeout', 'SSH 연결이 준비되지 않아 대화 이동 요청은 보내지 않았습니다. '
                                  '로컬 창은 그대로 쓸 수 있습니다. SSH 연결이 끝난 뒤 다시 여세요.')
@@ -81,7 +107,7 @@ class PendingNavigations:
                 result = self._attempt(plan)
         if result.get('state') == 'waiting_for_reader':
             plan['waiting_reason'] = result.get('reason')
-            self.pending[token] = plan
+            self._keep(token, plan)
             result['navigation_id'] = token
         return result
 

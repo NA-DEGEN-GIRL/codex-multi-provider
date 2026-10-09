@@ -5,7 +5,8 @@ namespace Codex.ControlCenter.Shell;
 
 public sealed partial class MainWindow
 {
-    private async Task VerifyShortcutNavigationAsync(int ticket, JsonElement result, JsonElement item, ShortcutOpenTrace trace)
+    private async Task VerifyShortcutNavigationAsync(int ticket, JsonElement result, JsonElement item, ShortcutOpenTrace trace,
+        CancellationToken cancellation = default)
     {
         if (!ShortcutNavigationRecovery.TryTarget(result, item, out var target)) { FinishShortcutTrace(trace, "sent", "selection_not_verifiable"); return; }
         var expected = WindowLaunchIdentity.From(result.Get("profile"));
@@ -14,18 +15,18 @@ public sealed partial class MainWindow
         var host = _host;
         string? initialRoute = null;
         bool superseded = false;
-        bool Current() => !superseded && !_closing && ticket == _navigation && _selectedProfile == expected.ProfileId
-            && !_viewingCatalog && _embedRequested && expected.Matches(Latest(Profile()));
+        bool Current() => !superseded && !_closing && !cancellation.IsCancellationRequested && ticket == _navigation
+            && _selectedProfile == expected.ProfileId && !_viewingCatalog && _embedRequested && expected.Matches(Latest(Profile()));
         bool Attached() => _host == host && host.HasLiveAttachment
             && _windowLaunches.TryGetValue(host, out var launch) && launch == expected
             && _attachedWindows.TryGetValue(host, out var window) && window.MatchesLifetime;
         // Why a verification stopped early, for the log (first failing check of Current, then Attached).
         string CancelReason() => _closing ? "관리창 종료" : superseded ? "화면에서 다른 대화로 이동"
-            : ticket != _navigation ? "새 이동 요청" : _selectedProfile != expected.ProfileId || _viewingCatalog ? "다른 화면 선택"
+            : ticket != _navigation || cancellation.IsCancellationRequested ? "새 이동 요청" : _selectedProfile != expected.ProfileId || _viewingCatalog ? "다른 화면 선택"
             : !_embedRequested ? "창 표시 해제" : !expected.Matches(Latest(Profile())) ? "창 실행 정보 변경"
             : !Attached() ? "창 연결 해제" : "확인 조건 변경";
         string CancelCode() => _closing ? "closing" : superseded ? "other_task_selected"
-            : ticket != _navigation ? "replaced" : _selectedProfile != expected.ProfileId || _viewingCatalog ? "other_view"
+            : ticket != _navigation || cancellation.IsCancellationRequested ? "replaced" : _selectedProfile != expected.ProfileId || _viewingCatalog ? "other_view"
             : !_embedRequested ? "view_released" : !expected.Matches(Latest(Profile())) ? "launch_changed"
             : !Attached() ? "window_detached" : "changed";
         async Task<bool> Selected()
@@ -49,7 +50,7 @@ public sealed partial class MainWindow
         try
         {
             var outcome = await ShortcutNavigationRecovery.RunAsync(Current, Attached, Selected,
-                token => host.NavigateAsync(target, token), remote: remote);
+                token => host.NavigateAsync(target, token), ms => Task.Delay(ms, cancellation), remote: remote);
             if (outcome == ShortcutRecoveryResult.Cancelled)
             {
                 var code = CancelCode();
@@ -76,6 +77,7 @@ public sealed partial class MainWindow
                 FinishShortcutTrace(trace, "unverified");
             }
         }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { FinishShortcutTrace(trace, "replaced"); }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException or InvalidOperationException or JsonException)
         {
             if (Current()) SetStatus("작업 화면 이동을 확인하지 못했습니다. 진행 중인 작업은 유지됩니다.", true);

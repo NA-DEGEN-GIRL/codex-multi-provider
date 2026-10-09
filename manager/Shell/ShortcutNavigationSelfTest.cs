@@ -104,7 +104,8 @@ internal static class ShortcutNavigationSelfTest
         }
         finally { invalidWindow.Close(); }
 
-        // Task opens of one account merge instead of rejecting each other.
+        // Latest click wins: a re-click joins the open in flight, another task
+        // of the account replaces it at once (no wait for its reply, no rejection).
         var other = new { id = "other", profile_id = "profile", alias = "다른 작업", thread_id = "thread-2", host_id = "local" };
         var pair = JsonSerializer.SerializeToElement(new { profiles = new[] { profile }, shortcuts = new[] { shortcut, other } });
         var opens = new List<(string Id, TaskCompletionSource<JsonElement> Reply)>();
@@ -122,25 +123,29 @@ internal static class ShortcutNavigationSelfTest
             Require(again.IsCompletedSuccessfully && opens.Count == 1,
                 "A re-click of the task being opened was rejected or sent a second open.");
             var replacement = Invoke(mergeWindow, "OpenShortcutAsync", "other");
-            var repeat = Invoke(mergeWindow, "OpenShortcutAsync", "other");
-            Require(!replacement.IsCompleted && repeat.IsCompletedSuccessfully && opens.Count == 1,
-                "Another task of the account was rejected, or sent before the open in flight ended.");
-            opens[0].Reply.SetResult(ready);
+            // The replaced open stops without waiting for its reply and without an error.
             await first.WaitAsync(TimeSpan.FromSeconds(3));
             for (var started = Environment.TickCount64; opens.Count < 2; await Task.Delay(10))
-                Require(Environment.TickCount64 - started < 3000, "The replacing task was not opened after the open in flight ended.");
-            Require(opens[1].Id == "other" && Field<Dictionary<string, JsonElement>>(mergeWindow, "_shownProfiles").Count == 0,
-                "The replaced open presented its result, or the replacement opened the wrong task.");
+                Require(Environment.TickCount64 - started < 3000, "The replacing task waited for the open in flight.");
+            var repeat = Invoke(mergeWindow, "OpenShortcutAsync", "other");
+            Require(opens[1].Id == "other" && !replacement.IsCompleted && repeat.IsCompletedSuccessfully && opens.Count == 2,
+                "Another task of the account did not replace the open in flight at once, or a re-click sent a third open.");
+            Require(!Field<TextBlock>(mergeWindow, "_status").Text.Contains("처리가 진행 중", StringComparison.Ordinal),
+                "The replacing click was refused.");
+            opens[0].Reply.SetResult(ready);
+            await Task.Delay(100);
+            Require(Field<Dictionary<string, JsonElement>>(mergeWindow, "_shownProfiles").Count == 0,
+                "The replaced open's late reply presented its result.");
             opens[1].Reply.SetResult(ready);
             await replacement.WaitAsync(TimeSpan.FromSeconds(3));
             Require(opens.Count == 2 && Field<Dictionary<string, JsonElement>>(mergeWindow, "_shownProfiles")["profile"].S("generation") == "new",
                 "The replacing open did not present its returned launch.");
             using (Field<ProfileActionGate>(mergeWindow, "_profileActions").Enter("profile", "fixture")) { }
-            checks.Add("A re-click of a task being opened joins it; another task of the account replaces it after the open in flight, with one open each and no rejection.");
+            checks.Add("A re-click of a task being opened joins it; another task of the account replaces it at once, its late reply ignored, with one open each and no rejection.");
         }
         finally { foreach (var open in opens) open.Reply.TrySetResult(ready); mergeWindow.Close(); }
 
-        // A replaced open still waiting for Codex readiness fails silently too.
+        // A replaced open still waiting for Codex readiness stops silently too.
         var steps = new List<(string Command, string Id, TaskCompletionSource<JsonElement> Reply)>();
         var abandonWindow = new MainWindow(root, fixture: true, fixtureRequest: (command, args) =>
         {
@@ -156,21 +161,49 @@ internal static class ShortcutNavigationSelfTest
             for (var started = Environment.TickCount64; steps.Count < 2; await Task.Delay(10))
                 Require(Environment.TickCount64 - started < 3000, "The cold open did not send its readiness continuation.");
             var replacement = Invoke(abandonWindow, "OpenShortcutAsync", "other");
-            Require(steps[1].Command == "conversation.navigate" && !replacement.IsCompleted,
-                "The replacing task did not wait for the open in flight.");
-            steps[1].Reply.SetException(new InvalidOperationException("fixture readiness failure"));
             // Unsilenced, the replaced open faults here and Safe reports it as an error.
             await first.WaitAsync(TimeSpan.FromSeconds(3));
             for (var started = Environment.TickCount64; steps.Count < 3; await Task.Delay(10))
-                Require(Environment.TickCount64 - started < 3000, "The replacing task was not opened after the replaced open ended.");
-            Require(steps[2].Command == "conversation.open" && steps[2].Id == "other",
-                "The replacement opened the wrong task after a replaced readiness failure.");
+                Require(Environment.TickCount64 - started < 3000, "The replacing task waited for the replaced readiness continuation.");
+            Require(steps[1].Command == "conversation.navigate" && steps[2].Command == "conversation.open" && steps[2].Id == "other",
+                "The replacement opened the wrong task while a readiness wait was replaced.");
+            steps[1].Reply.SetException(new InvalidOperationException("fixture readiness failure"));
             steps[2].Reply.SetResult(ready);
             await replacement.WaitAsync(TimeSpan.FromSeconds(3));
+            Require(!Field<TextBlock>(abandonWindow, "_status").Text.Contains("fixture readiness failure", StringComparison.Ordinal),
+                "The replaced readiness continuation's failure was reported.");
             using (Field<ProfileActionGate>(abandonWindow, "_profileActions").Enter("profile", "fixture")) { }
-            checks.Add("A replaced open's failed readiness continuation is not reported, and the replacing task still opens.");
+            checks.Add("A replaced open's readiness wait stops at once without reporting its late failure, and the replacing task opens.");
         }
         finally { foreach (var step in steps) step.Reply.TrySetResult(ready); abandonWindow.Close(); }
+
+        // A profile-card click while a task open is in flight replaces it.
+        var sent = new List<string>();
+        var pendingOpen = new TaskCompletionSource<JsonElement>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var launched = JsonSerializer.SerializeToElement(new { state = "launched", profile_id = "profile", profile = returned });
+        var cardWindow = new MainWindow(root, fixture: true, fixtureRequest: (command, _) =>
+        {
+            sent.Add(command);
+            return command switch { "conversation.open" => pendingOpen.Task, "profile.show" => Task.FromResult(launched),
+                "state" => Task.FromResult(state), _ => throw new InvalidOperationException("Unexpected request: " + command) };
+        }) { FixtureRefreshesState = true };
+        try
+        {
+            cardWindow.UseFixture(state);
+            var open = Invoke(cardWindow, "OpenShortcutAsync", "shortcut");
+            var safe = typeof(MainWindow).GetMethod("Safe", flags)!;
+            var click = (Task)safe.Invoke(cardWindow, [(Func<Task>)(() => Invoke(cardWindow, "ShowProfileAsync", "profile", "profile.show"))])!;
+            await open.WaitAsync(TimeSpan.FromSeconds(3));
+            await click.WaitAsync(TimeSpan.FromSeconds(3));
+            var status = Field<TextBlock>(cardWindow, "_status").Text;
+            Require(sent.Take(2).SequenceEqual(new[] { "conversation.open", "profile.show" }) && !status.Contains("처리가 진행 중", StringComparison.Ordinal),
+                "A profile click during a task open was refused: " + status);
+            Require(Field<ListBox>(cardWindow, "_shortcuts").Items.OfType<Choice>().First(c => c.Id == "shortcut").Shortcut is { State: not "opening" },
+                "The replaced task open kept its progress on the card.");
+            using (Field<ProfileActionGate>(cardWindow, "_profileActions").Enter("profile", "fixture")) { }
+            checks.Add("A profile-card click replaces a task open in flight instead of being refused; the replaced card stops showing progress.");
+        }
+        finally { pendingOpen.TrySetResult(ready); cardWindow.Close(); }
         checks.AddRange(DesktopCompatibilitySelfTest.Run(root));
         checks.AddRange(LocalModelSelfTest.Run());
         checks.AddRange(await ProfileOpenStatusSelfTest.RunAsync(root));

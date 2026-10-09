@@ -212,6 +212,49 @@ class ConversationOpenTests(unittest.TestCase):
         self.open()
         self.assertEqual(self.window_waits, [True])
 
+    def test_latest_open_of_a_profile_wins_and_other_profiles_never_wait(self):
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+        other = self.store.shortcut_add('other work', self.b['id'], **self.ref)
+        foreign = self.store.shortcut_add('profile a work', self.a['id'], **self.ref)
+        entered, release = threading.Event(), threading.Event()
+        def show(profile_id, **_):
+            self.shown.append(profile_id)
+            if len(self.shown) == 1:
+                # The first open of b is still launching when the next clicks arrive.
+                entered.set()
+                self.assertTrue(release.wait(5))
+            return dict(state='existing', profile=self.store.profile(profile_id))
+        self.center.instances.show.side_effect = show
+        def request(rid, shortcut):
+            return self.center.request(dict(id=rid, command='conversation.open', args={'shortcut_id': shortcut['id']}))
+        with patch('manager_core.rust_service.enabled', return_value=True), ThreadPoolExecutor(3) as pool:
+            first = pool.submit(request, 'first', self.link)
+            self.assertTrue(entered.wait(5))
+            # Another profile's open is keyed by its own profile, not one global lock.
+            elsewhere = pool.submit(request, 'elsewhere', foreign)
+            self.assertTrue(elsewhere.result(timeout=10)['ok'])
+            latest = pool.submit(request, 'latest', other)
+            time.sleep(.2)
+            self.assertFalse(latest.done(), 'a second open of the same profile did not wait for its gate')
+            release.set()
+            replaced, newest = first.result(timeout=10)['result'], latest.result(timeout=10)['result']
+        self.assertEqual((replaced['state'], replaced['reason']), ('superseded', 'open_superseded'))
+        self.assertEqual(newest['state'], 'request_sent', newest)
+        # Only the latest click sent a task link to profile b; profile a got its own.
+        self.assertEqual(len(self.launches), 2)
+        self.assertEqual(self.shown.count(self.b['id']), 2)
+
+    def test_a_new_wait_for_a_profile_drops_its_earlier_wait(self):
+        first = self.warmup()
+        self.assertEqual(self.center.navigations.profile_of(first), self.b['id'])
+        second = self.open()
+        self.assertEqual(second['state'], 'waiting_for_reader')
+        self.assertIsNone(self.center.navigations.profile_of(first))
+        self.assertEqual(self.navigate(first)['reason'], 'navigation_expired')
+        self.assertEqual(self.navigate(second['navigation_id'])['state'], 'waiting_for_reader')
+        self.assertIsNone(self.center.navigations.profile_of('not-a-token'))
+
     def test_moved_shortcut_rejects_captured_profile_before_any_open_or_handoff(self):
         expected = self.link['profile_id']
         self.store.shortcut_move(self.link['id'], self.a['id'])

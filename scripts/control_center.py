@@ -28,6 +28,7 @@ from manager_core.remote_updates import RemoteUpdates
 
 ROOT=Path(__file__).resolve().parents[1]
 INTERNAL_ERROR='관리 요청을 처리하지 못했습니다. 잠시 후 다시 시도해 주세요.'
+OPEN_COMMANDS=('conversation.open','conversation.continue','conversation.navigate')
 
 
 class ControlCenter:
@@ -81,6 +82,8 @@ class ControlCenter:
         self._mutex=threading.RLock()
         self._request_gates={}
         self._request_gate_lock=threading.Lock()
+        # Profile -> number of task opens that arrived for it; the latest wins.
+        self._open_arrivals={}
         self._state_ready=threading.Condition()
         self._state_flight=None
         self.personal_skills=self.instances.personal_skills
@@ -380,7 +383,7 @@ class ControlCenter:
                 pass
         return pinned
 
-    def dispatch(self,command,args):
+    def dispatch(self,command,args,*,open_arrival=None):
         if not isinstance(args,dict):raise ValueError('명령 인수가 올바르지 않습니다.')
         if command=='notes.refresh_forks':
             host=args['task'].get('host_id', 'local')
@@ -678,7 +681,8 @@ class ControlCenter:
             try:
                 result=open_shortcut(self,args['shortcut_id'],runtime_build(self.root).get('capabilities',{}),
                                      expected_profile_id=args.get('expected_profile_id'),
-                                     launched=lambda:self.profile_warmup.release(hold))
+                                     launched=lambda:self.profile_warmup.release(hold),
+                                     superseded=lambda:self._open_superseded(open_arrival))
             finally:
                 self.profile_warmup.release(hold)
             self._record_navigation(result,'conversation_open',started)
@@ -779,6 +783,31 @@ class ControlCenter:
             return result
         raise ValueError('지원하지 않는 관리 명령입니다.')
 
+    def _open_profile(self,command,args):
+        """The profile a task open or its readiness continuation acts on, or None."""
+        try:
+            if command=='conversation.navigate':
+                return self.navigations.profile_of(args.get('navigation_id'))
+            return self._shortcut_profile(args)
+        except (ValueError,KeyError,TypeError,AttributeError,OSError,RuntimeError):
+            return None
+
+    def _open_arrived(self,command,args):
+        """Count a task open (not a continuation) for its profile: (profile, number)."""
+        if command not in ('conversation.open','conversation.continue'):return None
+        profile_id=self._open_profile(command,args)
+        if not profile_id:return None
+        with self._request_gate_lock:
+            number=self._open_arrivals[profile_id]=self._open_arrivals.get(profile_id,0)+1
+        return profile_id,number
+
+    def _open_superseded(self,arrival):
+        """True once a later task open arrived for the same profile (latest click wins)."""
+        if arrival is None:return False
+        profile_id,number=arrival
+        with self._request_gate_lock:
+            return self._open_arrivals.get(profile_id,0)!=number
+
     def _shortcut_profile(self,args):
         """The profile a conversation.open targets: the one the shell captured, else the link's."""
         expected=args.get('expected_profile_id') if isinstance(args,dict) else None
@@ -864,6 +893,10 @@ class ControlCenter:
                 # Same-profile mutations stay ordered. Slow work for another
                 # profile must not hold a global UI/notes/connection lock.
                 profile_id=request.get('args',{}).get('profile_id')
+                if request['command'] in OPEN_COMMANDS:
+                    # Task opens carry no profile_id: key them by the profile
+                    # they open, so a cold open never holds another profile's.
+                    profile_id=self._open_profile(request['command'],request.get('args',{}))
                 # Email is a read-only, identity-checked display query. A slow
                 # Claude CLI status must not block opening or editing a profile.
                 key=(request['command']+':'+str(profile_id)) if request['command']=='profile.email' else (
@@ -871,8 +904,12 @@ class ControlCenter:
                 with self._request_gate_lock:
                     gate=self._request_gates.setdefault(key,threading.RLock())
             else:gate=self._mutex
+            # Counted on arrival, before the gate: an open still waiting for
+            # (or running behind) its profile's gate learns it was replaced.
+            arrival=self._open_arrived(request['command'],request.get('args',{}))
+            options={'open_arrival':arrival} if arrival else {}
             try:
-                with gate:result=self.dispatch(request['command'],request.get('args',{}))
+                with gate:result=self.dispatch(request['command'],request.get('args',{}),**options)
             finally:
                 # Counted before the reply leaves, so the caller's next poll
                 # never joins a computation that missed this request.

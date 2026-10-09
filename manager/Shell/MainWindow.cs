@@ -77,9 +77,10 @@ public sealed partial class MainWindow : Window
     private readonly Dictionary<Guid, (string Label, DateTime Started)> _pendingActions = [];
     private readonly ProfileActionGate _profileActions = new();
     private const string ShortcutOpenAction = "대화 열기";
-    // Per account: the task its latest shortcut open is for, that open's ticket
-    // and its trace (the phase its card and the status line show until it ends).
-    private sealed record ShortcutOpen(string Id, int Ticket, ShortcutOpenTrace Trace);
+    // Per account: the task its latest shortcut open is for, that open's ticket,
+    // its trace (the phase its card and the status line show until it ends) and
+    // its cancellation (a later click stops it at once: latest click wins).
+    private sealed record ShortcutOpen(string Id, int Ticket, ShortcutOpenTrace Trace, CancellationTokenSource Cancel);
     private readonly Dictionary<string, ShortcutOpen> _shortcutOpens = [];
     private bool OpenInFlight(string? profileId) =>
         profileId is not null && _shortcutOpens.TryGetValue(profileId, out var open) && !open.Trace.Finished;
@@ -795,7 +796,10 @@ public sealed partial class MainWindow : Window
             _profileOpenNoticeProfile = (ex as ProfileOpenException)?.ProfileId;
         }
     }
-    private async Task<JsonElement> Request(string command, object? args = null)
+    private Task<JsonElement> Request(string command, object? args = null) => Request(command, args, CancellationToken.None);
+    // cancellation: a replaced task or profile open stops waiting at once (the
+    // service still finishes the request; its late answer is dropped).
+    private async Task<JsonElement> Request(string command, object? args, CancellationToken cancellation)
     {
         if (_serviceShutdown.DrainStarted)
             throw new InvalidOperationException("관리 서비스가 종료 중입니다. 완전 종료를 다시 눌러 마무리해 주세요.");
@@ -810,7 +814,8 @@ public sealed partial class MainWindow : Window
         if (tracked) Log($"요청 시작 · {CommandLabel(command)} · {command}");
         try
         {
-            using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(command switch
+            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
+            deadline.CancelAfter(TimeSpan.FromSeconds(command switch
             {
                 // A cold task open waits for launch admission behind other
                 // launches; it must not be reported failed while still in progress.
@@ -820,12 +825,18 @@ public sealed partial class MainWindow : Window
                 _ => 180
             }));
             JsonElement result;
-            try { result = _fixtureRequest is not null ? await _fixtureRequest(command, args) : await _client!.RequestAsync(command, args, deadline.Token); }
-            catch (OperationCanceledException) when (deadline.IsCancellationRequested)
+            try
+            {
+                result = _fixtureRequest is not null ? await _fixtureRequest(command, args).WaitAsync(deadline.Token)
+                    : await _client!.RequestAsync(command, args, deadline.Token);
+            }
+            catch (OperationCanceledException) when (deadline.IsCancellationRequested && !cancellation.IsCancellationRequested)
             { throw new InvalidOperationException("요청 응답을 제한 시간 안에 받지 못했습니다. 이미 시작한 처리는 계속될 수 있습니다. 상태 갱신은 계속됩니다."); }
             if (tracked) Log($"요청 응답 · {CommandLabel(command)} · {result.S("state", "수신 완료")}");
             return result;
         }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
+        { if (tracked) Log($"요청 대체 · {CommandLabel(command)} · 새 클릭이 이어받음"); throw; }
         catch (Exception ex) { if (tracked) Log($"요청 실패 · {command} · {ex.Message}"); throw; }
         finally { if (showActivity) { _pendingActions.Remove(actionId); RenderActivity(); } }
     }
@@ -1212,12 +1223,40 @@ public sealed partial class MainWindow : Window
     private async Task ShowProfileAsync(string id, string command = "profile.show")
     {
         using var timing = _responsiveness?.Time("profile.switch." + id);
-        using var action = _profileActions.Enter(id, "계정 열기");
-        await ShowProfileCoreAsync(id, command, action);
+        if (command != "profile.show")
+        {
+            using var held = _profileActions.Enter(id, "계정 열기");
+            await ShowProfileCoreAsync(id, command, held);
+            return;
+        }
+        // Latest click wins: a profile click replaces a task or profile open in
+        // flight (that request's launch is joined by this one, never repeated)
+        // instead of being refused. Every other task open stops too.
+        // Another action on this account (settings, login) still refuses the
+        // click, before anything changes.
+        var previous = _profileActions.Replace(id);
+        var cancel = new CancellationTokenSource();
+        CancelShortcutOpens();
+        var ticket = ++_navigation;
+        while (previous is not null)
+        {
+            await previous;
+            if (ticket != _navigation || _closing) return;
+            previous = _profileActions.Replace(id);
+        }
+        using var action = _profileActions.Enter(id, "계정 열기", cancel);
+        try { await ShowProfileCoreAsync(id, command, action, cancel.Token); }
+        catch (OperationCanceledException) when (cancel.IsCancellationRequested) { /* A later click took over. */ }
+    }
+    // Every task open still in flight stops now; its trace ends as replaced.
+    private void CancelShortcutOpens()
+    {
+        foreach (var open in _shortcutOpens.Values.ToArray())
+            if (!open.Trace.Finished) open.Cancel.Cancel();
     }
     // Ends the caller's action gate once the returned window is attached; the
     // caller's using still releases it on every earlier exit.
-    private async Task ShowProfileCoreAsync(string id, string command, IDisposable action)
+    private async Task ShowProfileCoreAsync(string id, string command, IDisposable action, CancellationToken cancellation = default)
     {
         var started = Environment.TickCount64;
         var ticket = ++_navigation;
@@ -1257,7 +1296,7 @@ public sealed partial class MainWindow : Window
         JsonElement returnedProfile;
         try
         {
-            var result = await Request(command, new { profile_id = id });
+            var result = await Request(command, new { profile_id = id }, cancellation);
             if (ticket != _navigation || _closing) return;
             var workspace = result.Get("preparation").Get("common").Get("app").Get("workspace");
             if (workspace.ValueKind == JsonValueKind.Object)
@@ -1292,6 +1331,8 @@ public sealed partial class MainWindow : Window
             ++_stateRevision;
             _attachTiming = (ticket, id, started);
         }
+        // A later click replaced this open: its own selection already took over.
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { return; }
         catch (Exception error)
         {
             // Startup may acquire maintenance just after the state above was
@@ -2542,29 +2583,40 @@ public sealed partial class MainWindow : Window
                 .Get("current_task").S("thread_id"));
             _shortcuts.SelectedItem = _shortcuts.Items.OfType<Choice>().FirstOrDefault(c => c.Id == id);
         }
+        // A re-click of the task being opened joins it.
+        if (_shortcutOpens.TryGetValue(profileId, out var opening) && opening.Id == id && opening.Ticket == _navigation
+            && !opening.Trace.Finished && !opening.Cancel.IsCancellationRequested) return;
+        // A profile open or another task open of this account in flight is
+        // replaced; another action on the account (settings, login) still
+        // refuses the click, before anything changes.
+        var previous = _profileActions.Replace(profileId);
         // The card and the status line show this click's phase from now on.
         var trace = new ShortcutOpenTrace(id, profileId, item.S("host_id", "local"),
             Latest(profileId, _state.Arr("profiles").FirstOrDefault(p => p.S("id") == profileId)).S("status") == "running");
-        // Task opens of one account do not reject each other: a re-click of the
-        // task being opened joins it, and another task replaces it. The newer
-        // ticket discards the open in flight and this one follows once that
-        // releases the gate. Other actions on the account still meet the gate.
-        if (_profileActions.Held(profileId, ShortcutOpenAction) is { } inFlight)
+        // Latest click wins: every open still in flight (this account's or
+        // another's) stops now instead of being waited for. A launch it started
+        // continues in the service and this open joins it there.
+        var ticket = ++_navigation;
+        var cancel = new CancellationTokenSource();
+        CancelShortcutOpens();
+        _shortcutOpens[profileId] = new(id, ticket, trace, cancel);
+        try
         {
-            if (_shortcutOpens.TryGetValue(profileId, out var opening) && opening.Id == id && opening.Ticket == _navigation) return;
-            var queued = ++_navigation;
-            _shortcutOpens[profileId] = new(id, queued, trace);
             SelectCard(); ShowOpenProgress();
-            Log($"대화 열기 교체 대기 · {id}");
-            await inFlight;
-            if (queued != _navigation || _closing) { FinishShortcutTrace(trace, "replaced"); return; }
+            while (previous is not null)
+            {
+                await previous;
+                if (ticket != _navigation || _closing || cancel.IsCancellationRequested) { FinishShortcutTrace(trace, "replaced"); return; }
+                previous = _profileActions.Replace(profileId);
+            }
+            using var action = _profileActions.Enter(profileId, ShortcutOpenAction, cancel);
+            SelectCard();
+            if (_selectedProfile != profileId || _viewingCatalog) ParkCurrent(); _viewingCatalog = false; _selectedProfile = profileId;
+            ShowOpenProgress();
+            await OpenShortcutCoreAsync(id, item, profileId, ticket, trace, action, cancel.Token);
         }
-        using var action = _profileActions.Enter(profileId, ShortcutOpenAction);
-        SelectCard();
-        var ticket = ++_navigation; if (_selectedProfile != profileId || _viewingCatalog) ParkCurrent(); _viewingCatalog = false; _selectedProfile = profileId;
-        _shortcutOpens[profileId] = new(id, ticket, trace);
-        ShowOpenProgress();
-        try { await OpenShortcutCoreAsync(id, item, profileId, ticket, trace, action); }
+        // A later click took over: silent, like the replaced open's late answers.
+        catch (OperationCanceledException) when (cancel.IsCancellationRequested) { FinishShortcutTrace(trace, "replaced"); }
         // The filter only records this click's failure; the error still reaches Safe.
         catch (Exception error) when (TraceFailure(trace, ticket, error)) { throw; }
     }
@@ -2574,7 +2626,7 @@ public sealed partial class MainWindow : Window
         return false;
     }
     private async Task OpenShortcutCoreAsync(string id, JsonElement item, string profileId, int ticket,
-        ShortcutOpenTrace trace, IDisposable action)
+        ShortcutOpenTrace trace, IDisposable action, CancellationToken cancellation)
     {
         _expectedConversation = null; _expectedCanonicalThread = null;
         _hostDeck.Select(profileId); BeginAttach(); _profileRequestTicket = ticket;
@@ -2586,12 +2638,12 @@ public sealed partial class MainWindow : Window
         JsonElement result;
         trace.Mark("request_sent");
         ShowOpenProgress();
-        try { result = await Request("conversation.open", new { shortcut_id = id, expected_profile_id = profileId }); }
+        try { result = await Request("conversation.open", new { shortcut_id = id, expected_profile_id = profileId }, cancellation); }
         // A replaced open's failure is logged by Request; it must not overwrite the newer open's status.
-        catch (Exception) when (ticket != _navigation || _closing) { FinishShortcutTrace(trace, "replaced"); return; }
+        catch (Exception) when (ticket != _navigation || _closing || cancellation.IsCancellationRequested) { FinishShortcutTrace(trace, "replaced"); return; }
         finally { if (_profileRequestTicket == ticket) _profileRequestTicket = null; }
         trace.Observe(result);
-        if (ticket != _navigation || _closing) { FinishShortcutTrace(trace, "replaced"); return; }
+        if (ticket != _navigation || _closing || cancellation.IsCancellationRequested) { FinishShortcutTrace(trace, "replaced"); return; }
         if (result.S("state") == "waiting_for_reader")
         {
             PresentShortcutResult(result, item, profileId);
@@ -2604,10 +2656,10 @@ public sealed partial class MainWindow : Window
             try
             {
                 completed = await ConversationReadyWait.CompleteAsync(result,
-                    () => ticket == _navigation && _selectedProfile == profileId && !_closing,
+                    () => ticket == _navigation && _selectedProfile == profileId && !_closing && !cancellation.IsCancellationRequested,
                     async token =>
                     {
-                        var next = await Request("conversation.navigate", new { navigation_id = token });
+                        var next = await Request("conversation.navigate", new { navigation_id = token }, cancellation);
                         trace.Observe(next);
                         // The wait can move from the local runtime to an SSH task's connection.
                         if (next.S("state") == "waiting_for_reader" && ticket == _navigation && !_closing)
@@ -2617,13 +2669,13 @@ public sealed partial class MainWindow : Window
                         }
                         return next;
                     },
-                    () => Task.Delay(750));
+                    () => Task.Delay(750, cancellation));
             }
             // The ready wait of a replaced or abandoned open fails silently too.
             // Request does not log this untracked command, so it is logged here.
-            catch (Exception error) when (ticket != _navigation || _closing)
+            catch (Exception error) when (ticket != _navigation || _closing || cancellation.IsCancellationRequested)
             {
-                Log($"대화 이동 대기 정리 · {error.Message}");
+                Log($"대화 이동 대기 정리 · {(error is OperationCanceledException ? "새 클릭이 이어받음" : error.Message)}");
                 FinishShortcutTrace(trace, "replaced");
                 return;
             }
@@ -2637,7 +2689,7 @@ public sealed partial class MainWindow : Window
         action.Dispose();
         SetStatus(result.Message("대화 열기 요청을 보냈습니다."), result.S("state") == "blocked");
         if (result.S("state") != "request_sent") { FinishShortcutTrace(trace, result.S("state", "blocked"), result.S("reason")); return; }
-        _ = VerifyShortcutNavigationAsync(ticket, result, item, trace);
+        _ = VerifyShortcutNavigationAsync(ticket, result, item, trace, cancellation);
     }
     private static string FailureCode(Exception error) => error is ManagerException manager ? manager.Code : error.GetType().Name;
     // One structured record per click in the performance trace, and one line in the log.
