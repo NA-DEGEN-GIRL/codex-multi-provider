@@ -96,5 +96,7 @@ public sealed partial class MainWindow
             if (Current()) SetStatus("작업 화면 이동을 확인하지 못했습니다. 진행 중인 작업은 유지됩니다.", true);
             FinishShortcutTrace(trace, "unverified", FailureCode(error));
         }
+        // Nobody awaits this check: never leave its card showing progress.
+        catch (Exception error) { FinishShortcutTrace(trace, "unverified", FailureCode(error)); }
     }
 }
