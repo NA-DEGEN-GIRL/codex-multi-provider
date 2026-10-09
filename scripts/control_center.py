@@ -29,6 +29,10 @@ from manager_core.remote_updates import RemoteUpdates
 ROOT=Path(__file__).resolve().parents[1]
 INTERNAL_ERROR='관리 요청을 처리하지 못했습니다. 잠시 후 다시 시도해 주세요.'
 OPEN_COMMANDS=('conversation.open','conversation.continue','conversation.navigate')
+# The user stops, restarts or signs into a profile again: a task open still
+# waiting for it is dropped (it would otherwise relaunch an app that exits).
+ENDS_WAITING_OPENS=('profile.recover','profile.login','profile.remove','profile.restart',
+                    'profile.remote_restart','profile.remote_stop','profile.cleanup')
 
 
 class ControlCenter:
@@ -385,6 +389,9 @@ class ControlCenter:
 
     def dispatch(self,command,args,*,open_arrival=None):
         if not isinstance(args,dict):raise ValueError('명령 인수가 올바르지 않습니다.')
+        if command in ENDS_WAITING_OPENS and isinstance(args.get('profile_id'),str):
+            try:self.navigations.forget(identifier(args['profile_id']))
+            except ValueError:pass
         if command=='notes.refresh_forks':
             host=args['task'].get('host_id', 'local')
             if host.startswith(('ssh:', 'remote-ssh-discovered:')):

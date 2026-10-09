@@ -297,6 +297,74 @@ class ConversationOpenTests(unittest.TestCase):
         self.assertEqual((calls, len(self.launches)), ([], 1))
         self.center.instances.environment.assert_called_once()
 
+    def relaunch_fixture(self):
+        """Profile b's app exits while its open waits; show starts a new launch."""
+        token = self.warmup()
+        running = {'value': False}
+        self.center.instances.observe.side_effect = lambda p: {'status': 'running' if running['value'] else 'not_started'}
+        relaunches = []
+        def relaunch(profile_id, **options):
+            relaunches.append(options)
+            generation = str(uuid4())
+            self.store.mutate(lambda data: self.store.profile(profile_id, data).update(generation=generation, process_id=3000))
+            # The new launch's runtime is not ready yet.
+            atomic_json(self.status_path, {**self.ready_snapshot, 'generation': generation, 'initialized': False})
+            running['value'] = True
+            return dict(state='launched', profile=self.store.profile(profile_id))
+        self.center.instances.show.side_effect = relaunch
+        return token, running, relaunches
+
+    def test_app_exit_during_the_wait_relaunches_once_and_continues_the_same_task(self):
+        token, running, relaunches = self.relaunch_fixture()
+        waiting = self.navigate(token)
+        self.assertEqual((waiting['state'], waiting['reason']), ('waiting_for_reader', 'app_relaunching'), waiting)
+        self.assertEqual(relaunches, [dict(reopen_existing=False, wait_for_window=False)])
+        relaunched = self.store.profile(self.b['id'])
+        self.assertEqual((waiting['profile']['generation'], waiting['navigation_id']), (relaunched['generation'], token))
+        self.assertEqual(self.navigate(token)['reason'], 'runtime_starting')
+        self.assertFalse(self.launches)
+        atomic_json(self.status_path, {**self.ready_snapshot, 'generation': relaunched['generation']})
+        opened = self.navigate(token)
+        self.assertEqual(opened['state'], 'request_sent', opened)
+        self.assertEqual(opened['profile']['generation'], relaunched['generation'])
+        self.assertEqual(len(self.launches), 1)
+
+    def test_a_second_exit_or_a_failed_relaunch_ends_the_wait_without_a_link(self):
+        token, running, relaunches = self.relaunch_fixture()
+        self.assertEqual(self.navigate(token)['reason'], 'app_relaunching')
+        running['value'] = False
+        self.assertEqual(self.navigate(token)['reason'], 'profile_not_running')
+        self.assertEqual(len(relaunches), 1)
+        self.center.instances.observe.side_effect = lambda p: {'status': 'not_started'}
+        token = self.warmup_again()
+        self.center.instances.show.side_effect = RuntimeError('관리창을 닫는 중이므로 새 프로필 실행을 중지했습니다.')
+        failed = self.navigate(token)
+        self.assertEqual((failed['state'], failed['reason']), ('blocked', 'profile_relaunch_failed'))
+        self.assertNotIn('관리창을 닫는 중', failed['message'])
+        self.assertFalse(self.launches)
+
+    def warmup_again(self):
+        self.center.instances.observe.side_effect = lambda p: {'status': 'running'}
+        self.center.instances.show.side_effect = self.show
+        atomic_json(self.status_path, {**self.ready_snapshot, 'generation': self.store.profile(self.b['id'])['generation'],
+                                       'initialized': False})
+        result = self.open()
+        self.assertEqual(result['state'], 'waiting_for_reader')
+        self.center.instances.observe.side_effect = lambda p: {'status': 'not_started'}
+        return result['navigation_id']
+
+    def test_stopping_or_signing_into_a_profile_drops_its_waiting_open(self):
+        for command in ('profile.recover', 'profile.login', 'profile.restart'):
+            with self.subTest(command=command):
+                token = self.warmup()
+                self.center.navigations.forget(str(uuid4()))  # Another profile's: kept.
+                self.assertEqual(self.center.navigations.profile_of(token), self.b['id'])
+                with patch.object(self.center, 'restarts'), patch.object(self.center, 'native_login'), \
+                        patch('manager_core.profile_recovery.stop_profile', return_value={}):
+                    self.center.dispatch(command, dict(profile_id=self.b['id'], expected_generation='x'))
+                self.assertEqual(self.navigate(token)['reason'], 'navigation_expired')
+                self.assertFalse(self.launches)
+
     def test_moved_shortcut_rejects_captured_profile_before_any_open_or_handoff(self):
         expected = self.link['profile_id']
         self.store.shortcut_move(self.link['id'], self.a['id'])

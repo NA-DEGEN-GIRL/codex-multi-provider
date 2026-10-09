@@ -1639,6 +1639,9 @@ public sealed partial class MainWindow : Window
             ? $"{profile.S("alias")}의 기존 실행이 백그라운드에 남아 있습니다. 이 프로필을 종료한 뒤 전용 로그인 화면을 엽니다.\n\n이 프로필의 진행 중인 작업과 SSH 연결이 끊길 수 있고, 보내지 않은 입력은 사라질 수 있습니다. 저장된 대화와 다른 프로필은 유지됩니다.\n\n이 프로필의 작업을 마쳤다면 확인을 누르세요."
             : $"{profile.S("alias")} 프로필의 관리용 Codex를 종료하고 새 버전으로 다시 엽니다.\n이 창에서 실행 중인 작업은 중단되며, 보내지 않은 입력은 사라질 수 있습니다.\n\n작업을 정리했다면 확인을 누르세요. 원래 Codex와 다른 프로필은 유지됩니다.";
         if (!ConfirmProfileRestart(prompt, forLogin ? "이 프로필 다시 로그인" : "이 프로필 다시 열기")) return;
+        // A task open still checking its selection stops; the service drops
+        // its waits for this profile, so none relaunches the stopped app.
+        CancelShortcutOpens();
         var ticket = ++_navigation;
         _profileRequestTicket = ticket;
         _embedRequested = false;
@@ -2604,8 +2607,11 @@ public sealed partial class MainWindow : Window
         // refuses the click, before anything changes.
         var previous = _profileActions.Replace(profileId);
         // The card and the status line show this click's phase from now on.
+        var exitRetry = _exitRetryShortcut == id;
+        _exitRetryShortcut = null;
         var trace = new ShortcutOpenTrace(id, profileId, item.S("host_id", "local"),
-            Latest(profileId, _state.Arr("profiles").FirstOrDefault(p => p.S("id") == profileId)).S("status") == "running");
+            Latest(profileId, _state.Arr("profiles").FirstOrDefault(p => p.S("id") == profileId)).S("status") == "running")
+            { ExitRetry = exitRetry };
         // Latest click wins: every open still in flight (this account's or
         // another's) stops now instead of being waited for. A launch it started
         // continues in the service and this open joins it there.
@@ -2681,6 +2687,9 @@ public sealed partial class MainWindow : Window
                         if (next.S("state") == "waiting_for_reader" && ticket == _navigation && !_closing)
                         {
                             if (next.Message(waiting) != waiting) { waiting = next.Message(waiting); Log("대화 열기 대기 · " + waiting); }
+                            // The app was started once more after it exited, or its
+                            // window appeared: pin and attach that launch at once.
+                            if (LaunchChanged(profileId, next)) PresentShortcutResult(next, item, profileId);
                             ShowOpenProgress();
                         }
                         return next;
@@ -2708,6 +2717,18 @@ public sealed partial class MainWindow : Window
         _ = VerifyShortcutNavigationAsync(ticket, result, item, trace, cancellation);
     }
     private static string FailureCode(Exception error) => error is ManagerException manager ? manager.Code : error.GetType().Name;
+    // The service's answer names another launch of the profile than the one
+    // pinned (the app was started once more), or that launch's first window.
+    private bool LaunchChanged(string profileId, JsonElement result)
+    {
+        var returned = result.Get("profile");
+        if (returned.ValueKind != JsonValueKind.Object || returned.S("id") != profileId) return false;
+        var known = Latest(profileId, _state.Arr("profiles").FirstOrDefault(p => p.S("id") == profileId));
+        return !WindowLaunchIdentity.From(returned).Matches(known)
+            || (returned.N("window_handle") != 0 && returned.N("window_handle") != known.N("window_handle"));
+    }
+    // The shortcut whose next open repeats one whose app exited after its link.
+    private string? _exitRetryShortcut;
     // One structured record per click in the performance trace, and one line in the log.
     private void FinishShortcutTrace(ShortcutOpenTrace trace, string outcome, string? reason = null)
     {

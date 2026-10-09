@@ -56,6 +56,18 @@ public sealed partial class MainWindow
             {
                 var code = CancelCode();
                 Log("대화 이동 · 화면 선택 확인 취소 · " + CancelReason());
+                // The app exited after its link, before the task showed: open the
+                // same task once more (that open relaunches it); never twice.
+                if (code is "launch_changed" or "window_detached" && !trace.ExitRetry && !_closing
+                    && !cancellation.IsCancellationRequested && ticket == _navigation && _selectedProfile == expected.ProfileId
+                    && !NativeProcessMetrics.TryRead((int)expected.ProcessId, out _))
+                {
+                    FinishShortcutTrace(trace, "app_exited", code);
+                    Log("대화 이동 · Codex 앱이 종료되어 같은 작업을 한 번 다시 엽니다.");
+                    _exitRetryShortcut = item.S("id");
+                    await Safe(() => OpenShortcutAsync(item.S("id")));
+                    return;
+                }
                 FinishShortcutTrace(trace, code == "replaced" ? "replaced" : "cancelled", code);
                 return;
             }

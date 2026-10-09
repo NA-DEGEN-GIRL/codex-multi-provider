@@ -89,6 +89,37 @@ internal static class ShortcutNavigationSelfTest
         }
         finally { waitingWindow.Close(); }
 
+        // The app exits during the wait: the service starts it once more and the
+        // same open continues; the shell pins that launch at once and says so.
+        var relaunchedProfile = JsonSerializer.SerializeToElement(new { id = "profile", alias = "계정", status = "running", generation = "relaunched", process_id = 0 });
+        var replies = new Queue<JsonElement>(new[] {
+            JsonSerializer.SerializeToElement(new { state = "waiting_for_reader", reason = "app_relaunching", navigation_id = "opaque",
+                profile_id = "profile", profile = relaunchedProfile }),
+            JsonSerializer.SerializeToElement(new { state = "request_sent", profile_id = "profile", profile = relaunchedProfile }) });
+        string? pinnedDuringWait = null, statusDuringWait = null;
+        MainWindow relaunchWindow = null!;
+        relaunchWindow = new MainWindow(root, fixture: true, fixtureRequest: (command, _) =>
+        {
+            if (command == "conversation.navigate" && replies.Count == 1)
+            {
+                pinnedDuringWait = Field<WindowLaunchIdentity>(relaunchWindow, "_expectedWindowLaunch")?.Generation;
+                statusDuringWait = Field<TextBlock>(relaunchWindow, "_status").Text;
+            }
+            return Task.FromResult(command switch { "conversation.open" => waiting, "conversation.navigate" => replies.Dequeue(),
+                _ => throw new InvalidOperationException("Unexpected request: " + command) });
+        }) { FixtureRefreshesState = true };
+        try
+        {
+            relaunchWindow.UseFixture(state);
+            await Invoke(relaunchWindow, "OpenShortcutAsync", "shortcut").WaitAsync(TimeSpan.FromSeconds(5));
+            Require(pinnedDuringWait == "relaunched" && statusDuringWait?.StartsWith("앱 다시 시작 중", StringComparison.Ordinal) == true,
+                "The relaunched app was not pinned during the wait, or its phase was not shown: " + statusDuringWait);
+            Require(replies.Count == 0 && Field<Dictionary<string, JsonElement>>(relaunchWindow, "_shownProfiles")["profile"].S("generation") == "relaunched",
+                "The open did not continue to the same task in the relaunched app.");
+            checks.Add("An app relaunched during the wait is pinned at once, shown as '앱 다시 시작 중', and the same open continues.");
+        }
+        finally { relaunchWindow.Close(); }
+
         var wrong = JsonSerializer.SerializeToElement(new { state = "request_sent", profile_id = "other", profile = new { id = "other" } });
         var invalidWindow = new MainWindow(root, fixture: true, fixtureRequest: (_, _) => Task.FromResult(wrong));
         try

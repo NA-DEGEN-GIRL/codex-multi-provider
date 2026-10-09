@@ -17,6 +17,8 @@ internal sealed class ShortcutOpenTrace
     /// <summary>The SSH alias of the task's host, or "" for a local task.</summary>
     internal string Host { get; }
     internal bool ProfileRunning { get; }
+    /// <summary>This open repeats one whose app exited after its link (never repeated again).</summary>
+    internal bool ExitRetry { get; init; }
     internal string Phase { get; private set; } = "click";
     internal string? Outcome { get; private set; }
     internal bool Finished => Outcome is not null;

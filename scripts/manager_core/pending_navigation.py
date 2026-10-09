@@ -15,8 +15,11 @@ from .store import identifier
 class PendingNavigations:
     # An SSH task also waits for this launch's connection to its host, which
     # follows the local runtime (and may update a remote runtime first).
-    def __init__(self, center, *, clock=time.monotonic, timeout=45, remote_timeout=90):
+    # relaunch: an app that exits during the wait is started once more and the
+    # same task continues (_relaunch).
+    def __init__(self, center, *, clock=time.monotonic, timeout=45, remote_timeout=90, relaunch=True):
         self.center, self.clock, self.timeout, self.remote_timeout = center, clock, timeout, remote_timeout
+        self.relaunch = relaunch
         self.pending = {}
         # Opens of different profiles run concurrently (per-profile gates).
         self.lock = threading.Lock()
@@ -30,6 +33,12 @@ class PendingNavigations:
         with self.lock:
             plan = self.pending.get(key)
         return plan['profile']['id'] if plan else None
+
+    def forget(self, profile_id):
+        """Drop every wait for a profile the user stops, restarts or signs into
+        again: such a wait never resumes, so it can never relaunch that app."""
+        with self.lock:
+            self.pending = {k: v for k, v in self.pending.items() if v['profile']['id'] != profile_id}
 
     def _keep(self, token, plan):
         with self.lock:
@@ -95,21 +104,53 @@ class PendingNavigations:
                 return self._blocked('navigation_changed', '프로필 실행이나 바로가기가 변경되어 이전 대화 이동을 취소했습니다.')
             observed = self.center.instances.observe(current)
             if observed.get('status') != 'running':
-                return self._blocked('profile_not_running', 'Codex가 종료되어 대화 이동을 취소했습니다.')
-            # A cheap file read while warming; do not rebuild the environment or
-            # start another Electron process on each poll.
-            readiness = (self.transport.navigation_readiness(current)
-                         or self.transport.remote_navigation_readiness(current, plan['link']))
-            if readiness is not None:
-                result = self._describe({**readiness, 'profile_id': current['id']}, plan)
+                if plan.get('relaunched') or not self.relaunch:
+                    return self._blocked('profile_not_running', 'Codex가 종료되어 대화 이동을 취소했습니다.')
+                result = self._relaunch(plan)
             else:
-                plan['profile'] = {**current, **observed}
-                result = self._attempt(plan)
+                # A cheap file read while warming; do not rebuild the environment or
+                # start another Electron process on each poll.
+                readiness = (self.transport.navigation_readiness(current)
+                             or self.transport.remote_navigation_readiness(current, plan['link']))
+                if readiness is not None:
+                    # The same launch (lifetime checked above): its window, once
+                    # found, lets the shell attach before the next state poll.
+                    if observed.get('window_handle'):
+                        plan['profile'] = {**plan['profile'], 'window_handle': observed['window_handle']}
+                    result = self._describe({**readiness, 'profile_id': current['id']}, plan)
+                else:
+                    plan['profile'] = {**current, **observed}
+                    result = self._attempt(plan)
         if result.get('state') == 'waiting_for_reader':
             plan['waiting_reason'] = result.get('reason')
             self._keep(token, plan)
             result['navigation_id'] = token
         return result
+
+    def _relaunch(self, plan):
+        """The app this wait followed exited before its task link: start it once
+        more and keep waiting for the same task (inside the profile's launch
+        admission). Only a launch this wait started is followed; another
+        launch of the profile (a restart, an update) still cancels the wait.
+        """
+        profile_id = plan['profile']['id']
+        try:
+            shown = self.center.instances.show(profile_id, reopen_existing=False, wait_for_window=False)
+        except (RuntimeError, ValueError, OSError, KeyError, TypeError):
+            # Full exit in progress, maintenance, login or account problems:
+            # their own messages belong to an explicit open, not this wait.
+            return self._blocked('profile_relaunch_failed', 'Codex가 종료되어 한 번 다시 시작하려 했지만 시작하지 못했습니다. '
+                                 '대화 이동 요청은 보내지 않았습니다. 프로필을 다시 선택해 주세요.')
+        self.center.instances.finish_show_later(shown)
+        relaunched = shown.get('profile') or {}
+        if relaunched.get('id') != profile_id or not relaunched.get('generation'):
+            return self._blocked('profile_relaunch_failed', 'Codex를 다시 시작했지만 실행을 확인하지 못했습니다. 대화 이동 요청은 보내지 않았습니다.')
+        plan['profile'] = relaunched
+        plan['relaunched'] = True
+        remote = plan['link'].get('host_id', 'local') != 'local'
+        plan['expires'] = self.clock() + (self.remote_timeout if remote else self.timeout)
+        return self._describe(dict(state='waiting_for_reader', reason='app_relaunching', profile_id=profile_id,
+                                   message='Codex가 종료되어 한 번 다시 시작했습니다. 준비되면 선택한 작업으로 이동합니다.'), plan)
 
     def _attempt(self, plan):
         """Authorize from the record keys only; build the full launch environment
