@@ -105,6 +105,10 @@ class RemoteCatalog:
         if not isinstance(value, dict):
             raise ValueError('Invalid SSH catalog')
         discovered = value.get('discovered_sources', [])
+        # Catalog reads always run this release's helper (sent in BOOTSTRAP).
+        # 'llm_usage' now means it could not read the homes an older release
+        # enrolled from the retired llm-usage registry into the host's mixed
+        # catalog; cached frames may also carry it from that registry scan.
         discovery_errors = value.get('discovery_errors', [])
         if (not isinstance(discovered, list) or len(discovered) + len(sources) > 256
                 or not isinstance(discovery_errors, list)

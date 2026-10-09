@@ -32,7 +32,7 @@ class ClaudeProfilesTests(unittest.TestCase):
         self.assertFalse(profile.get('source_home'))
         self.assertFalse(profile.get('account_fingerprint'))
         with self.assertRaises(ValueError):
-            self.store.add_profile('invalid', source_home='private', claude_settings={})
+            self.store.add_profile('invalid', external_model_id='00000000-0000-4000-8000-000000000000', claude_settings={})
 
     def test_render_roundtrip_and_maximum_compaction(self):
         profile = dict(self.profile, claude_settings={**DEFAULTS, 'context_window': 200000, 'auto_compact_percent': 95})

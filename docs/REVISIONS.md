@@ -35,6 +35,18 @@
 
 ## 최근 수정
 
+### 수정 121 — llm-usage 연동 정리
+
+- 쓰지 않는 llm-usage 연동이 계속 돌았다. 상태 조회가 30초마다 계정 동기화를 했고, SSH 목록 읽기가 호스트마다 계정 레지스트리를 확인했다.
+  둘 다 없앴다. `profile.bind`·`accounts.list` 명령을 지웠고, ↻(`accounts.refresh`)는 Windows 로그인 프로필만 확인한다.
+- 기존 상태는 다시 쓰지 않는다. 가져온 프로필의 home·기록·이름·`usage:` source와 예전 필드는 그대로 남는다.
+  SSH 호스트의 `catalog-mixed-sources.json`에 이미 등록된 home은 폴더가 있는 동안 유지된다.
+- 수정 121 이전에 준비한 SSH helper는 다시 준비할 때까지 시작마다 레지스트리를 읽는다. 레지스트리를 읽지 못하면 시작이 실패한다.
+  호스트에서는 `~/.config/llm-usage`를 통째로 지우거나 먼저 다시 준비한다.
+- 새 릴리스를 활성화하기 전에는 llm-usage 체크아웃과 `%LOCALAPPDATA%\llm-usage`를 지우지 않는다.
+  사용자의 Claude Code `statusLine`도 아직 llm-usage를 실행한다.
+- [없앤 것·남긴 호환 경로·정리 순서](design/llm-usage-removal-121.md).
+
 ### 수정 120 — 런타임 시작 실패 자동 재시도, 시작 실패 뒤 오류창 정리
 
 - 프로필 여러 개가 한꺼번에 시작할 때 커밋 메모리가 한도에 가까우면 런타임이 DLL 초기화 단계에서 `0xC0000142`로 끝났다.
@@ -288,6 +300,8 @@
   커밋하지 않습니다.
 - 사용 설정 선택지(사용자 결정): Fast 등급 범위, 자동 압축 기준, 쓰지 않는 플러그인·MCP 정리.
 - 수정 97의 나머지: 원격 서버의 쓰지 않는 런타임 자동 정리(현재 바인딩과 실행 중 프로세스 기준).
+- 수정 121의 나머지(런타임 작업): 런타임 패치 문서의 "llm-usage metadata" SSH 검색 문장을 "기본 `~/.codex`와
+  이미 등록된 home"으로 고치고 패치와 `patches/runtime-source.json`을 다시 만든다.
 
 ## 전체 목록
 
@@ -371,3 +385,4 @@
 | 118 | [remote-exit-hang-118](design/remote-exit-hang-118.md) | 원격 Codex 종료 멈춤(sqlx 정리 작업), 완전 종료 대기 선택지, 서버 64스레드 제한·Windows 교차 빌드 |
 | 119 | [stability-perf-119](design/stability-perf-119.md), [ssh-worktree-project-grouping-96](design/ssh-worktree-project-grouping-96.md) | Claude·SSH 버그, 관리창 속도, 재발 방지 장치 |
 | 120 | [runtime-start-retry-120](design/runtime-start-retry-120.md) | 런타임 시작 실패 재시도, 시작 실패 뒤 오류창, 콘솔 공유 |
+| 121 | [llm-usage-removal-121](design/llm-usage-removal-121.md) | llm-usage 계정 동기화·명령·SSH 레지스트리 검색 제거, 기존 프로필·SSH home 호환 |

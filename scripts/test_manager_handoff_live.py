@@ -20,7 +20,6 @@ from uuid import uuid4
 
 from live_test import collect_routes
 from manager_core import authority, record_catalog
-from manager_core.accounts import Accounts
 from manager_core.catalog import list_catalog
 from manager_core.handoff import HandoffManager
 from manager_core.managed_sources import mark, manifest
@@ -118,10 +117,9 @@ def record_snapshot(home):
 
 
 def prepare_profile(store, account, fingerprint, registry, model_id, *, viewer=False):
-    # Deliberately omit source_home from add_profile: it would register the real
-    # account's existing conversation store. This fixture catalogs only new homes.
-    profile = store.add_profile('test-' + account['alias'] + ('-viewer' if viewer else ''),
-                                None if viewer else account['id'])
+    # source_home is set below without registering a source: the real account's
+    # existing conversation store stays out. This fixture catalogs only new homes.
+    profile = store.add_profile('test-' + account['alias'] + ('-viewer' if viewer else ''))
     home = Path(profile['home'])
     home.mkdir(parents=True)
     config = ('model = "gpt-6-astra"\nmodel_reasoning_effort = "low"\n'
@@ -259,7 +257,7 @@ def run(root=ROOT, candidate_manifest=None):
     parent_id = child_id = peer_id = None
     source_home = None
     try:
-        available = Accounts(root).list()
+        available = []
         windows_profiles = [p for p in Store(root).read()['profiles'] if p.get('auth_mode')=='native' and not p.get('view_only') and not p.get('removed_at')]
         for alias in ALLOWED_ALIASES:
             native = [p for p in windows_profiles if p['alias']==alias]
@@ -267,7 +265,6 @@ def run(root=ROOT, candidate_manifest=None):
                 if len(native)!=1 or native[0].get('login_state')!='signed_in':
                     raise RuntimeError('The Windows test account must have one verified direct login.')
                 profile=native[0]
-                available=[a for a in available if a['alias']!=alias]
                 available.append(dict(id=profile['id'],alias=alias,home=profile['home'],
                                       expected_fingerprint=profile['account_fingerprint'],auth_source='windows_native'))
         accounts = select_accounts(available)

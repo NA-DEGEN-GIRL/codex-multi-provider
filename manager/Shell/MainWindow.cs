@@ -2348,15 +2348,6 @@ public sealed partial class MainWindow : Window
         var result = await Request("profile.restore", new { profile_id = choice.Id });
         await RefreshAsync(); SetStatus(result.Message());
     }
-    private async Task BindAccountAsync()
-    {
-        var id = _contextProfile ?? RequireProfile(); var data = await Request("accounts.refresh");
-        var accounts = data.Arr("entries").Concat(data.Arr("accounts")).Concat(data.Arr("profiles")).ToArray();
-        if (accounts.Length == 0 && data.ValueKind == JsonValueKind.Array) accounts = data.Items().ToArray();
-        var choice = Dialogs.Select(this, "llm-usage 계정 연결", "이 프로필에 사용할 계정 별칭을 선택하세요.", accounts.Select(a => new Choice(a.S("id", a.S("account_id")), a.S("alias", a.S("name", "이름 없음")), a)));
-        if (choice is null) return;
-        var result = await Request("profile.bind", new { profile_id = id, usage_account_id = choice.Id }); await RefreshAsync(); SetStatus(result.Message("계정 별칭을 연결했습니다."));
-    }
     private Task PrepareProfileAsync() => PrepareProfileAsync(RequireProfile());
     private async Task PrepareProfileAsync(string id) { var result = await Request("profile.prepare", new { profile_id = id }); await RefreshAsync(); SetStatus(result.Message()); }
     private async Task RefreshAccountsAsync() { var result = await Request("accounts.refresh"); await RefreshAsync(); SetStatus(result.Message("계정과 사용량을 새로 확인했습니다.")); }

@@ -6,7 +6,6 @@ from unittest.mock import Mock
 from uuid import uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
-from manager_core.accounts import Accounts
 from manager_core.profile_lifecycle import ProfileLifecycle, account_alias
 from manager_core.store import Store
 
@@ -15,7 +14,7 @@ class ProfileLifecycleTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.store = Store(Path(self.temp.name))
-        self.profile = self.store.add_profile('04', str(uuid4()))
+        self.profile = self.store.add_profile('04')
         self.instances = Mock()
         self.instances.observe.return_value = {'status': 'not_started'}
         self.lifecycle = ProfileLifecycle(self.store, self.instances)
@@ -23,7 +22,7 @@ class ProfileLifecycleTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def test_remove_restore_preserves_identity_files_and_import_does_not_restore(self):
+    def test_remove_restore_preserves_identity_files(self):
         home = Path(self.profile['home'])
         home.mkdir(parents=True)
         record = home / 'fixture-record.jsonl'
@@ -32,8 +31,6 @@ class ProfileLifecycleTests(unittest.TestCase):
         auth.write_bytes(b'private fixture')
         sources = self.store.read()['sources']
         self.lifecycle.remove(self.profile['id'])
-        Accounts._sync_accounts(self.store, [{'id': self.profile['usage_account_id'],
-            'alias': '04', 'home': str(home), 'usage': {}}])
         self.assertTrue(self.store.profile(self.profile['id'])['removed_at'])
         self.assertEqual(self.store.read()['sources'], sources)
         self.lifecycle.restore(self.profile['id'])

@@ -8,7 +8,6 @@ import threading
 import time
 
 from manager_core.store import Store, identifier, json_copy, label, now
-from manager_core.accounts import Accounts
 from manager_core.catalog import list_catalog, sort_conversations
 from manager_core.catalog_pages import page as catalog_page, legacy_view as catalog_legacy_view
 from manager_core.remote_catalog import RemoteCatalog
@@ -47,7 +46,6 @@ class ControlCenter:
         self.root=Path(root).resolve(); self.store=Store(self.root)
         self.supervisor_protocol=supervisor_protocol
         self.providers=ProviderRegistry(self.root)
-        self.accounts=Accounts(self.root)
         # The standalone login helper has no window host. Only the desktop
         # supervisor may request hidden startup for later in-manager attachment.
         self.instances=Instances(self.root,self.store,self.providers,
@@ -79,7 +77,6 @@ class ControlCenter:
         from manager_core.claude_usage import ClaudeUsage
         self.claude_usage=ClaudeUsage(self.root,self.store)
         self.profile_lifecycle=ProfileLifecycle(self.store,self.instances)
-        self._sync_at=0
         self._due_at={}
         self._mutex=threading.RLock()
         self._request_gates={}
@@ -221,10 +218,6 @@ class ControlCenter:
 
     def state(self):
         notices=[]
-        if time.monotonic()-self._sync_at>30:
-            try:self.accounts.sync(self.store)
-            except (ValueError,RuntimeError,OSError):notices.append('llm-usage 연결을 확인하지 못했습니다. 등록된 프로필은 유지합니다.')
-            self._sync_at=time.monotonic()
         state=self.store.read()
         if not self._remote_reconcile_started:
             self._remote_reconcile_started = True
@@ -310,7 +303,7 @@ class ControlCenter:
                 p['status_message'] = '현재 앱 로그인 연결 · 별도 작업 창'
                 p['account_verification'] = p.get('login_state', 'credential_saved')
             elif p.get('usage_account_id') and p['account_verification']!='verified':
-                p['status_message']='연결 계정 확인 대기' if p['status']=='running' else 'llm-usage 계정 연결'
+                p['status_message']='연결 계정 확인 대기' if p['status']=='running' else '기존 연결 계정'
         state['updates']=self.update_jobs.status()
         self.usage_refresh.schedule(profiles=saved_profiles)
         self.claude_usage.schedule(profiles=saved_profiles)
@@ -446,13 +439,10 @@ class ControlCenter:
         if command=='manager.recover_legacy':return self.startup_updates.recover_legacy(
             args.get('profiles'), interrupt_running_work=args.get('interrupt_running_work') is True)
         if command=='accounts.refresh':
-            result=self.accounts.refresh_live(self.store)
-            if any(p.get('auth_mode') in ('native', 'source') for p in self.store.read()['profiles']):
-                native=self.native_login.refresh_all()
-                result['native_accounts']=native
-                result['message']=f"Windows 로그인 계정 {native['accounts']}개 중 {native['refreshed']}개의 최신 사용량을 확인했습니다."
-            self._sync_at=time.monotonic();return result
-        if command=='accounts.list':return dict(accounts=self.accounts.list())
+            native=self.native_login.refresh_all()
+            message=(f"Windows 로그인 계정 {native['accounts']}개 중 {native['refreshed']}개의 최신 사용량을 확인했습니다."
+                     if native['accounts'] else '새로 확인할 Windows 로그인 계정이 없습니다.')
+            return {**native,'message':message}
         if command=='profile.email':
             from manager_core.profile_email import read
             return read(self.store, args['profile_id'], reveal=args.get('reveal') is True)
@@ -556,7 +546,6 @@ class ControlCenter:
         if command=='profile.rename':
             def rename(data):
                 p=self.store.profile(args['profile_id'],data)
-                if p.get('usage_account_id') and p.get('alias_authority')!='manager':raise ValueError('llm-usage에 연결한 별칭은 llm-usage에서 변경하세요.')
                 p['alias']=account_alias(args['alias'],data['profiles'],excluding=p['id'])
                 for source in data['sources']:
                     if source['id']=='manager:'+p['id']:source['alias']=p['alias']
@@ -564,19 +553,6 @@ class ControlCenter:
             updated=self.store.mutate(rename)
             updated['message']='프로필 별칭을 변경했습니다.'
             return updated
-        if command=='profile.bind':
-            uid=identifier(args['usage_account_id'])
-            account=next((a for a in self.accounts.list() if a['id']==uid),None)
-            if not account:raise ValueError('llm-usage 계정을 찾을 수 없습니다.')
-            def bind(data):
-                p=self.store.profile(args['profile_id'],data)
-                if p.get('auth_mode')=='native':raise ValueError('직접 로그인한 계정은 별칭만으로 기존 계정에 연결하지 않습니다.')
-                if self.instances.observe(p)['status']=='running':raise ValueError('실행 중에는 연결 계정을 변경할 수 없습니다.')
-                if any(x['id']!=p['id'] and x.get('usage_account_id')==uid for x in data['profiles']):
-                    raise ValueError('이미 연결된 계정입니다. 해당 프로필을 선택하세요.')
-                p.update(usage_account_id=uid,alias=account['alias'],source_home=account['home'],account_missing=False)
-                Store._source(data,account['home'],'usage:'+uid,account['alias']);return p
-            return self.store.mutate(bind)
         if command=='profile.prepare':return self.instances.prepare(self.store.profile(args['profile_id']))
         if command=='profile.show':
             profile=self.store.profile(args['profile_id'])
@@ -670,17 +646,23 @@ class ControlCenter:
             catalog=self.current_catalog_refresh(built).ensure(self.store.read()['sources'],include_paginated=built.get('paginated_record_catalog',False))
             from uuid import uuid5,UUID
             vid=str(uuid5(UUID(parent_id),'codex-control-center-record-viewer-v1'))
+            # A directly signed-in parent authenticates from its own home. An
+            # imported-account home it still lists is no longer a credential source.
+            viewer_source=parent['home'] if parent.get('auth_mode')=='native' else (parent.get('source_home') or parent['home'])
             def viewer(data):
                 profile=next((p for p in data['profiles'] if p['id']==vid),None)
                 if profile is None:
                     directory=self.store.directory/'profiles'/vid
                     profile=dict(id=vid,alias='전체 기록 · '+parent['alias'],usage_account_id=None,
                                  home=str(directory/'codex'),ui_home=str(directory/'ui'),
-                                 status='not_started',process_id=None,source_home=parent.get('source_home') or parent['home'],
+                                 status='not_started',process_id=None,source_home=viewer_source,
                                  policy=dict(enabled=False,model_ids=[],desired_revision=0,effective_revision=None),
                                  view_only=True,representative_profile_id=parent_id,record_catalog_path=catalog['path'])
                     data['profiles'].append(profile)
                 profile['alias']='전체 기록 · '+parent['alias']
+                # A viewer created by an older release may still name the
+                # parent's imported-account home as its credential source.
+                profile['source_home']=viewer_source
                 if parent.get('account_fingerprint'):
                     profile['account_fingerprint']=parent['account_fingerprint']
                 profile['catalog_status']={k:v for k,v in catalog.items() if k not in ('mapping','path')}

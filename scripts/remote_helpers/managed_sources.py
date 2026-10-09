@@ -134,7 +134,11 @@ def _generate(profile, *, atomic, shared_catalog, legacy_discovery):
         else:
             from catalog_legacy import discover
         known = [dict(id=s['sourceStoreId'], home=s['codexHome']) for s in sources]
-        discovery = discover(Path.home(), known)
+        # Carry forward the homes the current descriptor already lists. A
+        # helper installed by an older release may still add homes from the
+        # retired account registry; this start must not remove them again.
+        discovery = discover(Path.home(), known,
+                             enrolled_catalog=profile.parent.parent / 'catalog-mixed-sources.json')
         if discovery['errors']:
             raise ValueError('legacy source discovery unavailable; previous catalog preserved')
         legacy = [dict(hostId='local', sourceStoreId=s['id'], codexHome=s['home'])

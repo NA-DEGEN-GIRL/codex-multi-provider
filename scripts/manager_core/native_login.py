@@ -100,6 +100,9 @@ class NativeLogin:
                 item.pop('login_verified_at',None)
             if item.get('runtime_channel')=='managed' or item.get('desired_runtime_channel')=='managed':
                 item['post_login_runtime_channel']='managed'
+            # alias_authority is a legacy field nothing here reads. It stays for
+            # a rollback: releases before revision 121 refuse to rename a profile
+            # that has a usage_account_id unless this field says 'manager'.
             item.update(auth_mode='native',alias_authority='manager',runtime_channel=channel,
                         desired_runtime_channel=channel,native_login_pending=(channel=='managed'),
                         account_missing=False,login_prepared_at=now())

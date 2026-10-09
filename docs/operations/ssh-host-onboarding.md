@@ -75,10 +75,27 @@ profile codex_workspace_bwrap "/home/USER/.local/share/codex-control-center/runt
 
 ## 세션 복원과 검증 범위
 
-`catalog_legacy.discover()`는 `$HOME/.codex` 및 지원하는 `llm-usage` 레지스트리의 Codex home을
-검색합니다. 관리 프로필들은 별도의 공통 source 목록으로 검색합니다. 기본 home 디렉터리는
-관리 런타임을 시작하기 전에 만들어 두면 빈 상태에서도 목록에 포함할 수 있습니다.
+`catalog_legacy.discover()`는 기본 Codex home인 `$HOME/.codex`를 검색하고, 호스트의
+`~/.local/share/codex-control-center/catalog-mixed-sources.json`에 이미 등록된 기존 home을 폴더가
+남아 있는 동안 유지합니다. 계정 레지스트리는 읽지 않습니다. 관리 프로필들은 별도의 공통 source 목록으로
+검색합니다. 기본 home 디렉터리는 관리 런타임을 시작하기 전에 만들어 두면 빈 상태에서도 목록에 포함할 수 있습니다.
 다른 임의 경로의 백업을 자동으로 찾아내는 기능은 아닙니다.
+
+수정 121 이전 릴리스는 `~/.config/llm-usage/config.json`에 있는 Codex home도 같은 파일에 등록했습니다.
+
+- SSH 대화 목록은 항상 현재 릴리스의 helper로 읽습니다. 관리 앱이 `llm_usage` 발견 오류를 허용하는 이유는
+  두 가지입니다. 이미 저장된 SSH 목록 캐시에 그 코드가 남아 있을 수 있고, 현재 helper는 위 파일의 기존 등록을
+  읽지 못할 때 그 코드를 보고합니다.
+- 프로필마다 준비 때 설치된 `helpers/<digest>`의 helper는 SSH 관리 프로필을 시작할 때마다 실행됩니다.
+  수정 121 이전에 설치된 helper는 시작할 때마다 이 레지스트리를 계속 읽습니다. helper 해시는 설정 지문에
+  들어가지 않으므로, 일반 사용만으로는 바뀌지 않습니다. 직접 다시 준비하거나 설정·런타임 변경으로 준비가
+  다시 실행될 때만 바뀝니다.
+- 그 helper는 레지스트리를 읽지 못하면 이전 목록을 보존하려고 시작을 실패시킵니다
+  (`legacy source discovery unavailable`). 호스트에서 llm-usage를 정리할 때는 `~/.config/llm-usage` 폴더를
+  통째로 지우거나(파일이 없으면 정상입니다) 그 호스트의 SSH 바인딩을 먼저 다시 준비하세요. 파일을 비우거나
+  편집하지 마세요.
+- 위 파일이 손상되면 수정 121 이후 helper도 같은 이유로 시작을 거부합니다. 이때는 그 파일만 지우면
+  다음 시작이 기본 home과 관리 프로필로 다시 만듭니다.
 
 일반 CLI 기록은 원래 `sessions/`, `archived_sessions/`의 구조와 관련 인덱스를 보존해 복원합니다.
 SQLite 파일은 해당 기록의 작성 프로세스를 중단하거나 일관된 백업을 만들어 옮깁니다.

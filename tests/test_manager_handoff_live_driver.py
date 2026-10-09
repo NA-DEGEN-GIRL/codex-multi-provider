@@ -39,7 +39,7 @@ class DriverPreparationTests(unittest.TestCase):
         with (contextlib.redirect_stdout(output),
               patch.object(driver, 'run', side_effect=AssertionError('must not execute')),
               patch.object(driver, 'checked_release', side_effect=AssertionError('no preflight side effects')),
-              patch.object(driver.Accounts, 'list', side_effect=AssertionError('no account reads'))):
+              patch.object(driver, 'Store', side_effect=AssertionError('no account reads'))):
             self.assertEqual(driver.main([]), 0)
         result = json.loads(output.getvalue())
         self.assertEqual(result['status'], 'NOT_RUN')

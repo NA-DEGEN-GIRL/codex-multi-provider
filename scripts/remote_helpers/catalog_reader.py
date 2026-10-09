@@ -58,7 +58,7 @@ def host_identity():
     return hashlib.sha256((machine + '\\0' + str(os.getuid()) + '\\0' + str(Path.home())).encode()).hexdigest()
 
 
-def read(request, *, user_home=None, identity=None, environ=None):
+def read(request, *, user_home=None, identity=None):
     user_home = Path(user_home) if user_home is not None else Path.home()
     if request['host_identity'] != (identity if identity is not None else host_identity()):
         raise ValueError('SSH host identity changed')
@@ -78,7 +78,7 @@ def read(request, *, user_home=None, identity=None, environ=None):
             or not all(isinstance(item, str) for item in known)):
         raise ValueError('Invalid fork inventory')
     known = set(known)
-    legacy = discover(user_home, sources, environ=environ) if request.get('discover_legacy') is True else dict(sources=[], errors=[])
+    legacy = discover(user_home, sources) if request.get('discover_legacy') is True else dict(sources=[], errors=[])
     all_sources = [*sources, *legacy['sources']]
     homes, roots = origins(all_sources)
     rows, errors, rollouts = [], [], {}

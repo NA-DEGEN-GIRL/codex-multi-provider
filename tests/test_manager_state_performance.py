@@ -83,14 +83,16 @@ class StoreNoChangeTests(unittest.TestCase):
         self.store.mutate(lambda data: data.update(marker=True))
         self.assertEqual(self.store.read()['revision'], revision + 1)
 
-    def test_existing_usage_account_is_returned_without_a_rewrite(self):
-        account = str(uuid4())
-        added = self.store.add_profile('usage', account, str(self.store.root / 'source'))
-        before, revision = self.store.path.read_bytes(), self.store.read()['revision']
-        again = self.store.add_profile('renamed elsewhere', account, str(self.store.root / 'source'))
-        self.assertEqual(again, added)
+    def test_new_profiles_get_no_imported_account_fields_or_sources(self):
+        before = self.store.path.read_bytes()
+        with self.assertRaises(TypeError):
+            self.store.add_profile('usage', str(uuid4()), str(self.store.root / 'source'))
         self.assertEqual(self.store.path.read_bytes(), before)
-        self.assertEqual(self.store.read()['revision'], revision)
+        added = self.store.add_profile('plain')
+        self.assertIsNone(added['usage_account_id'])
+        self.assertIsNone(added['source_home'])
+        self.assertEqual({s['id'] for s in self.store.read()['sources']},
+                         {'manager:' + self.profile['id'], 'manager:' + added['id']})
 
 
 class StoreReadCacheTests(unittest.TestCase):
@@ -214,10 +216,8 @@ class StatePollTests(unittest.TestCase):
             data['remote_updates'] = {self.one['id'] + ':fixture-a': dict(profile_id=self.one['id'],
                 alias='fixture-a', checking=False, job=None, stock={}, managed={}, _target=None)}
         self.store.mutate(seed)
-        with patch('manager_core.accounts.Accounts.list', return_value=[]):
-            self.center = ControlCenter(self.root)
+        self.center = ControlCenter(self.root)
         self.center._remote_reconcile_started = True
-        self.center._sync_at = time.monotonic()
         self.center.remote.list_hosts = Mock(return_value=[])
         self.center.usage_refresh.schedule = Mock()
         forks = patch('manager_core.note_forks.refresh')
@@ -304,22 +304,13 @@ class StatePollTests(unittest.TestCase):
         self.assertTrue(resolved)
         self.assertFalse(homes & set(resolved))
 
-    def test_periodic_account_sync_without_changes_never_rewrites_state(self):
+    def test_repeated_polls_never_rewrite_the_store_or_raise_notices(self):
         before = self.store.path.read_bytes()
-        self.center._sync_at = 0
-        with patch('manager_core.accounts.Accounts.list', return_value=[]), \
-                patch('manager_core.store.atomic_json', side_effect=AssertionError('rewrote unchanged store')):
-            result = self.center.state()
-        self.assertEqual(result['notices'], [])
+        with patch('manager_core.store.atomic_json', side_effect=AssertionError('rewrote unchanged store')):
+            for _ in range(3):
+                result = self.center.state()
+                self.assertEqual(result['notices'], [])
         self.assertEqual(self.store.path.read_bytes(), before)
-        self.assertGreater(self.center._sync_at, 0)
-
-    def test_account_sync_failure_still_reports_the_notice(self):
-        self.center._sync_at = 0
-        with patch.object(self.center.accounts, 'sync', side_effect=RuntimeError('llm-usage missing')):
-            result = self.center.state()
-        self.assertEqual(result['notices'], ['llm-usage 연결을 확인하지 못했습니다. 등록된 프로필은 유지합니다.'])
-        self.assertGreater(self.center._sync_at, 0)
 
 
 class SharedStateTests(unittest.TestCase):

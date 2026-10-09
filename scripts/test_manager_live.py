@@ -1,7 +1,7 @@
 """Headless, isolated end-to-end test of the shipped native manager bootstrap.
 
 Never opens or closes desktop windows. Uses a fresh unlisted manager profile,
-registered account access-token binding, and the generic provider registry.
+a directly signed-in Windows profile's access-token binding, and the generic provider registry.
 """
 from __future__ import annotations
 
@@ -19,8 +19,8 @@ import time
 from uuid import UUID, uuid4
 
 from live_test import Client, collect_routes
-from manager_core.accounts import Accounts
 from manager_core.providers import ProviderRegistry
+from manager_core.store import Store
 from progress import Progress
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -410,10 +410,12 @@ def main(arguments=None):
     progress = Progress(output, home)
     client = None
     try:
-        accounts = [a for a in Accounts(ROOT).list() if a['alias'] == args.account]
+        accounts = [p for p in Store(ROOT).read()['profiles'] if p.get('auth_mode') == 'native'
+                    and p.get('alias') == args.account and not p.get('removed_at') and not p.get('view_only')
+                    and p.get('login_state') == 'signed_in']
         if len(accounts) != 1:
-            raise RuntimeError('Requested registered account alias is missing or ambiguous.')
-        account = accounts[0]
+            raise RuntimeError('Requested Windows account alias is missing, ambiguous or not signed in.')
+        account = {'home': accounts[0]['home'], 'alias': accounts[0]['alias']}
         registry = ProviderRegistry(ROOT)
         matches = [m for m in registry.list()['models'] if m['wire_model_id'] == 'deepseek-flash']
         if len(matches) != 1:

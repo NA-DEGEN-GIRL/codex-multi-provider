@@ -17,7 +17,6 @@ import threading
 import time
 from uuid import uuid4
 
-from manager_core.accounts import Accounts
 from manager_core.providers import ProviderRegistry
 from manager_core.proxy_auth import account_fingerprint, read_existing_tokens
 from manager_core.remote import RemoteManager
@@ -202,17 +201,19 @@ def main(arguments=None):
         started_at=time.strftime('%Y-%m-%dT%H:%M:%S%z'), status='RUNNING', checks={})
     client, remote, workspace = None, None, None
     try:
-        if args.windows_profile_id:
-            profile = Store(ROOT).profile(args.windows_profile_id)
-            if profile.get('auth_mode') != 'native' or profile.get('login_state') != 'signed_in':
-                raise RuntimeError('The selected Windows profile has not completed direct login verification.')
-            account = {'home': profile['home'], 'alias': profile['alias']}
-            report.update(account_alias=profile['alias'], windows_profile_id=profile['id'], auth_source='windows_native')
-        else:
-            accounts = [a for a in Accounts(ROOT).list() if a['alias'] == args.account]
-            if len(accounts) != 1:
-                raise RuntimeError('Requested registered account alias is missing or ambiguous.')
-            account = accounts[0]
+        if not args.windows_profile_id:
+            # Only a directly signed-in Windows profile with this alias is used.
+            matches = [p for p in Store(ROOT).read()['profiles'] if p.get('auth_mode') == 'native'
+                       and p.get('alias') == args.account and not p.get('removed_at') and not p.get('view_only')
+                       and p.get('login_state') == 'signed_in']
+            if len(matches) != 1:
+                raise RuntimeError('Requested Windows account alias is missing or ambiguous. Use --windows-profile-id.')
+            args.windows_profile_id = matches[0]['id']
+        profile = Store(ROOT).profile(args.windows_profile_id)
+        if profile.get('auth_mode') != 'native' or profile.get('login_state') != 'signed_in':
+            raise RuntimeError('The selected Windows profile has not completed direct login verification.')
+        account = {'home': profile['home'], 'alias': profile['alias']}
+        report.update(account_alias=profile['alias'], windows_profile_id=profile['id'], auth_source='windows_native')
         tokens = read_existing_tokens(account['home'])
         expected_fingerprint = account_fingerprint(tokens.account_id)
         if args.windows_profile_id and expected_fingerprint != profile.get('account_fingerprint'):

@@ -199,39 +199,37 @@ class Store:
             atomic_json(self.path, data)
             return deepcopy(result)
 
-    def add_profile(self, alias, usage_account_id=None, source_home=None, *, external_model_id=None, external_settings=None, claude_settings=None):
+    def add_profile(self, alias, *, external_model_id=None, external_settings=None, claude_settings=None):
+        """Create a manager-owned profile. Imported-account fields stay unset.
+
+        Profiles imported before revision 121 keep their saved
+        usage_account_id/source_home and 'usage:' source; nothing creates new ones.
+        """
         alias = label(alias)
         if claude_settings is not None:
-            if usage_account_id or source_home or external_model_id:
+            if external_model_id:
                 raise ValueError('Claude 로그인은 다른 계정 인증과 함께 등록할 수 없습니다.')
             from .claude_profiles import settings as validate_claude_settings
             claude_settings = validate_claude_settings(claude_settings)
-        if usage_account_id:
-            usage_account_id = identifier(usage_account_id)
         def add(data):
-            if usage_account_id and any(p.get('usage_account_id') == usage_account_id for p in data['profiles']):
-                # Periodic llm-usage sync re-adds every account; a known one is a no-op.
-                return Unchanged(next(p for p in data['profiles'] if p.get('usage_account_id') == usage_account_id))
             pid = str(uuid4())
             directory = self.directory / 'profiles' / pid
-            profile = dict(id=pid, alias=alias, usage_account_id=usage_account_id,
+            profile = dict(id=pid, alias=alias, usage_account_id=None,
                            home=str(directory/'codex'), ui_home=str(directory/'ui'),
-                           source_home=source_home, status='not_started', process_id=None,
+                           source_home=None, status='not_started', process_id=None,
                            policy=dict(enabled=False, model_ids=[], desired_revision=0, effective_revision=None),
                            created_at=now())
             if external_model_id:
                 profile.update(auth_mode='external', profile_kind='external', runtime_channel='managed',
-                               external_model_id=identifier(external_model_id), external_settings=deepcopy(external_settings or {}), alias_authority='manager')
+                               external_model_id=identifier(external_model_id), external_settings=deepcopy(external_settings or {}))
             if claude_settings is not None:
                 profile.update(auth_mode='claude_code', profile_kind='claude_code', runtime_channel='managed',
-                               claude_settings=deepcopy(claude_settings), alias_authority='manager',
+                               claude_settings=deepcopy(claude_settings),
                                claude_status=dict(logged_in=False, state='login_needed'))
             data['profiles'].append(profile)
             if not data['representative_profile_id']:
                 data['representative_profile_id'] = pid
             self._source(data, directory/'codex', 'manager:'+pid, alias)
-            if source_home:
-                self._source(data, source_home, 'usage:'+usage_account_id, alias)
             return profile
         return self.mutate(add)
 
