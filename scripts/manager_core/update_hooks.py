@@ -90,6 +90,10 @@ def _cim_birth(ticks):
     return timestamp.strftime("%Y-%m-%dT%H:%M:%S") + f".{fraction // 10:06d}0Z"
 
 
+def _remote_alias(record):
+    return record.get('alias') or (record.get('binding') or {}).get('alias')
+
+
 def _same_process(first, second):
     return bool(first and second
                 and first.get("process_id") == second.get("process_id")
@@ -517,37 +521,56 @@ class UpdateHooks:
                     or coverage.get('generation') != entry['generation']
                     or set(coverage.get('hosts', [])[1:]) != {r.get('alias') for r in records}):
                 return False
+        lifecycle = lease.get('graceful_drain') or lease.get('force_runtime_update')
+        # Stopped hosts pinned to an older runtime bundle are prepared on the
+        # offered one before they can start again; every other host keeps the
+        # reuse decision below, so no running process is stopped for this.
+        refresh = [] if lifecycle else self._bundle_refresh(lease, records, current)
+        kept = [record for record in records if _remote_alias(record) not in refresh]
         reusable = getattr(self.remote_maintenance, 'reuse_unchanged', None)
-        reused = (not lease.get('graceful_drain') and not lease.get('force_runtime_update') and callable(reusable)
-                  and reusable(current(), records) is True)
+        if refresh and not kept:
+            reused = True
+        else:
+            reused = (not lifecycle and callable(reusable) and reusable(current(), kept) is True)
         adopted = None
-        if not reused and not lease.get('graceful_drain') and not lease.get('force_runtime_update'):
+        if not reused and not lifecycle:
             # An unchanged reconnect keeps a live listener even when that
             # listener publishes no idle inventory. Only a verified settings
             # change may enter the exit-verified lifecycle below.
             equivalent = getattr(self.remote_maintenance, 'reuse_equivalent', None)
             if callable(equivalent):
                 try:
-                    adopted = equivalent(current(), records)
+                    adopted = equivalent(current(), kept)
                 except UpdateError as error:
                     # The strict path below isolates the unreachable host.
                     if error.code != 'remote_host_unreachable':
                         raise
                     adopted = None
                 reused = adopted is not None
+        if refresh and not reused:
+            # A genuine settings change: the whole cohort takes the strict path,
+            # which prepares every stopped host on the offered bundle anyway.
+            refresh = self._end_bundle_refresh(lease)
+        refreshing = bool(refresh)
+        targets = ([record for record in records if _remote_alias(record) in refresh] if refreshing
+                   else [] if reused else records)
         # A host that cannot be reached at all (powered off, offline) is set
         # aside instead of blocking the other hosts. An explicit runtime update
         # still reports it.
         isolate = not lease.get('force_runtime_update')
         draining = []
-        for record in ([] if reused else records):
+        for record in targets:
             current()
             if record.get('state') == 'unobserved' or record.get('reinspect'):
+                # A reopened refresh may already have prepared and started this host.
+                requested = ((record.get('next_binding'), record.get('target_policy_revision'))
+                             if refreshing and record.get('reinspect') else None)
                 binding = record.get('next_binding') or record.get('active_binding') or record.get('binding')
                 if not binding:
                     raise UpdateError('remote_binding_unknown', '저장된 SSH 연결 설정을 확인해야 합니다.')
                 inspect_options = dict(discover_active=True)
-                if lease.get('graceful_drain'):
+                if lease.get('graceful_drain') or refreshing:
+                    # A refresh never stops anything, so it needs no idle proof.
                     inspect_options['observe_only'] = True
                 if isolate:
                     # Another profile of this wave may already have found the
@@ -576,6 +599,23 @@ class UpdateHooks:
                 record.pop('target_policy_revision', None)
                 self._save_lease(lease)
                 current()
+                if requested is not None and record['state'] == 'observed':
+                    if (requested[0] is not None and observed.get('active_binding') is None
+                            and record['process'].get('revision') == requested[0]['revision']):
+                        # Exactly the revision this refresh prepared runs: its
+                        # own start, whose reply was lost. Adopt it as started.
+                        record.update(state='started', next_binding=requested[0], started=observed,
+                                      target_policy_revision=requested[1])
+                        self._save_lease(lease)
+                    else:
+                        # Another process runs there. Only the strict path may
+                        # settle an interrupted lifecycle.
+                        self._end_bundle_refresh(lease)
+                        return False
+            if refreshing and record.get('state') == 'observed':
+                # A process appeared after the refresh was chosen. Live work is
+                # never stopped to refresh a bundle; this host keeps its binding.
+                continue
             if lease.get('graceful_drain') and record.get('state') in ('observed', 'drain_requested'):
                 # Write ahead; recovery always targets the same process birth.
                 record['state'] = 'drain_requested'
@@ -619,10 +659,13 @@ class UpdateHooks:
                             stop_only=bool(gate.get('stop_only') or lease.get('stop_only')), updated_at=now())
             self.store.mutate(waiting)
             return False
-        if not reused:
+        if refreshing:
+            # Hosts found running are kept as they are; nothing below touches them.
+            targets = [record for record in targets if record.get('state') != 'observed']
+        if not reused or targets:
             # A resumed start has already crossed the exit boundary. Never
             # replay stop or discard its write-ahead start journal.
-            pending_close = {**entry, 'remotes': [r for r in records if r.get('state') in ('observed', 'closed')]}
+            pending_close = {**entry, 'remotes': [r for r in targets if r.get('state') in ('observed', 'closed')]}
             self._close_remotes(lease, pending_close, lifecycle_guard=current)
             profile = current()
             if (not lease.get('stop_only')
@@ -631,15 +674,23 @@ class UpdateHooks:
                 lease['stop_only'] = True
                 lease['graceful_drain'] = True
                 self._save_lease(lease)
+                if refreshing:
+                    # The kept hosts were never drained; the next pass drains
+                    # the whole cohort before anything is released.
+                    return False
             if not lease.get('stop_only'):
                 # An explicit runtime update must report its failed host; a
                 # settings apply isolates it so the other hosts still connect.
-                self.remote_maintenance.prepare_and_start(profile, records, lambda: self._save_lease(lease),
+                self.remote_maintenance.prepare_and_start(profile, targets, lambda: self._save_lease(lease),
                                                           lifecycle_guard=current,
                                                           isolate_host_failures=not lease.get('force_runtime_update'))
                 profile = current()
-                self.remote_maintenance.publish_started(profile, records)
-        failed = sorted(r['binding']['alias'] for r in records if r.get('state') in ('prepare_failed', 'unreachable'))
+                # A refresh that could not prepare a host keeps its previous,
+                # unchanged binding published; it is not a deferred setting.
+                self.remote_maintenance.publish_started(profile, [r for r in targets if r.get('state') == 'started']
+                                                        if refreshing else targets)
+        failed_records = [r for r in targets if r.get('state') in ('prepare_failed', 'unreachable')]
+        failed = sorted(r['binding']['alias'] for r in failed_records)
         def release(data):
             gate = data['ssh_maintenance'][profile_id]
             profile = self.store.profile(profile_id, data)
@@ -654,12 +705,16 @@ class UpdateHooks:
             gate.update(state='released', updated_at=now())
             gate.pop('waiting_hosts', None)
             if failed:
-                from .ssh_deferred_settings import HOST_PREPARE_FAILED, host_failure_message
+                from .ssh_deferred_settings import (BUNDLE_REFRESH_FAILED, HOST_PREPARE_FAILED,
+                                                    bundle_refresh_message, host_failure_message)
                 if lease.get('stop_only'):
                     # A stop publishes nothing: no settings were deferred, the
                     # unreachable hosts were only not stopped.
                     gate.update(code='ssh_hosts_unreachable', unreachable_hosts=failed,
                                 message=host_failure_message(records, stop_only=True))
+                elif refreshing:
+                    gate.update(code=BUNDLE_REFRESH_FAILED, bundle_refresh_hosts=failed,
+                                message=bundle_refresh_message(failed_records))
                 else:
                     gate.update(settings_deferred=True, deferred_reason=HOST_PREPARE_FAILED,
                                 code='ssh_settings_deferred', deferred_policy_hosts=failed,
@@ -667,13 +722,42 @@ class UpdateHooks:
             return True
         if not self.store.mutate(release):
             return False
-        if reused:
+        if reused and kept:
             lease['reused_unchanged'] = True
             if adopted:
                 lease['reused_revisions'] = adopted
+        if refreshing:
+            lease['bundle_refreshed'] = sorted(_remote_alias(r) for r in targets if r.get('state') == 'started')
         lease['state'] = 'released'
         self._save_lease(lease)
         return True
+
+    def _bundle_refresh(self, lease, records, current):
+        """Hosts whose stopped runtime this reconcile prepares on the offered bundle.
+
+        Chosen once per journal before any lifecycle request and written ahead,
+        so a resumed pass keeps the same split. Only hosts a read-only
+        observation proved stopped qualify (stopped_stale_hosts).
+        """
+        if 'bundle_refresh' in lease:
+            return list(lease['bundle_refresh'])
+        select = getattr(self.remote_maintenance, 'stopped_stale_hosts', None)
+        selected = select(current(), records) if callable(select) else []
+        # Only a real list of journaled aliases selects anything.
+        aliases = {_remote_alias(record) for record in records}
+        selected = (sorted(alias for alias in selected if alias in aliases)
+                    if isinstance(selected, list) else [])
+        current()
+        if selected:
+            lease['bundle_refresh'] = selected
+            self._save_lease(lease)
+        return selected
+
+    def _end_bundle_refresh(self, lease):
+        """Hand the whole cohort to the strict path for the rest of this journal."""
+        lease['bundle_refresh'] = []
+        self._save_lease(lease)
+        return []
 
     def remote_open_failed(self, profile_id, transaction_id, code):
         def attention(data):

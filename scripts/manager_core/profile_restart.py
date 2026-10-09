@@ -12,7 +12,7 @@ from .store import Unchanged, identifier, now
 from .updates import UpdateError, _lock_file, _unlock_file
 from .instances import process_identity
 from .update_hooks import _process_liveness
-from .ssh_deferred_settings import HOST_PREPARE_FAILED
+from .ssh_deferred_settings import BUNDLE_REFRESH_FAILED, HOST_PREPARE_FAILED
 
 TERMINAL = frozenset({'complete', 'attention', 'superseded'})
 _CLAIM_WAIT = 10.0
@@ -242,6 +242,12 @@ class ProfileRestarts:
                 # Some hosts connected with the new settings; the failed ones
                 # reconnect with their previous settings. The window stays usable.
                 job.update(phase='attention', code='ssh_settings_deferred', connections_restored=True,
+                           updated_at=now(), message='로컬 창은 사용할 수 있습니다. ' + gate['message'])
+                return True
+            if own and gate.get('code') == BUNDLE_REFRESH_FAILED:
+                # The other hosts are ready; a host that could not be prepared
+                # on the current runtime keeps its previous, unchanged binding.
+                job.update(phase='attention', code=BUNDLE_REFRESH_FAILED, connections_restored=True,
                            updated_at=now(), message='로컬 창은 사용할 수 있습니다. ' + gate['message'])
                 return True
             job.update(phase='complete', updated_at=now(),

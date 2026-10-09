@@ -69,6 +69,60 @@ class RemoteMaintenanceTests(unittest.TestCase):
         self.store.mutate(lambda data: data.update(ssh_inventory={}))
         self.assertFalse(self.service.pending_on_open(self.profile))
 
+    def older_bundle(self):
+        atomic_json(self.root / 'artifacts/remote/linux-x86_64/manifest.json', dict(version='2.0', files=[]))
+        self.profile['policy']['launched_revision'] = self.profile['policy']['desired_revision']
+        self.profile['remote_bindings'] = [dict(self.binding, prepared=True, runtime_bundle='1.0-' + 'a' * 16,
+                                                host_identity='f' * 64)]
+        self.service.remote = MagicMock()
+        self.service.remote.binding_matches_settings.return_value = True
+        self.store.mutate(lambda data: data.update(ssh_inventory={self.profile['id']: {'hosts': ['remote-dev']}}))
+
+    def observe_platform(self, profile_id=None):
+        """A read-only check recorded this host account's platform."""
+        owner = profile_id or self.profile['id']
+        self.store.mutate(lambda data: data.update(remote_updates={owner + ':remote-dev': dict(
+            profile_id=owner, alias='remote-dev',
+            stock=dict(platform='linux', architecture='x86_64', managed_host_identity='f' * 64))}))
+
+    def test_closed_profile_reconciles_a_binding_pinned_to_an_older_bundle(self):
+        from manager_core.remote_updates import offered_bundle
+        self.older_bundle()
+        # Without an observed platform no offered bundle can be chosen for it.
+        self.assertFalse(self.service.pending_on_open(self.profile))
+        self.observe_platform()
+        self.assertTrue(self.service.pending_on_open(self.profile))
+        # Another profile's observation of the same host account counts too.
+        self.observe_platform(str(uuid4()))
+        self.assertTrue(self.service.pending_on_open(self.profile))
+        self.profile['remote_bindings'][0]['runtime_bundle'] = offered_bundle(self.root, 'linux', 'x86_64')['bundle_id']
+        self.assertFalse(self.service.pending_on_open(self.profile))
+        self.service.remote._run.assert_not_called()
+
+    def test_only_an_untouched_stopped_host_on_an_older_bundle_is_selected_for_refresh(self):
+        self.older_bundle()
+        self.observe_platform()
+        record = dict(binding=deepcopy(self.binding), publication_binding=deepcopy(self.binding),
+                      alias='remote-dev', state='unobserved')
+        self.service.request = MagicMock(return_value=dict(process=None, idle=True, exited=True))
+        self.assertEqual(self.service.stopped_stale_hosts(self.profile, [record]), ['remote-dev'])
+        self.service.request.assert_called_once_with(self.binding, 'inspect', discover_active=True, observe_only=True)
+        # A live process of any revision is work in progress, never selected.
+        self.service.request.return_value = dict(process={'pid': 12, 'revision': 'b' * 64}, idle=False, exited=False)
+        self.assertEqual(self.service.stopped_stale_hosts(self.profile, [record]), [])
+        # An unobservable host stays on the ordinary path.
+        self.service.request.side_effect = UpdateError('remote_host_unreachable', 'fixture unreachable')
+        self.assertEqual(self.service.stopped_stale_hosts(self.profile, [record]), [])
+        self.service.request.reset_mock(side_effect=True)
+        # Touched or republished records never qualify, nor a changed saved binding.
+        for change in (dict(state='closed'), dict(reinspect=True), dict(next_binding=self.binding),
+                       dict(process=None), dict(publication_binding=dict(self.binding, revision='b' * 64))):
+            with self.subTest(change=change):
+                self.assertEqual(self.service.stopped_stale_hosts(self.profile, [{**record, **change}]), [])
+        self.profile['remote_bindings'][0]['revision'] = 'b' * 64
+        self.assertEqual(self.service.stopped_stale_hosts(self.profile, [record]), [])
+        self.service.request.assert_not_called()
+
     def unchanged_records(self):
         self.profile['remote_bindings'] = [dict(self.binding, prepared=True)]
         self.service.remote = MagicMock()

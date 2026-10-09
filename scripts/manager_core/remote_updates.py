@@ -7,6 +7,12 @@ A relaunch leaves a reservation pinned to an older generation; the scheduler
 retires it only while the transaction's own preserved journal proves no host
 was ever asked to stop or start, and keeps the automatic update setting for the
 new generation.
+
+Automatic application is on by default (auto_apply). While the profile's desktop
+runs it also covers a host whose runtime is stopped but whose prepared binding
+pins an older bundle than artifacts/remote offers: the next connection would
+otherwise start that older bundle. A closed desktop's next open prepares such a
+host itself (remote_maintenance.pending_on_open).
 """
 from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
@@ -36,6 +42,10 @@ UNTOUCHED = ('exit_proof', 'next_binding', 'started', 'reinspect')
 # Refusals that keep the SSH gate until the preserved evidence is reviewed.
 REVIEW = frozenset({'lifecycle_pending', 'journal_missing', 'journal_unverified',
                     'journal_generation_changed', 'gate_generation_changed'})
+# Version of the enabled auto_apply default. The store never recorded whether
+# a False auto_apply was the old default or the user's choice, so start() turns
+# it on once for every pair without this marker; settings() still turns it off.
+AUTO_APPLY_DEFAULT = 1
 
 
 def _journal_entry(lease, profile_id, transaction_id):
@@ -75,6 +85,87 @@ def _version(bundle):
     return re.sub(r'-[0-9a-f]{16}$', '', bundle)
 
 
+def offered_bundle(root, platform, architecture):
+    """The managed runtime bundle artifacts/remote offers for one host platform.
+
+    Reads only the manifest (no file hashing): preparation still verifies every
+    file before anything is uploaded. Raises UpdateError when none is offered.
+    """
+    if platform != 'linux' or architecture not in ('x86_64', 'aarch64'):
+        raise UpdateError('remote_artifact_missing', '지원되는 Linux 관리 런타임 묶음이 필요합니다.')
+    path = Path(root) / 'artifacts/remote' / (platform + '-' + architecture) / 'manifest.json'
+    if path.is_symlink() or not path.is_file() or path.stat().st_size > 256000:
+        raise UpdateError('remote_artifact_missing', 'Linux 관리 런타임 묶음을 확인할 수 없습니다.')
+    manifest = json.loads(path.read_text(encoding='utf-8-sig'))
+    version = manifest.get('version')
+    if not isinstance(version, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,95}', version):
+        raise UpdateError('invalid_artifact', 'Linux 관리 런타임 버전을 확인할 수 없습니다.')
+    digest = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()[:16]
+    return dict(version=version, bundle_id=version + '-' + digest)
+
+
+def observed_platform(data, profile_id, alias, host_identity):
+    """(platform, architecture) last observed for this exact SSH account, or None.
+
+    The pair's own observation is preferred; another profile's observation of
+    the same host account (same host identity) is equally valid evidence.
+    """
+    if not isinstance(host_identity, str) or not re.fullmatch(r'[0-9a-f]{64}', host_identity):
+        return None
+    entries = data.get('remote_updates') or {}
+    own = entries.get(str(profile_id) + ':' + str(alias))
+    for value in [own, *(entries[key] for key in sorted(entries))]:
+        if not isinstance(value, dict):
+            continue
+        target, stock = value.get('_target') or {}, value.get('stock') or {}
+        if isinstance(target, dict) and target.get('host_identity') == host_identity:
+            pair = (target.get('platform'), target.get('architecture'))
+        elif isinstance(stock, dict) and stock.get('managed_host_identity') == host_identity:
+            pair = (stock.get('platform'), stock.get('architecture'))
+        else:
+            continue
+        if all(isinstance(item, str) for item in pair):
+            return pair
+    return None
+
+
+def offered_for_host(root, data, profile_id, alias, host_identity):
+    """The bundle offered for this host's observed platform, or None when unknown."""
+    platform = observed_platform(data, profile_id, alias, host_identity)
+    if platform is None:
+        return None
+    try:
+        return offered_bundle(root, *platform)['bundle_id']
+    except (UpdateError, OSError, ValueError, TypeError, AttributeError):
+        return None
+
+
+def stale_bundle(root, data, profile_id, binding):
+    """The offered bundle id when a prepared binding pins another bundle, else None.
+
+    Local metadata only. A host whose platform was never observed, or whose
+    platform has no offered bundle, is never called stale: preparing it again
+    could not select a newer runtime.
+    """
+    if not isinstance(binding, dict) or binding.get('prepared') is not True:
+        return None
+    bundle = binding.get('runtime_bundle')
+    if not isinstance(bundle, str):
+        return None
+    offered = offered_for_host(root, data, profile_id, binding.get('alias'), binding.get('host_identity'))
+    return offered if offered is not None and offered != bundle else None
+
+
+def needs_apply(managed):
+    """Whether an automatic managed update applies to this observation.
+
+    A running older bundle is an update. A stopped runtime whose prepared
+    binding pins an older bundle is one too: its next start would run it.
+    """
+    state = (managed or {}).get('state')
+    return state == 'update_available' or (state == 'stopped' and managed.get('stale_bundle') is True)
+
+
 def _stock_pending(value):
     job = value.get('update_job') or {}
     return job.get('state') in STOCK_ACTIVE or job.get('verification_pending') is True
@@ -106,7 +197,10 @@ class RemoteUpdates:
 
     @staticmethod
     def _default(profile_id, alias):
-        return dict(profile_id=profile_id, alias=alias, auto_check=True, auto_apply=False,
+        # _auto_apply_default marks a pair whose auto_apply already follows the
+        # enabled default, so the one-time migration in start() leaves it alone.
+        return dict(profile_id=profile_id, alias=alias, auto_check=True, auto_apply=True,
+                    _auto_apply_default=AUTO_APPLY_DEFAULT,
                     checking=False, checked_at=None, job=None,
                     managed=dict(active_version=None, prepared_version=None, available_version=None,
                                  state='unknown', message='SSH 버전을 확인하면 실행 중인 관리 런타임을 표시합니다.'),
@@ -199,17 +293,7 @@ class RemoteUpdates:
         return self.status(profile_id, alias)
 
     def _available(self, platform, architecture):
-        if platform != 'linux' or architecture not in ('x86_64', 'aarch64'):
-            raise UpdateError('remote_artifact_missing', '지원되는 Linux 관리 런타임 묶음이 필요합니다.')
-        path = self.root / 'artifacts/remote' / (platform + '-' + architecture) / 'manifest.json'
-        if path.is_symlink() or not path.is_file() or path.stat().st_size > 256000:
-            raise UpdateError('remote_artifact_missing', 'Linux 관리 런타임 묶음을 확인할 수 없습니다.')
-        manifest = json.loads(path.read_text(encoding='utf-8-sig'))
-        version = manifest.get('version')
-        if not isinstance(version, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,95}', version):
-            raise UpdateError('invalid_artifact', 'Linux 관리 런타임 버전을 확인할 수 없습니다.')
-        digest = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()[:16]
-        return dict(version=version, bundle_id=version + '-' + digest)
+        return offered_bundle(self.root, platform, architecture)
 
     def _check(self, profile_id, alias):
         self.remote._alias(alias)
@@ -240,8 +324,12 @@ class RemoteUpdates:
                           host_identity=observed['managed_host_identity'])
             if source and source.get('host_identity') != target['host_identity']:
                 raise UpdateError('ssh_host_changed', '저장된 SSH 호스트 식별 정보가 변경되었습니다.')
+            prepared = (source or {}).get('runtime_bundle')
+            # A binding or a running process on another bundle than the offered
+            # one; a stopped one would start that older bundle again.
             managed.update(available_version=artifact['version'], available_bundle=artifact['bundle_id'],
-                           prepared_bundle=(source or {}).get('runtime_bundle'))
+                           prepared_bundle=prepared,
+                           stale_bundle=isinstance(prepared, str) and prepared != artifact['bundle_id'])
             if source and source.get('prepared') is True:
                 actual = self.hooks.remote_maintenance.request(source, 'inspect', discover_active=True, observe_only=True)
                 bundle = actual.get('runtime_bundle')
@@ -250,8 +338,13 @@ class RemoteUpdates:
                 managed.update(active_version=_version(bundle), active_bundle=bundle,
                                active_revision=(actual.get('process') or {}).get('revision'),
                                idle=actual['idle'], running=actual['process'] is not None)
+                if isinstance(bundle, str) and bundle != artifact['bundle_id']:
+                    managed['stale_bundle'] = True
                 if actual['process'] is None:
                     state, message = ('stopped', '관리 SSH 런타임이 실행 중이지 않습니다. 준비된 파일은 별도로 표시합니다.')
+                    if managed['stale_bundle']:
+                        message = ('관리 SSH 런타임이 실행 중이지 않지만 준비된 런타임이 현재 제공 버전보다 이전 버전입니다. '
+                                   '프로필을 열거나 SSH 업데이트를 적용하면 현재 버전으로 다시 준비합니다.')
                 elif bundle is None:
                     state, message = ('unknown', '실행 중인 관리 런타임의 버전을 확인할 수 없습니다.')
                 elif bundle == artifact['bundle_id']:
@@ -284,11 +377,56 @@ class RemoteUpdates:
         self._save(profile_id, alias, stock=stock, managed=managed, checked_at=now(),
                    _checked_epoch=self.clock(), _target=target, error=error)
         value = self._read(profile_id, alias)
-        if (value['auto_apply'] and managed['state'] == 'update_available'
+        if (value['auto_apply'] and self._wants_apply(profile_id, managed)
                 and (value.get('job') or {}).get('state') in (None, 'complete', 'cancelled')):
-            self.schedule(profile_id, alias)
+            self.schedule(profile_id, alias, automatic=True)
 
-    def schedule(self, profile_id, alias):
+    def _desktop_running(self, profile_id):
+        """Whether this profile's desktop runs; unknown counts as running."""
+        try:
+            observed = self.hooks.instances.observe(self.store.profile(profile_id))
+        except (AttributeError, RuntimeError, ValueError, OSError, KeyError, TypeError):
+            return True
+        return observed.get('status') == 'running'
+
+    def _wants_apply(self, profile_id, managed):
+        """needs_apply, minus stopped hosts of a closed desktop.
+
+        While the desktop is closed, its next open prepares a stopped host on
+        the offered bundle before anything starts (remote_maintenance
+        pending_on_open). An update holding the SSH gate then would only race
+        that open: the launch moves the profile generation and strands it.
+        """
+        if not needs_apply(managed):
+            return False
+        return managed.get('state') != 'stopped' or self._desktop_running(profile_id)
+
+    def _binding_marks(self, profile_id):
+        """The saved bindings' identity; an open that prepares a host changes it."""
+        return sorted(([item.get('alias'), item.get('revision'), item.get('runtime_bundle')]
+                       for item in self.store.profile(profile_id).get('remote_bindings', [])
+                       if isinstance(item, dict) and isinstance(item.get('alias'), str)),
+                      key=lambda mark: mark[0])
+
+    def _apply_still_needed(self, profile_id):
+        """Read-only recheck before an automatic job takes the SSH gate.
+
+        Opening the profile may already have prepared its stopped hosts on the
+        offered bundle while the job waited; restarting them again would only
+        interrupt fresh work. An unobservable host counts as not needing it:
+        the next periodic observation schedules it again.
+        """
+        hosts = self.store.read().get('ssh_inventory', {}).get(profile_id, {}).get('hosts', [])
+        for host in sorted(hosts):
+            try:
+                self._check(profile_id, host)
+            except (RuntimeError, ValueError, OSError, KeyError, TypeError):
+                continue
+            if self._wants_apply(profile_id, self._read(profile_id, host).get('managed')):
+                return True
+        return False
+
+    def schedule(self, profile_id, alias, *, automatic=False):
         self._key(profile_id, alias)
         with self.mutex, self.store.locked():
             data = self.store.read()
@@ -306,7 +444,7 @@ class RemoteUpdates:
                        message='이 프로필에 연결된 SSH 호스트의 작업이 끝나면 관리 런타임을 업데이트합니다.')
             self._save(profile_id, alias, job=job, _job=dict(transaction_id=str(uuid4()),
                        generation=profile.get('generation'), revision=profile['policy']['desired_revision'],
-                       targets=None, cancel_requested=False))
+                       targets=None, cancel_requested=False, automatic=automatic is True))
         self._launch(profile_id, alias, lambda: self.step(profile_id, alias))
         self.wake.set()
         return self.status(profile_id, alias)
@@ -585,6 +723,20 @@ class RemoteUpdates:
                 raise UpdateError('ssh_generation_changed', '프로필 실행 세대 또는 설정이 변경되었습니다.')
             gate = self.store.read().get('ssh_maintenance', {}).get(profile_id, {})
             if gate.get('transaction_id') != transaction:
+                if gate.get('state') not in (None, 'released'):
+                    # Another SSH operation (an open preparing this profile's
+                    # hosts) owns the gate; wait without observing the hosts.
+                    raise UpdateError('ssh_maintenance', 'Another SSH operation owns this profile.')
+                if pin.get('automatic'):
+                    # Probe again only when the saved bindings moved since the
+                    # last probe, so a refused start never polls SSH each pass.
+                    marks = self._binding_marks(profile_id)
+                    if pin.get('prechecked') != marks:
+                        if not self._apply_still_needed(profile_id):
+                            self._job_state(profile_id, alias, 'complete',
+                                            '관리 SSH 런타임이 이미 현재 버전이라 자동 업데이트를 건너뛰었습니다.')
+                            return
+                        pin = self._update_pin(profile_id, alias, transaction, prechecked=marks)
                 self.hooks.begin_remote_reconcile(profile_id, ensure_local=False,
                     force_runtime_update=True, transaction_id=transaction)
             lease = self._lease(transaction)
@@ -678,11 +830,17 @@ class RemoteUpdates:
         # A process restart only resumes managed journals and read-only probes.
         # It never resubmits the explicit stock update operation. Clear stale
         # checking claims in one write, and only when one is actually set.
+        # The same write turns automatic application on once for every pair
+        # saved before it was the default (see AUTO_APPLY_DEFAULT).
         def clear(data):
-            stale = [value for value in data.get('remote_updates', {}).values() if value.get('checking') is not False]
+            values = list(data.get('remote_updates', {}).values())
+            stale = [value for value in values if value.get('checking') is not False]
             for value in stale:
                 value['checking'] = False
-            return len(stale) if stale else Unchanged(0)
+            legacy = [value for value in values if value.get('_auto_apply_default') != AUTO_APPLY_DEFAULT]
+            for value in legacy:
+                value.update(auto_apply=True, _auto_apply_default=AUTO_APPLY_DEFAULT)
+            return len(stale) + len(legacy) if stale or legacy else Unchanged(0)
         self.store.mutate(clear)
         threading.Thread(target=self._loop, name='ssh-update-scheduler', daemon=True).start()
 

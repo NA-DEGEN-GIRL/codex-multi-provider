@@ -6,7 +6,8 @@ Prints one JSON document, then a short Korean summary: the runtime pointers
 (current, last-known-good, previous) and whether their files still verify,
 staged candidates newer than the active runtime, whether the current runtime's
 migrations fit the live stores (and store migrations it does not embed), the
-SSH update backlog, Claude login expiry, the last runtime exit of each profile,
+SSH update backlog and SSH runtimes pinned to an older bundle, Claude login
+expiry, the last runtime exit of each profile,
 runtimes that recovered after process-start retries and the manager release. It writes nothing and starts or stops nothing; of a
 Claude credential file it reads expiresAt only.
 """
@@ -154,11 +155,16 @@ def _aliases(state):
     return {item.get('id'): item.get('alias') for item in (state or {}).get('profiles', []) if isinstance(item, dict)}
 
 
-def remote_updates(state):
-    """Profile/host pairs whose managed SSH runtime has an update waiting."""
+def remote_updates(state, root=None):
+    """Profile/host pairs whose managed SSH runtime has an update waiting.
+
+    stale lists prepared bindings, and runtimes last seen running, on another
+    bundle than the one artifacts/remote now offers for that host's platform
+    (needs root). A stopped one would start that older bundle again.
+    """
     if state is None:
         return dict(state='missing')
-    aliases, pending, states = _aliases(state), [], {}
+    aliases, pending, states, stale = _aliases(state), [], {}, []
     removed = {item.get('id') for item in state.get('profiles', [])
                if isinstance(item, dict) and item.get('removed_at')}
     for value in (state.get('remote_updates') or {}).values():
@@ -174,7 +180,36 @@ def remote_updates(state):
                 available_bundle=managed.get('available_bundle'), prepared_bundle=managed.get('prepared_bundle'),
                 job=(value.get('job') or {}).get('state'), auto_apply=value.get('auto_apply'),
                 checked_at=value.get('checked_at'))))
-    return dict(pending=pending, states=states)
+    if root is not None:
+        stale = _stale_bundles(Path(root), state, aliases)
+    return dict(pending=pending, states=states, stale=stale)
+
+
+def _stale_bundles(root, state, aliases):
+    from manager_core.remote_updates import offered_for_host
+    result = []
+    observed = state.get('remote_updates') or {}
+    for profile in state.get('profiles', []):
+        if not isinstance(profile, dict) or profile.get('removed_at') or profile.get('view_only'):
+            continue
+        for binding in profile.get('remote_bindings') or []:
+            if not isinstance(binding, dict) or binding.get('prepared') is not True:
+                continue
+            offered = offered_for_host(root, state, profile.get('id'), binding.get('alias'),
+                                       binding.get('host_identity'))
+            if offered is None:
+                continue  # The host's platform was never observed, or nothing is offered for it.
+            managed = (observed.get('%s:%s' % (profile.get('id'), binding.get('alias'))) or {}).get('managed') or {}
+            running = managed.get('active_bundle') if managed.get('running') is True else None
+            prepared = binding.get('runtime_bundle')
+            if prepared == offered and running in (None, offered):
+                continue
+            result.append(_compact(dict(
+                profile_id=profile.get('id'), profile=aliases.get(profile.get('id')), host=binding.get('alias'),
+                offered_bundle=offered, prepared_bundle=prepared if prepared != offered else None,
+                running_bundle=running if running not in (None, offered) else None,
+                checked_at=(observed.get('%s:%s' % (profile.get('id'), binding.get('alias'))) or {}).get('checked_at'))))
+    return result
 
 
 def _expires_at(path):
@@ -285,7 +320,7 @@ def report(root=ROOT, *, now=None, environ=None):
                                              for entry in known_bad(root)]),
                  candidates=_section(candidates, root, pointers),
                  migrations=_section(migrations, root),
-                 remote_updates=_section(remote_updates, state),
+                 remote_updates=_section(remote_updates, state, root),
                  claude_logins=_section(claude_logins, state, now, environ),
                  runtime_exits=_section(runtime_exits, root, state),
                  runtime_start_retries=_section(runtime_start_retries, root, state))
@@ -358,6 +393,11 @@ def summary(value):
         lines.append('SSH 업데이트 대기: ' + ('%d건 (%s)' % (len(updates['pending']), ', '.join(
             '%s@%s' % (item.get('profile') or item.get('profile_id'), item.get('host')) for item in updates['pending']))
             if updates['pending'] else '없음'))
+        if updates.get('stale'):
+            lines.append('이전 버전 SSH 런타임: %d건 (%s)' % (len(updates['stale']), ', '.join(
+                '%s@%s%s' % (item.get('profile') or item.get('profile_id'), item.get('host'),
+                             ' 실행 중' if item.get('running_bundle') else '')
+                for item in updates['stale'])))
     logins = value['claude_logins']
     if _failed(logins):
         lines.append('Claude 로그인: 확인 실패')

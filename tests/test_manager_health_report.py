@@ -252,6 +252,38 @@ class HealthReportTests(unittest.TestCase):
         self.assertEqual(value['candidates']['incomplete'], ['20261001-000000-aaaaaa'])
         self.assertEqual([item['release'] for item in value['candidates']['pending']], ['20261002-000000-bbbbbb'])
 
+    def test_ssh_runtimes_on_an_older_bundle_are_flagged(self):
+        from manager_core.remote_updates import offered_bundle
+        atomic_json(self.root / 'artifacts/remote/linux-x86_64/manifest.json', dict(version='2.0', files=[]))
+        offered = offered_bundle(self.root, 'linux', 'x86_64')['bundle_id']
+        stopped_id, running_id, current_id = str(uuid4()), str(uuid4()), str(uuid4())
+        identity, older = 'f' * 64, '1.0-' + 'a' * 16
+        def binding(bundle):
+            return dict(alias='remote-host', prepared=True, runtime_bundle=bundle, host_identity=identity)
+        def observation(profile_id, **managed):
+            return dict(profile_id=profile_id, alias='remote-host', checked_at='2026-10-07T11:00:00+00:00',
+                        managed=dict(state='current', **managed),
+                        stock=dict(platform='linux', architecture='x86_64', managed_host_identity=identity))
+        atomic_json(self.root / 'work/control-center/state.json', dict(version=1, revision=1, profiles=[
+            dict(id=stopped_id, alias='stopped-profile', remote_bindings=[binding(older)]),
+            dict(id=running_id, alias='running-profile', remote_bindings=[binding(offered)]),
+            dict(id=current_id, alias='current-profile', remote_bindings=[binding(offered)]),
+            dict(id=str(uuid4()), alias='removed-profile', removed_at='2026-10-01', remote_bindings=[binding(older)]),
+            # Never observed: its platform, and so its offered bundle, is unknown.
+            dict(id=str(uuid4()), alias='unobserved-profile',
+                 remote_bindings=[dict(binding(older), host_identity='e' * 64)])],
+            remote_updates={
+                running_id + ':remote-host': observation(running_id, running=True, active_bundle=older),
+                current_id + ':remote-host': observation(current_id, running=True, active_bundle=offered)}))
+        value = report(self.root, now=NOW, environ={'LOCALAPPDATA': str(self.local)})
+        self.assertEqual(value['remote_updates']['stale'], [
+            dict(profile_id=stopped_id, profile='stopped-profile', host='remote-host', offered_bundle=offered,
+                 prepared_bundle=older),
+            dict(profile_id=running_id, profile='running-profile', host='remote-host', offered_bundle=offered,
+                 running_bundle=older, checked_at='2026-10-07T11:00:00+00:00')])
+        self.assertIn('이전 버전 SSH 런타임: 2건 (stopped-profile@remote-host, running-profile@remote-host 실행 중)',
+                      summary(value))
+
     def test_runs_as_a_script_from_the_repository_root(self):
         environment = {key: value for key, value in os.environ.items() if key != 'PYTHONPATH'}
         environment.update(LOCALAPPDATA=str(self.local), PYTHONUTF8='1')

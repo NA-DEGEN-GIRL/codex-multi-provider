@@ -83,10 +83,17 @@ class RemoteUpdateTests(unittest.TestCase):
         value = self.service._read(self.profile_id, 'fixture-a')
         return self.service._lease(value['_job']['transaction_id'])['profiles'][0]['remotes']
 
-    def test_status_is_passive_and_defaults_do_not_auto_apply(self):
+    def manual_only(self):
+        # Tests of a reservation's own lifecycle opt out of automatic application,
+        # which would otherwise queue the same update again after it ends.
+        for alias in ('fixture-a', 'fixture-b'):
+            self.service.settings(self.profile_id, alias, auto_apply=False)
+
+    def test_status_is_passive_and_automatic_application_defaults_on(self):
         value = self.status()
         self.assertTrue(value['auto_check'])
-        self.assertFalse(value['auto_apply'])
+        self.assertTrue(value['auto_apply'])
+        self.assertNotIn('_auto_apply_default', value)
         self.assertTrue(value['managed']['can_schedule'])
         self.probe.assert_not_called()
         self.assertEqual(self.fleet.calls, [])
@@ -311,6 +318,7 @@ class RemoteUpdateTests(unittest.TestCase):
         self.assertEqual(self.status()['job']['state'], 'cancelled')
 
     def test_generation_change_supersedes_job_before_any_lifecycle(self):
+        self.manual_only()
         self.schedule()
         self.store.mutate(lambda data: self.store.profile(self.profile_id, data).update(generation=str(uuid4())))
         self.drain()
@@ -357,6 +365,7 @@ class RemoteUpdateTests(unittest.TestCase):
     def test_scheduler_recovers_a_gate_left_by_an_older_generation(self):
         # Production shape: the reservation flipped to attention when the
         # profile relaunched and nothing can step it any more.
+        self.manual_only()
         request = self.fleet.request
         self.fleet.request = lambda *a, **k: {**request(*a, **k), 'idle': False}
         self.schedule()
@@ -497,6 +506,7 @@ class RemoteUpdateTests(unittest.TestCase):
         self.assertEqual(path.read_bytes(), before)
 
     def test_recover_reports_busy_while_another_controller_holds_the_claim(self):
+        self.manual_only()
         self.schedule()
         transaction = self.service._read(self.profile_id, 'fixture-a')['_job']['transaction_id']
         self.hooks.begin_remote_reconcile(self.profile_id, ensure_local=False,
@@ -527,6 +537,7 @@ class RemoteUpdateTests(unittest.TestCase):
         self.stock_update.assert_not_called()
 
     def test_stock_manual_update_requires_current_confirmed_observation(self):
+        self.manual_only()
         with self.assertRaises(ValueError):
             self.service.update_stock(self.profile_id, 'fixture-a', confirmed=True)
         self.service.check(self.profile_id, 'fixture-a')
@@ -636,6 +647,164 @@ class RemoteUpdateTests(unittest.TestCase):
         self.assertEqual(notice['phase'], 'attention')
         self.assertEqual(notice['code'], 'ssh_settings_deferred')
         self.assertTrue(notice['connections_restored'])
+
+    def test_start_turns_automatic_application_on_once_and_keeps_a_later_choice(self):
+        # Saved before the enabled default: the store cannot tell a deliberate
+        # False from the old default, so the migration turns it on once.
+        def legacy(data):
+            for value in data['remote_updates'].values():
+                value.pop('_auto_apply_default')
+                value['auto_apply'] = False
+        self.service._save(self.profile_id, 'fixture-a', checking=False)
+        self.service._save(self.profile_id, 'fixture-b', checking=False)
+        self.store.mutate(legacy)
+        revision = self.store.read()['revision']
+        restarted = self.make_service()
+        restarted._loop = lambda: None
+        restarted.start()
+        self.assertEqual(self.store.read()['revision'], revision + 1)
+        self.assertTrue(self.service.status(self.profile_id, 'fixture-a')['auto_apply'])
+        self.assertTrue(self.service.status(self.profile_id, 'fixture-b')['auto_apply'])
+        # The user's later choice survives every following start.
+        self.service.settings(self.profile_id, 'fixture-b', auto_apply=False)
+        revision = self.store.read()['revision']
+        again = self.make_service()
+        again._loop = lambda: None
+        again.start()
+        self.assertEqual(self.store.read()['revision'], revision)
+        self.assertFalse(self.service.status(self.profile_id, 'fixture-b')['auto_apply'])
+        self.assertEqual(self.pending, [])
+        self.assertEqual(self.fleet.calls, [])
+
+    def stopped_hosts(self):
+        """Nothing of this profile runs; its bindings still pin the older bundle."""
+        self.fleet.running = {alias: None for alias in self.fleet.running}
+
+    def run_queued(self, alias='fixture-a'):
+        """The scheduler's next pass over a job an observation worker queued."""
+        self.assertTrue(self.service._launch(self.profile_id, alias,
+                                             lambda: self.service._queued_pass(self.profile_id, alias)))
+        self.drain()
+
+    def test_stopped_host_with_an_older_prepared_bundle_schedules_an_automatic_update(self):
+        self.stopped_hosts()
+        self.service.check(self.profile_id, 'fixture-a')
+        self.drain()
+        managed = self.status()['managed']
+        self.assertEqual((managed['state'], managed['stale_bundle']), ('stopped', True))
+        self.assertEqual(self.status()['job']['state'], 'queued')
+        self.assertTrue(self.service._read(self.profile_id, 'fixture-a')['_job']['automatic'])
+        self.run_queued()
+        self.assertEqual(self.status()['job']['state'], 'complete')
+        self.assertFalse(any(op == 'stop' for op, _ in self.fleet.calls))
+        self.assertEqual(sorted(alias for op, alias in self.fleet.calls if op == 'prepare'), ['fixture-a', 'fixture-b'])
+        self.assertEqual({b['runtime_bundle'] for b in self.store.profile(self.profile_id)['remote_bindings']},
+                         {self.bundle})
+        self.assertEqual(self.status()['managed']['state'], 'current')
+        self.assertEqual(self.fixture.instances.show_calls, [])
+        self.assertEqual(self.fixture.closes, [])
+
+    def test_closed_desktop_leaves_a_stopped_older_bundle_to_its_next_open(self):
+        # The open prepares it before anything starts; an update holding the
+        # gate meanwhile would lose its generation to that launch.
+        self.stopped_hosts()
+        self.fixture.instances.close(self.store.profile(self.profile_id))
+        self.service.check(self.profile_id, 'fixture-a')
+        self.drain()
+        managed = self.status()['managed']
+        self.assertEqual((managed['state'], managed['stale_bundle']), ('stopped', True))
+        self.assertIsNone(self.status()['job'])
+        self.assertEqual(self.pending, [])
+        # A running older bundle is still an update while the desktop is closed.
+        self.fleet.running['fixture-a'] = self.fleet.process(self.fleet.bindings_by_alias['fixture-a'])
+        self.service.check(self.profile_id, 'fixture-a')
+        self.drain()
+        self.assertEqual(self.status()['managed']['state'], 'update_available')
+        self.assertEqual(self.status()['job']['state'], 'queued')
+
+    def test_stopped_host_on_the_offered_bundle_is_not_an_update(self):
+        self.stopped_hosts()
+        self.store.mutate(lambda data: [binding.update(runtime_bundle=self.bundle) for binding in
+                                        self.store.profile(self.profile_id, data)['remote_bindings']])
+        self.service.check(self.profile_id, 'fixture-a')
+        self.drain()
+        managed = self.status()['managed']
+        self.assertEqual((managed['state'], managed['stale_bundle']), ('stopped', False))
+        self.assertIsNone(self.status()['job'])
+        self.assertEqual(self.pending, [])
+
+    def test_automatic_update_is_skipped_when_an_open_already_prepared_the_offered_bundle(self):
+        self.stopped_hosts()
+        self.service.check(self.profile_id, 'fixture-a')
+        self.drain()
+        self.assertEqual(self.status()['job']['state'], 'queued')
+        # Opening the profile prepared both stopped hosts before the job ran.
+        self.store.mutate(lambda data: [binding.update(runtime_bundle=self.bundle) for binding in
+                                        self.store.profile(self.profile_id, data)['remote_bindings']])
+        self.run_queued()
+        job = self.status()['job']
+        self.assertEqual(job['state'], 'complete')
+        self.assertIn('건너뛰', job['message'])
+        self.assertFalse(any(op in ('stop', 'prepare', 'start') for op, _ in self.fleet.calls))
+        self.assertIsNone(self.store.read().get('ssh_maintenance', {}).get(self.profile_id))
+
+    def test_automatic_recheck_probes_again_only_after_the_bindings_moved(self):
+        self.stopped_hosts()
+        self.service.check(self.profile_id, 'fixture-a')
+        self.drain()
+        self.hooks.begin_remote_reconcile = Mock(side_effect=UpdateError('profile_launch_busy', 'fixture busy'))
+        self.probe.reset_mock()
+        self.run_queued()
+        self.assertEqual(self.status()['job']['state'], 'waiting')
+        # The first host still needing the update ends the probe.
+        self.assertEqual(self.probe.call_count, 1)
+        # A refused start retries without probing the hosts again.
+        self.run_queued()
+        self.assertEqual(self.probe.call_count, 1)
+        self.assertEqual(self.hooks.begin_remote_reconcile.call_count, 2)
+        # An open prepared both hosts meanwhile: probe both once more, then skip.
+        self.store.mutate(lambda data: [binding.update(runtime_bundle=self.bundle) for binding in
+                                        self.store.profile(self.profile_id, data)['remote_bindings']])
+        self.run_queued()
+        self.assertEqual(self.probe.call_count, 3)
+        self.assertEqual(self.status()['job']['state'], 'complete')
+        self.assertEqual(self.hooks.begin_remote_reconcile.call_count, 2)
+
+    def test_automatic_update_waits_while_another_ssh_operation_owns_the_gate(self):
+        self.stopped_hosts()
+        self.service.check(self.profile_id, 'fixture-a')
+        self.drain()
+        self.store.mutate(lambda data: data.setdefault('ssh_maintenance', {}).update({self.profile_id: dict(
+            state='held', transaction_id=str(uuid4()), generation=self.fixture.profile['generation'])}))
+        calls = len(self.fleet.calls)
+        self.probe.reset_mock()
+        self.run_queued()
+        self.assertEqual(self.status()['job']['state'], 'waiting')
+        self.probe.assert_not_called()
+        self.assertEqual(len(self.fleet.calls), calls)
+
+    def test_relaunch_rearms_auto_apply_for_a_stopped_older_bundle(self):
+        self.stopped_hosts()
+        # The job takes the gate, then waits for SSH coverage of this generation.
+        self.hooks.host_inventory = lambda profile: dict(complete=False, generation=profile['generation'],
+            hosts=['local', 'fixture-a', 'fixture-b'])
+        self.service.check(self.profile_id, 'fixture-a')
+        self.drain()
+        self.run_queued()
+        self.assertEqual(self.status()['job']['state'], 'waiting')
+        self.assertEqual(self.store.read()['ssh_maintenance'][self.profile_id]['state'], 'held')
+        generation = str(uuid4())
+        self.store.mutate(lambda data: self.store.profile(self.profile_id, data).update(generation=generation))
+        self.service.tick()
+        self.drain()
+        value = self.service._read(self.profile_id, 'fixture-a')
+        # Retired without any lifecycle request, then queued again at once by
+        # the observation that still finds the stopped host on the older bundle.
+        self.assertEqual(value['job']['state'], 'queued')
+        self.assertEqual(value['_job']['generation'], generation)
+        self.assertTrue(value['_job']['automatic'])
+        self.assertEqual(self.store.read()['ssh_maintenance'][self.profile_id]['state'], 'released')
+        self.assertFalse(any(op in ('stop', 'prepare', 'start') for op, _ in self.fleet.calls))
 
 
 if __name__ == '__main__':

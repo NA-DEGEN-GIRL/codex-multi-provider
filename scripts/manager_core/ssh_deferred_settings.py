@@ -35,6 +35,19 @@ def host_failure_message(records, *, stop_only=False):
             + '서버를 다시 쓸 수 있게 되면 다음 실행 때 또는 ‘SSH 작업 종료 후 설정 적용’으로 다시 적용합니다.')
 
 
+# A stopped host pinned to an older runtime bundle could not be prepared on the
+# offered one when its profile opened. Its settings are unchanged and its
+# previous binding stays published; the next open or SSH update retries.
+BUNDLE_REFRESH_FAILED = 'ssh_bundle_refresh_failed'
+
+
+def bundle_refresh_message(records):
+    details = ' / '.join(f"{r['binding']['alias']}: {(r.get('failure_message') or 'SSH 준비 실패').rstrip('.')}"
+                         for r in records)
+    return ('일부 SSH 서버의 관리 런타임을 현재 버전으로 준비하지 못해 이전 버전 그대로 두었습니다. ' + details + '. '
+            '다음 실행 때 또는 SSH 업데이트로 다시 준비합니다.')
+
+
 def _unmodified(lease, profile):
     if (lease.get('ssh_only') is not True or lease.get('force_runtime_update')
             or lease.get('state') != 'held' or lease.get('profile_scope') != [profile['id']]

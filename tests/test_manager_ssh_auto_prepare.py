@@ -34,7 +34,9 @@ class AutoPrepareTests(unittest.TestCase):
         self.remote.prepare.side_effect = self.prepare
 
     def prepare(self, alias, pid, home, models, *, reuse_host_runtime=False):
-        self.assertTrue(reuse_host_runtime)
+        # A first start on a host runs the offered bundle (a cached copy of it
+        # is still reused), never an older bundle another profile pinned there.
+        self.assertFalse(reuse_host_runtime)
         self.assertEqual(pid, self.pid)
         self.assertEqual(models, [])
         self.assertFalse(SshInventory(self.root).coverage(self.store.profile(pid))['complete'])

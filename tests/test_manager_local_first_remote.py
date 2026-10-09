@@ -674,6 +674,175 @@ class LocalFirstRemoteTests(unittest.TestCase):
         self.assertEqual(json.loads(self.manifest.read_text()), changed)
         self.assertEqual(self.gate()['state'], 'attention')
 
+    def older_bundle_fleet(self, *, stopped):
+        """Unchanged settings; every binding pins an older bundle than the offered one."""
+        from manager_core.remote_updates import offered_bundle
+        atomic_json(self.fixture.root / 'artifacts/remote/linux-x86_64/manifest.json', dict(version='2.0', files=[]))
+        self.offered = offered_bundle(self.fixture.root, 'linux', 'x86_64')['bundle_id']
+        self.older = '1.0-' + 'a' * 16
+        self.fleet.binding_matches_settings = lambda profile, binding: True
+        def record(data):
+            self.store.profile(self.profile['id'], data)['remote_bindings'] = [
+                dict(b, prepared=True, runtime_bundle=self.older, host_identity='f' * 64)
+                for b in self.fleet.bindings_by_alias.values()]
+            # The last observation of this host account names its platform.
+            data['remote_updates'] = {self.profile['id'] + ':fixture-a': dict(
+                profile_id=self.profile['id'], alias='fixture-a',
+                stock=dict(platform='linux', architecture='x86_64', managed_host_identity='f' * 64))}
+        self.store.mutate(record)
+        for alias in stopped:
+            self.fleet.running[alias] = None
+        prepare = self.fleet.prepare
+        self.fleet.prepare = lambda *a, **k: dict(prepare(*a, **k), runtime_bundle=self.offered,
+                                                  host_identity='f' * 64)
+
+    def lease(self):
+        return json.loads(self.hooks._lease_path(self.gate()['transaction_id']).read_text(encoding='utf-8'))
+
+    def published(self):
+        return {b['alias']: b['revision'] for b in json.loads(self.manifest.read_text())['bindings']}
+
+    def stored_bundles(self):
+        return {b['alias']: b['runtime_bundle'] for b in self.store.profile(self.profile['id'])['remote_bindings']}
+
+    def test_open_prepares_a_stopped_host_on_the_offered_bundle_and_keeps_the_running_one(self):
+        self.older_bundle_fleet(stopped=('fixture-a',))
+        running = deepcopy(self.fleet.running['fixture-b'])
+        shown = self.open()
+        self.pending.pop()()
+        self.assertEqual(self.job()['phase'], 'complete')
+        self.assertEqual(self.gate()['state'], 'released')
+        self.assertFalse(any(operation == 'stop' for operation, _ in self.fleet.calls))
+        self.assertEqual([call for call in self.fleet.calls if call[0] in ('prepare', 'start')],
+                         [('prepare', 'fixture-a'), ('start', 'fixture-a')])
+        self.assertEqual(self.fleet.running['fixture-b'], running)
+        self.assertEqual(self.published(), {'fixture-a': 'b' * 64, 'fixture-b': 'a' * 64})
+        self.assertEqual(self.stored_bundles(), {'fixture-a': self.offered, 'fixture-b': self.older})
+        manifest = json.loads(self.manifest.read_text())
+        self.assertFalse(manifest.get('pending_policy_hosts') or manifest.get('deferred_policy_hosts'))
+        lease = self.lease()
+        self.assertEqual((lease['bundle_refresh'], lease['bundle_refreshed']), (['fixture-a'], ['fixture-a']))
+        self.assertIs(lease['reused_unchanged'], True)
+        self.assertEqual(self.store.profile(self.profile['id'])['generation'], shown['profile']['generation'])
+        self.assertEqual(self.instances.show_calls, [self.profile['id']])
+        self.assertEqual(self.fixture.closes, [])
+
+    def test_open_never_stops_or_replaces_a_running_host_on_an_older_bundle(self):
+        self.older_bundle_fleet(stopped=())
+        running = deepcopy(self.fleet.running)
+        self.open()
+        self.pending.pop()()
+        self.assertEqual(self.job()['phase'], 'complete')
+        self.assertEqual(self.gate()['state'], 'released')
+        self.assertFalse(any(operation in ('stop', 'drain', 'prepare', 'start') for operation, _ in self.fleet.calls))
+        self.assertEqual(self.fleet.running, running)
+        self.assertEqual(self.published(), {'fixture-a': 'a' * 64, 'fixture-b': 'a' * 64})
+        self.assertEqual(self.stored_bundles(), {'fixture-a': self.older, 'fixture-b': self.older})
+        self.assertNotIn('bundle_refresh', self.lease())
+
+    def test_every_stopped_host_is_prepared_on_the_offered_bundle(self):
+        self.older_bundle_fleet(stopped=('fixture-a', 'fixture-b'))
+        self.open()
+        self.pending.pop()()
+        self.assertEqual(self.job()['phase'], 'complete')
+        self.assertFalse(any(operation == 'stop' for operation, _ in self.fleet.calls))
+        self.assertEqual(self.published(), {'fixture-a': 'b' * 64, 'fixture-b': 'b' * 64})
+        self.assertEqual(self.stored_bundles(), {'fixture-a': self.offered, 'fixture-b': self.offered})
+        self.assertEqual(self.lease()['bundle_refreshed'], ['fixture-a', 'fixture-b'])
+
+    def test_a_process_that_appears_before_the_refresh_is_left_running(self):
+        self.older_bundle_fleet(stopped=('fixture-a', 'fixture-b'))
+        original, appeared = self.fleet.request, []
+        def appearing(binding, operation, **params):
+            result = original(binding, operation, **params)
+            if operation == 'inspect' and binding['alias'] == 'fixture-a' and not appeared:
+                # Started elsewhere right after the read-only selection.
+                appeared.append(self.fleet.process(binding))
+                self.fleet.running['fixture-a'] = appeared[0]
+            return result
+        self.fleet.request = appearing
+        self.open()
+        self.pending.pop()()
+        self.assertEqual(self.job()['phase'], 'complete')
+        self.assertEqual(self.fleet.running['fixture-a'], appeared[0])
+        self.assertFalse(any(operation == 'stop' for operation, _ in self.fleet.calls))
+        self.assertEqual([call for call in self.fleet.calls if call[0] in ('prepare', 'start')],
+                         [('prepare', 'fixture-b'), ('start', 'fixture-b')])
+        self.assertEqual(self.published(), {'fixture-a': 'a' * 64, 'fixture-b': 'b' * 64})
+        lease = self.lease()
+        self.assertEqual((lease['bundle_refresh'], lease['bundle_refreshed']),
+                         (['fixture-a', 'fixture-b'], ['fixture-b']))
+
+    def test_reopen_adopts_a_refresh_start_whose_reply_was_lost(self):
+        self.older_bundle_fleet(stopped=('fixture-a',))
+        self.fleet.lose_start = 'fixture-a'
+        running = deepcopy(self.fleet.running['fixture-b'])
+        self.open()
+        self.pending.pop()()
+        self.assertEqual(self.gate()['state'], 'attention')
+        records = {record['alias']: record for record in self.lease()['profiles'][0]['remotes']}
+        self.assertEqual(records['fixture-a']['state'], 'start_requested')
+        self.open()
+        self.pending.pop()()
+        self.assertEqual(self.job()['phase'], 'complete')
+        self.assertEqual(self.gate()['state'], 'released')
+        # Never started twice, and the kept host was never stopped.
+        self.assertEqual(self.fleet.calls.count(('start', 'fixture-a')), 1)
+        self.assertFalse(any(operation == 'stop' for operation, _ in self.fleet.calls))
+        self.assertEqual(self.fleet.running['fixture-b'], running)
+        self.assertEqual(self.published(), {'fixture-a': 'b' * 64, 'fixture-b': 'a' * 64})
+        self.assertEqual(self.lease()['bundle_refreshed'], ['fixture-a'])
+
+    def test_reopened_refresh_hands_another_live_process_to_the_strict_path(self):
+        self.older_bundle_fleet(stopped=('fixture-a',))
+        self.fleet.lose_start = 'fixture-a'
+        self.open()
+        self.pending.pop()()
+        # Something else replaced the started runtime before the reopen.
+        self.fleet.running['fixture-a'] = self.fleet.process(self.fleet.bindings_by_alias['fixture-a'])
+        self.open()
+        self.assertFalse(self.restarts.step(self.profile['id'], self.job()['id']))
+        self.assertEqual(self.lease()['bundle_refresh'], [])
+        self.assertEqual(self.gate()['state'], 'held')
+        self.assertFalse(any(operation == 'stop' for operation, _ in self.fleet.calls))
+
+    def test_refresh_that_cannot_prepare_keeps_the_previous_binding_without_deferring(self):
+        self.older_bundle_fleet(stopped=('fixture-a',))
+        self.fleet.fail_host = 'fixture-a'
+        running = deepcopy(self.fleet.running['fixture-b'])
+        self.open()
+        self.pending.pop()()
+        gate, job = self.gate(), self.job()
+        self.assertEqual(gate['state'], 'released')
+        self.assertEqual((gate['code'], gate['bundle_refresh_hosts']), ('ssh_bundle_refresh_failed', ['fixture-a']))
+        self.assertNotIn('settings_deferred', gate)
+        self.assertEqual((job['phase'], job['code'], job['connections_restored']),
+                         ('attention', 'ssh_bundle_refresh_failed', True))
+        self.assertIn('fixture-a', job['message'])
+        self.assertIn('디스크 공간', job['message'])
+        manifest = json.loads(self.manifest.read_text())
+        self.assertEqual(self.published(), {'fixture-a': 'a' * 64, 'fixture-b': 'a' * 64})
+        self.assertFalse(manifest.get('pending_policy_hosts') or manifest.get('deferred_policy_hosts'))
+        self.assertEqual(self.stored_bundles(), {'fixture-a': self.older, 'fixture-b': self.older})
+        self.assertFalse(any(operation in ('stop', 'start') for operation, _ in self.fleet.calls))
+        self.assertEqual(self.fleet.running['fixture-b'], running)
+        self.hooks.guard_launch(self.profile['id'])
+
+    def test_changed_settings_hand_a_refresh_to_the_strict_path(self):
+        self.older_bundle_fleet(stopped=('fixture-a',))
+        # A genuine settings change on the host kept for reuse.
+        self.fleet.binding_matches_settings = lambda profile, binding: False
+        self.fleet.settings_files = lambda profile, binding: {'config.toml': 'c' * 64}
+        self.fleet.settings_evidence = False
+        self.open()
+        self.pending.pop()()
+        self.assertEqual(self.job()['phase'], 'complete')
+        self.assertEqual(self.lease()['bundle_refresh'], [])
+        self.assertNotIn('bundle_refreshed', self.lease())
+        # The strict path applies the settings to the whole cohort as before.
+        self.assertEqual([alias for operation, alias in self.fleet.calls if operation == 'stop'], ['fixture-b'])
+        self.assertEqual(self.published(), {'fixture-a': 'b' * 64, 'fixture-b': 'b' * 64})
+
 
 if __name__ == '__main__':
     unittest.main()

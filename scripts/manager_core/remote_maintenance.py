@@ -134,8 +134,14 @@ class RemoteMaintenance:
         self.root, self.store, self.remote = Path(root).resolve(), store, remote
 
     def pending_on_open(self, profile):
-        """Local metadata only: a stopped desktop must reconcile older SSH work."""
-        inventory = self.store.read().get('ssh_inventory', {}).get(profile['id'], {})
+        """Local metadata only: a stopped desktop must reconcile older SSH work.
+
+        A prepared binding pinned to an older runtime bundle than the one
+        offered also reconciles: its stopped hosts are prepared on the offered
+        bundle before they can start again (stopped_stale_hosts).
+        """
+        data = self.store.read()
+        inventory = data.get('ssh_inventory', {}).get(profile['id'], {})
         if not inventory.get('hosts'):
             return False
         policy = profile['policy']
@@ -153,8 +159,46 @@ class RemoteMaintenance:
             return True
         # GUI, clipboard and other manager-only updates must not restart SSH.
         bindings = {b['alias']: b for b in profile.get('remote_bindings', []) if b.get('prepared') is True}
+        from .remote_updates import stale_bundle
         return any(alias not in bindings or not self.remote.binding_matches_settings(profile, bindings[alias])
+                   or stale_bundle(self.root, data, profile['id'], bindings[alias]) is not None
                    for alias in inventory['hosts'])
+
+    def stopped_stale_hosts(self, profile, records):
+        """Unchanged hosts whose stopped runtime would start an older bundle.
+
+        Only an untouched preflight record whose publication is exactly the
+        saved prepared binding qualifies, and only after an observation-only
+        inspect proves nothing of this profile runs there. A live process of
+        any revision is work in progress and is never selected; an unreachable
+        host or a failed observation stays on the ordinary path. Read-only.
+        """
+        from .remote_updates import stale_bundle
+        data = self.store.read()
+        saved = {item.get('alias'): item for item in profile.get('remote_bindings', [])
+                 if item.get('prepared') is True}
+        selected = []
+        for record in records:
+            binding = record.get('binding')
+            if (not isinstance(binding, dict) or record.get('state') != 'unobserved' or record.get('reinspect')
+                    or record.get('publication_binding') != binding
+                    or any(key in record for key in ('next_binding', 'exit_proof', 'started', 'process'))):
+                continue
+            prepared = saved.get(binding.get('alias'))
+            try:
+                if prepared is None or validate_binding(prepared, profile['id']) != binding:
+                    continue
+            except ShimError:
+                continue
+            if stale_bundle(self.root, data, profile['id'], prepared) is None:
+                continue
+            try:
+                observed = self.observe_live(binding)
+            except UpdateError:
+                continue
+            if observed['process'] is None and observed.get('active_binding') is None:
+                selected.append(binding['alias'])
+        return selected
 
     def verify_settings(self, profile, binding):
         """Backfill old bindings using read-only evidence from immutable config."""

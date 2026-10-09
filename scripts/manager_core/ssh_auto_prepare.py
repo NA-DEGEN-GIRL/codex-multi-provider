@@ -68,8 +68,11 @@ def ensure_binding(arguments, manifest, path, *, remote=None):
             if remote is None:
                 from .remote import RemoteManager
                 remote = RemoteManager(root, ssh_executable=manifest['real_ssh'])
+            # Nothing of this profile runs on the host yet, so it starts on the
+            # offered bundle: a copy already cached on the host is still reused,
+            # but an older bundle another profile pinned there is never chosen.
             result = remote.prepare(alias, profile_id, profile['home'], models,
-                reuse_host_runtime=True, **render_options(profile))
+                **render_options(profile))
             if not result.get('prepared'):
                 raise ShimError('ssh_auto_prepare_failed', 'SSH 자동 준비를 완료하지 못했습니다. SSH 연결 준비에서 상태를 확인하세요.')
             binding = validate_binding(result, profile_id)
