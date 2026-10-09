@@ -210,8 +210,11 @@ def render_for_host(registry, config_home, profile, existing_config='', *, host_
                       _runtime=runtime)
     rendered['files'][relative] = json.dumps(binding, sort_keys=True, ensure_ascii=False) + '\n'
     rendered['helper_files'] = remote_helper_files()
+    # credential_sources: the helper files prepared with this authority accept a credential's
+    # source and ID, so the Windows broker may lend the profile's long-lived token here once
+    # the runtime also declares it. Older authorities lack the key and only borrow the login.
     rendered['main_auth'] = dict(kind='claude', auth_source='manager_proxy', profile_id=target,
-                                 expected_account_identity=identity)
+                                 expected_account_identity=identity, credential_sources=1)
     return rendered
 
 

@@ -52,17 +52,41 @@ def scrub_environment(directory, environ=None):
     return result
 
 
+LENT_KEYS = frozenset({'profileId', 'accessToken', 'expiresAt', 'accountIdentity'})
+# A runtime adds these only when the Windows broker reported them, which it does only for a
+# runtime and a prepared helper that both understand them.
+SOURCE_KEYS = frozenset({'credentialSource', 'credentialId'})
+WINDOWS_LOGIN, LONG_LIVED_TOKEN = 'windowsLogin', 'longLivedToken'
+
+
+def canonical_uuid(value):
+    """True for a lowercase hyphenated UUID string exactly as str(UUID()) prints it."""
+    if not isinstance(value, str) or len(value) != 36:
+        return False
+    try:
+        return str(UUID(value)) == value
+    except ValueError:
+        return False
+
+
 def borrowed_credential(value, profile_id, account_identity, minimum_expiry):
     """Validate an access-only credential lent by the manager.
 
-    The same rules apply at runner start and to a renewal during a turn. The
-    error never repeats the received value, which may contain a token.
+    The same rules apply at runner start and to a renewal during a turn. A credential has the
+    four original keys, or those and its source: the PC's Windows login (no ID) or the profile's
+    saved long-lived token (its credential ID). The error never repeats the received value,
+    which may contain a token.
     """
-    if (not isinstance(value, dict) or set(value) != {'profileId', 'accessToken', 'expiresAt', 'accountIdentity'}
+    keys = set(value) if isinstance(value, dict) else None
+    if (keys not in (LENT_KEYS, LENT_KEYS | SOURCE_KEYS)
             or value['profileId'] != profile_id or value['accountIdentity'] != account_identity
             or type(value['expiresAt']) is not int or value['expiresAt'] < minimum_expiry
             or not isinstance(value['accessToken'], str) or not 1 <= len(value['accessToken']) <= 65536
             or any(ord(char) <= 32 or ord(char) >= 127 for char in value['accessToken'])):
+        raise ValueError('Claude access credential unavailable')
+    if keys == LENT_KEYS | SOURCE_KEYS and not (
+            (value['credentialSource'] == WINDOWS_LOGIN and value['credentialId'] is None)
+            or (value['credentialSource'] == LONG_LIVED_TOKEN and canonical_uuid(value['credentialId']))):
         raise ValueError('Claude access credential unavailable')
     return value
 

@@ -25,8 +25,8 @@ from multiprocessing.connection import Listener
 if __package__ in (None, ''):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from manager_core.claude_auth import (ClaudeError, auth_status, borrowed_credential, config_dir,
-                                      discover_cli, scrub_environment)
+from manager_core.claude_auth import (LONG_LIVED_TOKEN, ClaudeError, auth_status, borrowed_credential,
+                                      config_dir, discover_cli, scrub_environment)
 from manager_core.claude_protocol import (MAX_LINE_BYTES, ProtocolError, bounded_text, compact_summary_fits,
                                           encode_message, normalize, read_message, usage_fields)
 from manager_core.claude_profiles import MODEL_EFFORTS, automatic_context_window
@@ -510,9 +510,12 @@ def build_command(cli, session, resume, settings, mode, prompts, directory, mana
         raise ClaudeError('permissions', 'Unsupported Claude permission policy.')
     if prompts == 'host' and mcp_path is None:
         raise ClaudeError('permissions', 'Claude native approval bridge is required.')
+    # Defence in depth for local runs only: the Read tool is not the only way to a file, and on
+    # an SSH host manager_root is the remote root, where no saved credential exists.
     deny = ['Read(**/.credentials.json)', 'Read(**/auth.json)',
             'Read(//' + directory.parent.as_posix().lstrip('/') + '/**)',
-            'Read(//' + (manager_root / 'work/control-center/profiles').as_posix().lstrip('/') + '/**/auth.json)']
+            'Read(//' + (manager_root / 'work/control-center/profiles').as_posix().lstrip('/') + '/**/auth.json)',
+            'Read(//' + (manager_root / 'work/control-center/credentials').as_posix().lstrip('/') + '/**)']
     if managed_delegation:
         deny += ['Agent', 'Task']
     permissions = {'deny': deny}
@@ -632,6 +635,20 @@ AUTH_FAILURES = {
     'claude_login_required': ("Claude rejected this profile's login. "
                               'Sign in through Claude CLI for this profile again, then send the message again.'),
 }
+# The same failures of the profile's saved long-lived token, when the PC login could not take over.
+LONG_LIVED_FAILURES = {
+    'claude_auth_expired': ('The long-lived Claude token saved for this profile has expired, and no Windows login '
+                            "token could replace it. Replace the token in the manager's Claude profile settings "
+                            'or sign in to this profile on Windows, then send the message again.'),
+    'claude_auth_rejected': ('Claude rejected the long-lived token saved for this profile (it may have been revoked), '
+                             "and no Windows login token could replace it. Replace or remove the token in the manager's "
+                             'Claude profile settings or sign in to this profile on Windows, then send the message again.'),
+}
+LONG_LIVED_SWITCH_NOTICE = ('Claude rejected the long-lived token saved for this profile; this turn continues with '
+                            "the Windows login. Replace the long-lived token in the manager's Claude profile settings.")
+# A long-lived token refused this close to its computed expiry has expired: the user enters the
+# validity the CLI showed when it was issued, and only the server knows the exact instant.
+LONG_LIVED_EXPIRY_WINDOW = 2 * 86400
 # The API's own reason for an expired OAuth access token, which the CLI relays in its error text.
 AUTH_EXPIRED_TEXT = re.compile(r'\bOAuth (?:access )?token has expired\b')
 # Without that reason, a borrowed token rejected this close to its expiry has expired. The expiry
@@ -646,17 +663,20 @@ AUTH_REFRESH_SECONDS = 90
 # request is sent only after that window, counted from the first request.
 AUTH_REFRESH_RETRY_SECONDS = 35
 # Closes the stopped process's open tool calls in shared history before a renewal.
-AUTH_TOOL_STOPPED = ('The Claude process stopped when its login expired; the outcome of this tool is unknown. '
+AUTH_TOOL_STOPPED = ('The Claude process stopped when its login stopped working; the outcome of this tool is unknown. '
                      'Inspect the workspace before repeating this action.')
+# Neutral about why: an expired login was renewed, or a refused saved token was replaced.
 AUTH_CONTINUATION = (
-    'The previous attempt of this request stopped because the Claude login expired; the login has been renewed. '
+    'The previous attempt of this request stopped because its Claude login stopped working (it expired or was '
+    'refused); a renewed or replacement login is now in use. '
     'Background shells, agents and workflows that this Claude session started before the stop were terminated; '
     'restart any that are still needed. Native Codex agents started through the codex_agents tools are separate '
     'tasks and keep running. Continue the current request from where it stopped, and check the workspace before '
     'repeating an action whose outcome is unclear.')
 # Prepended to the next request when a session stopped by its login is resumed.
 AUTH_STOP_NOTE = (
-    'Note: the previous request in this session stopped before it finished because the Claude login expired. '
+    'Note: the previous request in this session stopped before it finished because its Claude login stopped '
+    'working (it expired or was refused). '
     'Background shells, agents and workflows that this Claude session started were terminated with it; native Codex '
     'agents started through the codex_agents tools are separate tasks. Check the workspace before relying on the '
     'outcome of the stopped work.')
@@ -763,10 +783,11 @@ def token_expired(message, text):
 
 
 class BorrowedLogin:
-    """Owner, expiry and token of the newest login lent for this turn.
+    """Owner, expiry, source and token of the newest login lent for this turn.
 
-    The token is handed only to a CLI launch or a rotation; it never appears in repr, events,
-    notices or the ledger.
+    The source is the PC's Windows login or the profile's saved long-lived token (with its
+    credential ID), when the host reported it. The token is handed only to a CLI launch or a
+    rotation; it never appears in repr, events, notices or the ledger.
     """
     def __init__(self, value, token=None):
         if (not isinstance(value, dict) or not isinstance(value.get('profileId'), str)
@@ -774,25 +795,53 @@ class BorrowedLogin:
             raise ClaudeError('protocol', 'Invalid borrowed Claude login metadata.')
         self.profile_id, self.account_identity = value['profileId'], value['accountIdentity']
         self.expires_at, self.token = value['expiresAt'], token
+        self.source, self.credential_id = value.get('credentialSource'), value.get('credentialId')
+        if self.source == LONG_LIVED_TOKEN and not isinstance(self.credential_id, str):
+            raise ClaudeError('protocol', 'Invalid borrowed Claude login metadata.')
+        # Long-lived credential IDs that Claude refused during this turn; never accepted again.
+        self.refused = set()
 
     def __repr__(self):
-        return 'BorrowedLogin(expires_at=%r)' % self.expires_at
+        return 'BorrowedLogin(expires_at=%r, source=%r)' % (self.expires_at, self.source)
 
-    def failure(self, reported_expired=False, expires_at=None):
-        """Classify a refused request made with the token that expires at `expires_at`."""
-        expiry = self.expires_at if expires_at is None else expires_at
+    def credential(self):
+        """The newest credential's (expiry, source, ID), for the CLI process that receives it."""
+        return self.expires_at, self.source, self.credential_id
+
+    def failure(self, reported_expired=False, credential=None):
+        """Classify a refused request made with `credential` (default: the newest one)."""
+        expiry, source, _ = self.credential() if credential is None else credential
+        if source == LONG_LIVED_TOKEN:
+            # Expiry is computed from the issue date and validity the user entered.
+            if reported_expired or abs(time.time() - expiry) <= LONG_LIVED_EXPIRY_WINDOW:
+                return 'claude_auth_expired'
+            return 'claude_auth_rejected'
         if reported_expired or time.time() >= expiry - AUTH_EXPIRY_MARGIN:
             return 'claude_auth_expired'
         return 'claude_auth_rejected'
 
-    def renewed(self, credentials):
-        """Keep a newer token for the same login: True, or False when it is not newer.
+    def refuse(self, credential):
+        """Mark a refused long-lived credential; True the first time it is refused."""
+        _, source, credential_id = credential
+        if source != LONG_LIVED_TOKEN or credential_id in self.refused:
+            return False
+        self.refused.add(credential_id)
+        return True
 
-        ValueError for any other credential."""
+    def renewed(self, credentials, switch=False):
+        """Keep a newer token for the same login: True, or False when it is not usable.
+
+        A switch replaces a refused long-lived token, so any other credential of this login
+        with enough time left qualifies; otherwise the token must expire later than the
+        current one. A refused credential is never taken back. ValueError for any other
+        login or a malformed credential."""
         value = borrowed_credential(credentials, self.profile_id, self.account_identity, int(time.time()) + 30)
-        if value['expiresAt'] <= self.expires_at or value['expiresAt'] < int(time.time()) + AUTH_RENEWAL_MINIMUM:
+        if (value.get('credentialId') in self.refused
+                or value['expiresAt'] < int(time.time()) + AUTH_RENEWAL_MINIMUM
+                or (not switch and value['expiresAt'] <= self.expires_at)):
             return False
         self.expires_at, self.token = value['expiresAt'], value['accessToken']
+        self.source, self.credential_id = value.get('credentialSource'), value.get('credentialId')
         return True
 
 
@@ -803,15 +852,24 @@ class Rotation:
     pushed with update_environment_variables and counts once the CLI acknowledges it.
     Without that acknowledgement this process keeps its token, rotation stops for it, and the
     relaunch path handles its next failure with the newer token.
+
+    A saved long-lived token is never rotated ahead of time. When the API refuses it, the
+    refusal is reported (`refuse`) and the host is asked to switch to another credential
+    (reason "switch"), which reaches the waiting CLI the same way.
     """
-    def __init__(self, borrowed, emit, enabled):
+    def __init__(self, borrowed, emit, enabled, refuse=None):
         self.borrowed, self.emit, self.enabled = borrowed, emit, enabled
-        self.outstanding, self.requested_at, self.process = False, None, None
-        self.expires_at = borrowed.expires_at if borrowed is not None else None
+        self.refuse = refuse or (lambda credential: None)
+        self.outstanding, self.switching, self.requested_at, self.process = False, False, None, None
+        self.credential = borrowed.credential() if borrowed is not None else None
+
+    @property
+    def expires_at(self):
+        return self.credential[0] if self.credential else None
 
     def launch(self, process):
         """A CLI process started with the newest token."""
-        self.process, self.expires_at = process, self.borrowed.expires_at if self.borrowed else None
+        self.process, self.credential = process, self.borrowed.credential() if self.borrowed else None
         self.failed, self.ack, self.urgent, self.attempts, self.recoveries = False, None, False, 0, 0
 
     def stop(self):
@@ -820,8 +878,17 @@ class Rotation:
     def _active(self):
         return self.enabled and self.process is not None and not self.failed
 
+    def _long_lived(self):
+        return self.credential is not None and self.credential[1] == LONG_LIVED_TOKEN
+
     def _request(self):
-        self.emit(dict(type='auth_refresh', reason='rotate'))
+        if self._long_lived():
+            # Only a refusal gets here: the host records it and lends another credential.
+            self.emit(dict(type='auth_refresh', reason='switch', rejected_credential_id=self.credential[2]))
+            self.switching = True
+        else:
+            self.emit(dict(type='auth_refresh', reason='rotate'))
+            self.switching = False
         self.outstanding, self.requested_at = True, time.monotonic()
 
     def tick(self):
@@ -837,13 +904,15 @@ class Rotation:
         if self.urgent and since >= AUTH_ROTATE_SPACING:
             self.urgent, self.recoveries = False, self.recoveries + 1
             self._request()
-        elif (self.attempts < AUTH_ROTATE_ATTEMPTS and since >= AUTH_REFRESH_RETRY_SECONDS
-              and time.time() >= self.expires_at - AUTH_ROTATE_MARGIN):
+        elif (not self._long_lived() and self.attempts < AUTH_ROTATE_ATTEMPTS
+              and since >= AUTH_REFRESH_RETRY_SECONDS and time.time() >= self.expires_at - AUTH_ROTATE_MARGIN):
             self.attempts += 1
             self._request()
 
     def recover(self):
         """The API refused this process's token and the CLI waits for a rotated one."""
+        if self.process is not None and self._long_lived():
+            self.refuse(self.credential)  # A refused long-lived token is reported even without a switch.
         if (self._active() and not self.outstanding and self.ack is None
                 and self.recoveries < AUTH_ROTATE_RECOVERIES):
             self.urgent = True
@@ -855,7 +924,7 @@ class Rotation:
         if update.get('available') is not True:
             return
         try:
-            if not self.borrowed.renewed(update.get('credentials')):
+            if not self.borrowed.renewed(update.get('credentials'), switch=self.switching):
                 return
         except ValueError:
             self.failed = True  # Another account or a malformed credential is never applied.
@@ -870,7 +939,7 @@ class Rotation:
         except (OSError, ValueError):
             self.failed = True
             return
-        self.ack = (request_id, time.monotonic() + AUTH_ROTATE_ACK_SECONDS, self.borrowed.expires_at)
+        self.ack = (request_id, time.monotonic() + AUTH_ROTATE_ACK_SECONDS, self.borrowed.credential())
 
     def acknowledged(self, message):
         """Consume the CLI's answer to a pushed token; False for any other control response."""
@@ -878,7 +947,10 @@ class Rotation:
         if self.ack is None or response.get('request_id') != self.ack[0]:
             return False
         if response.get('subtype') == 'success':
-            self.expires_at, self.attempts, self.recoveries = self.ack[2], 0, 0
+            switched = self._long_lived() and self.ack[2][1] != LONG_LIVED_TOKEN
+            self.credential, self.attempts, self.recoveries = self.ack[2], 0, 0
+            if switched:
+                self.emit(dict(type='event', kind='notice', message=LONG_LIVED_SWITCH_NOTICE))
         else:
             self.failed = True
         self.ack = None
@@ -925,12 +997,15 @@ def host_wait(events, until, bridge, delegation, expect_update=False):
             return 'protocol', None
 
 
-def renew_login(borrowed, events, emit, bridge, delegation, rotation=None):
+def renew_login(borrowed, events, emit, bridge, delegation, rotation=None, rejected=None):
     """Ask the native host for the renewed login at most twice; return the outcome.
 
     The renewed token is kept in `borrowed`. A rotation request still unanswered when the CLI
-    stopped is awaited first, and a newer token in its reply needs no further request.
+    stopped is awaited first, and a newer token in its reply needs no further request. With
+    `rejected` (a refused long-lived credential ID) the host is asked to switch to another
+    credential instead, which need not expire later.
     """
+    switch = rejected is not None
     if rotation is not None and rotation.outstanding:
         outcome, update = host_wait(events, time.monotonic() + AUTH_REFRESH_SECONDS, bridge, delegation,
                                     expect_update=True)
@@ -938,7 +1013,8 @@ def renew_login(borrowed, events, emit, bridge, delegation, rotation=None):
             return 'unavailable' if outcome == 'timeout' else outcome
         rotation.outstanding = False
         try:
-            if update.get('available') is True and borrowed.renewed(update.get('credentials')):
+            if update.get('available') is True and borrowed.renewed(update.get('credentials'),
+                                                                    switch=switch or rotation.switching):
                 return 'renewed'
         except ValueError:
             return 'unavailable'  # Another account or a malformed credential.
@@ -952,14 +1028,16 @@ def renew_login(borrowed, events, emit, bridge, delegation, rotation=None):
                 return outcome
             if deadline - time.monotonic() < 5:
                 return 'unavailable'
-        emit(dict(type='auth_refresh'))
+        # An expiry request keeps the original shape, which every runtime answers.
+        emit(dict(type='auth_refresh', reason='switch', rejected_credential_id=rejected) if switch
+             else dict(type='auth_refresh'))
         outcome, update = host_wait(events, deadline, bridge, delegation, expect_update=True)
         if outcome != 'update':
             return 'unavailable' if outcome == 'timeout' else outcome
         if update.get('available') is not True:
             continue
         try:
-            if borrowed.renewed(update.get('credentials')):
+            if borrowed.renewed(update.get('credentials'), switch=switch):
                 return 'renewed'
         except ValueError:
             return 'unavailable'  # Another account or a malformed credential.
@@ -1089,18 +1167,28 @@ def execute(command, cwd, environment, incoming, emit, bridge, stopped, observed
     last_usage, model_started, compactions, results = {}, False, 0, []
     prior_cost = record.get('cost_total_usd', 0)
     # Only a host that lent this token and announced auth_refresh can renew it. Each relaunch
-    # reason has its own budget of one, so an expired launch is resumed at most once.
+    # reason has its own budget of one, so an expired launch is resumed at most once, and a
+    # refused long-lived token is replaced at most once, separately.
     renewable = borrowed is not None and hello.get('auth_refresh') == 1
-    relaunches = dict(expired=0)
+    relaunches = dict(expired=0, switch=0)
+    # The failing long-lived credential of the last auth error, reported with done.
+    refused_credential = None
+
+    def refuse(credential):
+        """Report a refused long-lived token once, so the host stops lending it (fire and forget)."""
+        if borrowed.refuse(credential) and hello.get('auth_sources') == 1:
+            emit(dict(type='auth_rejected', credential_id=credential[2]))
+
     # A host that also announced auth_rotate renews the token of a running CLI without stopping it.
-    rotation = Rotation(borrowed, emit, renewable and hello.get('auth_rotate') == 1)
+    rotation = Rotation(borrowed, emit, renewable and hello.get('auth_rotate') == 1, refuse)
     launch_environment = (dict(environment, CLAUDE_CODE_OAUTH_401_WAIT_MS=AUTH_401_WAIT_MS) if rotation.enabled
                           else environment)
     prompt, launch, channel, process, renewal_requested = hello['_prompt'], 0, 'cli', None, False
     threading.Thread(target=_reader, args=(incoming, 'host', events), daemon=True).start()
     try:
         while True:
-            result, problem, auth_error, relaunch = None, None, None, False
+            result, problem, auth_error, relaunch, switch = None, None, None, False, False
+            refused_credential = None
             prompt_seen, auth_seen, expired_reported, forced, tree = False, False, False, False, None
             launch_results = len(results)
             # Workflows and background agents report back after the turn's first
@@ -1259,10 +1347,18 @@ def execute(command, cwd, environment, incoming, emit, bridge, stopped, observed
                         # A report may already be queued; give the CLI a moment to start that turn.
                         settle_deadline = time.monotonic() + BACKGROUND_SETTLE_SECONDS
                 if auth_seen and not interrupted and not problem and (result is None or result.get('is_error')):
-                    code = (borrowed.failure(expired_reported, rotation.expires_at) if borrowed is not None
+                    credential = rotation.credential  # The token this process was using.
+                    code = (borrowed.failure(expired_reported, credential) if borrowed is not None
                             else 'claude_login_required')
-                    auth_error = (code, AUTH_FAILURES[code])
-                    relaunch = code == 'claude_auth_expired' and renewable and not relaunches['expired']
+                    if borrowed is not None and credential[1] == LONG_LIVED_TOKEN:
+                        # Always reported, on any launch, with or without a replacement (C2).
+                        refuse(credential)
+                        refused_credential = credential
+                        auth_error = (code, LONG_LIVED_FAILURES[code])
+                        relaunch = switch = renewable and not relaunches['switch']
+                    else:
+                        auth_error = (code, AUTH_FAILURES[code])
+                        relaunch = code == 'claude_auth_expired' and renewable and not relaunches['expired']
             finally:
                 rotation.stop()
                 if not relaunch:
@@ -1293,14 +1389,24 @@ def execute(command, cwd, environment, incoming, emit, bridge, stopped, observed
                 observed.clear()
             for tool_id in stale:
                 emit(dict(type='event', kind='tool_end', id=tool_id, output=AUTH_TOOL_STOPPED, is_error=True))
-            emit(dict(type='event', kind='notice',
-                      message='Claude access token expired; renewing it and resuming this turn...'))
-            relaunches['expired'] += 1
-            if borrowed.expires_at > rotation.expires_at and borrowed.expires_at >= time.time() + AUTH_RENEWAL_MINIMUM:
+            failed = rotation.credential
+            if switch:
+                emit(dict(type='event', kind='notice', message=(
+                    'Claude rejected the long-lived token saved for this profile; switching to the Windows login '
+                    "and resuming this turn. Replace the long-lived token in the manager's Claude profile settings.")))
+                relaunches['switch'] += 1
+                held = borrowed.credential() != failed and borrowed.credential_id not in borrowed.refused
+            else:
+                emit(dict(type='event', kind='notice',
+                          message='Claude access token expired; renewing it and resuming this turn...'))
+                relaunches['expired'] += 1
+                held = borrowed.expires_at > failed[0]
+            if held and borrowed.expires_at >= time.time() + AUTH_RENEWAL_MINIMUM:
                 outcome = 'renewed'  # This launch received a newer token it could not apply.
             else:
-                renewal_requested = True
-                outcome = renew_login(borrowed, events, emit, bridge, delegation, rotation)
+                renewal_requested = renewal_requested or not switch
+                outcome = renew_login(borrowed, events, emit, bridge, delegation, rotation,
+                                      rejected=failed[2] if switch else None)
             if outcome != 'renewed':
                 interrupted = outcome == 'interrupted'
                 if outcome == 'protocol':
@@ -1344,16 +1450,33 @@ def execute(command, cwd, environment, incoming, emit, bridge, stopped, observed
             if checkpoint.get('limit_event'):
                 emit(dict(type='event', **checkpoint['limit_event']))
             answer = checkpoint['result']
-            # The lent token can expire after the turn's last request. Renew it once for this call
-            # unless the turn already asked; the host answers two expiry requests per runner.
-            if (checkpoint['success'] or checkpoint['cancelled'] or checkpoint_channel != 'checkpoint'
-                    or not renewable or renewal_requested or not auth_failed(answer)
-                    or borrowed.failure(token_expired(answer, answer.get('result'))) != 'claude_auth_expired'):
+            if checkpoint['success'] or checkpoint['cancelled'] or borrowed is None or not auth_failed(answer):
                 break
-            emit(dict(type='event', kind='notice',
-                      message='Claude access token expired; renewing it to finish the portable checkpoint...'))
-            renewal_requested = True
-            outcome = renew_login(borrowed, events, emit, bridge, delegation, rotation)
+            credential = borrowed.credential()  # The checkpoint call used the newest token.
+            long_lived = credential[1] == LONG_LIVED_TOKEN
+            if long_lived:
+                refuse(credential)
+            if checkpoint_channel != 'checkpoint' or not renewable:
+                break
+            # The lent token can expire after the turn's last request. Renew it once for this call
+            # unless the turn already asked; the host answers two expiry requests per runner. A
+            # refused long-lived token is replaced once, unless the turn already did.
+            if long_lived:
+                if relaunches['switch']:
+                    break
+                relaunches['switch'] += 1
+                emit(dict(type='event', kind='notice', message=(
+                    'Claude rejected the long-lived token saved for this profile; switching to the Windows login '
+                    'to finish the portable checkpoint...')))
+            else:
+                if (renewal_requested or borrowed.failure(token_expired(answer, answer.get('result')), credential)
+                        != 'claude_auth_expired'):
+                    break
+                emit(dict(type='event', kind='notice',
+                          message='Claude access token expired; renewing it to finish the portable checkpoint...'))
+                renewal_requested = True
+            outcome = renew_login(borrowed, events, emit, bridge, delegation, rotation,
+                                  rejected=credential[2] if long_lived else None)
             if outcome != 'renewed':
                 checkpoint['cancelled'] = outcome == 'interrupted'
                 break
@@ -1403,6 +1526,9 @@ def execute(command, cwd, environment, incoming, emit, bridge, stopped, observed
         code, message = problem or auth_error or (
             'claude_error', 'Claude did not complete this turn. Review the CLI account and permission status.')
         done['error'] = dict(code=code, message=message)
+        if not problem and auth_error and refused_credential is not None:
+            # The refused saved token; the host records it even if it missed auth_rejected (C2).
+            done['error'].update(credential_source=refused_credential[1], credential_id=refused_credential[2])
     emit(done)
     if success:
         # The model result is not durable task history yet. Rust records and

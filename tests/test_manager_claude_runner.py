@@ -23,7 +23,8 @@ from manager_core.claude_runner import (SessionLedger, compact_summary, digest, 
                                        private_temporary_directory, build_command, AUTH_FAILURES,
                                        AUTH_STOP_NOTE, AUTH_TOOL_STOPPED, BorrowedLogin, renew_login,
                                        token_expired, CLI_TOKEN_DESCRIPTOR, AUTH_ROTATE_ATTEMPTS,
-                                       AUTH_ROTATE_RECOVERIES, Rotation)
+                                       AUTH_ROTATE_RECOVERIES, Rotation, LONG_LIVED_FAILURES,
+                                       LONG_LIVED_SWITCH_NOTICE)
 
 
 FAKE = r'''
@@ -147,14 +148,17 @@ else:
         emit({'type':'result','subtype':'success','is_error':True,'session_id':session,'result':text,
               'api_error_status':401,'usage':{'input_tokens':1,'output_tokens':0},'total_cost_usd':0.01})
     elif scenario == 'api_error' or (scenario.startswith('auth_') and scenario != 'auth_checkpoint' and (
-            scenario == 'auth_always' or token == 'dummy-token-1')):
+            scenario in ('auth_always', 'auth_rejected_always') or token == 'dummy-token-1'
+            or (scenario == 'auth_chain' and token == 'dummy-token-2'))):
         if scenario == 'auth_tool':
             # A background agent's command that is still running when the main request fails.
             emit({'type':'assistant','parent_tool_use_id':'agent-1','message':{'content':[
                   {'type':'tool_use','id':'bg-tool-1','name':'Bash','input':{'command':'sleep 600'}}]}})
-        # The official CLI's shape for a failed API request (2.1.282).
+        # The official CLI's shape for a failed API request (2.1.282). auth_chain: the first
+        # token is refused, the second expires, the third works.
         text = ('API Error: 529 Overloaded' if scenario == 'api_error'
-                else 'Failed to authenticate. API Error: 401 Invalid bearer token' if scenario == 'auth_rejected'
+                else 'Failed to authenticate. API Error: 401 Invalid bearer token'
+                if scenario.startswith('auth_rejected') or (scenario == 'auth_chain' and token == 'dummy-token-1')
                 else 'Failed to authenticate. API Error: 401 OAuth access token has expired')
         emit({'type':'assistant','error':'server_error' if scenario == 'api_error' else 'authentication_failed',
               'message':{'content':[{'type':'text','text':text}],'usage':{'input_tokens':0,'output_tokens':0}}})
@@ -285,27 +289,44 @@ class Outgoing(io.BytesIO):
         return result
 
 
+SAVED_ID = '44444444-4444-4444-8444-444444444444'
+NEWER_ID = '55555555-5555-4555-8555-555555555555'
+
+
 class BorrowedContext:
-    """The SSH execution context's shape with a dummy lent token; no host binding."""
-    def __init__(self, root, cli, profile, expires_at):
+    """The SSH execution context's shape with a dummy lent token; no host binding.
+
+    With `credential_id` the lent token is the profile's saved long-lived token."""
+    def __init__(self, root, cli, profile, expires_at, credential_id=None):
         self.ledger_directory = root / 'remote-state'
         self.configuration_directory = root.parent / 'remote-account'
         self.cli, self.profile, self.expires_at = cli, profile, expires_at
         self.identity = digest('remote-account')
+        self.credential_id = credential_id
 
     def prepare(self, cwd):
         self.configuration_directory.mkdir(exist_ok=True)
+        borrowed = dict(profileId=self.profile, accountIdentity=self.identity, expiresAt=self.expires_at)
+        if self.credential_id:
+            borrowed.update(credentialSource='longLivedToken', credentialId=self.credential_id)
         return dict(settings={}, configuration_directory=self.configuration_directory,
                     environment=scrub_environment(self.configuration_directory),
                     cli=self.cli, plugins=[], status=dict(logged_in=True, method='oauth_token',
                     cli_version='2.1.282', account_identity=self.identity),
-                    borrowed_auth=dict(profileId=self.profile, accountIdentity=self.identity,
-                                       expiresAt=self.expires_at), lent_token='dummy-token-1')
+                    borrowed_auth=borrowed, lent_token='dummy-token-1')
 
     def renewal(self, token='dummy-token-2', expires_in=8 * 3600, **changes):
         credentials = dict(profileId=self.profile, accessToken=token, accountIdentity=self.identity,
                            expiresAt=int(time.time()) + expires_in)
         return dict(type='auth_update', available=True, credentials=dict(credentials, **changes))
+
+    def windows(self, token='dummy-token-2', expires_in=8 * 3600):
+        """The PC login lent in place of a refused saved token."""
+        return self.renewal(token, expires_in, credentialSource='windowsLogin', credentialId=None)
+
+    def saved(self, token='dummy-token-2', credential_id=NEWER_ID):
+        """A newer saved long-lived token (the user replaced it)."""
+        return self.renewal(token, 365 * 86400, credentialSource='longLivedToken', credentialId=credential_id)
 
 
 class ClaudeAuthTests(unittest.TestCase):
@@ -465,12 +486,13 @@ class ClaudeRunnerTests(unittest.TestCase):
         return code, events
 
     def run_borrowed(self, scenario, expires_in, updates=(), announce=True, turn='turn-1', prior=(),
-                     auth_resume=False, rotate=False, defer=False):
+                     auth_resume=False, rotate=False, defer=False, credential_id=None, sources=False):
         """Run with a lent dummy token; `updates` answer each auth_refresh in order.
 
-        `rotate` announces live rotation; `defer` holds every answer until the turn's done."""
+        `rotate` announces live rotation; `defer` holds every answer until the turn's done.
+        `credential_id` lends a saved long-lived token; `sources` announces auth_sources."""
         context = BorrowedContext(self.root, [sys.executable, str(self.fake)], self.profile,
-                                  int(time.time()) + expires_in)
+                                  int(time.time()) + expires_in, credential_id)
         incoming, events, replies = Incoming(), [], list(updates)
         hello = dict(type='hello', protocol=1, thread_id='borrowed-task', turn_id=turn,
                      claude_profile_id=self.profile, cwd=str(self.root), trusted_cwd=True,
@@ -481,6 +503,8 @@ class ClaudeRunnerTests(unittest.TestCase):
             hello['auth_resume'] = 1
         if rotate:
             hello['auth_rotate'] = 1
+        if sources:
+            hello['auth_sources'] = 1
         incoming.send(hello)
         deferred = []
         def on_output(message):
@@ -533,7 +557,7 @@ class ClaudeRunnerTests(unittest.TestCase):
         self.assertEqual(launches[0]['session'], launches[1]['session'])
         self.assertEqual(launches[1]['session'], done['session_id'])
         continuation = launches[1]['request']['message']['content'][0]['text']
-        self.assertIn('stopped because the Claude login expired', continuation)
+        self.assertIn('stopped because its Claude login stopped working', continuation)
         self.assertNotIn('fixture request', json.dumps(launches[1]['request']))
         # The CLI's API-error text is a notice, never shared assistant history.
         self.assertFalse(any('Failed to authenticate' in event.get('text', '') for event in events), events)
@@ -793,6 +817,132 @@ class ClaudeRunnerTests(unittest.TestCase):
             self.assertTrue(rotation.failed)
             self.assertEqual(rotation.process.stdin.getvalue(), b'')
             self.assertEqual(borrowed.token, 'dummy-token-1')
+
+    # Saved long-lived tokens (rev 121): refusals are always reported, and replaced once.
+    YEAR = 365 * 86400
+
+    @staticmethod
+    def of_type(events, kind):
+        return [event for event in events if event['type'] == kind]
+
+    def test_a_refused_saved_token_is_reported_and_the_turn_resumes_once_with_the_windows_login(self):
+        code, events, launches = self.run_borrowed('auth_rejected', self.YEAR, [lambda context: context.windows()],
+                                                   credential_id=SAVED_ID, sources=True)
+        self.assertEqual(code, 0, events)
+        kinds = [event['type'] for event in events]
+        # Reported first (fire and forget), then one switch request naming the refused ID.
+        self.assertEqual(self.of_type(events, 'auth_rejected'), [dict(type='auth_rejected', credential_id=SAVED_ID)])
+        self.assertEqual(self.of_type(events, 'auth_refresh'),
+                         [dict(type='auth_refresh', reason='switch', rejected_credential_id=SAVED_ID)])
+        self.assertLess(kinds.index('auth_rejected'), kinds.index('auth_refresh'))
+        self.assertEqual([(launch['token'], launch['resume']) for launch in launches],
+                         [('dummy-token-1', False), ('dummy-token-2', True)])
+        continuation = launches[1]['request']['message']['content'][0]['text']
+        self.assertIn('it expired or was refused', continuation)
+        notices = [event['message'] for event in events if event.get('kind') == 'notice']
+        self.assertTrue(any('rejected the long-lived token' in notice and 'Windows login' in notice
+                            for notice in notices), notices)
+        done = self.of_type(events, 'done')[0]
+        self.assertEqual(done['status'], 'success')
+
+    def test_a_switch_leaves_the_expiry_relaunch_for_the_replacement_login(self):
+        # The saved token is refused; the Windows login that replaces it then expires mid-turn.
+        code, events, launches = self.run_borrowed(
+            'auth_chain', self.YEAR, [lambda context: context.windows(expires_in=600),
+                                      lambda context: context.windows('dummy-token-3')],
+            credential_id=SAVED_ID, sources=True)
+        self.assertEqual(code, 0, events)
+        self.assertEqual(self.of_type(events, 'auth_refresh'), [
+            dict(type='auth_refresh', reason='switch', rejected_credential_id=SAVED_ID), dict(type='auth_refresh')])
+        self.assertEqual([launch['token'] for launch in launches], ['dummy-token-1', 'dummy-token-2', 'dummy-token-3'])
+        self.assertEqual(self.of_type(events, 'done')[0]['status'], 'success')
+
+    def test_a_refusal_without_a_replacement_reports_the_saved_token_and_its_own_message(self):
+        for announce, sources in ((False, True), (True, True), (False, False)):
+            with self.subTest(announce=announce, sources=sources):
+                updates = [dict(type='auth_update', available=False)] * 2 if announce else []
+                code, events, launches = self.run_borrowed('auth_rejected', self.YEAR, updates, announce=announce,
+                                                           credential_id=SAVED_ID, sources=sources)
+                done = self.of_type(events, 'done')[0]
+                self.assertEqual(done['error'], dict(code='claude_auth_rejected',
+                                                     message=LONG_LIVED_FAILURES['claude_auth_rejected'],
+                                                     credential_source='longLivedToken', credential_id=SAVED_ID))
+                # Without auth_sources (an older runtime) only done carries the report.
+                self.assertEqual(self.of_type(events, 'auth_rejected'),
+                                 [dict(type='auth_rejected', credential_id=SAVED_ID)] if sources else [])
+                self.assertEqual(len(launches), 1)
+
+    def test_the_relaunched_launch_reports_its_own_refused_token_and_is_not_switched_again(self):
+        code, events, launches = self.run_borrowed('auth_rejected_always', self.YEAR,
+                                                   [lambda context: context.saved()],
+                                                   credential_id=SAVED_ID, sources=True)
+        self.assertEqual(self.of_type(events, 'auth_rejected'), [
+            dict(type='auth_rejected', credential_id=SAVED_ID), dict(type='auth_rejected', credential_id=NEWER_ID)])
+        self.assertEqual(len(self.of_type(events, 'auth_refresh')), 1)
+        self.assertEqual([launch['token'] for launch in launches], ['dummy-token-1', 'dummy-token-2'])
+        done = self.of_type(events, 'done')[0]
+        self.assertEqual((done['error']['code'], done['error']['credential_id']), ('claude_auth_rejected', NEWER_ID))
+
+    def test_a_refusal_is_reported_before_an_interrupted_switch(self):
+        code, events, launches = self.run_borrowed('auth_rejected', self.YEAR, [{'type': 'interrupt'}],
+                                                   credential_id=SAVED_ID, sources=True)
+        done = self.of_type(events, 'done')[0]
+        self.assertEqual(done['status'], 'interrupted')
+        kinds = [event['type'] for event in events]
+        self.assertLess(kinds.index('auth_rejected'), kinds.index('done'))
+        self.assertEqual(len(launches), 1)
+
+    def test_a_refused_saved_token_is_replaced_live_without_relaunching(self):
+        code, events, launches = self.run_borrowed('rotate_retry', self.YEAR, [lambda context: context.windows()],
+                                                   rotate=True, credential_id=SAVED_ID, sources=True)
+        self.assertEqual(code, 0, events)
+        # The API's 401 is a refusal of the saved token: reported, then a switch, never a rotation.
+        self.assertEqual(self.of_type(events, 'auth_rejected'), [dict(type='auth_rejected', credential_id=SAVED_ID)])
+        self.assertEqual(self.of_type(events, 'auth_refresh'),
+                         [dict(type='auth_refresh', reason='switch', rejected_credential_id=SAVED_ID)])
+        self.assertEqual((len(launches), self.final_tokens), (1, ['dummy-token-2']))
+        self.assertEqual([entry['rotated'] for entry in self.rotations], ['dummy-token-2'])
+        self.assertIn(LONG_LIVED_SWITCH_NOTICE, [event.get('message') for event in events])
+        self.assertEqual(self.of_type(events, 'done')[0]['status'], 'success')
+
+    def test_a_saved_token_is_never_rotated_ahead_of_its_expiry(self):
+        # Even a saved token that would be due by the clock is not rotated; the CLI still waits on a 401.
+        code, events, launches = self.run_borrowed('success', 200, rotate=True, credential_id=SAVED_ID, sources=True)
+        self.assertEqual(code, 0, events)
+        self.assertEqual(self.of_type(events, 'auth_refresh'), [])
+        self.assertEqual([launch['wait'] for launch in launches], ['60000'])
+
+    def test_saved_token_classification_and_switch_acceptance(self):
+        identity = digest('remote-account')
+        now = int(time.time())
+        borrowed = BorrowedLogin(dict(profileId=self.profile, accountIdentity=identity, expiresAt=now + 90 * 86400,
+                                      credentialSource='longLivedToken', credentialId=SAVED_ID), 'dummy-token-1')
+        self.assertEqual(borrowed.failure(), 'claude_auth_rejected')
+        self.assertEqual(borrowed.failure(reported_expired=True), 'claude_auth_expired')
+        # Within two days of the computed expiry, on either side, a refusal is an expiry.
+        for offset, expected in ((86400, 'claude_auth_expired'), (-86400, 'claude_auth_expired'),
+                                 (3 * 86400, 'claude_auth_rejected')):
+            self.assertEqual(borrowed.failure(credential=(now + offset, 'longLivedToken', SAVED_ID)), expected)
+        self.assertNotIn('dummy-token', repr(borrowed))
+        self.assertTrue(borrowed.refuse(borrowed.credential()))
+        self.assertFalse(borrowed.refuse(borrowed.credential()), 'reported once')
+        self.assertFalse(borrowed.refuse((now, 'windowsLogin', None)))
+        windows = dict(profileId=self.profile, accessToken='dummy-token-2', accountIdentity=identity,
+                       expiresAt=now + 8 * 3600, credentialSource='windowsLogin', credentialId=None)
+        # An ordinary renewal must expire later; a switch away from the refused token need not.
+        self.assertFalse(borrowed.renewed(windows))
+        self.assertFalse(borrowed.renewed(dict(windows, expiresAt=now + 120), switch=True))
+        refused = dict(windows, credentialSource='longLivedToken', credentialId=SAVED_ID, expiresAt=now + 300 * 86400)
+        self.assertFalse(borrowed.renewed(refused, switch=True), 'a refused credential is never taken back')
+        self.assertTrue(borrowed.renewed(windows, switch=True))
+        self.assertEqual(borrowed.credential(), (now + 8 * 3600, 'windowsLogin', None))
+        self.assertEqual(borrowed.failure(), 'claude_auth_rejected')
+        for change in (dict(credentialSource='windowsLogin', credentialId=SAVED_ID),
+                       dict(credentialSource='longLivedToken', credentialId=None),
+                       dict(credentialSource='longLivedToken', credentialId=SAVED_ID.upper().replace('4', 'A')),
+                       dict(credentialSource='elsewhere', credentialId=None)):
+            with self.assertRaises(ValueError):
+                borrowed.renewed(dict(windows, **change), switch=True)
 
     def borrowed_record(self):
         return json.loads(next(self.root.glob('remote-state/sessions/*/*/*.json')).read_text(encoding='utf-8'))

@@ -49,8 +49,10 @@ from .store import Store, Unchanged, file_stamp, identifier
 METADATA_KEY = 'claude_long_lived_token'
 PRESENTATION_KEY = 'claude_long_lived'
 SOURCE = 'longLivedToken'
-# Set on a prepared SSH binding once its runtime, helper and authority accept
-# credentialSource/credentialId (stage 2). Until then nothing is lent there.
+# Set by SSH preparation on a binding whose runtime, helpers and authority accept
+# credentialSource/credentialId; the settings panel counts it. The broker itself lends only
+# when the running runtime declares the capability and the role's prepared authority has
+# credential_sources == 1.
 SSH_SUPPORT_KEY = 'claude_credential_sources'
 DEFAULT_VALIDITY_DAYS = 365
 MAX_VALIDITY_DAYS = 366
@@ -538,6 +540,25 @@ def lend(root, profile_id, expected_identity, rejected_credential_id=None, *, no
                 'accountIdentity': expected_identity, 'credentialSource': SOURCE,
                 'credentialId': credential_id}
     return None
+
+
+# Reason codes the broker adds to a refused read when the saved token was refused or expired
+# and the PC login could not replace it; the runtime explains them in English.
+REJECTED_REASON, EXPIRED_REASON = 'claude_long_lived_rejected', 'claude_long_lived_expired'
+
+
+def refusal_reason(root, profile_id, *, now=None):
+    """Why the saved token cannot be lent, when it was refused or has expired; else None."""
+    current = int(time.time() if now is None else now)
+    try:
+        value = metadata(Store(root).profile(_profile_id(profile_id)))
+    except (ValueError, RuntimeError, OSError):
+        return None
+    if value is None:
+        return None
+    if value['rejected_credential_id'] == value['credential_id']:
+        return EXPIRED_REASON if value['rejection_kind'] == 'expired' else REJECTED_REASON
+    return EXPIRED_REASON if current >= value['expires_at'] - STOP_MARGIN else None
 
 
 def preset_users(root):

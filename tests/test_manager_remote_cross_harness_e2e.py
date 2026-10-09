@@ -25,6 +25,41 @@ from manager_core.store import atomic_json
 from remote_helpers.install import DISPATCHER
 
 
+# Prepended to the shared fake CLI: the lent token arrives through an inherited pipe, never the
+# environment. Each launch records which credential it got (by label, never the token). With
+# REFUSE_SAVED the API refuses the saved long-lived token like CLI 2.1.282 reports it.
+FAKE_PREFIX = r'''import json,os,sys
+if sys.argv[1:]==["--version"]:
+    print("2.1.282 (Claude Code)"); raise SystemExit(0)
+_lent = {"synthetic-claude-access": "windows", "synthetic-long-lived": "long"}
+with open("/proc/self/fd/"+os.environ["CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR"]) as _pipe:
+    _token = _pipe.read()
+assert _token in _lent, "unexpected lent token"
+assert not any(_secret in _value for _value in os.environ.values() for _secret in _lent)
+assert os.environ["CLAUDE_CODE_OAUTH_SCOPES"]=="user:inference"
+assert "CODEX_MANAGER_CLAUDE_AUTH" not in os.environ
+with open(TOKENS_PATH, "a") as _out:
+    _out.write(_lent[_token] + "\n")
+if _lent[_token] == "long" and REFUSE_SAVED:
+    _args = sys.argv[1:]
+    _session = _args[_args.index("--resume")+1] if "--resume" in _args else _args[_args.index("--session-id")+1]
+    _request = json.loads(sys.stdin.readline())
+    _config = json.loads(open(_args[_args.index("--mcp-config")+1]).read()) if "--mcp-config" in _args else {"mcpServers":{}}
+    def _emit(value): print(json.dumps(value), flush=True)
+    _emit({"type":"system","subtype":"init","session_id":_session,"model":"fixture",
+           "mcp_servers":[{"name":_name,"status":"connected"} for _name in _config["mcpServers"]]})
+    _emit({"type":"user","message":_request["message"]})
+    _text = "Failed to authenticate. API Error: 401 Invalid bearer token"
+    _emit({"type":"assistant","error":"authentication_failed",
+           "message":{"content":[{"type":"text","text":_text}],"usage":{"input_tokens":0,"output_tokens":0}}})
+    _emit({"type":"result","subtype":"success","is_error":True,"session_id":_session,"result":_text,
+           "api_error_status":401,"usage":{"input_tokens":1,"output_tokens":0}})
+    for _line in sys.stdin: pass
+    raise SystemExit(0)
+'''
+SAVED_ID = '44444444-4444-4444-8444-444444444444'
+
+
 class BrokerRpc(Rpc):
     """The SSH wrapper's message pump over an actual native app-server process."""
     def __init__(self, executable, environment, cwd, broker):
@@ -96,6 +131,21 @@ class RemoteCrossHarnessTests(unittest.TestCase):
         machine = Path('/etc/machine-id').read_text().strip()
         self.host = hashlib.sha256((machine + '\\0' + str(os.getuid()) + '\\0' + str(Path.home())).encode()).hexdigest()
         self.private_reads = []
+        # The saved long-lived token: offered only by tests that ask for it, refused once lent.
+        self.offer_saved, self.saved_lends, self.saved_refused = False, [], set()
+        self.tokens_path = self.base / 'lent-token-labels.txt'
+
+    def lend_saved(self, root, profile_id, identity, rejected):
+        self.saved_lends.append(rejected)
+        if rejected is not None:
+            self.saved_refused.add(rejected)
+        if not self.offer_saved or SAVED_ID in self.saved_refused:
+            return None
+        return dict(accessToken='synthetic-long-lived', expiresAt=int(time.time()) + 365 * 86400,
+                    accountIdentity=self.identity, credentialSource='longLivedToken', credentialId=SAVED_ID)
+
+    def lent_labels(self):
+        return self.tokens_path.read_text().split() if self.tokens_path.exists() else []
 
     def prepare(self, parent_claude, alternate=False):
         self.assertFalse(alternate)
@@ -109,14 +159,9 @@ class RemoteCrossHarnessTests(unittest.TestCase):
         self.presets.set_default(owner['id'], preset['id'], preset['revision'])
         role = self.presets.role_id(preset['roles'][0])
         fake = self.base / 'official-fake-claude'
-        source = ('#!' + sys.executable + '\nimport os,sys\n'
-                  'if sys.argv[1:]==["--version"]:\n print("2.1.282 (Claude Code)"); raise SystemExit(0)\n'
-                  # The lent token arrives through an inherited pipe, never this environment.
-                  'with open("/proc/self/fd/"+os.environ["CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR"]) as _pipe:\n'
-                  ' assert _pipe.read()=="synthetic-claude-access"\n'
-                  'assert not any("synthetic-claude-access" in _value for _value in os.environ.values())\n'
-                  'assert os.environ["CLAUDE_CODE_OAUTH_SCOPES"]=="user:inference"\n'
-                  'assert "CODEX_MANAGER_CLAUDE_AUTH" not in os.environ\n' + cross_native.FAKE_CLAUDE)
+        prefix = FAKE_PREFIX.replace('TOKENS_PATH', repr(str(self.tokens_path))).replace(
+            'REFUSE_SAVED', repr(self.offer_saved))
+        source = '#!' + sys.executable + '\n' + prefix + cross_native.FAKE_CLAUDE
         source = source.replace('TRACE_PATH', repr(str(self.trace))).replace('CHILD_ROLE', repr(role)).replace(
             '__CANCEL_PATH__', repr(str(self.cancel_marker)))
         fake.write_text(source, encoding='utf-8')
@@ -175,7 +220,7 @@ class RemoteCrossHarnessTests(unittest.TestCase):
             return dict(accessToken='synthetic-claude-access', expiresAt=int(time.time()) + 3600,
                         accountIdentity=self.identity)
         broker = ExecutionPresetAuthProxy(ParentAuth(), self.store, authority, owner['generation'],
-                                          claude_reader=read_claude)
+                                          claude_reader=read_claude, long_lived_reader=self.lend_saved)
         environment = self.environment(home, owner['id'])
         environment.update(CODEX_MANAGER_EXECUTION_PRESETS=str(manifest_path),
                            CODEX_MANAGER_DEFINITION_REVISION=revision)
@@ -198,8 +243,9 @@ class RemoteCrossHarnessTests(unittest.TestCase):
         self.assertFalse(list(self.base.rglob('.credentials.json')))
         # Include the account ledger and fake-CLI trace outside the owner profile.
         for path in self.base.rglob('*'):
-            if path.is_file() and path.suffix in ('.toml', '.json', '.jsonl'):
-                self.assertNotIn(b'synthetic-claude-access', path.read_bytes(), str(path))
+            if path.is_file() and path.suffix in ('.toml', '.json', '.jsonl', '.txt'):
+                for token in (b'synthetic-claude-access', b'synthetic-long-lived'):
+                    self.assertNotIn(token, path.read_bytes(), str(path))
         self.assertFalse(any(value.get('method') == 'account/executionPresetAuthTokens/read'
                              for value in self.rpc.pending))
 
@@ -211,6 +257,31 @@ class RemoteCrossHarnessTests(unittest.TestCase):
     def test_remote_gpt_parent_borrows_claude_child_account_and_resumes_session(self):
         cross_native.CrossHarnessTests.test_native_gpt_parent_controls_claude_child_and_preserves_cli_session(self)
         self._assert_private_credentials(False)
+
+    def test_remote_claude_saved_token_is_lent_and_replaced_by_the_windows_login_after_a_refusal(self):
+        self.offer_saved = True
+        client, role, preset = self.prepare(True)
+        thread = client.request('thread/start', {'cwd': str(self.cwd)})['thread']['id']
+        self.turn(thread, 'SAVED_TOKEN_MARKER: answer directly.', client)
+        claude = [value for value in self.rpc.private_requests if value['kind'] == 'claude']
+        fields = {'ownerProfileId', 'roleId', 'profileId', 'kind', 'expectedAccountFingerprint',
+                  'expectedAccountIdentity'}
+        if client.broker.credential_sources != 1:
+            # An older runtime never declares the capability: only the PC login is lent, in the
+            # original shape, and nothing is reported.
+            self.assertEqual((self.saved_lends, self.lent_labels()), ([], ['windows']))
+            self.assertTrue(all(set(value) == fields for value in claude))
+        else:
+            # The saved token is lent first (six fields, no rejection), refused by the API, reported,
+            # and the same turn resumes on the PC login; every later read names the refused ID.
+            self.assertEqual(self.lent_labels(), ['long', 'windows'])
+            self.assertEqual(set(claude[0]), fields)
+            self.assertEqual(self.saved_lends[0], None)
+            self.assertTrue(claude[1:] and all(value.get('rejectedCredentialId') == SAVED_ID for value in claude[1:]))
+            self.assertEqual(self.saved_refused, {SAVED_ID})
+        self._assert_private_credentials(True)
+        restored = client.request('thread/read', {'threadId': thread, 'includeTurns': True})
+        self.assertIn('CLAUDE_CHILD_FIRST_DONE', json.dumps(restored))
 
 
 if __name__ == '__main__':

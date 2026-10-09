@@ -328,6 +328,22 @@ class LendTests(Fixture):
         self.assertIsNone(self.meta()['rejected_credential_id'])
         self.assertEqual(self.lend()['accessToken'], OTHER)
 
+    def test_refusal_reason_names_only_a_refused_or_expired_saved_token(self):
+        expires = NOW + 365 * DAY
+        reason = lambda now=NOW + DAY: long_lived.refusal_reason(self.root, self.pid, now=now)
+        self.assertIsNone(reason())
+        self.assertEqual(reason(expires - DAY), long_lived.EXPIRED_REASON)
+        long_lived.record_rejection(self.root, self.pid, self.cid, now=NOW + DAY)
+        self.assertEqual(reason(), long_lived.REJECTED_REASON)
+        long_lived.retry(self.root, self.pid)
+        long_lived.record_rejection(self.root, self.pid, self.cid, now=expires)
+        self.assertEqual(reason(), long_lived.EXPIRED_REASON)
+        long_lived.delete(self.root, self.pid)
+        self.assertIsNone(reason())
+        self.assertIsNone(long_lived.refusal_reason(self.root, 'not-a-profile'))
+        self.assertEqual((long_lived.REJECTED_REASON, long_lived.EXPIRED_REASON),
+                         ('claude_long_lived_rejected', 'claude_long_lived_expired'))
+
     def test_a_401_near_the_computed_expiry_is_classified_as_expiry(self):
         near = NOW + 365 * DAY - DAY - 3600
         self.assertTrue(long_lived.record_rejection(self.root, self.pid, self.cid, now=near))

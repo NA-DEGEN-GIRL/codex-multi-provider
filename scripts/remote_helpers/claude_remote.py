@@ -101,9 +101,11 @@ class RemoteExecution:
             raise ClaudeError('cli_changed', 'The Linux Claude CLI changed. Prepare this SSH profile again.')
         plugin = prepare_shared_skills(self.root, self.binding['target_profile_id'], cwd,
             config_home=self.profile / 'codex', output_root=self.ledger_directory / 'skill-plugins')
-        # The runner keeps who lent the token and when it expires apart from the token, which
-        # reaches each CLI launch by pipe and never enters an environment or the ledger.
-        borrowed = {key: self.auth[key] for key in ('profileId', 'accountIdentity', 'expiresAt')}
+        # The runner keeps who lent the token, when it expires and (when reported) its source
+        # apart from the token, which reaches each CLI launch by pipe and never enters an
+        # environment or the ledger.
+        borrowed = {key: self.auth[key] for key in ('profileId', 'accountIdentity', 'expiresAt',
+                                                     'credentialSource', 'credentialId') if key in self.auth}
         return dict(settings=self.binding['settings'], configuration_directory=self.configuration_directory,
                     environment=environment, cli=[str(path)], plugins=[plugin] if plugin else [],
                     status=dict(logged_in=True, method='oauth_token', cli_version=version,

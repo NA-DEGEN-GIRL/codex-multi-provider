@@ -216,6 +216,8 @@ class RemoteClaudeRenderTests(unittest.TestCase):
                          'claude-runner', '--binding', str(self.home / binding)])
         self.assertNotIn('\\', main['files']['config.toml'])
         self.assertEqual(role['auth_metadata'], main['main_auth'])
+        # Helpers prepared from this authority accept a credential's source (rev 121 stage 2).
+        self.assertEqual(main['main_auth']['credential_sources'], 1)
         self.assertIn('claude_remote.py', main['helper_files'])
         for name, source in main['helper_files'].items():
             compile(source, name, 'exec')
@@ -283,6 +285,33 @@ class RemoteClaudeContextTests(unittest.TestCase):
         with patch('remote_helpers.claude_remote.cli_version', return_value='2.1.283'), \
              self.assertRaisesRegex(ClaudeError, 'changed'):
             self.context().prepare(self.base)
+
+    def test_a_credential_names_its_source_only_in_the_six_key_form(self):
+        saved = '44444444-4444-4444-8444-444444444444'
+        year = int(time.time()) + 365 * 86400
+        accepted = [dict(), dict(credentialSource='windowsLogin', credentialId=None),
+                    dict(credentialSource='longLivedToken', credentialId=saved, expiresAt=year)]
+        for auth in accepted:
+            with self.subTest(auth=auth), \
+                 patch('remote_helpers.claude_remote.cli_version', return_value='2.1.282'), \
+                 patch('remote_helpers.claude_remote.prepare_shared_skills', return_value=None):
+                actual = self.context(**auth).prepare(self.base)
+                # The source travels with the owner and expiry, never the token.
+                expected = dict(profileId=self.target, accountIdentity=self.identity,
+                                expiresAt=auth.get('expiresAt', self.auth['expiresAt']))
+                expected.update({key: auth[key] for key in ('credentialSource', 'credentialId') if key in auth})
+                self.assertEqual(actual['borrowed_auth'], expected)
+        refused = [dict(credentialSource='windowsLogin'), dict(credentialId=None),
+                   dict(credentialSource='windowsLogin', credentialId=saved),
+                   dict(credentialSource='longLivedToken', credentialId=None),
+                   dict(credentialSource='longLivedToken', credentialId=saved.replace('4', 'A')),
+                   dict(credentialSource='longLivedToken', credentialId='../' + saved),
+                   dict(credentialSource='elsewhere', credentialId=None),
+                   dict(credentialSource='windowsLogin', credentialId=None, extra=1)]
+        for auth in refused:
+            with self.subTest(auth=auth), self.assertRaises(ValueError) as caught:
+                self.context(**auth)
+            self.assertNotIn('synthetic-access', str(caught.exception))
 
     def test_production_context_runs_fake_cli_and_resumes_same_session_without_auth_files(self):
         from test_manager_claude_runner import FAKE, Incoming, Outgoing

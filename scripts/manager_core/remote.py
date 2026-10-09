@@ -40,6 +40,8 @@ REMOTE_CAPABILITY_MARKERS = {
     'execution_preset_auth_present': b'account/executionPresetAuthTokens/read',
     'claude_account_auth_present': b'CODEX_MANAGER_CLAUDE_AUTH',
 }
+# Optional: a runtime that reports a lent Claude credential's source (initialize capability).
+CLAUDE_CREDENTIAL_SOURCES_MARKER = b'executionPresetCredentialSources'
 _CAPABILITY_CACHE = {}
 
 
@@ -755,9 +757,26 @@ class RemoteManager:
                 raise RemoteError('invalid_preset_binding', '기존 SSH 프리셋 권한 정보와 충돌합니다.')
             atomic_json(cache, authority)
             result['execution_presets_version'] = 1
+            if self._claude_credential_sources(artifact, authority):
+                # Display only (the Claude settings panel): the broker checks the runtime's
+                # initialize capability and the authority's flag itself on every read.
+                from .claude_long_lived_auth import SSH_SUPPORT_KEY
+                result[SSH_SUPPORT_KEY] = 1
             publication = self.publish_execution_presets(profile, result)
             result['execution_presets'] = publication
         return result
+
+    @staticmethod
+    def _claude_credential_sources(artifact, authority):
+        """Whether this prepared runtime and authority can carry a long-lived Claude token."""
+        from remote_helpers.package_runtime import contains_marker
+        accounts = [authority.get('main_auth')] + list((authority.get('roles') or {}).values())
+        if not any(isinstance(item, dict) and item.get('credential_sources') == 1 for item in accounts):
+            return False
+        try:
+            return contains_marker(artifact['directory'] / 'codex', CLAUDE_CREDENTIAL_SOURCES_MARKER)
+        except OSError:
+            return False
 
     def _select_runtime(self, alias, observed, artifact, reuse_host_runtime):
         candidates = [artifact]

@@ -89,7 +89,7 @@ internal sealed class ClaudeLongLivedTokenPanel
         Status = Note(""); Status.FontWeight = FontWeights.SemiBold; content.Children.Add(Status);
         Ssh = Note(""); content.Children.Add(Ssh);
         content.Children.Add(Note("토큰은 이 Windows 사용자 전용(DPAPI)으로 암호화해 이 PC에만 저장합니다. 다른 Windows 사용자와 디스크 복사본으로부터는 보호되지만, 이 Windows 사용자로 실행되는 프로그램으로부터는 보호되지 않습니다. " +
-            "작업 중에는 SSH 서버의 같은 사용자 계정으로 실행되는 프로세스(에이전트 포함)가 이 토큰을 읽을 수 있습니다."));
+            "SSH 서버에서는 토큰을 파일이나 환경 변수에 남기지 않고 실행 중인 Claude에 파이프로만 전달하지만, 작업 중에는 그 프로세스 메모리에 있으므로 서버의 관리자나 디버거 권한이 있는 프로그램은 읽을 수 있습니다."));
 
         content.Children.Add(new TextBlock { Text = "장기 토큰 (화면에 표시하지 않습니다)" });
         var tokenRow = new DockPanel { LastChildFill = true };

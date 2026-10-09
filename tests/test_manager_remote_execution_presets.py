@@ -407,6 +407,22 @@ class RemoteExecutionPresetTests(unittest.TestCase):
                 self.assertEqual(supports_remote_claude(self.root), missing is None)
                 self.assertEqual(manager._execution_presets_supported(dict(directory=artifact)), missing is None)
 
+    def test_long_lived_claude_support_needs_the_authority_flag_and_the_runtime_marker(self):
+        artifact = self.root / 'artifact-sources'
+        artifact.mkdir()
+        binary = artifact / 'codex'
+        authority = dict(roles={'role': dict(auth_source='manager_proxy')},
+                         main_auth=dict(kind='claude', auth_source='manager_proxy', credential_sources=1))
+        role_only = dict(roles={'role': dict(auth_source='manager_proxy', credential_sources=1)})
+        older = dict(roles={}, main_auth=dict(kind='claude', auth_source='manager_proxy'))
+        cases = []
+        for content in (b'\x7fELF executionPresetCredentialSources', b'\x7fELF without it'):
+            binary.write_bytes(content)
+            cases += [RemoteManager._claude_credential_sources(dict(directory=artifact), value)
+                      for value in (authority, role_only, older)]
+        self.assertEqual(cases, [True, True, False, False, False, False])
+        self.assertFalse(RemoteManager._claude_credential_sources(dict(directory=self.root / 'missing'), authority))
+
     def test_missing_prepared_authority_requires_preparation_for_every_selection(self):
         manager = RemoteManager(self.root, registry=self.providers)
         binding = dict(profile_id=self.owner['id'], alias='staging', revision='a' * 64,

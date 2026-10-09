@@ -285,6 +285,134 @@ class BorrowingTests(unittest.TestCase):
             expiresAt=None, accountIdentity=None)}])
         self.assert_secret_free(logs, refused)
 
+    # Long-lived tokens (rev 121): lent only with the runtime capability and the prepared flag.
+    LENT = '33333333-3333-4333-8333-333333333333'
+    NEWER = '55555555-5555-4555-8555-555555555555'
+
+    def sources_fixture(self, capability=True, prepared=True, long_lived=None, windows=None):
+        """Main Claude account with dummy long-lived and Windows-login readers."""
+        params = self.claude_params()
+        identity = params['expectedAccountIdentity']
+        if prepared:
+            self.broker.authority['main_auth']['credential_sources'] = 1
+        self.broker.process('runtime', {'id':'init', 'result':{
+            'executionPresetsVersion':1, **({'executionPresetCredentialSources':1} if capability else {})}})
+        self.lends, self.windows = [], []
+        def lend(root, profile, expected, rejected):
+            self.lends.append((profile, expected, rejected))
+            if long_lived is not None:
+                return long_lived(len(self.lends), rejected)
+            return dict(accessToken='dummy-token-long', expiresAt=2_000_000_000, accountIdentity=expected,
+                        credentialSource='longLivedToken', credentialId=self.LENT)
+        def read(root, profile, expected):
+            self.windows.append(profile)
+            if windows is not None:
+                return windows(len(self.windows))
+            return dict(accessToken='dummy-token-windows', expiresAt=1_900_000_000, accountIdentity=expected)
+        self.broker._long_lived_reader, self.broker._claude_reader = lend, read
+        return params
+
+    def test_long_lived_token_is_lent_only_with_runtime_capability_and_prepared_flag(self):
+        logs = capture_logs(self)
+        identity = 'd' * 64
+        legacy = dict(kind='claude', accessToken='dummy-token-windows', chatgptAccountId=None,
+                      expiresAt=1_900_000_000, accountIdentity=identity)
+        for capability, prepared in ((False, True), (True, False), (False, False)):
+            with self.subTest(capability=capability, prepared=prepared):
+                params = self.sources_fixture(capability, prepared)
+                result = self.request(params, f'gated-{capability}-{prepared}')['result']
+                # An older runtime or helper gets the original five keys and never the saved token.
+                self.assertEqual(result, legacy)
+                self.assertEqual(self.lends, [])
+        params = self.sources_fixture()
+        result = self.request(params, 'lent')['result']
+        self.assertEqual(result, dict(legacy, accessToken='dummy-token-long', expiresAt=2_000_000_000,
+                                      credentialSource='longLivedToken', credentialId=self.LENT))
+        self.assertEqual((self.lends, self.windows), ([(self.peer, identity, None)], []))
+        # Without a usable saved token the PC login is lent and says so.
+        params = self.sources_fixture(long_lived=lambda count, rejected: None)
+        self.assertEqual(self.request(params, 'fallback')['result'],
+                         dict(legacy, credentialSource='windowsLogin', credentialId=None))
+        self.assert_secret_free(logs)
+        self.broker.close()
+        self.assertEqual((self.broker.credential_sources, self.broker._lent), (0, set()))
+
+    def test_rejection_is_recorded_only_for_a_credential_this_connection_lent(self):
+        params = self.sources_fixture()
+        self.assertEqual(self.request(params, 1)['result']['credentialId'], self.LENT)
+        # Now the saved token counts as refused: the lender returns nothing for it.
+        self.broker._long_lived_reader = lambda root, profile, expected, rejected: (
+            self.lends.append((profile, expected, rejected)) or None)
+        result = self.request(dict(params, rejectedCredentialId=self.LENT), 2)['result']
+        self.assertEqual((result['credentialSource'], result['accessToken']), ('windowsLogin', 'dummy-token-windows'))
+        self.assertEqual(self.lends[-1][2], self.LENT, 'a lent ID is passed on to be recorded')
+        # Another connection's (or an invented) ID is never recorded, and still keeps the saved
+        # token with that ID out of this read.
+        params = self.sources_fixture()
+        other = str(uuid4())
+        self.broker._lent.clear()
+        self.broker._long_lived_reader = lambda root, profile, expected, rejected: (
+            self.lends.append((profile, expected, rejected)) or dict(
+                accessToken='dummy-token-long', expiresAt=2_000_000_000, accountIdentity=expected,
+                credentialSource='longLivedToken', credentialId=other))
+        result = self.request(dict(params, rejectedCredentialId=other), 3)['result']
+        self.assertEqual((result['credentialSource'], self.lends[-1][2]), ('windowsLogin', None))
+        # A newer saved token than the refused one is lent.
+        self.assertEqual(self.request(dict(params, rejectedCredentialId=self.NEWER), 4)['result']['credentialId'],
+                         other)
+
+    def test_malformed_rejection_reports_are_refused_before_any_read(self):
+        params = self.sources_fixture()
+        bad = [dict(params, rejectedCredentialId=value) for value in
+               ('not-a-uuid', self.NEWER.replace('5', 'A'), '../' + self.LENT, 7, '')]
+        bad.append(dict(params, rejectedCredentialId=self.LENT, extra=True))
+        openai = self.params()
+        openai['rejectedCredentialId'] = self.LENT
+        bad.append(openai)
+        for index, value in enumerate(bad):
+            self.assertEqual(self.request(value, f'bad-{index}'), {'id': f'bad-{index}', 'error': REFUSED})
+        self.assertEqual((self.lends, self.windows, self.reads), ([], [], []))
+
+    def test_a_rejecting_read_never_joins_a_read_that_may_lend_the_rejected_token(self):
+        params = self.sources_fixture()
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        def lend(root, profile, expected, rejected):
+            self.lends.append(rejected)
+            if rejected is None:
+                entered.set()
+                release.wait(5)
+            return None if rejected else dict(accessToken='dummy-token-long', expiresAt=2_000_000_000,
+                                               accountIdentity=expected, credentialSource='longLivedToken',
+                                               credentialId=self.LENT)
+        self.broker._long_lived_reader = lend
+        self.broker._lent.add(self.LENT)
+        self.send([1], params)
+        self.assertTrue(entered.wait(2))
+        self.send([2], dict(params, rejectedCredentialId=self.LENT))
+        # The rejecting read runs on its own while the first one is still blocked.
+        self.wait_for(lambda: len(self.lends) == 2)
+        release.set()
+        answers = self.answers(2)
+        self.assertEqual([answer['result']['credentialSource'] for answer in answers],
+                         ['longLivedToken', 'windowsLogin'])
+        self.assertEqual(self.lends, [None, self.LENT])
+
+    def test_no_fallback_after_a_refused_saved_token_reports_a_reason_code(self):
+        def refuse(count):
+            raise ClaudeError('claude_account_unavailable', 'The selected Claude account needs a current local login.')
+        params = self.sources_fixture(long_lived=lambda count, rejected: None, windows=refuse)
+        self.broker._lent.add(self.LENT)
+        with patch('manager_core.claude_long_lived_auth.refusal_reason', return_value='claude_long_lived_rejected'):
+            answer = self.request(dict(params, rejectedCredentialId=self.LENT), 'none')
+        self.assertEqual(answer, {'id': 'none', 'error': dict(REFUSED, data={'reason': 'claude_long_lived_rejected'})})
+        with patch('manager_core.claude_long_lived_auth.refusal_reason', return_value=None):
+            self.assertEqual(self.request(params, 'plain'), {'id': 'plain', 'error': REFUSED})
+        # Without the capability the generic refusal stays exactly as before.
+        params = self.sources_fixture(capability=False, windows=refuse)
+        with patch('manager_core.claude_long_lived_auth.refusal_reason', return_value='claude_long_lived_rejected'):
+            self.assertEqual(self.request(params, 'old'), {'id': 'old', 'error': REFUSED})
+
     def test_request_waiting_for_a_worker_is_still_bounded(self):
         logs = capture_logs(self)
         now, release, reads = self.queued_behind_slow_read()
