@@ -2009,6 +2009,7 @@ public sealed partial class MainWindow : Window
             }
             if (!_serviceShutdown.DrainStarted)
             {
+                JsonElement[] hidden = [];
                 if (_client is not null && !_client.IsConnected)
                 {
                     // Reconnect only for shutdown; startup hooks would enqueue new
@@ -2041,27 +2042,10 @@ public sealed partial class MainWindow : Window
                     _state = await _client.RequestAsync("state", cancellationToken: stopWarmup.Token);
                     // Preloaded windows have never been attached or parked. Include
                     // their verified process/window identities in normal shutdown.
-                    var hidden = _state.Arr("profiles").Concat(_state.Arr("view_instances")).Where(p => p.S("status") == "running" &&
+                    hidden = _state.Arr("profiles").Concat(_state.Arr("view_instances")).Where(p => p.S("status") == "running" &&
                         p.N("window_handle") != 0 && !_parked.ContainsKey((nint)p.N("window_handle"))).ToArray();
-                    await Task.WhenAll(hidden.Select(async profile =>
-                    {
-                        if (!await NativeWindowShutdown.RequestAsync(_root, (int)profile.N("process_id"),
-                            (nint)profile.N("window_handle"), profile.S("executable_path"), profile.N("process_created")))
-                            throw new InvalidOperationException("백그라운드 프로필의 정상 종료 확인이 필요합니다.");
-                    }));
                 }
-                await Task.WhenAll(_parked.Values.ToArray().Select(async window =>
-                {
-                    if (!window.MatchesLifetime) { _parked.Remove(window.Handle); return; }
-                    Log($"관리 중인 Codex 앱 종료 요청 · PID {window.Pid}");
-                    if (await NativeWindowShutdown.RequestAsync(_root, window.Pid, window.Handle, window.Executable))
-                    {
-                        Log($"관리 중인 Codex 프로세스 종료 확인 · PID {window.Pid}");
-                        window.ClearMarker(); _parked.Remove(window.Handle);
-                    }
-                }));
-                if (_parked.Count > 0)
-                    throw new InvalidOperationException("일부 Codex가 1분 안에 종료를 마치지 못했습니다. 관리창을 유지합니다. 잠시 뒤 완전 종료를 다시 눌러 주세요.");
+                var leftovers = await CloseManagedAppsAsync(hidden);
                 if (_client?.IsConnected == true)
                 {
                     // A mode switch can hand the UI to a process that is no longer a
@@ -2071,6 +2055,10 @@ public sealed partial class MainWindow : Window
                     // Every profile that ever launched is swept, not only observed
                     // ones: a launch that failed before its identity was saved leaves
                     // a desktop that no recorded process id points to.
+                    // It also ends an app that closed its window but did not finish
+                    // quitting within the wait, as a second 완전 종료 press did.
+                    SetStatus(leftovers > 0 ? $"창을 닫은 Codex {leftovers}개의 남은 프로세스를 정리하고 있습니다…"
+                        : "남은 Codex 프로세스가 없는지 확인하고 있습니다…");
                     var cleanupErrors = new List<string>();
                     var cleanupWarnings = new List<string>();
                     foreach (var profile in _state.Arr("profiles").Concat(_state.Arr("view_instances")))
@@ -2080,7 +2068,10 @@ public sealed partial class MainWindow : Window
                         var observed = profile.S("process_id") != "";
                         try
                         {
-                            using var stopDeadline = new CancellationTokenSource(TimeSpan.FromSeconds(6));
+                            // Longer than the service's own 12 s limit for a reap, so
+                            // a slow termination returns the service's verdict
+                            // instead of being abandoned while it still runs.
+                            using var stopDeadline = new CancellationTokenSource(TimeSpan.FromSeconds(15));
                             var cleanup = await _client.RequestAsync("profile.cleanup",
                                 new { profile_id = id, generation = profile.S("generation") },
                                 cancellationToken: stopDeadline.Token);
@@ -2095,13 +2086,14 @@ public sealed partial class MainWindow : Window
                             // older service's refusal of a profile with no recorded
                             // process is expected; any other failure (a sweep timeout,
                             // an unverifiable process) may leave an orphan running.
-                            if (observed) cleanupErrors.Add(profile.S("alias", id));
+                            if (observed) cleanupErrors.Add($"{profile.S("alias", id)} · {reason}");
                             else if (!reason.Contains("실행 프로필이 없습니다", StringComparison.Ordinal))
                                 cleanupWarnings.Add($"{profile.S("alias", id)} · {reason}");
                         }
                     }
                     if (cleanupErrors.Count > 0)
-                        throw new InvalidOperationException("일부 프로필의 종료를 확인하지 못해 관리창을 유지합니다: " + string.Join(", ", cleanupErrors));
+                        throw new InvalidOperationException("남은 Codex 프로세스를 정리하지 못해 관리창을 유지합니다: " +
+                            string.Join(", ", cleanupErrors) + ". 잠시 뒤 완전 종료를 다시 눌러 주세요.");
                     if (cleanupWarnings.Count > 0 && MessageBox.Show(this,
                             "다음 프로필에 남은 Codex 프로세스가 없는지 확인하지 못했습니다. 그대로 종료하면 백그라운드 Codex가 남을 수 있습니다.\n\n" +
                             string.Join("\n", cleanupWarnings) +
@@ -2164,6 +2156,62 @@ public sealed partial class MainWindow : Window
             if (!_closing) { _timer.Start(); _activityTimer.Start(); }
             SetStatus(error.Message, true);
         }
+    }
+    private sealed record ExitTarget(int Pid, nint Handle, string Executable, long Created, string Label, WindowIdentity? Parked);
+    // Asks every managed app (parked and never-shown preloads) to quit at once
+    // and waits under one deadline that grows with their number. Returns how
+    // many closed their window but were still quitting at the end; the caller's
+    // leftover cleanup ends those, exactly as a second 완전 종료 press did.
+    // A window that is still open has not started to quit: the exit stops.
+    private async Task<int> CloseManagedAppsAsync(JsonElement[] hidden)
+    {
+        foreach (var window in _parked.Values.ToArray())
+            if (!window.MatchesLifetime) _parked.Remove(window.Handle);
+        var profiles = _state.Arr("profiles").Concat(_state.Arr("view_instances")).ToArray();
+        string AliasOf(int pid) => profiles.FirstOrDefault(p => p.N("process_id") == pid) is { ValueKind: JsonValueKind.Object } p
+            ? p.S("alias", p.S("id")) : $"PID {pid}";
+        var targets = hidden.Select(p => new ExitTarget((int)p.N("process_id"), (nint)p.N("window_handle"),
+                p.S("executable_path"), p.N("process_created"), p.S("alias", p.S("id")), null))
+            .Concat(_parked.Values.Select(w => new ExitTarget(w.Pid, w.Handle, w.Executable, 0, AliasOf(w.Pid), w)))
+            .ToArray();
+        if (targets.Length == 0) return 0;
+        var limit = NativeWindowShutdown.GracefulWait(targets.Length);
+        Log($"관리 중인 Codex {targets.Length}개 종료 요청 · 최대 {(int)limit.TotalSeconds}초 대기");
+        foreach (var target in targets) Log($"관리 중인 Codex 앱 종료 요청 · {target.Label} · PID {target.Pid}");
+        var results = await NativeWindowShutdown.WaitAllAsync(targets, limit,
+            (target, deadline) => NativeWindowShutdown.RequestAsync(_root, target.Pid, target.Handle, target.Executable,
+                target.Created, deadline, NativeWindowShutdown.QuitGrace),
+            target =>
+            {
+                Log($"관리 중인 Codex 프로세스 종료 확인 · PID {target.Pid}");
+                if (target.Parked is { } window) { window.ClearMarker(); _parked.Remove(window.Handle); }
+            },
+            (exited, elapsed) => ShowShutdownProgress(NativeWindowShutdown.Progress(exited, targets.Length, elapsed, limit)));
+        var quitting = results.Where(r => r.Error is null && r.Outcome == NativeExitOutcome.Quitting).ToArray();
+        foreach (var (target, _, _) in quitting)
+        {
+            Log($"창은 닫혔지만 종료 정리가 끝나지 않은 Codex · {target.Label} · PID {target.Pid} · 남은 프로세스 정리로 마무리합니다");
+            if (target.Parked is { } window) { window.ClearMarker(); _parked.Remove(window.Handle); }
+        }
+        Log($"관리 중인 Codex 종료 대기 끝 · {results.Count(r => r.Error is null && r.Outcome == NativeExitOutcome.Exited)}/{targets.Length} 종료됨" +
+            (quitting.Length > 0 ? $" · 종료 정리 중 {quitting.Length}개" : ""));
+        if (results.FirstOrDefault(r => r.Error is not null).Error is { } failure)
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw(failure);
+        var stuck = results.Where(r => r.Error is null && r.Outcome == NativeExitOutcome.Unresponsive)
+            .Select(r => r.Target.Label).ToArray();
+        if (stuck.Length > 0)
+            throw new InvalidOperationException($"Codex {stuck.Length}개가 {(int)limit.TotalSeconds}초 안에 종료 요청에 응답하지 않아 관리창을 유지합니다: " +
+                string.Join(", ", stuck) + ". 잠시 뒤 완전 종료를 다시 눌러 주세요.");
+        if (_parked.Count > 0)
+            throw new InvalidOperationException("일부 Codex 창의 종료를 확인하지 못해 관리창을 유지합니다. 잠시 뒤 완전 종료를 다시 눌러 주세요.");
+        return quitting.Length;
+    }
+    // Per-second shutdown progress replaces the status line only. The log keeps
+    // the requests, each confirmed exit and the outcome.
+    private void ShowShutdownProgress(string message)
+    {
+        _profileOpenNoticeProfile = null;
+        _status.Text = message; _status.ToolTip = message; _status.Foreground = Muted;
     }
     private void SetStatus(string message, bool error = false)
     {
