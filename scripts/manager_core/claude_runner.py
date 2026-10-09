@@ -632,14 +632,22 @@ AUTH_FAILURES = {
     'claude_login_required': ("Claude rejected this profile's login. "
                               'Sign in through Claude CLI for this profile again, then send the message again.'),
 }
-# A borrowed token rejected this close to its expiry has expired, allowing for clock skew.
+# The API's own reason for an expired OAuth access token, which the CLI relays in its error text.
+AUTH_EXPIRED_TEXT = re.compile(r'\bOAuth (?:access )?token has expired\b')
+# Without that reason, a borrowed token rejected this close to its expiry has expired. The expiry
+# comes from the lending host's clock, so this is only a fallback that allows for some skew.
 AUTH_EXPIRY_MARGIN = 60
 # A renewal must outlive the rejected token and leave room for a long turn.
 AUTH_RENEWAL_MINIMUM = 300
-AUTH_REFRESH_SECONDS = 75
-# Windows renews one login at most every 30 seconds, and the turns of one
-# account usually expire together; a second request waits for that renewal.
-AUTH_REFRESH_RETRY_SECONDS = 20
+# Two requests, each answered within the runtime's 35 second resolve limit.
+AUTH_REFRESH_SECONDS = 90
+# Windows starts one CLI renewal of a login at most every 30 seconds, counted from the
+# attempt's start, and the turns of one account usually expire together. A second
+# request is sent only after that window, counted from the first request.
+AUTH_REFRESH_RETRY_SECONDS = 35
+# Closes the stopped process's open tool calls in shared history before a renewal.
+AUTH_TOOL_STOPPED = ('The Claude process stopped when its login expired; the outcome of this tool is unknown. '
+                     'Inspect the workspace before repeating this action.')
 AUTH_CONTINUATION = (
     'The previous attempt of this request stopped because the Claude login expired; the login has been renewed. '
     'Background shells, agents and workflows that this Claude session started before the stop were terminated; '
@@ -666,6 +674,12 @@ def auth_failed(message):
     return False
 
 
+def token_expired(message, text):
+    """Whether a failed request's API error says that the access token expired."""
+    return message.get('api_error_code') == 'token_expired' or (
+        isinstance(text, str) and AUTH_EXPIRED_TEXT.search(text) is not None)
+
+
 class BorrowedLogin:
     """Owner and expiry of the access token lent for this turn; never the token itself."""
     def __init__(self, value):
@@ -675,8 +689,10 @@ class BorrowedLogin:
         self.profile_id, self.account_identity = value['profileId'], value['accountIdentity']
         self.expires_at = value['expiresAt']
 
-    def failure(self):
-        return 'claude_auth_expired' if time.time() >= self.expires_at - AUTH_EXPIRY_MARGIN else 'claude_auth_rejected'
+    def failure(self, reported_expired=False):
+        if reported_expired or time.time() >= self.expires_at - AUTH_EXPIRY_MARGIN:
+            return 'claude_auth_expired'
+        return 'claude_auth_rejected'
 
     def renewed(self, credentials):
         """Return a newer token for the same login, or None; ValueError for any other credential."""
@@ -722,10 +738,11 @@ def host_wait(events, until, bridge, delegation, expect_update=False):
 
 def renew_login(borrowed, events, emit, bridge, delegation):
     """Ask the native host for the renewed login at most twice; return (token, outcome)."""
-    deadline = time.monotonic() + AUTH_REFRESH_SECONDS
+    started = time.monotonic()
+    deadline = started + AUTH_REFRESH_SECONDS
     for request in range(2):
         if request:
-            outcome, _ = host_wait(events, min(deadline, time.monotonic() + AUTH_REFRESH_RETRY_SECONDS),
+            outcome, _ = host_wait(events, min(deadline, started + AUTH_REFRESH_RETRY_SECONDS),
                                    bridge, delegation)
             if outcome != 'timeout':
                 return None, outcome
@@ -759,11 +776,12 @@ def sum_usage(*values):
     return result
 
 
-def generate_checkpoint(command, cwd, environment, events, session_id):
+def generate_checkpoint(command, cwd, environment, events, session_id, channel='checkpoint'):
     """One bounded maintenance call; never recursively summarizes itself.
 
 The primary call's permission stop event is already set. Cancellation for this
 independent child comes directly from the existing native-input event queue.
+A retry reads its own channel, so the previous call's late EOF cannot end it.
 """
     options = {'creationflags': subprocess.CREATE_NO_WINDOW} if os.name == 'nt' else {'start_new_session': True}
     process = subprocess.Popen(checkpoint_command(command), cwd=cwd, env=environment, stdin=subprocess.PIPE,
@@ -772,7 +790,7 @@ independent child comes directly from the existing native-input event queue.
     compactions, last_usage, limit_event = 0, {}, None
     try:
         tree = ProcessTree(process)
-        threading.Thread(target=_reader, args=(process.stdout, 'checkpoint', events), daemon=True).start()
+        threading.Thread(target=_reader, args=(process.stdout, channel, events), daemon=True).start()
         threading.Thread(target=_discard_stderr, args=(process.stderr,), daemon=True).start()
         process.stdin.write(encode_message(prompt_message([{'kind':'request', 'text':CHECKPOINT_PROMPT}])))
         process.stdin.flush()
@@ -794,10 +812,12 @@ independent child comes directly from the existing native-input event queue.
                     break
                 continue
             if source == 'fault':
+                if message not in ('host', channel):
+                    continue  # A stopped process's reader.
                 invalid = True
                 break
-            if source != 'checkpoint':
-                continue  # The main call may have queued its final EOF.
+            if source != channel:
+                continue  # The main call or a previous attempt may have queued its final EOF.
             if message is None:
                 break
             if message.get('type') == 'control_request':
@@ -870,7 +890,8 @@ def execute(command, cwd, environment, incoming, emit, bridge, stopped, observed
     try:
         while True:
             result, problem, auth_error, relaunch = None, None, None, False
-            prompt_seen, auth_seen, forced, tree = False, False, False, None
+            prompt_seen, auth_seen, expired_reported, forced, tree = False, False, False, False, None
+            launch_results = len(results)
             # Workflows and background agents report back after the turn's first
             # result; the CLI then starts the next turn by itself. The final result
             # is the one that arrives while none of them is still running.
@@ -984,6 +1005,7 @@ def execute(command, cwd, environment, incoming, emit, bridge, stopped, observed
                         normalized = [event for event in normalized if event['kind'] != 'text']
                         if auth_failed(message):
                             auth_seen = True
+                            expired_reported = expired_reported or token_expired(message, detail)
                             normalized.append(dict(kind='notice', message='Claude could not authenticate its request.'))
                         else:
                             normalized.append(dict(kind='notice', message='Claude API request failed'
@@ -1007,9 +1029,10 @@ def execute(command, cwd, environment, incoming, emit, bridge, stopped, observed
                         result = message
                         if message.get('is_error') is True and (auth_seen or auth_failed(message)):
                             auth_seen = True
+                            expired_reported = expired_reported or token_expired(message, message.get('result'))
                             break  # Nothing in this process can continue without a login.
                         if background:
-                            if len(results) == 1:
+                            if len(results) == launch_results + 1:
                                 emit(dict(type='event', kind='notice', message=(
                                     'Claude is waiting for its background workflow; the answer continues when it reports back.')))
                             continue
@@ -1018,7 +1041,7 @@ def execute(command, cwd, environment, incoming, emit, bridge, stopped, observed
                         # A report may already be queued; give the CLI a moment to start that turn.
                         settle_deadline = time.monotonic() + BACKGROUND_SETTLE_SECONDS
                 if auth_seen and not interrupted and not problem and (result is None or result.get('is_error')):
-                    code = borrowed.failure() if borrowed is not None else 'claude_login_required'
+                    code = borrowed.failure(expired_reported) if borrowed is not None else 'claude_login_required'
                     auth_error = (code, AUTH_FAILURES[code])
                     relaunch = code == 'claude_auth_expired' and renewable and channel == 'cli'
             finally:
@@ -1043,6 +1066,13 @@ def execute(command, cwd, environment, incoming, emit, bridge, stopped, observed
                 process.stderr.close()
             if not relaunch:
                 break
+            # The stopped process never reports its open tool calls, and a resumed turn ends
+            # successfully, so the host would keep them running; record them as interrupted.
+            with bridge.guard if bridge else nullcontext():
+                stale = list(observed)
+                observed.clear()
+            for tool_id in stale:
+                emit(dict(type='event', kind='tool_end', id=tool_id, output=AUTH_TOOL_STOPPED, is_error=True))
             emit(dict(type='event', kind='notice',
                       message='Claude access token expired; renewing it and resuming this turn...'))
             token, outcome = renew_login(borrowed, events, emit, bridge, delegation)
@@ -1080,13 +1110,29 @@ def execute(command, cwd, environment, incoming, emit, bridge, stopped, observed
     if success and compactions:
         emit(dict(type='event', kind='notice',
                   message='Generating a portable task checkpoint with one additional Claude response; tools are disabled.'))
-        try:
-            checkpoint = generate_checkpoint(command, cwd, environment, events, record['id'])
-        except (ClaudeError, OSError, ProtocolError):
-            checkpoint = {'success':False, 'cancelled':False, 'result':{}}
-        compactions += checkpoint.get('compactions', 0)
-        if checkpoint.get('limit_event'):
-            emit(dict(type='event', **checkpoint['limit_event']))
+        for checkpoint_channel in ('checkpoint', 'checkpoint-renewed'):
+            try:
+                checkpoint = generate_checkpoint(command, cwd, environment, events, record['id'], checkpoint_channel)
+            except (ClaudeError, OSError, ProtocolError):
+                checkpoint = {'success':False, 'cancelled':False, 'result':{}}
+            compactions += checkpoint.get('compactions', 0)
+            if checkpoint.get('limit_event'):
+                emit(dict(type='event', **checkpoint['limit_event']))
+            answer = checkpoint['result']
+            # The lent token can expire after the turn's last request. Renew it once for this call
+            # unless the turn already did; the host answers two renewal requests per runner.
+            if (checkpoint['success'] or checkpoint['cancelled'] or checkpoint_channel != 'checkpoint'
+                    or not renewable or channel != 'cli' or not auth_failed(answer)
+                    or borrowed.failure(token_expired(answer, answer.get('result'))) != 'claude_auth_expired'):
+                break
+            emit(dict(type='event', kind='notice',
+                      message='Claude access token expired; renewing it to finish the portable checkpoint...'))
+            token, outcome = renew_login(borrowed, events, emit, bridge, delegation)
+            if outcome != 'renewed':
+                checkpoint['cancelled'] = outcome == 'interrupted'
+                break
+            environment = dict(environment, CLAUDE_CODE_OAUTH_TOKEN=token)
+            token = None
         checkpoint_failed = not checkpoint['success']
         if checkpoint['cancelled']:
             interrupted, success = True, False

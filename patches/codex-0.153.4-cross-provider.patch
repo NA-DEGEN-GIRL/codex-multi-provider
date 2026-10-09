@@ -53105,10 +53105,10 @@ index a75dbe2af..27eb8f8c6 100644
              output.needs_follow_up = true;
 diff --git a/codex-rs/core/src/tasks/claude_code.rs b/codex-rs/core/src/tasks/claude_code.rs
 new file mode 100644
-index 000000000..b5c2c084c
+index 000000000..f76b7a501
 --- /dev/null
 +++ b/codex-rs/core/src/tasks/claude_code.rs
-@@ -0,0 +1,465 @@
+@@ -0,0 +1,471 @@
 +//! Runs the official installed Claude Code CLI through the manager's authenticated runner.
 +//! All shared history and events still go through the native session recorder.
 +mod auth_refresh;
@@ -53504,17 +53504,23 @@ index 000000000..b5c2c084c
 +        let event = bridge.receive().await?;
 +        match event["type"].as_str() {
 +            Some("event") => output.handle(session, ctx, &event, &snapshot).await,
++            // An answer can outlive the runner: one that stopped its CLI (for example on an
++            // expired login) may exit while the user decides. Its queued terminal message,
++            // read next, then decides the turn instead of this write's broken pipe.
 +            Some("permission_request") => {
-+                bridge
-+                    .send(&events::approve(session, ctx, &event).await)
-+                    .await?
++                let decision = events::approve(session, ctx, &event).await;
++                if bridge.send(&decision).await.is_err() {
++                    tracing::debug!("Claude runner closed before its permission decision arrived");
++                }
 +            }
 +            Some("agent_request") => {
 +                let Some(delegation) = delegation.as_mut() else {
 +                    return Err(failure("native delegation is not enabled for this task"));
 +                };
 +                let response = delegation.dispatch(session, event, cancellation).await?;
-+                bridge.send(&response).await?;
++                if bridge.send(&response).await.is_err() {
++                    tracing::debug!("Claude runner closed before its agent response arrived");
++                }
 +            }
 +            Some("auth_refresh") => {
 +                // The same account request as the turn start: main profile or this role.
@@ -63826,10 +63832,10 @@ index ace2f50a7..e65800ce9 100644
          "followup-call",
 diff --git a/codex-rs/core/tests/suite/claude_code.rs b/codex-rs/core/tests/suite/claude_code.rs
 new file mode 100644
-index 000000000..cd6bec675
+index 000000000..eeedfc834
 --- /dev/null
 +++ b/codex-rs/core/tests/suite/claude_code.rs
-@@ -0,0 +1,204 @@
+@@ -0,0 +1,237 @@
 +//! Native task regression: no paid model or real Claude process is invoked.
 +use codex_core::TurnInputRequest;
 +use codex_model_provider_info::ModelProviderInfo;
@@ -64031,6 +64037,39 @@ index 000000000..cd6bec675
 +    assert_eq!(
 +        records[1],
 +        serde_json::json!({"announced":false,"reply":{"type":"auth_update","available":false}})
++    );
++    Ok(())
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn claude_runner_gone_before_a_permission_decision_reports_its_own_error()
++-> anyhow::Result<()> {
++    let server = responses::start_mock_server().await;
++    let fixture = tempfile::tempdir()?;
++    // Like a runner that gave up waiting for a login renewal, this one stops reading and
++    // exits while its permission request is still open; its terminal message decides the turn.
++    let runner = RUNNER.replace(
++        "assert run['type'] == 'run'\n",
++        r#"assert run['type'] == 'run'
++import os
++os.close(0)
++emit({'type':'permission_request','id':'stale','tool':'ExitPlanMode','input':{},'summary':'stale'})
++emit({'type':'done','status':'error','error':{'code':'claude_auth_expired','message':'login expired'}})
++sys.exit(0)
++"#,
++    );
++    let test = claude_task(&server, fixture.path(), &runner).await?;
++    test.codex
++        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
++            text: "Request".into(),
++            text_elements: Vec::new(),
++        }]))
++        .await
++        .expect("turn starts");
++    let stopped = wait_for_event(&test.codex, |event| matches!(event, EventMsg::Error(_))).await;
++    assert!(
++        matches!(&stopped, EventMsg::Error(error) if error.message.contains("Claude agent: login expired")),
++        "unexpected stop: {stopped:?}"
 +    );
 +    Ok(())
 +}

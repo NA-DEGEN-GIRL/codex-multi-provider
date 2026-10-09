@@ -6,6 +6,7 @@ from pathlib import Path
 import queue
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -20,7 +21,8 @@ from manager_core.claude_profiles import automatic_context_window
 from manager_core.claude_runner import (SessionLedger, compact_summary, digest, run_settings,
                                        serve, session_lock, PermissionBridge, system_prompt_text,
                                        private_temporary_directory, build_command, AUTH_FAILURES,
-                                       AUTH_STOP_NOTE)
+                                       AUTH_STOP_NOTE, AUTH_TOOL_STOPPED, BorrowedLogin, renew_login,
+                                       token_expired)
 
 
 FAKE = r'''
@@ -47,7 +49,13 @@ if 'CODEX_PORTABLE_CHECKPOINT_V1' in json.dumps(request):
         emit({'type':'system','subtype':'compact_boundary','compact_metadata':{'trigger':'auto'}})
     if scenario == 'compact_rate_limit':
         emit({'type':'rate_limit_event','rate_limit_info':{'status':'allowed_warning','utilization':0.9}})
-    if scenario != 'compact_cancel':
+    if scenario == 'auth_checkpoint' and os.environ.get('CLAUDE_CODE_OAUTH_TOKEN') == 'dummy-token-1':
+        text = 'Failed to authenticate. API Error: 401 OAuth access token has expired'
+        emit({'type':'assistant','error':'authentication_failed',
+              'message':{'content':[{'type':'text','text':text}],'usage':{'input_tokens':0,'output_tokens':0}}})
+        emit({'type':'result','subtype':'success','is_error':True,'session_id':session,'result':text,
+              'api_error_status':401,'usage':{'input_tokens':0,'output_tokens':0},'total_cost_usd':0.02})
+    elif scenario != 'compact_cancel':
         summary = 'Deliberate complete portable summary: goal, constraints, completed work and next steps.'
         emit({'type':'assistant','message':{'content':[{'type':'text','text':summary}],
               'usage':{'input_tokens':3,'output_tokens':2,'cache_read_input_tokens':50}}})
@@ -99,10 +107,15 @@ else:
               'total_cost_usd':0.05})
     elif scenario == 'wait':
         emit({'type':'stream_event','event':{'type':'content_block_delta','delta':{'type':'text_delta','text':'waiting'}}})
-    elif scenario == 'api_error' or (scenario.startswith('auth_') and (scenario == 'auth_always'
-            or os.environ.get('CLAUDE_CODE_OAUTH_TOKEN') == 'dummy-token-1')):
+    elif scenario == 'api_error' or (scenario.startswith('auth_') and scenario != 'auth_checkpoint' and (
+            scenario == 'auth_always' or os.environ.get('CLAUDE_CODE_OAUTH_TOKEN') == 'dummy-token-1')):
+        if scenario == 'auth_tool':
+            # A background agent's command that is still running when the main request fails.
+            emit({'type':'assistant','parent_tool_use_id':'agent-1','message':{'content':[
+                  {'type':'tool_use','id':'bg-tool-1','name':'Bash','input':{'command':'sleep 600'}}]}})
         # The official CLI's shape for a failed API request (2.1.282).
         text = ('API Error: 529 Overloaded' if scenario == 'api_error'
+                else 'Failed to authenticate. API Error: 401 Invalid bearer token' if scenario == 'auth_rejected'
                 else 'Failed to authenticate. API Error: 401 OAuth access token has expired')
         emit({'type':'assistant','error':'server_error' if scenario == 'api_error' else 'authentication_failed',
               'message':{'content':[{'type':'text','text':text}],'usage':{'input_tokens':0,'output_tokens':0}}})
@@ -111,6 +124,17 @@ else:
         emit({'type':'result','subtype':'success','is_error':True,'session_id':session,'result':text,
               'api_error_status':529 if scenario == 'api_error' else 401,
               'usage':{'input_tokens':1,'output_tokens':0},'total_cost_usd':0.01})
+    elif scenario == 'auth_background':
+        # The renewed launch starts a background agent and reports after its first result.
+        emit({'type':'system','subtype':'background_tasks_changed',
+              'tasks':[{'task_id':'agent-1','task_type':'local_agent','description':'review'}]})
+        emit({'type':'result','subtype':'success','is_error':False,'session_id':session,'result':'Agent started.',
+              'usage':{'input_tokens':5,'output_tokens':2},'total_cost_usd':0.02})
+        emit({'type':'system','subtype':'background_tasks_changed','tasks':[]})
+        emit({'type':'assistant','message':{'content':[{'type':'text','text':'Agent finished.'}],
+              'usage':{'input_tokens':6,'output_tokens':3}}})
+        emit({'type':'result','subtype':'success','is_error':False,'session_id':session,'result':'Agent finished.',
+              'usage':{'input_tokens':6,'output_tokens':3},'total_cost_usd':0.03})
     else:
         if scenario == 'managed_leaf':
             assert '--mcp-config' not in args
@@ -165,7 +189,8 @@ else:
             helper.stdout.close()
             emit({'type':'user','message':{'content':[{'type':'tool_result','tool_use_id':'tool-1',
                   'content':decision['behavior'],'is_error':decision['behavior'] != 'allow'}]}})
-        if scenario in ('compact','compact_failure','compact_cancel','compact_nested','compact_rate_limit','auth_compact'):
+        if scenario in ('compact','compact_failure','compact_cancel','compact_nested','compact_rate_limit','auth_compact',
+                        'auth_checkpoint'):
             emit({'type':'system','subtype':'compact_boundary','compact_metadata':{'trigger':'auto','pre_tokens':170000}})
             path = Path(os.environ['CLAUDE_CONFIG_DIR']) / 'projects' / 'fixture' / (session + '.jsonl')
             path.parent.mkdir(parents=True,exist_ok=True)
@@ -453,16 +478,16 @@ class ClaudeRunnerTests(unittest.TestCase):
         code, events, launches = self.run_borrowed('auth_always', 45, [lambda context: context.renewal()])
         done = next(event for event in events if event['type'] == 'done')
         self.assertEqual(done['status'], 'error')
-        # The renewed token was far from its expiry, so Claude rejected it.
-        self.assertEqual(done['error']['code'], 'claude_auth_rejected')
+        # The API reports the renewed token as expired too; it is still not renewed again.
+        self.assertEqual(done['error']['code'], 'claude_auth_expired')
         self.assertEqual(len(launches), 2)
         self.assertEqual(sum(event['type'] == 'auth_refresh' for event in events), 1)
 
     def test_rejected_or_unannounced_renewal_reports_a_specific_auth_error(self):
-        for expires_in, announce, expected in ((3600, True, 'claude_auth_rejected'),
-                                               (45, False, 'claude_auth_expired')):
-            with self.subTest(expires_in=expires_in, announce=announce):
-                code, events, launches = self.run_borrowed('auth_expired', expires_in, announce=announce)
+        for scenario, expires_in, announce, expected in (('auth_rejected', 3600, True, 'claude_auth_rejected'),
+                                                         ('auth_expired', 45, False, 'claude_auth_expired')):
+            with self.subTest(scenario=scenario, announce=announce):
+                code, events, launches = self.run_borrowed(scenario, expires_in, announce=announce)
                 done = next(event for event in events if event['type'] == 'done')
                 self.assertEqual((done['status'], done['error']['code']), ('error', expected))
                 self.assertEqual(done['error']['message'], AUTH_FAILURES[expected])
@@ -526,6 +551,74 @@ class ClaudeRunnerTests(unittest.TestCase):
         self.assertEqual([(launch['token'], launch['checkpoint']) for launch in launches],
                          [('dummy-token-1', False), ('dummy-token-2', False), ('dummy-token-2', True)])
 
+    def test_the_api_expiry_reason_outweighs_a_skewed_lender_clock(self):
+        # By this host's clock the lent token has an hour left; the API says it expired.
+        code, events, launches = self.run_borrowed('auth_expired', 3600, [lambda context: context.renewal()])
+        self.assertEqual(code, 0, events)
+        self.assertEqual(next(event for event in events if event['type'] == 'done')['status'], 'success')
+        self.assertEqual([launch['token'] for launch in launches], ['dummy-token-1', 'dummy-token-2'])
+        self.assertTrue(token_expired({'api_error_code': 'token_expired'}, 'Failed to authenticate.'))
+        self.assertTrue(token_expired({}, 'Failed to authenticate. API Error: 401 OAuth token has expired. Retry.'))
+        self.assertFalse(token_expired({}, 'Failed to authenticate. API Error: 401 Invalid bearer token'))
+        self.assertFalse(token_expired({'api_error_code': 'token_revoked'}, None))
+
+    def test_open_tool_calls_of_the_stopped_process_are_closed_before_it_resumes(self):
+        code, events, launches = self.run_borrowed('auth_tool', 45, [lambda context: context.renewal()])
+        self.assertEqual(code, 0, events)
+        kinds = [(event.get('kind') or event['type'], event.get('id')) for event in events]
+        closed = next(event for event in events if event.get('kind') == 'tool_end')
+        self.assertEqual(closed, dict(type='event', kind='tool_end', id='bg-tool-1', output=AUTH_TOOL_STOPPED,
+                                      is_error=True))
+        self.assertLess(kinds.index(('tool_start', 'bg-tool-1')), kinds.index(('tool_end', 'bg-tool-1')))
+        self.assertLess(kinds.index(('tool_end', 'bg-tool-1')), kinds.index(('auth_refresh', None)))
+        self.assertEqual(next(event for event in events if event['type'] == 'done')['status'], 'success')
+
+    def test_a_resumed_launch_reports_that_it_waits_for_background_work(self):
+        code, events, launches = self.run_borrowed('auth_background', 45, [lambda context: context.renewal()])
+        self.assertEqual(code, 0, events)
+        done = next(event for event in events if event['type'] == 'done')
+        self.assertEqual((done['status'], done['result_text']), ('success', 'Agent finished.'))
+        self.assertEqual(sum('waiting for its background workflow' in event.get('message', '') for event in events), 1)
+
+    def test_an_expired_login_is_renewed_once_for_the_portable_checkpoint(self):
+        code, events, launches = self.run_borrowed('auth_checkpoint', 3600, [lambda context: context.renewal()])
+        self.assertEqual(code, 0, events)
+        self.assertTrue(any(event.get('deliberate_full_context_summary') for event in events), events)
+        self.assertEqual(sum(event['type'] == 'auth_refresh' for event in events), 1)
+        self.assertEqual([(launch['token'], launch['checkpoint']) for launch in launches],
+                         [('dummy-token-1', False), ('dummy-token-1', True), ('dummy-token-2', True)])
+        self.assertFalse(self.borrowed_record()['dirty'])
+        # A host that cannot renew keeps the failed checkpoint's fresh-session rule.
+        code, events, launches = self.run_borrowed('auth_checkpoint', 3600, announce=False)
+        self.assertEqual(next(event for event in events if event['type'] == 'done')['status'], 'success')
+        self.assertFalse(any(event['type'] == 'auth_refresh' for event in events))
+        self.assertEqual(len(launches), 2)
+        self.assertTrue(self.borrowed_record()['dirty'])
+
+    def test_a_second_renewal_request_waits_out_the_host_cooldown_from_the_first(self):
+        borrowed = BorrowedLogin(dict(profileId=self.profile, accountIdentity=digest('remote-account'),
+                                      expiresAt=int(time.time()) + 45))
+        renewal = dict(type='auth_update', available=True, credentials=dict(
+            profileId=self.profile, accessToken='dummy-token-2', accountIdentity=digest('remote-account'),
+            expiresAt=int(time.time()) + 8 * 3600))
+        for delay, low, high in ((0, .8, 1.6), (1.2, 1.1, 1.9)):
+            with self.subTest(delay=delay):
+                events, sent = queue.Queue(), []
+                def emit(message, delay=delay):
+                    sent.append(time.monotonic())
+                    reply = dict(type='auth_update', available=False) if len(sent) == 1 else renewal
+                    if len(sent) == 1 and delay:
+                        threading.Timer(delay, events.put, args=(('host', reply),)).start()
+                    else:
+                        events.put(('host', reply))
+                with patch('manager_core.claude_runner.AUTH_REFRESH_RETRY_SECONDS', 1.0):
+                    token, outcome = renew_login(borrowed, events, emit, None, None)
+                self.assertEqual((outcome, len(sent)), ('renewed', 2))
+                self.assertIsNotNone(token)
+                # A quick refusal still waits for the window; a slow one is retried at once.
+                self.assertTrue(low <= sent[1] - sent[0] < high, sent[1] - sent[0])
+                borrowed.expires_at = int(time.time()) + 45
+
     def borrowed_record(self):
         return json.loads(next(self.root.glob('remote-state/sessions/*/*/*.json')).read_text(encoding='utf-8'))
 
@@ -565,7 +658,7 @@ class ClaudeRunnerTests(unittest.TestCase):
                 self.assertTrue(record['dirty'])
                 self.assertNotIn('auth_stop', record)
         # A rejected token stops cleanly too; an older runtime still gets a fresh session.
-        code, events, stopped = self.run_borrowed('auth_always', 3600, auth_resume=True)
+        code, events, stopped = self.run_borrowed('auth_rejected', 3600, auth_resume=True)
         self.assertEqual(next(event for event in events if event['type'] == 'done')['error']['code'],
                          'claude_auth_rejected')
         self.assertEqual(self.borrowed_record()['auth_stop']['turn_id'], 'turn-1')
