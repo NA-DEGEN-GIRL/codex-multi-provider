@@ -24849,10 +24849,10 @@ index 000000000..a43126d64
 +}
 diff --git a/codex-rs/app-server/src/manager_shared_execution.rs b/codex-rs/app-server/src/manager_shared_execution.rs
 new file mode 100644
-index 000000000..a0047d31b
+index 000000000..ada041e17
 --- /dev/null
 +++ b/codex-rs/app-server/src/manager_shared_execution.rs
-@@ -0,0 +1,426 @@
+@@ -0,0 +1,434 @@
 +//! Direct shared editing selected by the manager. Storage routing is independent
 +//! of the active account: only registered record homes are opened here. Auth,
 +//! config, MCP, permissions and model requests remain with the selected profile.
@@ -25008,7 +25008,15 @@ index 000000000..a0047d31b
 +                });
 +            }
 +            let store = self.default_store().await?;
-+            routes.insert(id, Arc::clone(&store));
++            // Pin the native route only for a record the native store holds.
++            // Peers read a new task as soon as its owner signals it, which can
++            // precede the owner's first durable state row. A pinned miss would
++            // keep that task "not loaded" here until this runtime restarts.
++            if matches!(store.read_thread_metadata(id).await, Ok(Some(_)))
++                || matches!(store.local_rollout_path(id).await, Ok(Some(_)))
++            {
++                routes.insert(id, Arc::clone(&store));
++            }
 +            return Ok(store);
 +        };
 +        if matches.any(|other| other.codex_home != source.codex_home) {
@@ -25281,10 +25289,10 @@ index 000000000..a0047d31b
 +mod tests;
 diff --git a/codex-rs/app-server/src/manager_shared_execution_tests.rs b/codex-rs/app-server/src/manager_shared_execution_tests.rs
 new file mode 100644
-index 000000000..d23e1b2c6
+index 000000000..6b3625973
 --- /dev/null
 +++ b/codex-rs/app-server/src/manager_shared_execution_tests.rs
-@@ -0,0 +1,203 @@
+@@ -0,0 +1,267 @@
 +use super::*;
 +use codex_protocol::protocol::HistoryPosition;
 +use codex_protocol::protocol::ThreadHistoryMode;
@@ -25487,6 +25495,70 @@ index 000000000..d23e1b2c6
 +
 +    assert!(!parent.exists());
 +    assert!(!child.exists());
++}
++
++#[tokio::test]
++async fn shared_route_miss_is_rechecked_after_the_owner_materializes_the_record() {
++    let temp = TempDir::new().unwrap();
++    let source_home = temp.path().join("owner");
++    let selected_home = temp.path().join("selected-account");
++    std::fs::create_dir_all(&selected_home).unwrap();
++    let id = ThreadId::new();
++    let path = temp.path().join("catalog.json");
++    let write_catalog = |entries: Vec<serde_json::Value>| {
++        std::fs::write(
++            &path,
++            json!({"version":1,"hostId":"local","revision":"test","entries":entries}).to_string(),
++        )
++        .unwrap();
++    };
++    // The owner signaled a new task before writing its first durable record.
++    write_catalog(vec![]);
++    let store = SharedStore {
++        fallback: Arc::new(LocalThreadStore::new(
++            LocalThreadStoreConfig {
++                codex_home: selected_home.clone(),
++                sqlite: codex_state::SqliteConfig::from_sqlite_home(
++                    AbsolutePathBuf::from_absolute_path(&selected_home).unwrap(),
++                ),
++                default_model_provider_id: "openai".into(),
++            },
++            /*state_db*/ None,
++        )),
++        path: path.clone(),
++        canonical_home: None,
++        new_thread_home: None,
++        default_store: OnceCell::new(),
++        routes: Mutex::new(HashMap::new()),
++        homes: Mutex::new(HashMap::new()),
++    };
++    assert!(read_summary(&store, id).await.is_err());
++
++    let rollout =
++        super::super::tests::fixture(&source_home, &id.to_string(), "owner question", "legacy");
++    write_catalog(vec![super::super::tests::source(
++        &source_home,
++        &rollout,
++        &id.to_string(),
++        &ThreadId::new().to_string(),
++        "owner:local",
++    )]);
++    let stored = read_summary(&store, id).await.unwrap();
++    assert_eq!(
++        (stored.thread_id, stored.history_mode),
++        (id, ThreadHistoryMode::Legacy)
++    );
++    assert!(!selected_home.join("sessions").exists());
++}
++
++async fn read_summary(store: &SharedStore, thread_id: ThreadId) -> ThreadStoreResult<StoredThread> {
++    store
++        .read_thread(ReadThreadParams {
++            thread_id,
++            include_archived: true,
++            include_history: false,
++        })
++        .await
 +}
 diff --git a/codex-rs/app-server/src/manager_shared_routes.rs b/codex-rs/app-server/src/manager_shared_routes.rs
 new file mode 100644
@@ -43603,7 +43675,7 @@ index 91022fdc3..677af7c8c 100644
  
  impl AgentCommunicationContext {
 diff --git a/codex-rs/core/src/client.rs b/codex-rs/core/src/client.rs
-index 9f03c939e..26b9c93d6 100644
+index 9f03c939e..2a0ef013a 100644
 --- a/codex-rs/core/src/client.rs
 +++ b/codex-rs/core/src/client.rs
 @@ -121,6 +121,8 @@ use crate::attestation::X_OAI_ATTESTATION_HEADER;
@@ -43623,7 +43695,26 @@ index 9f03c939e..26b9c93d6 100644
  use codex_model_provider::SharedModelProvider;
  use codex_model_provider::create_model_provider;
  #[cfg(test)]
-@@ -973,16 +976,25 @@ impl ModelClient {
+@@ -342,6 +345,8 @@ struct WebsocketSession {
+     last_response_rx: Option<oneshot::Receiver<LastResponse>>,
+     last_response_from_untraced_warmup: bool,
+     connection_reused: StdMutex<bool>,
++    /// Client version the connection's handshake identified as, when not this build's.
++    client_version: Option<String>,
+ }
+ 
+ // This is intentionally not a `PartialEq` implementation: request equality includes `input` and
+@@ -702,6 +707,9 @@ impl ModelClient {
+             extra_headers.insert(X_CODEX_ROUTING_HINT_HEADER, header_value);
+         }
+         add_responses_lite_header(&mut extra_headers, model_info.use_responses_lite);
++        if let Some(version) = self.inference_client_version(&model_info.slug) {
++            crate::client_version::add_client_version_headers(&mut extra_headers, &version);
++        }
+         let compact_request_timeout = client_setup
+             .api_provider
+             .stream_idle_timeout
+@@ -973,16 +981,25 @@ impl ModelClient {
                  Some(create_tools_raw_json_for_responses_api(&prompt.tools)?.into()),
              )
          };
@@ -43659,7 +43750,7 @@ index 9f03c939e..26b9c93d6 100644
              }
          }
          let reasoning = self.build_reasoning(model_info, effort, summary);
-@@ -1032,6 +1044,27 @@ impl ModelClient {
+@@ -1032,6 +1049,27 @@ impl ModelClient {
          Ok(request)
      }
  
@@ -43687,7 +43778,37 @@ index 9f03c939e..26b9c93d6 100644
      fn prepare_response_items_for_request(&self, input: &mut [ResponseItem]) {
          for item in input {
              if item.id().is_some_and(|id| !id.is_prefixed()) {
-@@ -1283,6 +1316,18 @@ impl ModelClientSession {
+@@ -1056,6 +1094,15 @@ impl ModelClient {
+         true
+     }
+ 
++    /// Client version a request for `model_slug` identifies as, when it is not this build's:
++    /// models newer than this build are served only to newer clients (see `client_version`).
++    fn inference_client_version(&self, model_slug: &str) -> Option<String> {
++        if !self.state.provider.info().is_openai() {
++            return None;
++        }
++        crate::client_version::inference_client_version(model_slug)
++    }
++
+     /// Returns auth + provider configuration resolved from the current session auth state.
+     ///
+     /// This centralizes setup used by both prewarm and normal request paths so they stay in
+@@ -1154,8 +1201,12 @@ impl ModelClient {
+         auth_context: AuthRequestTelemetryContext,
+         request_route_telemetry: RequestRouteTelemetry,
+         endpoint: ResponsesEndpoint,
++        client_version: Option<&str>,
+     ) -> std::result::Result<ApiWebSocketConnection, ApiError> {
+-        let headers = self.build_websocket_headers(responses_metadata).await;
++        let mut headers = self.build_websocket_headers(responses_metadata).await;
++        if let Some(version) = client_version {
++            crate::client_version::add_client_version_headers(&mut headers, version);
++        }
+         let websocket_telemetry = ModelClientSession::build_websocket_telemetry(
+             session_telemetry,
+             auth_context.clone(),
+@@ -1283,9 +1334,22 @@ impl ModelClientSession {
          Arc::clone(&self.turn_state)
      }
  
@@ -43706,7 +43827,65 @@ index 9f03c939e..26b9c93d6 100644
      fn reset_websocket_session(&mut self) {
          self.websocket_session.connection = None;
          self.websocket_session.endpoint = None;
-@@ -1533,14 +1578,31 @@ impl ModelClientSession {
++        self.websocket_session.client_version = None;
+         self.websocket_session.last_request = None;
+         self.websocket_session.last_response_rx = None;
+         self.websocket_session.last_response_from_untraced_warmup = false;
+@@ -1441,6 +1505,7 @@ impl ModelClientSession {
+         let endpoint = self
+             .client
+             .responses_endpoint(client_setup.auth.as_ref(), &model_info.slug);
++        let client_version = self.client.inference_client_version(&model_info.slug);
+         let connection = self
+             .client
+             .connect_websocket(
+@@ -1451,10 +1516,12 @@ impl ModelClientSession {
+                 auth_context,
+                 RequestRouteTelemetry::for_endpoint(endpoint.path()),
+                 endpoint,
++                client_version.as_deref(),
+             )
+             .await?;
+         self.websocket_session.connection = Some(connection);
+         self.websocket_session.endpoint = Some(endpoint);
++        self.websocket_session.client_version = client_version;
+         self.websocket_session
+             .set_connection_reused(/*connection_reused*/ false);
+         Ok(())
+@@ -1484,10 +1551,15 @@ impl ModelClientSession {
+             auth_context,
+             request_route_telemetry,
+             endpoint,
++            client_version,
+         } = params;
++        // The handshake carries the client version, so a model that needs another version
++        // needs its own connection.
+         let needs_new = match self.websocket_session.connection.as_ref() {
+             Some(conn) => {
+-                self.websocket_session.endpoint != Some(endpoint) || conn.is_closed().await
++                self.websocket_session.endpoint != Some(endpoint)
++                    || self.websocket_session.client_version != client_version
++                    || conn.is_closed().await
+             }
+             None => true,
+         };
+@@ -1504,6 +1576,7 @@ impl ModelClientSession {
+                     auth_context,
+                     request_route_telemetry,
+                     endpoint,
++                    client_version.as_deref(),
+                 )
+                 .await
+             {
+@@ -1517,6 +1590,7 @@ impl ModelClientSession {
+             };
+             self.websocket_session.connection = Some(new_conn);
+             self.websocket_session.endpoint = Some(endpoint);
++            self.websocket_session.client_version = client_version;
+             self.websocket_session
+                 .set_connection_reused(/*connection_reused*/ false);
+         } else {
+@@ -1533,14 +1607,31 @@ impl ModelClientSession {
      }
  
      fn responses_request_compression(&self, auth: Option<&CodexAuth>) -> Compression {
@@ -43744,7 +43923,7 @@ index 9f03c939e..26b9c93d6 100644
      }
  
      /// Streams a turn via the OpenAI Responses API.
-@@ -1577,6 +1639,7 @@ impl ModelClientSession {
+@@ -1577,6 +1668,7 @@ impl ModelClientSession {
              .map(AuthManager::unauthorized_recovery);
          let mut provider_auth_recovery_attempted = false;
          let mut pending_retry = PendingUnauthorizedRetry::default();
@@ -43752,7 +43931,20 @@ index 9f03c939e..26b9c93d6 100644
          loop {
              let client_setup = self.client.current_client_setup().await?;
              let endpoint = self
-@@ -1635,6 +1698,10 @@ impl ModelClientSession {
+@@ -1606,6 +1698,12 @@ impl ModelClientSession {
+                     model_info.use_responses_lite,
+                 )
+                 .await;
++            if let Some(version) = self.client.inference_client_version(&model_info.slug) {
++                crate::client_version::add_client_version_headers(
++                    &mut options.extra_headers,
++                    &version,
++                );
++            }
+ 
+             let mut request = self.client.build_responses_request(
+                 prompt,
+@@ -1635,6 +1733,10 @@ impl ModelClientSession {
              );
              self.client
                  .prepare_response_items_for_request(&mut request.input);
@@ -43763,7 +43955,7 @@ index 9f03c939e..26b9c93d6 100644
              let request_session_telemetry =
                  session_telemetry_for_request(session_telemetry, &request);
              let inference_trace_attempt = inference_trace.start_attempt();
-@@ -1738,6 +1805,8 @@ impl ModelClientSession {
+@@ -1738,6 +1840,8 @@ impl ModelClientSession {
              .map(AuthManager::unauthorized_recovery);
          let mut provider_auth_recovery_attempted = false;
          let mut pending_retry = PendingUnauthorizedRetry::default();
@@ -43772,7 +43964,15 @@ index 9f03c939e..26b9c93d6 100644
          loop {
              let client_setup = self.client.current_client_setup().await?;
              let endpoint = self
-@@ -1848,6 +1917,15 @@ impl ModelClientSession {
+@@ -1796,6 +1900,7 @@ impl ModelClientSession {
+                     auth_context: request_auth_context,
+                     request_route_telemetry: RequestRouteTelemetry::for_endpoint(endpoint.path()),
+                     endpoint,
++                    client_version: self.client.inference_client_version(&model_info.slug),
+                 })
+                 .await
+             {
+@@ -1848,6 +1953,15 @@ impl ModelClientSession {
              let original_item_ids = if let Some(incremental_items) = &mut incremental_items {
                  self.client
                      .prepare_response_items_for_request(incremental_items);
@@ -43788,7 +43988,7 @@ index 9f03c939e..26b9c93d6 100644
                  None
              } else {
                  let original_item_ids = request
-@@ -1857,6 +1935,10 @@ impl ModelClientSession {
+@@ -1857,6 +1971,10 @@ impl ModelClientSession {
                      .collect::<Vec<_>>();
                  self.client
                      .prepare_response_items_for_request(&mut request.input);
@@ -43799,6 +43999,15 @@ index 9f03c939e..26b9c93d6 100644
                  Some(original_item_ids)
              };
              let ws_payload = ResponseCreateWsRequest {
+@@ -2390,6 +2508,8 @@ struct WebsocketConnectParams<'a> {
+     auth_context: AuthRequestTelemetryContext,
+     request_route_telemetry: RequestRouteTelemetry,
+     endpoint: ResponsesEndpoint,
++    /// Client version the handshake identifies as, when not this build's.
++    client_version: Option<String>,
+ }
+ 
+ fn emit_auth_recovery_event(
 diff --git a/codex-rs/core/src/client_common.rs b/codex-rs/core/src/client_common.rs
 index f2d6be2a2..ee34fff84 100644
 --- a/codex-rs/core/src/client_common.rs
@@ -44434,6 +44643,177 @@ index 6eda1c86b..de5d86b2a 100644
  fn test_session_telemetry() -> SessionTelemetry {
      SessionTelemetry::new(
          ThreadId::new(),
+diff --git a/codex-rs/core/src/client_version.rs b/codex-rs/core/src/client_version.rs
+new file mode 100644
+index 000000000..af4e1e460
+--- /dev/null
++++ b/codex-rs/core/src/client_version.rs
+@@ -0,0 +1,85 @@
++//! Client version an inference request identifies itself with.
++//!
++//! The service serves a model only to clients at or above the model's minimum version. It checks
++//! that version on the model catalog request (`client_version`) and again on inference, where a
++//! request below it fails with "The '<model>' model is not supported when using Codex with a
++//! ChatGPT account". This managed build asks for the catalog as the official desktop's bundled
++//! CLI does (`codex_models_manager::client_version_to_whole`), so the catalog offers models newer
++//! than this build. Requests for those models identify as that catalog version, as the official
++//! CLI does. Models this build's own bundled catalog knows keep identifying as this build, as
++//! before.
++
++use std::collections::HashSet;
++use std::sync::LazyLock;
++
++use http::HeaderMap;
++use http::HeaderValue;
++use http::header::USER_AGENT;
++
++/// Provider header that carries the client version (see `create_openai_provider`).
++const VERSION_HEADER: &str = "version";
++
++/// This build's version, as the provider header and user agent carry it.
++const OWN_VERSION: &str = env!("CARGO_PKG_VERSION");
++
++static BUNDLED_MODEL_SLUGS: LazyLock<HashSet<String>> = LazyLock::new(|| {
++    codex_models_manager::bundled_models_response()
++        .map(|response| {
++            response
++                .models
++                .into_iter()
++                .map(|model| model.slug)
++                .collect()
++        })
++        .unwrap_or_default()
++});
++
++/// The version an inference request for `model_slug` identifies as, when it is not this build's.
++pub(crate) fn inference_client_version(model_slug: &str) -> Option<String> {
++    inference_client_version_for(
++        model_slug,
++        &BUNDLED_MODEL_SLUGS,
++        codex_models_manager::client_version_to_whole(),
++    )
++}
++
++fn inference_client_version_for(
++    model_slug: &str,
++    bundled_model_slugs: &HashSet<String>,
++    catalog_version: String,
++) -> Option<String> {
++    // Without a readable bundled catalog every model would look new; keep this build's identity.
++    if bundled_model_slugs.is_empty() || bundled_model_slugs.contains(model_slug) {
++        return None;
++    }
++    (catalog_version != OWN_VERSION).then_some(catalog_version)
++}
++
++/// Makes `headers` identify the request as client `version`: the provider's version header and
++/// the version in the user agent. Request headers take precedence over the provider's and the
++/// client's defaults.
++pub(crate) fn add_client_version_headers(headers: &mut HeaderMap, version: &str) {
++    if let Ok(value) = HeaderValue::from_str(version) {
++        headers.insert(VERSION_HEADER, value);
++    }
++    let user_agent = with_version(
++        &codex_login::default_client::get_codex_user_agent(),
++        version,
++    );
++    if let Ok(value) = HeaderValue::from_str(&user_agent) {
++        headers.insert(USER_AGENT, value);
++    }
++}
++
++/// Replaces this build's version after the originator (`<originator>/<version> (<os> ...`).
++fn with_version(user_agent: &str, version: &str) -> String {
++    user_agent.replacen(
++        &format!("/{OWN_VERSION} ("),
++        &format!("/{version} ("),
++        /*count*/ 1,
++    )
++}
++
++#[cfg(test)]
++#[path = "client_version_tests.rs"]
++mod tests;
+diff --git a/codex-rs/core/src/client_version_tests.rs b/codex-rs/core/src/client_version_tests.rs
+new file mode 100644
+index 000000000..c567a33e2
+--- /dev/null
++++ b/codex-rs/core/src/client_version_tests.rs
+@@ -0,0 +1,74 @@
++use super::*;
++use pretty_assertions::assert_eq;
++
++fn slugs(slugs: &[&str]) -> HashSet<String> {
++    slugs.iter().map(ToString::to_string).collect()
++}
++
++#[test]
++fn models_this_build_bundles_keep_its_version() {
++    assert_eq!(
++        inference_client_version_for(
++            "gpt-6-astra",
++            &slugs(&["gpt-6-astra", "gpt-5.5"]),
++            "0.160.0".to_string(),
++        ),
++        None
++    );
++}
++
++#[test]
++fn models_newer_than_this_build_identify_as_the_catalog_version() {
++    assert_eq!(
++        inference_client_version_for(
++            "gpt-6.1-sol",
++            &slugs(&["gpt-6-astra", "gpt-5.5"]),
++            "0.160.0".to_string(),
++        ),
++        Some("0.160.0".to_string())
++    );
++}
++
++#[test]
++fn catalog_at_this_builds_version_changes_nothing() {
++    assert_eq!(
++        inference_client_version_for(
++            "gpt-6.1-sol",
++            &slugs(&["gpt-6-astra"]),
++            OWN_VERSION.to_string(),
++        ),
++        None
++    );
++}
++
++#[test]
++fn unreadable_bundled_catalog_keeps_this_builds_version() {
++    assert_eq!(
++        inference_client_version_for("gpt-6.1-sol", &HashSet::new(), "0.160.0".to_string()),
++        None
++    );
++}
++
++#[test]
++fn headers_carry_the_version_in_both_places() {
++    let mut headers = HeaderMap::new();
++    add_client_version_headers(&mut headers, "0.160.0");
++    assert_eq!(headers[VERSION_HEADER], "0.160.0");
++    let user_agent = headers[USER_AGENT].to_str().unwrap();
++    assert!(
++        user_agent.contains("/0.160.0 ("),
++        "user agent should carry the version: {user_agent}"
++    );
++    assert!(!user_agent.contains(&format!("/{OWN_VERSION} (")));
++}
++
++#[test]
++fn only_the_originator_version_is_replaced() {
++    assert_eq!(
++        with_version(
++            &format!("codex_cli_rs/{OWN_VERSION} (Linux 6.8; x86_64) term ({OWN_VERSION})"),
++            "0.160.0"
++        ),
++        format!("codex_cli_rs/0.160.0 (Linux 6.8; x86_64) term ({OWN_VERSION})")
++    );
++}
 diff --git a/codex-rs/core/src/codex_delegate.rs b/codex-rs/core/src/codex_delegate.rs
 index af194098e..175aa6c47 100644
 --- a/codex-rs/core/src/codex_delegate.rs
@@ -46894,10 +47274,18 @@ index 000000000..ef75a8a02
 +    Ok(())
 +}
 diff --git a/codex-rs/core/src/lib.rs b/codex-rs/core/src/lib.rs
-index b4e979289..7659683b1 100644
+index b4e979289..d1e33ec8a 100644
 --- a/codex-rs/core/src/lib.rs
 +++ b/codex-rs/core/src/lib.rs
-@@ -33,6 +33,8 @@ mod compact_remote;
+@@ -9,6 +9,7 @@ mod apply_patch;
+ mod apps;
+ mod client;
+ mod client_common;
++mod client_version;
+ mod realtime_context;
+ mod realtime_conversation;
+ mod realtime_history;
+@@ -33,6 +34,8 @@ mod compact_remote;
  mod compact_remote_history;
  mod compact_remote_v2;
  mod compact_token_budget;
@@ -46906,7 +47294,7 @@ index b4e979289..7659683b1 100644
  pub use codex_network_proxy::EnvironmentNetworkPolicy;
  pub use codex_network_proxy::NetworkDomainPermission;
  pub use codex_network_proxy::NetworkDomainPermissionEntry;
-@@ -48,6 +50,7 @@ pub use codex_thread::GuardianAuthorizationVersion;
+@@ -48,6 +51,7 @@ pub use codex_thread::GuardianAuthorizationVersion;
  pub use codex_thread::GuardianRootMessage;
  pub use codex_thread::GuardianRootSnapshot;
  pub use codex_thread::ThreadConfigSnapshot;
@@ -46914,7 +47302,7 @@ index b4e979289..7659683b1 100644
  pub use session::turn_context::TurnContext;
  mod agent;
  mod agent_communication;
-@@ -118,7 +121,11 @@ pub use codex_prompts as review_prompts;
+@@ -118,7 +122,11 @@ pub use codex_prompts as review_prompts;
  mod thread_manager;
  pub(crate) mod web_search;
  pub(crate) mod windows_sandbox_read_grants;
@@ -46988,10 +47376,10 @@ index 000000000..b16e10636
 +}
 diff --git a/codex-rs/core/src/portable_context.rs b/codex-rs/core/src/portable_context.rs
 new file mode 100644
-index 000000000..7f92d3cc0
+index 000000000..9dbb8b6e7
 --- /dev/null
 +++ b/codex-rs/core/src/portable_context.rs
-@@ -0,0 +1,770 @@
+@@ -0,0 +1,791 @@
 +//! Carries a thread's model context across provider families.
 +//!
 +//! Providers in one family can read each other's opaque state, such as encrypted compaction and
@@ -47088,6 +47476,7 @@ index 000000000..7f92d3cc0
 +pub(crate) use agent_summary::apply_verified_summary;
 +pub(crate) use agent_summary::has_agent_summary;
 +pub(crate) use budget::RebuildBudget;
++pub(crate) use budget::exceeds_request_window;
 +pub(crate) use budget::rebuild_token_count;
 +pub(crate) use budget::text_token_count;
 +pub(crate) use foreign_state::ENCRYPTED_MESSAGE_PLACEHOLDER;
@@ -47749,6 +48138,26 @@ index 000000000..7f92d3cc0
 +    provenance
 +}
 +
++/// Whether a local agent's plaintext turns follow the newest checkpoint replay installs, so that
++/// replay appends them to the history as they are.
++pub(crate) fn plaintext_turns_after_newest_checkpoint(rollout_items: &[RolloutItem]) -> bool {
++    use codex_protocol::protocol::TranscriptKind;
++    for item in rollout_items.iter().rev() {
++        match item {
++            RolloutItem::TurnContext(context)
++                if context.transcript == Some(TranscriptKind::Plaintext) =>
++            {
++                return true;
++            }
++            RolloutItem::Compacted(compacted) if compacted.replacement_history.is_some() => {
++                return false;
++            }
++            _ => {}
++        }
++    }
++    false
++}
++
 +/// Builds a transcript from rollout records already in memory, such as a legacy rollout or a
 +/// fork's inherited history. Only the records a transcript keeps are copied.
 +pub(crate) fn transcript_from_rollout_items(rollout_items: &[RolloutItem]) -> ModelTranscript {
@@ -47950,10 +48359,10 @@ index 000000000..78d8f98c4
 +}
 diff --git a/codex-rs/core/src/portable_context/budget.rs b/codex-rs/core/src/portable_context/budget.rs
 new file mode 100644
-index 000000000..74db4c54d
+index 000000000..56dd7e91d
 --- /dev/null
 +++ b/codex-rs/core/src/portable_context/budget.rs
-@@ -0,0 +1,77 @@
+@@ -0,0 +1,92 @@
 +//! Sizes a rebuilt context so it stays below the limit that makes the target compact.
 +//!
 +//! The runtime's estimator counts 4 bytes of serialized item per token. That holds for English
@@ -48001,6 +48410,21 @@ index 000000000..74db4c54d
 +            },
 +        }
 +    }
++}
++
++/// Whether a history of `history_tokens` ([`rebuild_token_count`] units) cannot be sent in one
++/// request to a model with `context_window` usable tokens, beside its base instructions and a
++/// typical tool set. Not even a compaction request can carry such a history, so it has to be
++/// rebuilt within a budget instead of compacted.
++pub(crate) fn exceeds_request_window(
++    history_tokens: i64,
++    context_window: i64,
++    base_instructions: &str,
++) -> bool {
++    let room = context_window
++        .saturating_sub(text_token_count(base_instructions))
++        .saturating_sub(TOOL_SCHEMA_ESTIMATE_TOKENS.min(context_window / 8));
++    history_tokens > room
 +}
 +
 +/// Estimates an item's tokens for a rebuild, erring high; see the module docs.
@@ -51687,7 +52111,7 @@ index 000000000..eb0225606
 +    assert!(matches!(receiver.recv().await.unwrap().op, Op::Interrupt));
 +}
 diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
-index 91300365b..c31e18b8d 100644
+index 91300365b..06ca18112 100644
 --- a/codex-rs/core/src/session/mod.rs
 +++ b/codex-rs/core/src/session/mod.rs
 @@ -162,6 +162,7 @@ use codex_terminal_detection::user_agent;
@@ -51856,7 +52280,7 @@ index 91300365b..c31e18b8d 100644
              window_number,
              first_window_id,
              previous_window_id,
-@@ -1553,6 +1583,65 @@ impl Session {
+@@ -1553,6 +1583,74 @@ impl Session {
          } = self
              .reconstruct_history_from_rollout(turn_context, rollout_items)
              .await;
@@ -51873,8 +52297,17 @@ index 91300365b..c31e18b8d 100644
 +        let use_agent_summary = self
 +            .should_rebuild_with_agent_summary(turn_context, &history, rollout_items)
 +            .await;
++        // Another family's plaintext turns replay natively, so a long stretch of them can leave
++        // a history that not even a compaction request fits; rebuild it within the budget.
++        let oversized_after_other_family = turn_context.provider.info().agent.is_none()
++            && changed_family.is_none()
++            && !use_agent_summary
++            && portable_context::plaintext_turns_after_newest_checkpoint(rollout_items)
++            && self
++                .replayed_history_exceeds_request_window(turn_context, &history)
++                .await;
 +        let rebuilt = turn_context.provider.info().agent.is_none()
-+            && (changed_family.is_some() || use_agent_summary)
++            && (changed_family.is_some() || use_agent_summary || oversized_after_other_family)
 +            && !history.is_empty();
 +        let mut taken_over = None;
 +        if rebuilt {
@@ -51922,7 +52355,7 @@ index 91300365b..c31e18b8d 100644
          // Keep the recorded rollout unchanged. Prepare its reconstructed history before
          // installing it, so legacy media is processed once for this resume or fork and
          // will be processed again if the rollout is reconstructed in a future session.
-@@ -1602,6 +1691,17 @@ impl Session {
+@@ -1602,6 +1700,17 @@ impl Session {
                  },
              );
              state.set_previous_turn_settings(previous_turn_settings.clone());
@@ -51940,7 +52373,7 @@ index 91300365b..c31e18b8d 100644
          }
          let prefix_tokens = if matches!(
              turn_context.config.model_auto_compact_token_limit_scope,
-@@ -1620,6 +1720,64 @@ impl Session {
+@@ -1620,6 +1729,69 @@ impl Session {
          previous_turn_settings
      }
  
@@ -51973,14 +52406,19 @@ index 91300365b..c31e18b8d 100644
 +        portable_context::transcript_from_rollout_items(rollout_items)
 +    }
 +
-+    /// Recorded token counts describe another family's context, not the rebuilt one.
++    /// Recorded token counts describe another family's context, not the rebuilt one. A context
++    /// rebuilt for the same family (after another family's plaintext turns) also differs from
++    /// what the recorded counts measured.
 +    async fn recompute_token_usage_after_provider_switch(&self, turn_context: &TurnContext) {
 +        let current_family = portable_context::current_provider_family(turn_context);
-+        if self
-+            .previous_turn_provider_family()
-+            .await
-+            .is_some_and(|family| family != current_family)
-+        {
++        let (previous_family, rebuilt) = {
++            let state = self.state.lock().await;
++            (
++                state.previous_turn_provider_family(),
++                state.has_pending_rebuilt_context(),
++            )
++        };
++        if rebuilt || previous_family.is_some_and(|family| family != current_family) {
 +            self.recompute_token_usage(turn_context).await;
 +        }
 +    }
@@ -52005,7 +52443,7 @@ index 91300365b..c31e18b8d 100644
      async fn set_auto_compact_window_estimated_prefill_for_scope(
          &self,
          turn_context: &TurnContext,
-@@ -2137,7 +2295,11 @@ impl Session {
+@@ -2137,7 +2309,11 @@ impl Session {
          turn_context: &TurnContext,
          msg: &EventMsg,
      ) {
@@ -52018,7 +52456,7 @@ index 91300365b..c31e18b8d 100644
              return;
          }
  
-@@ -3363,7 +3525,7 @@ impl Session {
+@@ -3363,7 +3539,7 @@ impl Session {
              .await;
      }
  
@@ -52027,7 +52465,7 @@ index 91300365b..c31e18b8d 100644
          &self,
          turn_context: &TurnContext,
          items: Vec<ResponseItemEnvelope>,
-@@ -3773,6 +3935,8 @@ impl Session {
+@@ -3773,6 +3949,8 @@ impl Session {
              window_id: Some(metadata.window_ids.window_id.to_string()),
              compaction_response_id: metadata.compaction_response_id,
              latest_token_usage_record: self.state.lock().await.latest_token_usage_record.clone(),
@@ -52036,7 +52474,7 @@ index 91300365b..c31e18b8d 100644
          };
          // Wait for accepted updates to finish persisting, then keep later updates from
          // overtaking the current settings snapshot while its checkpoint is written.
-@@ -3781,6 +3945,8 @@ impl Session {
+@@ -3781,6 +3959,8 @@ impl Session {
          let mut world_state_item = None;
          {
              let mut state = self.state.lock().await;
@@ -52045,7 +52483,7 @@ index 91300365b..c31e18b8d 100644
              state.replace_annotated_history(
                  items,
                  reference_context_item.clone(),
-@@ -4225,6 +4391,13 @@ impl Session {
+@@ -4225,6 +4405,13 @@ impl Session {
                  window_number,
                  window_ids,
                  compaction_response_id: None,
@@ -52059,7 +52497,7 @@ index 91300365b..c31e18b8d 100644
              },
          )
          .await;
-@@ -4232,6 +4405,73 @@ impl Session {
+@@ -4232,6 +4419,73 @@ impl Session {
          window_number
      }
  
@@ -52133,7 +52571,7 @@ index 91300365b..c31e18b8d 100644
      pub(crate) async fn reference_context_item(&self) -> Option<TurnContextItem> {
          let state = self.state.lock().await;
          state.reference_context_item()
-@@ -4256,6 +4496,8 @@ impl Session {
+@@ -4256,6 +4510,8 @@ impl Session {
          step_context: &StepContext,
      ) -> CodexResult<Arc<WorldState>> {
          let turn_context = step_context.turn.as_ref();
@@ -52142,7 +52580,7 @@ index 91300365b..c31e18b8d 100644
          let reference_context_item = {
              let state = self.state.lock().await;
              state.reference_context_item()
-@@ -4358,17 +4600,25 @@ impl Session {
+@@ -4358,17 +4614,25 @@ impl Session {
          let Some(usage) = usage else {
              return;
          };
@@ -52181,10 +52619,10 @@ index 91300365b..c31e18b8d 100644
      }
 diff --git a/codex-rs/core/src/session/provider_switch.rs b/codex-rs/core/src/session/provider_switch.rs
 new file mode 100644
-index 000000000..a6fc1aab6
+index 000000000..d75aca342
 --- /dev/null
 +++ b/codex-rs/core/src/session/provider_switch.rs
-@@ -0,0 +1,228 @@
+@@ -0,0 +1,265 @@
 +//! Installs a thread's model context when it resumes on another provider family.
 +//!
 +//! The family taking the thread over either continues its own earlier context
@@ -52223,6 +52661,43 @@ index 000000000..a6fc1aab6
 +}
 +
 +impl Session {
++    /// Whether the replayed `history` is too large for even one request to the current model.
++    ///
++    /// Another family's plaintext turns (a local agent's transcript) replay natively after this
++    /// family's own checkpoint and are never compacted by this family while the other one serves
++    /// the thread. After a long stretch they can exceed the model's whole context window, and the
++    /// compaction the first returning turn starts with would overflow as well. Such a history is
++    /// rebuilt within the model's budget instead.
++    pub(super) async fn replayed_history_exceeds_request_window(
++        &self,
++        turn_context: &TurnContext,
++        history: &[ResponseItemEnvelope],
++    ) -> bool {
++        let Some(context_window) = turn_context.model_info().usable_context_window() else {
++            return false;
++        };
++        let base_instructions = self.get_base_instructions().await;
++        let mut history_tokens = 0_i64;
++        for envelope in history {
++            history_tokens = history_tokens
++                .saturating_add(portable_context::rebuild_token_count(&envelope.item));
++            if portable_context::exceeds_request_window(
++                history_tokens,
++                context_window,
++                &base_instructions.text,
++            ) {
++                info!(
++                    target: SPLICE_LOG_TARGET,
++                    items = history.len(),
++                    context_window,
++                    "replayed history after another family's turns exceeds the model's context window"
++                );
++                return true;
++            }
++        }
++        false
++    }
++
 +    /// Loads the thread's transcript once, records where `leaving` left the thread, and either
 +    /// splices `target`'s own earlier context or rebuilds one.
 +    pub(super) async fn take_over_context(
@@ -52430,10 +52905,10 @@ index 786e26c2d..05be1ac95 100644
                          active_segment.get_or_insert_with(ActiveReplaySegment::default);
                      // `TurnContextItem` can attach metadata to an existing segment, but only a
 diff --git a/codex-rs/core/src/session/rollout_reconstruction_tests.rs b/codex-rs/core/src/session/rollout_reconstruction_tests.rs
-index f6a86d5f0..04d47b822 100644
+index f6a86d5f0..a83c5161b 100644
 --- a/codex-rs/core/src/session/rollout_reconstruction_tests.rs
 +++ b/codex-rs/core/src/session/rollout_reconstruction_tests.rs
-@@ -127,6 +127,46 @@ fn completed_user_turn_rollout(
+@@ -127,6 +127,178 @@ fn completed_user_turn_rollout(
      rollout_items
  }
  
@@ -52477,10 +52952,142 @@ index f6a86d5f0..04d47b822 100644
 +    assert!(provenance.other_family_seen);
 +}
 +
++/// A thread this family served before, followed by a local agent's plaintext turns of
++/// `claude_replies` replies of `reply_chars` characters each, and that agent's last usage.
++fn gpt_then_plaintext_agent_rollout(
++    ctx: &TurnContext,
++    claude_replies: usize,
++    reply_chars: usize,
++) -> Vec<RolloutItem> {
++    let mut gpt = ctx.to_turn_context_item();
++    gpt.turn_id = Some("gpt-turn".into());
++    gpt.model_provider = Some("openai".into());
++    let mut records = completed_user_turn_rollout(
++        gpt.clone(),
++        vec![
++            RolloutItem::ResponseItem(user_message("start the work").into()),
++            RolloutItem::ResponseItem(assistant_message("gpt reply").into()),
++        ],
++    );
++    for turn in 0..claude_replies {
++        let mut claude = gpt.clone();
++        claude.turn_id = Some(format!("claude-turn-{turn}"));
++        claude.model = "cc-opus".into();
++        claude.model_provider = Some("claude_code".into());
++        claude.transcript = Some(codex_protocol::protocol::TranscriptKind::Plaintext);
++        let reply = format!("claude reply {turn} {}", "x".repeat(reply_chars));
++        records.extend(completed_user_turn_rollout(
++            claude,
++            vec![
++                RolloutItem::ResponseItem(user_message(&format!("request {turn}")).into()),
++                RolloutItem::ResponseItem(assistant_message(&reply).into()),
++            ],
++        ));
++    }
++    // The agent's own window is far larger; its last request measured its own context.
++    let claude_usage = TokenUsage {
++        input_tokens: 900_000,
++        total_tokens: 900_000,
++        ..Default::default()
++    };
++    records.push(RolloutItem::EventMsg(EventMsg::TokenCount(
++        TokenCountEvent {
++            info: Some(TokenUsageInfo {
++                total_token_usage: claude_usage.clone(),
++                last_token_usage: claude_usage,
++                model_context_window: Some(1_000_000),
++            }),
++            rate_limits: None,
++        },
++    )));
++    records
++}
++
++fn contains_text(history: &[ResponseItem], needle: &str) -> bool {
++    history.iter().any(|item| match item {
++        ResponseItem::Message { content, .. } => content.iter().any(|content| match content {
++            ContentItem::InputText { text } | ContentItem::OutputText { text } => {
++                text.contains(needle)
++            }
++            _ => false,
++        }),
++        _ => false,
++    })
++}
++
++#[tokio::test]
++async fn plaintext_agent_stretch_beyond_the_window_is_rebuilt_on_return() {
++    let (session, ctx) = make_session_and_context().await;
++    let window = ctx
++        .model_info()
++        .usable_context_window()
++        .expect("test model has a context window");
++    // Well beyond the window even by the runtime's plain estimate.
++    let reply_chars = 8_000;
++    let replies = usize::try_from(window).unwrap() * 4 * 2 / reply_chars;
++    let records = gpt_then_plaintext_agent_rollout(&ctx, replies, reply_chars);
++
++    session
++        .record_initial_history(InitialHistory::Resumed(ResumedHistory {
++            conversation_id: ThreadId::default(),
++            history: Arc::new(records),
++            rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
++        }))
++        .await;
++
++    let history = raw_history_items(&session.state.lock().await.clone_history());
++    let history_tokens = history
++        .iter()
++        .map(crate::portable_context::rebuild_token_count)
++        .sum::<i64>();
++    assert!(
++        history_tokens < window,
++        "rebuilt history must fit the window: {history_tokens} >= {window}"
++    );
++    assert!(
++        contains_text(&history, &format!("claude reply {}", replies - 1)),
++        "the newest agent reply must be kept"
++    );
++    assert!(
++        !contains_text(&history, "claude reply 0 "),
++        "the oldest agent replies must be left out"
++    );
++    assert!(session.state.lock().await.has_pending_rebuilt_context());
++    // The agent's recorded usage measured its own context, not the rebuilt one; the first
++    // returning turn must not start with a compaction because of it.
++    let status = crate::session::context_window::context_window_token_status(&session, &ctx).await;
++    assert!(
++        !status.token_limit_reached,
++        "recorded agent usage must be replaced by the rebuilt context's estimate: {status:?}"
++    );
++}
++
++#[tokio::test]
++async fn plaintext_agent_stretch_within_the_window_replays_natively() {
++    let (session, ctx) = make_session_and_context().await;
++    let records =
++        gpt_then_plaintext_agent_rollout(&ctx, /*claude_replies*/ 3, /*reply_chars*/ 100);
++
++    session
++        .record_initial_history(InitialHistory::Resumed(ResumedHistory {
++            conversation_id: ThreadId::default(),
++            history: Arc::new(records),
++            rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
++        }))
++        .await;
++
++    let history = raw_history_items(&session.state.lock().await.clone_history());
++    for reply in 0..3 {
++        assert!(contains_text(&history, &format!("claude reply {reply} ")));
++    }
++    assert!(contains_text(&history, "gpt reply"));
++    assert!(!session.state.lock().await.has_pending_rebuilt_context());
++}
++
  #[tokio::test]
  async fn record_initial_history_reconstructs_typed_inter_agent_message() {
      let (session, _turn_context) = make_session_and_context().await;
-@@ -264,6 +304,7 @@ async fn record_initial_history_resumed_bare_turn_context_does_not_hydrate_previ
+@@ -264,6 +436,7 @@ async fn record_initial_history_resumed_bare_turn_context_does_not_hydrate_previ
      let (session, turn_context) = make_session_and_context().await;
      let previous_model = "previous-rollout-model";
      let previous_context_item = TurnContextItem {
@@ -52488,7 +53095,7 @@ index f6a86d5f0..04d47b822 100644
          turn_id: Some(turn_context.sub_id.clone()),
          root_turn_id: None,
          #[allow(deprecated)]
-@@ -288,6 +329,7 @@ async fn record_initial_history_resumed_bare_turn_context_does_not_hydrate_previ
+@@ -288,6 +461,7 @@ async fn record_initial_history_resumed_bare_turn_context_does_not_hydrate_previ
          cyber_access_program: None,
          effort: turn_context.reasoning_effort().cloned(),
          summary: codex_protocol::config_types::ReasoningSummary::Auto,
@@ -52496,7 +53103,7 @@ index f6a86d5f0..04d47b822 100644
      };
      let rollout_items = vec![RolloutItem::TurnContext(previous_context_item)];
  
-@@ -314,6 +356,7 @@ async fn record_initial_history_resumed_hydrates_previous_turn_settings_from_lif
+@@ -314,6 +488,7 @@ async fn record_initial_history_resumed_hydrates_previous_turn_settings_from_lif
      let (session, turn_context) = make_session_and_context().await;
      let previous_model = "previous-rollout-model";
      let mut previous_context_item = TurnContextItem {
@@ -52504,7 +53111,7 @@ index f6a86d5f0..04d47b822 100644
          turn_id: Some(turn_context.sub_id.clone()),
          root_turn_id: None,
          #[allow(deprecated)]
-@@ -338,6 +381,7 @@ async fn record_initial_history_resumed_hydrates_previous_turn_settings_from_lif
+@@ -338,6 +513,7 @@ async fn record_initial_history_resumed_hydrates_previous_turn_settings_from_lif
          cyber_access_program: None,
          effort: turn_context.reasoning_effort().cloned(),
          summary: codex_protocol::config_types::ReasoningSummary::Auto,
@@ -52512,7 +53119,7 @@ index f6a86d5f0..04d47b822 100644
      };
      let turn_id = previous_context_item
          .turn_id
-@@ -714,6 +758,7 @@ async fn reconstruct_history_rollback_skips_non_user_turns_for_history_and_metad
+@@ -714,6 +890,7 @@ async fn reconstruct_history_rollback_skips_non_user_turns_for_history_and_metad
          RolloutItem::ResponseItem(standalone_assistant.into()),
          RolloutItem::WorldState(WorldStateItem::full(object!({}))),
          RolloutItem::TurnContext(TurnContextItem {
@@ -52520,7 +53127,7 @@ index f6a86d5f0..04d47b822 100644
              turn_id: Some(standalone_turn_id.clone()),
              ..first_context_item.clone()
          }),
-@@ -767,6 +812,7 @@ async fn reconstruct_history_rollback_counts_inter_agent_assistant_turns() {
+@@ -767,6 +944,7 @@ async fn reconstruct_history_rollback_counts_inter_agent_assistant_turns() {
          .expect("turn context should have turn_id");
      let assistant_turn_id = "assistant-instruction-turn".to_string();
      let assistant_turn_context = TurnContextItem {
@@ -52528,7 +53135,7 @@ index f6a86d5f0..04d47b822 100644
          turn_id: Some(assistant_turn_id.clone()),
          ..first_context_item.clone()
      };
-@@ -1069,6 +1115,8 @@ async fn record_initial_history_resumed_rollback_drops_incomplete_user_turn_comp
+@@ -1069,6 +1247,8 @@ async fn record_initial_history_resumed_rollback_drops_incomplete_user_turn_comp
              window_id: None,
              compaction_response_id: None,
              latest_token_usage_record: None,
@@ -52537,7 +53144,7 @@ index f6a86d5f0..04d47b822 100644
          }),
          RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
              codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 1 },
-@@ -1132,6 +1180,8 @@ async fn record_initial_history_requires_surviving_full_snapshot_without_user_tu
+@@ -1132,6 +1312,8 @@ async fn record_initial_history_requires_surviving_full_snapshot_without_user_tu
                  window_id: None,
                  compaction_response_id: None,
                  latest_token_usage_record: None,
@@ -52546,7 +53153,7 @@ index f6a86d5f0..04d47b822 100644
              }),
          ],
      };
-@@ -1167,6 +1217,8 @@ async fn record_initial_history_resumed_does_not_seed_reference_context_item_aft
+@@ -1167,6 +1349,8 @@ async fn record_initial_history_resumed_does_not_seed_reference_context_item_aft
              window_id: None,
              compaction_response_id: None,
              latest_token_usage_record: None,
@@ -52555,7 +53162,7 @@ index f6a86d5f0..04d47b822 100644
          }),
      ];
  
-@@ -1240,6 +1292,8 @@ async fn reconstruct_history_prefers_compacted_window_over_session_meta() {
+@@ -1240,6 +1424,8 @@ async fn reconstruct_history_prefers_compacted_window_over_session_meta() {
              window_id: Some(compacted_window_id.to_string()),
              compaction_response_id: None,
              latest_token_usage_record: None,
@@ -52564,7 +53171,7 @@ index f6a86d5f0..04d47b822 100644
          }),
      ];
  
-@@ -1279,6 +1333,8 @@ async fn reconstruct_history_replays_world_state_from_latest_compaction_window()
+@@ -1279,6 +1465,8 @@ async fn reconstruct_history_replays_world_state_from_latest_compaction_window()
                  window_id: None,
                  compaction_response_id: None,
                  latest_token_usage_record: None,
@@ -52573,7 +53180,7 @@ index f6a86d5f0..04d47b822 100644
              }),
              RolloutItem::WorldState(WorldStateItem::full(object!({
                  "environment": {"status": "starting", "cwd": "/workspace"}
-@@ -1346,6 +1402,8 @@ async fn bounded_replay_matches_full_replay_after_empty_turn_compactions() {
+@@ -1346,6 +1534,8 @@ async fn bounded_replay_matches_full_replay_after_empty_turn_compactions() {
                      window_id: Some(window_ids[window_number].to_string()),
                      compaction_response_id: None,
                      latest_token_usage_record: None,
@@ -52582,7 +53189,7 @@ index f6a86d5f0..04d47b822 100644
                  }),
                  RolloutItem::WorldState(WorldStateItem::full(object!({
                      "environment": {"window": window_number, "status": "starting"}
-@@ -1454,6 +1512,8 @@ async fn reconstruct_history_preserves_legacy_compaction_count_with_session_meta
+@@ -1454,6 +1644,8 @@ async fn reconstruct_history_preserves_legacy_compaction_count_with_session_meta
              window_id: None,
              compaction_response_id: None,
              latest_token_usage_record: None,
@@ -52591,7 +53198,7 @@ index f6a86d5f0..04d47b822 100644
          }),
      ];
  
-@@ -1485,6 +1545,8 @@ async fn reconstruct_history_legacy_compaction_without_replacement_history_does_
+@@ -1485,6 +1677,8 @@ async fn reconstruct_history_legacy_compaction_without_replacement_history_does_
              window_id: None,
              compaction_response_id: None,
              latest_token_usage_record: None,
@@ -52600,7 +53207,7 @@ index f6a86d5f0..04d47b822 100644
          }),
      ];
  
-@@ -1524,6 +1586,8 @@ async fn reconstruct_history_legacy_compaction_without_replacement_history_clear
+@@ -1524,6 +1718,8 @@ async fn reconstruct_history_legacy_compaction_without_replacement_history_clear
              window_id: None,
              compaction_response_id: None,
              latest_token_usage_record: None,
@@ -52609,7 +53216,7 @@ index f6a86d5f0..04d47b822 100644
          }),
          RolloutItem::EventMsg(EventMsg::TurnStarted(
              codex_protocol::protocol::TurnStartedEvent {
-@@ -1571,6 +1635,7 @@ async fn record_initial_history_resumed_turn_context_after_compaction_reestablis
+@@ -1571,6 +1767,7 @@ async fn record_initial_history_resumed_turn_context_after_compaction_reestablis
      let (session, turn_context) = make_session_and_context().await;
      let previous_model = "previous-rollout-model";
      let previous_context_item = TurnContextItem {
@@ -52617,7 +53224,7 @@ index f6a86d5f0..04d47b822 100644
          turn_id: Some(turn_context.sub_id.clone()),
          root_turn_id: Some("root-turn".to_string()),
          #[allow(deprecated)]
-@@ -1595,6 +1660,7 @@ async fn record_initial_history_resumed_turn_context_after_compaction_reestablis
+@@ -1595,6 +1792,7 @@ async fn record_initial_history_resumed_turn_context_after_compaction_reestablis
          cyber_access_program: None,
          effort: turn_context.reasoning_effort().cloned(),
          summary: codex_protocol::config_types::ReasoningSummary::Auto,
@@ -52625,7 +53232,7 @@ index f6a86d5f0..04d47b822 100644
      };
      let previous_turn_id = previous_context_item
          .turn_id
-@@ -1632,6 +1698,8 @@ async fn record_initial_history_resumed_turn_context_after_compaction_reestablis
+@@ -1632,6 +1830,8 @@ async fn record_initial_history_resumed_turn_context_after_compaction_reestablis
              window_id: None,
              compaction_response_id: None,
              latest_token_usage_record: None,
@@ -52634,7 +53241,7 @@ index f6a86d5f0..04d47b822 100644
          }),
          RolloutItem::TurnContext(previous_context_item),
          RolloutItem::EventMsg(EventMsg::TurnComplete(
-@@ -1667,6 +1735,7 @@ async fn record_initial_history_resumed_turn_context_after_compaction_reestablis
+@@ -1667,6 +1867,7 @@ async fn record_initial_history_resumed_turn_context_after_compaction_reestablis
          serde_json::to_value(session.reference_context_item().await)
              .expect("serialize seeded reference context item"),
          serde_json::to_value(Some(TurnContextItem {
@@ -52642,7 +53249,7 @@ index f6a86d5f0..04d47b822 100644
              turn_id: Some(turn_context.sub_id.clone()),
              root_turn_id: Some("root-turn".to_string()),
              #[allow(deprecated)]
-@@ -1691,6 +1760,7 @@ async fn record_initial_history_resumed_turn_context_after_compaction_reestablis
+@@ -1691,6 +1892,7 @@ async fn record_initial_history_resumed_turn_context_after_compaction_reestablis
              cyber_access_program: None,
              effort: turn_context.reasoning_effort().cloned(),
              summary: codex_protocol::config_types::ReasoningSummary::Auto,
@@ -52650,7 +53257,7 @@ index f6a86d5f0..04d47b822 100644
          }))
          .expect("serialize expected reference context item")
      );
-@@ -1702,6 +1772,7 @@ async fn record_initial_history_resumed_aborted_turn_without_id_clears_active_tu
+@@ -1702,6 +1904,7 @@ async fn record_initial_history_resumed_aborted_turn_without_id_clears_active_tu
      let (session, turn_context) = make_session_and_context().await;
      let previous_model = "previous-rollout-model";
      let previous_context_item = TurnContextItem {
@@ -52658,7 +53265,7 @@ index f6a86d5f0..04d47b822 100644
          turn_id: Some(turn_context.sub_id.clone()),
          root_turn_id: None,
          #[allow(deprecated)]
-@@ -1726,6 +1797,7 @@ async fn record_initial_history_resumed_aborted_turn_without_id_clears_active_tu
+@@ -1726,6 +1929,7 @@ async fn record_initial_history_resumed_aborted_turn_without_id_clears_active_tu
          cyber_access_program: None,
          effort: turn_context.reasoning_effort().cloned(),
          summary: codex_protocol::config_types::ReasoningSummary::Auto,
@@ -52666,7 +53273,7 @@ index f6a86d5f0..04d47b822 100644
      };
      let previous_turn_id = previous_context_item
          .turn_id
-@@ -1804,6 +1876,8 @@ async fn record_initial_history_resumed_aborted_turn_without_id_clears_active_tu
+@@ -1804,6 +2008,8 @@ async fn record_initial_history_resumed_aborted_turn_without_id_clears_active_tu
              window_id: None,
              compaction_response_id: None,
              latest_token_usage_record: None,
@@ -52675,7 +53282,7 @@ index f6a86d5f0..04d47b822 100644
          }),
      ];
  
-@@ -1839,6 +1913,7 @@ async fn record_initial_history_resumed_unmatched_abort_preserves_active_turn_fo
+@@ -1839,6 +2045,7 @@ async fn record_initial_history_resumed_unmatched_abort_preserves_active_turn_fo
      let current_turn_id = "current-turn".to_string();
      let unmatched_abort_turn_id = "other-turn".to_string();
      let current_context_item = TurnContextItem {
@@ -52683,7 +53290,7 @@ index f6a86d5f0..04d47b822 100644
          turn_id: Some(current_turn_id.clone()),
          root_turn_id: None,
          #[allow(deprecated)]
-@@ -1863,6 +1938,7 @@ async fn record_initial_history_resumed_unmatched_abort_preserves_active_turn_fo
+@@ -1863,6 +2070,7 @@ async fn record_initial_history_resumed_unmatched_abort_preserves_active_turn_fo
          cyber_access_program: None,
          effort: turn_context.reasoning_effort().cloned(),
          summary: codex_protocol::config_types::ReasoningSummary::Auto,
@@ -52691,7 +53298,7 @@ index f6a86d5f0..04d47b822 100644
      };
  
      let rollout_items = vec![
-@@ -1969,6 +2045,7 @@ async fn record_initial_history_resumed_trailing_incomplete_turn_compaction_clea
+@@ -1969,6 +2177,7 @@ async fn record_initial_history_resumed_trailing_incomplete_turn_compaction_clea
      let (session, turn_context) = make_session_and_context().await;
      let previous_model = "previous-rollout-model";
      let previous_context_item = TurnContextItem {
@@ -52699,7 +53306,7 @@ index f6a86d5f0..04d47b822 100644
          turn_id: Some(turn_context.sub_id.clone()),
          root_turn_id: None,
          #[allow(deprecated)]
-@@ -1993,6 +2070,7 @@ async fn record_initial_history_resumed_trailing_incomplete_turn_compaction_clea
+@@ -1993,6 +2202,7 @@ async fn record_initial_history_resumed_trailing_incomplete_turn_compaction_clea
          cyber_access_program: None,
          effort: turn_context.reasoning_effort().cloned(),
          summary: codex_protocol::config_types::ReasoningSummary::Auto,
@@ -52707,7 +53314,7 @@ index f6a86d5f0..04d47b822 100644
      };
      let previous_turn_id = previous_context_item
          .turn_id
-@@ -2062,6 +2140,8 @@ async fn record_initial_history_resumed_trailing_incomplete_turn_compaction_clea
+@@ -2062,6 +2272,8 @@ async fn record_initial_history_resumed_trailing_incomplete_turn_compaction_clea
              window_id: None,
              compaction_response_id: None,
              latest_token_usage_record: None,
@@ -52716,7 +53323,7 @@ index f6a86d5f0..04d47b822 100644
          }),
      ];
  
-@@ -2146,6 +2226,7 @@ async fn record_initial_history_resumed_replaced_incomplete_compacted_turn_clear
+@@ -2146,6 +2358,7 @@ async fn record_initial_history_resumed_replaced_incomplete_compacted_turn_clear
      let (session, turn_context) = make_session_and_context().await;
      let previous_model = "previous-rollout-model";
      let previous_context_item = TurnContextItem {
@@ -52724,7 +53331,7 @@ index f6a86d5f0..04d47b822 100644
          turn_id: Some(turn_context.sub_id.clone()),
          root_turn_id: None,
          #[allow(deprecated)]
-@@ -2170,6 +2251,7 @@ async fn record_initial_history_resumed_replaced_incomplete_compacted_turn_clear
+@@ -2170,6 +2383,7 @@ async fn record_initial_history_resumed_replaced_incomplete_compacted_turn_clear
          cyber_access_program: None,
          effort: turn_context.reasoning_effort().cloned(),
          summary: codex_protocol::config_types::ReasoningSummary::Auto,
@@ -52732,7 +53339,7 @@ index f6a86d5f0..04d47b822 100644
      };
      let previous_turn_id = previous_context_item
          .turn_id
-@@ -2240,6 +2322,8 @@ async fn record_initial_history_resumed_replaced_incomplete_compacted_turn_clear
+@@ -2240,6 +2454,8 @@ async fn record_initial_history_resumed_replaced_incomplete_compacted_turn_clear
              window_id: None,
              compaction_response_id: None,
              latest_token_usage_record: None,
@@ -53439,7 +54046,7 @@ index 16297ea41..b37087e2a 100644
  pub(crate) use turn::MailboxDeliveryPhase;
  pub(crate) use turn::PendingRequestPermissions;
 diff --git a/codex-rs/core/src/state/session.rs b/codex-rs/core/src/state/session.rs
-index e9e42cf00..ee44ea51d 100644
+index e9e42cf00..1ba34dbdc 100644
 --- a/codex-rs/core/src/state/session.rs
 +++ b/codex-rs/core/src/state/session.rs
 @@ -18,7 +18,9 @@ use crate::session::PreviousTurnSettings;
@@ -53509,7 +54116,7 @@ index e9e42cf00..ee44ea51d 100644
              auto_compact_window: AutoCompactWindow::new_with_ids(auto_compact_window_ids),
              startup_prewarm: None,
              shell_snapshot_prewarm: None,
-@@ -112,6 +150,30 @@ impl SessionState {
+@@ -112,6 +150,34 @@ impl SessionState {
          self.previous_turn_settings = previous_turn_settings;
      }
  
@@ -53533,6 +54140,10 @@ index e9e42cf00..ee44ea51d 100644
 +        self.pending_rebuilt_context = pending;
 +    }
 +
++    pub(crate) fn has_pending_rebuilt_context(&self) -> bool {
++        self.pending_rebuilt_context.is_some()
++    }
++
 +    pub(crate) fn take_pending_rebuilt_context(&mut self) -> Option<PendingRebuiltContext> {
 +        self.pending_rebuilt_context.take()
 +    }
@@ -53540,7 +54151,7 @@ index e9e42cf00..ee44ea51d 100644
      pub(crate) fn set_next_turn_is_first(&mut self, value: bool) {
          self.next_turn_is_first = value;
      }
-@@ -190,6 +252,7 @@ impl SessionState {
+@@ -190,6 +256,7 @@ impl SessionState {
              usage: usage.clone(),
              turn_token_usage,
              thread_token_usage,
@@ -57307,14 +57918,38 @@ index 000000000..ab90ad1a3
 +    assert!(plaintext(&content("가".repeat(2731))).is_err());
 +}
 diff --git a/codex-rs/core/src/tasks/compact.rs b/codex-rs/core/src/tasks/compact.rs
-index 99e211348..3a5b386ca 100644
+index 99e211348..a589b1a2b 100644
 --- a/codex-rs/core/src/tasks/compact.rs
 +++ b/codex-rs/core/src/tasks/compact.rs
-@@ -32,6 +32,11 @@ impl SessionTask for CompactTask {
+@@ -10,6 +10,8 @@ use crate::state::TaskKind;
+ use codex_features::Feature;
+ use codex_model_provider::RemoteCompactionSupport;
+ use codex_protocol::error::CodexErrorDetails;
++use codex_protocol::protocol::EventMsg;
++use codex_protocol::protocol::TurnStartedEvent;
+ use codex_protocol::user_input::UserInput;
+ use tokio_util::sync::CancellationToken;
+ 
+@@ -32,6 +34,26 @@ impl SessionTask for CompactTask {
          _input: Vec<TurnInput>,
          _cancellation_token: CancellationToken,
      ) -> SessionTaskResult {
 +        if ctx.provider.info().agent.is_some() {
++            // Every compaction path opens its turn before it can fail. Clients pair the failure
++            // and the turn's completion with this start; without it the compaction they asked
++            // for stays shown as running.
++            session
++                .send_event(
++                    ctx.as_ref(),
++                    EventMsg::TurnStarted(TurnStartedEvent {
++                        turn_id: ctx.sub_id.clone(),
++                        trace_id: ctx.trace_id.clone(),
++                        started_at: ctx.turn_timing_state.started_at_unix_secs().await,
++                        model_context_window: ctx.model_context_window(),
++                        collaboration_mode_kind: ctx.mode(),
++                    }),
++                )
++                .await;
 +            return Err(codex_protocol::error::CodexErr::InvalidRequest(
 +                "Codex compaction is unavailable for this agent; reset the Claude session or use Claude's configured automatic compaction".into(),
 +            ));
@@ -65337,10 +65972,10 @@ index ace2f50a7..e65800ce9 100644
          "followup-call",
 diff --git a/codex-rs/core/tests/suite/claude_code.rs b/codex-rs/core/tests/suite/claude_code.rs
 new file mode 100644
-index 000000000..f2d33624c
+index 000000000..8f86a0685
 --- /dev/null
 +++ b/codex-rs/core/tests/suite/claude_code.rs
-@@ -0,0 +1,349 @@
+@@ -0,0 +1,392 @@
 +//! Native task regression: no paid model or real Claude process is invoked.
 +use codex_core::TurnInputRequest;
 +use codex_core::config::Config;
@@ -65690,6 +66325,49 @@ index 000000000..f2d33624c
 +    );
 +    Ok(())
 +}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn claude_manual_compaction_fails_inside_a_started_turn() -> anyhow::Result<()> {
++    let server = responses::start_mock_server().await;
++    let fixture = tempfile::tempdir()?;
++    let test = claude_task(&server, fixture.path(), RUNNER).await?;
++    test.codex.submit(Op::Compact).await?;
++    // Clients pair the failure and the turn's completion with its start; a compaction that
++    // fails without one stays shown as running.
++    let started = wait_for_event(&test.codex, |event| {
++        matches!(
++            event,
++            EventMsg::TurnStarted(_) | EventMsg::Error(_) | EventMsg::TurnComplete(_)
++        )
++    })
++    .await;
++    assert!(
++        matches!(started, EventMsg::TurnStarted(_)),
++        "compaction must open its turn first: {started:?}"
++    );
++    let failed = wait_for_event(&test.codex, |event| {
++        matches!(event, EventMsg::Error(_) | EventMsg::TurnComplete(_))
++    })
++    .await;
++    assert!(
++        matches!(&failed, EventMsg::Error(error)
++            if error.message.contains("Codex compaction is unavailable for this agent")),
++        "unexpected compaction outcome: {failed:?}"
++    );
++    wait_for_event(&test.codex, |event| {
++        matches!(event, EventMsg::TurnComplete(_))
++    })
++    .await;
++    assert!(
++        !fixture.path().join("requests.jsonl").exists(),
++        "a refused compaction must not start the agent runner"
++    );
++    assert!(
++        server.received_requests().await.unwrap().is_empty(),
++        "agent compaction must never use the model HTTP endpoint"
++    );
++    Ok(())
++}
 diff --git a/codex-rs/core/tests/suite/client.rs b/codex-rs/core/tests/suite/client.rs
 index c209df576..3edce1d31 100644
 --- a/codex-rs/core/tests/suite/client.rs
@@ -65727,10 +66405,79 @@ index c209df576..3edce1d31 100644
          base_url: Some(format!("{}/openai", server.uri())),
          // Reuse the existing environment variable to avoid using unsafe code
 diff --git a/codex-rs/core/tests/suite/client_websockets.rs b/codex-rs/core/tests/suite/client_websockets.rs
-index 3263b9e4c..4d9da4bd1 100755
+index 3263b9e4c..8271b4fe7 100755
 --- a/codex-rs/core/tests/suite/client_websockets.rs
 +++ b/codex-rs/core/tests/suite/client_websockets.rs
-@@ -2490,6 +2490,7 @@ fn websocket_provider_with_connect_timeout(
+@@ -821,6 +821,68 @@ async fn responses_websocket_reuses_connection_after_session_drop() {
+     server.shutdown().await;
+ }
+ 
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn responses_websocket_reconnects_as_the_catalog_version_for_a_newer_model() {
++    skip_if_no_network!();
++
++    let server = start_websocket_server(vec![
++        vec![vec![ev_response_created("resp-1"), ev_completed("resp-1")]],
++        vec![vec![ev_response_created("resp-2"), ev_completed("resp-2")]],
++    ])
++    .await;
++
++    let harness = websocket_harness_for_codex_backend(&server).await;
++    let mut client_session = harness.client.new_session();
++    let prompt = prompt_with_input(vec![message_item("hello")]);
++    // A model this build bundles keeps this build's version.
++    stream_until_complete_with_model_info(
++        &mut client_session,
++        &harness,
++        &prompt,
++        &harness.model_info,
++        "resp-1",
++    )
++    .await;
++    // A model newer than this build is served only to the catalog's client version, which the
++    // handshake carries, so the session reconnects.
++    let mut newer_model = harness.model_info.clone();
++    newer_model.slug = "gpt-6.1-sol".to_string();
++    stream_until_complete_with_model_info(
++        &mut client_session,
++        &harness,
++        &prompt,
++        &newer_model,
++        "resp-2",
++    )
++    .await;
++
++    let handshakes = server.handshakes();
++    assert_eq!(handshakes.len(), 2);
++    let own_version = env!("CARGO_PKG_VERSION");
++    let catalog_version = codex_models_manager::client_version_to_whole();
++    assert_eq!(
++        handshakes[0].header("version"),
++        Some(own_version.to_string())
++    );
++    assert_eq!(
++        handshakes[0].header(USER_AGENT_HEADER),
++        Some(codex_login::default_client::get_codex_user_agent())
++    );
++    assert_eq!(
++        handshakes[1].header("version"),
++        Some(catalog_version.clone())
++    );
++    let user_agent = handshakes[1]
++        .header(USER_AGENT_HEADER)
++        .expect("user agent header");
++    assert!(
++        user_agent.contains(&format!("/{catalog_version} (")),
++        "user agent should identify as {catalog_version}: {user_agent}"
++    );
++
++    server.shutdown().await;
++}
++
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+ async fn responses_websocket_sends_responses_lite_metadata_per_request() {
+     skip_if_no_network!();
+@@ -2490,6 +2552,7 @@ fn websocket_provider_with_connect_timeout(
      websocket_connect_timeout_ms: Option<u64>,
  ) -> ModelProviderInfo {
      ModelProviderInfo {
@@ -66830,6 +67577,95 @@ index 000000000..01b8343e1
 +    assert_eq!(thread_routes.len(), 3);
 +    Ok(())
 +}
+diff --git a/codex-rs/core/tests/suite/inference_client_version.rs b/codex-rs/core/tests/suite/inference_client_version.rs
+new file mode 100644
+index 000000000..82c535ba3
+--- /dev/null
++++ b/codex-rs/core/tests/suite/inference_client_version.rs
+@@ -0,0 +1,83 @@
++//! Client version inference requests identify as: models newer than this build are served only
++//! to clients at the catalog's version.
++use codex_core::TurnInputRequest;
++use codex_login::CodexAuth;
++use codex_models_manager::client_version_to_whole;
++use codex_protocol::protocol::EventMsg;
++use codex_protocol::user_input::UserInput;
++use core_test_support::responses::ResponsesRequest;
++use core_test_support::responses::ev_completed;
++use core_test_support::responses::ev_response_created;
++use core_test_support::responses::mount_sse_once;
++use core_test_support::responses::sse;
++use core_test_support::skip_if_no_network;
++use core_test_support::test_codex::test_codex;
++use core_test_support::wait_for_event;
++use pretty_assertions::assert_eq;
++use wiremock::MockServer;
++
++const OWN_VERSION: &str = env!("CARGO_PKG_VERSION");
++
++/// Runs one turn on `model` and returns its request.
++async fn single_turn_request(model: &str) -> ResponsesRequest {
++    let server = MockServer::start().await;
++    let resp_mock = mount_sse_once(
++        &server,
++        sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
++    )
++    .await;
++    let test = test_codex()
++        .with_auth(CodexAuth::from_api_key("Test API Key"))
++        .with_model(model)
++        .build(&server)
++        .await
++        .expect("create new conversation");
++    test.codex
++        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
++            text: "hello".into(),
++            text_elements: Vec::new(),
++        }]))
++        .await
++        .expect("turn starts");
++    wait_for_event(&test.codex, |event| {
++        matches!(event, EventMsg::TurnComplete(_))
++    })
++    .await;
++    resp_mock.single_request()
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn model_newer_than_this_build_identifies_as_the_catalog_version() {
++    skip_if_no_network!();
++    let catalog_version = client_version_to_whole();
++    assert_ne!(
++        catalog_version, OWN_VERSION,
++        "the catalog asks as a newer client"
++    );
++
++    let request = single_turn_request("gpt-6.1-sol").await;
++
++    assert_eq!(
++        request.header("version").as_deref(),
++        Some(catalog_version.as_str())
++    );
++    let user_agent = request.header("user-agent").expect("user agent");
++    assert!(
++        user_agent.contains(&format!("/{catalog_version} (")),
++        "user agent should identify as {catalog_version}: {user_agent}"
++    );
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn model_this_build_bundles_keeps_its_own_version() {
++    skip_if_no_network!();
++
++    let request = single_turn_request("gpt-6-astra").await;
++
++    assert_eq!(request.header("version").as_deref(), Some(OWN_VERSION));
++    let user_agent = request.header("user-agent").expect("user agent");
++    assert!(
++        user_agent.contains(&format!("/{OWN_VERSION} (")),
++        "user agent should identify as this build: {user_agent}"
++    );
++}
 diff --git a/codex-rs/core/tests/suite/managed_close_idle.rs b/codex-rs/core/tests/suite/managed_close_idle.rs
 new file mode 100644
 index 000000000..59dba3b20
@@ -67187,7 +68023,7 @@ index 000000000..59dba3b20
 +    Ok(())
 +}
 diff --git a/codex-rs/core/tests/suite/mod.rs b/codex-rs/core/tests/suite/mod.rs
-index 8d43ca03e..24e8c9e2d 100644
+index 8d43ca03e..b4dd777ee 100644
 --- a/codex-rs/core/tests/suite/mod.rs
 +++ b/codex-rs/core/tests/suite/mod.rs
 @@ -1,4 +1,5 @@
@@ -67204,7 +68040,14 @@ index 8d43ca03e..24e8c9e2d 100644
  mod current_time_reminder;
  mod cyber_access_program;
  mod cyber_exec_policy;
-@@ -93,6 +95,7 @@ mod interrupt_hooks;
+@@ -87,12 +89,14 @@ mod hooks_executor;
+ #[cfg(not(target_os = "windows"))]
+ mod hooks_mcp;
+ mod image_rollout;
++mod inference_client_version;
+ mod injected_models_cache;
+ #[cfg(not(target_os = "windows"))]
+ mod interrupt_hooks;
  mod items;
  mod json_result;
  mod live_cli;
@@ -67212,7 +68055,7 @@ index 8d43ca03e..24e8c9e2d 100644
  mod mcp_auth_elicitation;
  mod mcp_auth_refresh;
  mod mcp_optional_startup_grace;
-@@ -119,6 +122,7 @@ mod override_updates;
+@@ -119,6 +123,7 @@ mod override_updates;
  mod pending_input;
  mod permissions_messages;
  mod personality;
