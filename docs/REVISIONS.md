@@ -35,6 +35,29 @@
 
 ## 최근 수정
 
+### 수정 125 — 런타임 핫픽스: 새 GPT 모델 버전 식별, Claude 뒤 GPT 문맥 재구성, Claude 압축 거부 표시, 공유 경로 음성 캐시
+
+0.153.4 런타임 패치만 바꾼다(결과 트리 `c1ac1ce5…`, 패치 SHA256 `0767d660…`, 423개 파일). 관리 앱 코드 변경은 없다.
+
+- **새 GPT 모델 버전 식별:** 이 빌드의 번들 카탈로그에 없는 모델(0.160 카탈로그가 더한 sol 계열 등)은 추론 요청에서
+  카탈로그 클라이언트 버전을 `version` 헤더와 user agent로 보낸다(HTTP, websocket 연결, `/responses/compact`).
+  서비스는 최소 버전보다 낮은 클라이언트에 "model is not supported when using Codex with a ChatGPT account"로 거절했다.
+  식별 버전이 바뀌면 websocket을 다시 연결한다. 번들 카탈로그가 아는 모델은 이전처럼 이 빌드의 버전을 쓴다.
+- **Claude→GPT 예산 재구성:** 마지막 체크포인트 뒤의 Claude(로컬 에이전트) 평문 turn 때문에 이어 받을 기록이 모델 문맥 창보다
+  커지면, 다시 열 때 예산 안으로 문맥을 재구성한다. 이전에는 첫 GPT turn이 전체 기록을 원격 압축하려다 압축 요청 자체가 창을 넘었다.
+  재구성한 문맥의 토큰 사용량도 다시 계산한다.
+- **Claude 압축 거부 표시:** Claude 공급자에서 수동 압축은 오류 전에 turn 시작을 알린다. 이제 압축이 계속 실행 중으로 보이지 않고 실패로 끝난다.
+- **공유 경로 음성 캐시:** 소유 프로필이 새 공유 작업을 알린 직후, 첫 상태 행이 생기기 전에 다른 프로필이 읽으면
+  `SharedStore::route`가 그 실패를 자기 저장소 경로로 영구 캐시했다. 그 런타임이 다시 시작될 때까지 `thread/read`가 "thread not loaded"로 실패했다.
+  이제 자기 저장소에 기록(상태 행 또는 실행 중 recorder)이 있을 때만 경로를 고정하고, 없으면 다음 호출에서 카탈로그로 다시 찾는다.
+- 시험(빌드 서버): codex-core lib 2,579 통과·3 실패(`multi_agents` 2, `turn_tests` 1 — 수정 121 배포 트리에서도 실패하는 기존 실패),
+  core 스위트(`inference_client_version`, `client_websockets`, `claude_code`) 51 통과, app-server `manager_record_catalog`(공유 실행 포함) 32 통과,
+  `tasks::claude_code`·`portable_context`·`client_version`·`rollout_reconstruction`·`tasks::compact` 93 통과.
+- 배포 후보(활성화하지 않음): Linux 묶음 `0.153.4-managed-0767d660038aa500`(`codex` `1c769954…`, 격리 SIGHUP 종료 감사 통과 →
+  `DRAIN_AUDITED_SHA256`에 추가), Windows 서버 교차 빌드(CRLF, `codex.exe` `9a27df01…`)를 스테이징했다. 공유 편집(paginated)·공통 저장소 무인 검증,
+  Claude 네이티브 e2e 12개가 PASS이고 마이그레이션 지문은 수정 121과 같다. 활성화 게이트는 포인터를 쓰지 않는 시험 실행으로 통과했다.
+  적용은 완전 종료 뒤 일회성 helper(`work/swap-rev125-on-exit.py`, 한 번만 활성화·더 새 런타임이면 건너뜀)로 한다.
+
 ### 수정 124 — Claude 사용 한도 안내·알림·재설정 후 자동 이어하기
 
 - 증상: 03:13 KST에 한 Claude 프로필의 SSH 작업 3개가 함께 멈췄다. CLI 기록은 합성 assistant 메시지(`error: "rate_limit"`, `isApiErrorMessage`,
@@ -507,3 +530,4 @@
 | 122 | (REVISIONS 본문) | SSH 이전 런타임 재실행 방지, SSH 자동 업데이트 기본 켜기와 대기 확인 간격 늘림, 완전 종료 대기를 앱 수에 맞추고 남은 정리 자동 진행 |
 | 123 | (REVISIONS 본문) | 작업 바로가기 클릭별 기록과 하루치 로그, 카드·상태 줄 진행 표시, 클릭한 프로필 우선 시작·메모리 부족 시 미리 열기 축소, 마지막 클릭 우선과 프로필별 처리, 앱 파이프 직접 이동·대기 단축, 대기 중 앱 종료 시 한 번 다시 시작 |
 | 124 | (REVISIONS 본문) | Claude 사용 한도 멈춤의 구체 오류(`claude_usage_limit`)와 같은 세션 이어 쓰기, 재설정 후 자동 이어하기(예약·확인·재예약·기록, admin 고정 `turn/start`), 모든 계정의 90%·한도·재설정 알림과 카드 강조 |
+| 125 | (REVISIONS 본문) | 런타임 핫픽스: 번들 카탈로그 밖 GPT 모델(sol 계열)의 카탈로그 클라이언트 버전 식별, Claude 평문 구간 뒤 GPT 복귀 시 예산 안 문맥 재구성·토큰 재계산, Claude 압축 거부의 실패 표시, 공유 작업 경로 음성 캐시 제거 |

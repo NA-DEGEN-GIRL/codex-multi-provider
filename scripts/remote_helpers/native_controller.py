@@ -336,6 +336,9 @@ DRAIN_AUDITED_SHA256 = frozenset({
     "02b5eda30561e2673a8f393f86205fa220d6b7863888103483d93614783901e6",
     "4e91610c7644b93bdd0d2a2c736a376f98dc55ab083b0bc12734a1eb670431e7",
     "d54ddec5a7b310fb5b7cad95ce90df530b200188863f40177d5f3e412b708a5e",
+    # Revision 125 (0.153.4-managed-0767d660038aa500): isolated SIGHUP drain
+    # audit passed (work/validation/release-125/drain-audit.json).
+    "1c769954d233111616bbe180d507e90c6c76332357d5e48d80938b38d183306e",
 })
 # Unstripped revision 94-96 builds are ~1.3 GB; a smaller bound refused them.
 DRAIN_HASH_BYTES = 2 * 1024 * 1024 * 1024
