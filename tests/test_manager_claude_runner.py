@@ -24,7 +24,9 @@ from manager_core.claude_runner import (SessionLedger, compact_summary, digest, 
                                        AUTH_STOP_NOTE, AUTH_TOOL_STOPPED, BorrowedLogin, renew_login,
                                        token_expired, PRIVATE_CHANNELS, AUTH_ROTATE_ATTEMPTS,
                                        AUTH_ROTATE_RECOVERIES, Rotation, LONG_LIVED_FAILURES,
-                                       LONG_LIVED_SWITCH_NOTICE, AUTH_WAIT_ASKS, AUTH_WAIT_NOTICE, AUTH_WAIT_STOP)
+                                       LONG_LIVED_SWITCH_NOTICE, AUTH_WAIT_ASKS, AUTH_WAIT_NOTICE, AUTH_WAIT_STOP,
+                                       USAGE_STOP_NOTE, usage_limit_details, usage_limit_message,
+                                       usage_reset_from_text)
 
 
 FAKE = r'''
@@ -157,6 +159,30 @@ else:
               'total_cost_usd':0.05})
     elif scenario == 'wait':
         emit({'type':'stream_event','event':{'type':'content_block_delta','delta':{'type':'text_delta','text':'waiting'}}})
+    elif scenario.startswith('limit_'):
+        # The official CLI's shape for a request refused by a subscription limit (2.1.282):
+        # an optional rejected rate_limit_event, an API-error assistant message (error
+        # "rate_limit") with the CLI's own line, then an is_error result with the same line.
+        # Dummy reset times only.
+        reset = int(os.environ.get('CLAUDE_FIXTURE_RESET', '0'))
+        texts = {'limit_session': "You've hit your session limit · resets 4:30am (Asia/Seoul)",
+                 'limit_weekly': "You've hit your weekly limit · resets " + os.environ.get('CLAUDE_FIXTURE_RESET_DATE', 'Jan 1')
+                                 + ", 4am (Codex/Test)",
+                 'limit_opus': "You've hit your Opus limit · resets 9pm (Asia/Seoul)",
+                 'limit_credits': "You're out of usage credits. Run /usage-credits to keep using Fable 5 or /model to switch models.",
+                 'limit_result_only': "You've hit your session limit · resets 4:30am (Asia/Seoul) · progress saved"}
+        text = texts[scenario]
+        emit({'type':'assistant','message':{'content':[{'type':'tool_use','id':'limit-tool','name':'Read',
+              'input':{'file_path':'README.md'}}],'usage':{'input_tokens':5,'output_tokens':1}}})
+        emit({'type':'user','message':{'content':[{'type':'tool_result','tool_use_id':'limit-tool','content':'readme'}]}})
+        if scenario in ('limit_session', 'limit_opus'):
+            emit({'type':'rate_limit_event','rate_limit_info':{'status':'rejected','resetsAt':reset,'utilization':1.0,
+                  'rateLimitType':'five_hour' if scenario == 'limit_session' else 'seven_day_opus'}})
+        if scenario != 'limit_result_only':
+            emit({'type':'assistant','error':'rate_limit','isApiErrorMessage':True,
+                  'message':{'content':[{'type':'text','text':text}],'usage':{'input_tokens':0,'output_tokens':0}}})
+        emit({'type':'result','subtype':'success','is_error':True,'session_id':session,'result':text,
+              'api_error_status':429,'usage':{'input_tokens':5,'output_tokens':1},'total_cost_usd':0.01})
     elif scenario in ('rotate_silent', 'rotate_refused') and token == 'dummy-token-1':
         # The token pushed during the turn is never applied; the next request still uses the old one.
         rotated(acknowledge=None if scenario == 'rotate_silent' else 'error')
@@ -1180,6 +1206,76 @@ class ClaudeRunnerTests(unittest.TestCase):
             with self.subTest(change=change):
                 ledger.save(dict(record, **change))
                 self.assertIsNone(ledger.load(later, 'next'))
+
+    def test_usage_limit_stops_end_with_a_specific_error_and_reset_time(self):
+        from datetime import datetime, timedelta
+        from manager_core.usage_continuation import parse_stop
+        reset = int(time.time()) + 3 * 3600
+        weekly = datetime.now().astimezone().replace(hour=4, minute=0, second=0, microsecond=0) + timedelta(days=2)
+        month = ('Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec')[weekly.month - 1]
+        result_only = usage_reset_from_text("You've hit your session limit · resets 4:30am (Asia/Seoul)")
+        cases = {'limit_session': ('session', reset), 'limit_opus': ('opus', reset),
+                 'limit_weekly': ('weekly', int(weekly.timestamp())), 'limit_credits': ('credits', None),
+                 'limit_result_only': ('session', result_only)}
+        environment = {'CLAUDE_FIXTURE_RESET': str(reset), 'CLAUDE_FIXTURE_RESET_DATE': f'{month} {weekly.day}'}
+        for scenario, (kind, expected) in cases.items():
+            with self.subTest(scenario=scenario), patch.dict(os.environ, environment):
+                code, events = self.run_fake(scenario)
+                done = next(event for event in events if event['type'] == 'done')
+                self.assertEqual(done['status'], 'error')
+                error = done['error']
+                self.assertEqual((error['code'], error['limit_kind'], error['resets_at']),
+                                 ('claude_usage_limit', kind, expected))
+                self.assertTrue(error['message'].startswith('Claude usage limit reached'), error['message'])
+                # The Windows manager reads the reset back from the runtime's turn error.
+                self.assertEqual(parse_stop('Claude agent: ' + error['message']), dict(kind=kind, resets_at=expected))
+                # The CLI's own line is neither task output nor a notice; it is the turn's error only.
+                shown = json.dumps([event for event in events if event['type'] == 'event'], ensure_ascii=False)
+                self.assertNotIn("You've hit", shown)
+                self.assertNotIn('out of usage credits', shown)
+                if scenario != 'limit_result_only':
+                    self.assertTrue(any(event.get('message') == 'Claude reached its usage limit.' for event in events))
+        self.assertIsNotNone(result_only)
+
+    def test_usage_limit_details_prefer_the_rejected_event_and_tag_the_message(self):
+        now = 1800000000
+        events = [{'status': 'allowed_warning', 'rateLimitType': 'five_hour', 'resetsAt': now + 100},
+                  {'status': 'rejected', 'rateLimitType': 'seven_day', 'resetsAt': now + 7200},
+                  {'status': 'rejected', 'rateLimitType': 'five_hour', 'resetsAt': now - 7200}]
+        self.assertEqual(usage_limit_details("You've hit your weekly limit · resets 4am (Codex/Test)", events, now),
+                         ('weekly', now + 7200, '4am (Codex/Test)'))
+        self.assertEqual(usage_limit_details('', events, now), ('weekly', now + 7200, None))
+        self.assertEqual(usage_limit_details("You've hit your Sonnet limit", events, now), ('sonnet', None, None))
+        self.assertEqual(usage_limit_details('', [], now), ('unknown', None, None))
+        message = usage_limit_message('weekly', now + 7200, '4am (Codex/Test)')
+        self.assertIn("this account's weekly limit is used up; it resets 4am (Codex/Test).", message)
+        self.assertTrue(message.endswith('[usage-limit: weekly, resets 2027-01-15T10:00:00Z]'), message)
+        self.assertTrue(usage_limit_message('credits', None, None).endswith('[usage-limit: credits]'))
+        # A phrase without a known zone is read in this machine's zone; one too far ahead is dropped.
+        self.assertIsNone(usage_reset_from_text('resets in 5h', now))
+        self.assertIsNone(usage_reset_from_text('no reset here', now))
+
+    def test_a_usage_limit_stop_resumes_the_same_session_with_a_usage_note(self):
+        with patch.dict(os.environ, {'CLAUDE_FIXTURE_RESET': str(int(time.time()) + 3600)}):
+            code, events, stopped = self.run_borrowed('limit_session', 3600, announce=False, auth_resume=True)
+        done = next(event for event in events if event['type'] == 'done')
+        self.assertEqual(done['error']['code'], 'claude_usage_limit')
+        record = self.borrowed_record()
+        self.assertTrue(record['dirty'])
+        self.assertEqual(record['auth_stop'], {'turn_id': 'turn-1', 'turn_fingerprints': {}, 'reason': 'usage_limit'})
+        code, events, resumed = self.run_borrowed('success', 3600, turn='turn-2', prior=['turn-1'], auth_resume=True)
+        self.assertEqual(code, 0, events)
+        self.assertEqual([(launch['resume'], launch['session']) for launch in resumed], [(True, stopped[0]['session'])])
+        content = resumed[0]['request']['message']['content']
+        self.assertEqual([block['text'] for block in content], [USAGE_STOP_NOTE, 'fixture request'])
+        record = self.borrowed_record()
+        self.assertEqual((record['dirty'], record['covered'], 'auth_stop' in record), (False, ['turn-1', 'turn-2'], False))
+        # A host without auth_resume still starts the next turn fresh.
+        with patch.dict(os.environ, {'CLAUDE_FIXTURE_RESET': str(int(time.time()) + 3600)}):
+            self.run_fake('limit_session')
+        local = json.loads(next(self.root.glob('work/control-center/claude/sessions/*/*/*.json')).read_text(encoding='utf-8'))
+        self.assertTrue(local['dirty'])
+        self.assertNotIn('auth_stop', local)
 
     def test_rate_limit_event_during_checkpoint_keeps_the_runner_alive(self):
         code, events = self.run_fake('compact_rate_limit')

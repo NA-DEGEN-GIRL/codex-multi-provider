@@ -153,6 +153,37 @@ internal sealed class WorkspaceNotifications : IDisposable
         catch (Exception error) when (error is IOException or UnauthorizedAccessException or ExternalException or InvalidOperationException or ArgumentException)
         { log("작업공간 알림 전달 실패 · " + error.Message); return false; }
     }
+    // Revision 124: an account usage alert (90%, limit reached, task stopped, available again).
+    // A stopped local task opens from the toast through a ticket like a task notice; any other
+    // alert only brings the workspace forward (scheme://manager).
+    internal Task<bool> ShowAccountAlertAsync(string alias, string title, string body, string id, NotificationTarget? target)
+        => Run(() =>
+        {
+            try
+            {
+                Register();
+                string uri = WorkspaceActivation.Scheme(root) + "://manager";
+                if (target is not null && Valid(target))
+                {
+                    string ticket = Guid.NewGuid().ToString("N");
+                    Save(Path.Combine(directory, ticket + ".json"), target with { CreatedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() });
+                    uri = WorkspaceActivation.Scheme(root) + "://notification/" + ticket;
+                }
+                var xml = BuildAccountXml(uri, alias, title, body);
+                var document = new Windows.Data.Xml.Dom.XmlDocument(); document.LoadXml(xml);
+                string tag = Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(id)))[..16];
+                Notifier().Show(new ToastNotification(document) { Tag = tag, Group = "usage", ExpirationTime = DateTimeOffset.Now.AddDays(1) });
+                return true;
+            }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException or ExternalException or InvalidOperationException or ArgumentException)
+            { log("사용량 알림 표시 실패 · " + error.Message); return false; }
+        });
+    internal static string BuildAccountXml(string uri, string alias, string title, string body) => new XElement("toast",
+        new XAttribute("activationType", "protocol"), new XAttribute("launch", uri), new XAttribute("duration", "short"),
+        new XElement("visual", new XElement("binding", new XAttribute("template", "ToastGeneric"),
+            new XElement("text", $"[{alias}] {title}"), new XElement("text", body),
+            new XElement("text", new XAttribute("placement", "attribution"), "Codex 작업 공간 · 사용량 알림")))).ToString(SaveOptions.DisableFormatting);
+
     // Once, after the first state render: the toolkit's static registration,
     // the URI handler and the first WinRT XML projection, all on the worker.
     internal void Warm()

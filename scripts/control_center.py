@@ -82,6 +82,12 @@ class ControlCenter:
         self.usage_refresh=UsageRefresh(self.root,self.store)
         from manager_core.claude_usage import ClaudeUsage
         self.claude_usage=ClaudeUsage(self.root,self.store)
+        # Revision 124: one automatic continuation per Claude turn stopped on a usage limit,
+        # and account usage alerts from the usage already shown.
+        from manager_core.usage_continuation import UsageContinuations
+        from manager_core.usage_alerts import UsageAlerts
+        self.usage_continuations=UsageContinuations(self.root,self.store)
+        self.usage_alerts=UsageAlerts(self.root)
         self.profile_lifecycle=ProfileLifecycle(self.store,self.instances)
         self._due_at={}
         self._mutex=threading.RLock()
@@ -224,6 +230,31 @@ class ControlCenter:
         if last is not None and moment-last<seconds:return False
         self._due_at[name]=moment;return True
 
+    def _save_auto_continue(self,profile_id,value):
+        if type(value) is not bool:raise ValueError('한도 재설정 후 자동 이어하기 설정을 확인하세요.')
+        def update(data):
+            profile=self.store.profile(profile_id,data)
+            if profile.get('auth_mode')!='claude_code':raise ValueError('Claude 프로필을 선택하세요.')
+            profile['claude_auto_continue']=value
+            return True
+        self.store.mutate(update)
+
+    def _usage_alerts(self,state):
+        """Usage alerts, card emphasis and continuation log lines; never a network call."""
+        from manager_core.usage_alerts import UsageAlerts
+        from manager_core.usage_continuation import enabled
+        try:
+            self.usage_continuations.ingest()
+            live=[p for p in state['profiles'] if not p.get('view_only')]
+            state['usage_alerts']=self.usage_alerts.evaluate(live,self.usage_continuations.entries())
+            state['usage_continuation_events']=self.usage_continuations.events()
+            for p in live:
+                p['usage_alert']=UsageAlerts.attention(p,self.usage_continuations.scheduled(p['id']))
+                if p.get('auth_mode')=='claude_code':p['claude_auto_continue']=enabled(p)
+        except (OSError,ValueError,RuntimeError,KeyError,TypeError,AttributeError):
+            # Alerts never break the state poll.
+            state.setdefault('usage_alerts',[]);state.setdefault('usage_continuation_events',[])
+
     def state(self):
         notices=[]
         state=self.store.read()
@@ -319,6 +350,7 @@ class ControlCenter:
         for p in state['profiles']:
             p['usage'] = (self.claude_usage.value(p) if p.get('auth_mode') == 'claude_code'
                           else presentation(self.usage_refresh.value(p), refreshing=self.usage_refresh.active(p['id'])))
+        self._usage_alerts(state)
         state['hosts']=self.remote.list_hosts()
         state['view_instances']=[p for p in state['profiles'] if p.get('view_only')]
         state['profiles']=[p for p in state['profiles'] if not p.get('view_only')]
@@ -465,8 +497,12 @@ class ControlCenter:
                 from manager_core.claude_auth import discover_cli
                 from manager_core.claude_profiles import settings as claude_settings
                 discover_cli()
-                return self.store.add_profile(account_alias(args['alias'], self.store.read()['profiles']),
-                                              claude_settings=claude_settings(args.get('settings')))
+                added = self.store.add_profile(account_alias(args['alias'], self.store.read()['profiles']),
+                                               claude_settings=claude_settings(args.get('settings')))
+                if args.get('auto_continue_after_limit') is False:
+                    self._save_auto_continue(added['id'], False)
+                    added = self.store.profile(added['id'])
+                return added
             if kind=='external':
                 model_id=args['model_id']
                 # Validate adapter, model and decryptable key before creating a profile.
@@ -510,6 +546,15 @@ class ControlCenter:
             if command == 'claude.status':
                 return claude.refresh(args['profile_id'])
             values = {k: args[k] for k in ('model', 'reasoning_effort', 'effort', 'context_window', 'auto_compact_percent') if k in args}
+            if 'auto_continue_after_limit' in args:
+                # Revision 124: a manager-side choice outside claude_settings, so it never changes
+                # the profile's runtime configuration or a prepared SSH binding.
+                from manager_core.claude_profiles import settings as claude_settings
+                self._save_auto_continue(args['profile_id'], args['auto_continue_after_limit'])
+                current = claude.profile(args['profile_id'])
+                if claude_settings({**current.get('claude_settings', {}), **values}) == claude_settings(current.get('claude_settings')):
+                    return dict(profile=self.store.profile(args['profile_id']), state='saved',
+                                message='Claude 설정을 저장했습니다.')
             saved = claude.configure(args['profile_id'], values)
             profile = saved['profile']
             prepared = self.instances.prepare(profile)
@@ -963,6 +1008,7 @@ def main():
         center.source_catalog_refresh.start(center.native_catalog_sources)
         center.remote_catalog.start()
         center.ssh_inventory.start_sweeper()
+        center.usage_continuations.start()
     try:
         from concurrent.futures import ThreadPoolExecutor
         from manager_core import rust_service
@@ -1015,6 +1061,7 @@ def main():
             center.source_catalog_refresh.stop()
             center.remote_catalog.stop()
             center.ssh_inventory.stop_sweeper()
+            center.usage_continuations.shutdown()
 
 
 if __name__=='__main__':

@@ -831,6 +831,122 @@ def token_expired(message, text):
         isinstance(text, str) and AUTH_EXPIRED_TEXT.search(text) is not None)
 
 
+# The official CLI 2.1.282 ends a request refused by the account's subscription limit with an
+# API-error assistant message (error "rate_limit") whose text it composes itself, e.g.
+# "You've hit your session limit · resets 4:30am (Asia/Seoul)" (limit names: session, weekly,
+# Opus, Sonnet, Fable, usage credit; other lines: monthly spend limit, team's shared budget,
+# out of usage credits / extra usage), followed by an is_error result with the same text.
+USAGE_LIMIT_TEXT = re.compile(
+    r"\bYou've (?:hit|reached) your\b|\bYou're out of (?:usage credits|extra usage)\b|\busage limit reached\b",
+    re.IGNORECASE)
+USAGE_LIMIT_NAMES = (('session limit', 'session'), ('weekly limit', 'weekly'), ('opus limit', 'opus'),
+                     ('sonnet limit', 'sonnet'), ('fable limit', 'model'), ('usage credit limit', 'credits'),
+                     ('monthly spend limit', 'credits'), ("shared budget", 'credits'),
+                     ('out of usage credits', 'credits'), ('out of extra usage', 'credits'))
+USAGE_LIMIT_TYPES = {'five_hour': 'session', 'seven_day': 'weekly', 'seven_day_opus': 'opus',
+                     'seven_day_sonnet': 'sonnet', 'seven_day_overage_included': 'model', 'overage': 'credits'}
+USAGE_LIMIT_LABELS = {'session': '5-hour session limit', 'weekly': 'weekly limit', 'opus': 'weekly Opus limit',
+                      'sonnet': 'weekly Sonnet limit', 'model': 'model usage limit', 'credits': 'usage credits',
+                      'unknown': 'usage limit'}
+# "resets 4:30am (Asia/Seoul)", "resets Oct 12, 4am (Asia/Seoul)" or "resets Oct 12 at 4am (...)".
+USAGE_RESET_TEXT = re.compile(
+    r'\bresets (?:(?P<month>[A-Z][a-z]{2}) (?P<day>\d{1,2})(?:,| at) )?(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?'
+    r' ?(?P<half>am|pm)(?: \((?P<zone>[A-Za-z][A-Za-z0-9_+\-]*(?:/[A-Za-z0-9_+\-]+){0,2})\))?')
+USAGE_RESET_LIMIT = 31 * 86400
+USAGE_LIMIT_CODE = 'claude_usage_limit'
+# Prepended to the next request when a session stopped by a usage limit is resumed.
+USAGE_STOP_NOTE = (
+    'Note: the previous request in this session stopped before it finished because the Claude account reached '
+    'its usage limit. Background shells, agents and workflows that this Claude session started were terminated '
+    'with it; native Codex agents started through the codex_agents tools are separate tasks. Check the workspace '
+    'before relying on the outcome of the stopped work, and do not repeat work that is already complete.')
+
+
+def usage_limit_failed(message):
+    """The official CLI's markers for a request refused by a subscription usage limit."""
+    if message.get('type') == 'assistant':
+        return message.get('error') == 'rate_limit'
+    if message.get('type') == 'result' and message.get('is_error') is True:
+        text = message.get('result')
+        return isinstance(text, str) and USAGE_LIMIT_TEXT.search(text) is not None
+    return False
+
+
+def usage_limit_kind(text):
+    lowered = text.lower() if isinstance(text, str) else ''
+    return next((kind for name, kind in USAGE_LIMIT_NAMES if name in lowered), None)
+
+
+def usage_reset_from_text(text, now=None):
+    """The epoch of the CLI's own "resets ..." phrase, or None when it cannot be placed in time."""
+    match = USAGE_RESET_TEXT.search(text) if isinstance(text, str) else None
+    if match is None:
+        return None
+    try:
+        from datetime import datetime, timedelta
+        zone = None
+        if match.group('zone'):
+            try:
+                from zoneinfo import ZoneInfo
+                zone = ZoneInfo(match.group('zone'))
+            except (ImportError, ValueError, KeyError, OSError):
+                zone = None  # No time zone database (Windows without tzdata).
+        # The CLI formats the reset in its own machine's zone, which is this runner's machine.
+        reference = time.time() if now is None else now
+        current = (datetime.fromtimestamp(reference, zone) if zone is not None
+                   else datetime.fromtimestamp(reference).astimezone())
+        hour = int(match.group('hour')) % 12 + (12 if match.group('half') == 'pm' else 0)
+        minute = int(match.group('minute') or 0)
+        if match.group('month'):
+            month = ('Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov',
+                     'Dec').index(match.group('month')) + 1
+            moment = current.replace(month=month, day=int(match.group('day')), hour=hour, minute=minute,
+                                     second=0, microsecond=0)
+            if moment < current - timedelta(days=1):
+                moment = moment.replace(year=moment.year + 1)
+        else:
+            moment = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if moment <= current:
+                moment += timedelta(days=1)
+        value = int(moment.timestamp())
+    except (ImportError, ValueError, KeyError, OverflowError, OSError):
+        return None
+    reference = time.time() if now is None else now
+    return value if reference - 3600 < value <= reference + USAGE_RESET_LIMIT else None
+
+
+def usage_limit_details(text, events, now=None):
+    """(kind, resets_at, reset_text) from the CLI's stop text and its rate_limit_event reports.
+
+    The rejected rate_limit_event's resetsAt is exact; the CLI's phrase is the fallback."""
+    reference = time.time() if now is None else now
+    kind = usage_limit_kind(text)
+    rejected = [(USAGE_LIMIT_TYPES.get(info.get('rateLimitType')), info.get('resetsAt')) for info in events
+                if info.get('status') == 'rejected']
+    rejected = [(name, at) for name, at in rejected
+                if type(at) in (int, float) and reference - 3600 < at <= reference + USAGE_RESET_LIMIT]
+    match = [at for name, at in rejected if kind is not None and name == kind]
+    resets_at = int(match[-1]) if match else None
+    if resets_at is None and rejected and kind is None:
+        kind, resets_at = rejected[-1][0], int(rejected[-1][1])
+    if resets_at is None:
+        resets_at = usage_reset_from_text(text, reference)
+    phrase = USAGE_RESET_TEXT.search(text) if isinstance(text, str) else None
+    reset_text = phrase.group(0)[len('resets '):][:64] if phrase else None
+    return kind or 'unknown', resets_at, reset_text
+
+
+def usage_limit_message(kind, resets_at, reset_text):
+    """English stop message with a fixed trailing tag the Windows manager reads to continue the task."""
+    label = USAGE_LIMIT_LABELS.get(kind, USAGE_LIMIT_LABELS['unknown'])
+    stamp = (time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(resets_at)) if resets_at is not None else None)
+    when = reset_text or (time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(resets_at)) if resets_at is not None else None)
+    return ("Claude usage limit reached: this account's " + label + ' is used up'
+            + ('; it resets ' + when if when else '') + '. This turn stopped; the same Claude session '
+            'continues after the reset. [usage-limit: ' + (kind if kind in USAGE_LIMIT_LABELS else 'unknown')
+            + (', resets ' + stamp if stamp else '') + ']')
+
+
 class BorrowedLogin:
     """Owner, expiry, source and token of the newest login lent for this turn.
 
@@ -1274,7 +1390,10 @@ A rotation reply that outlived the primary call is consumed here.
 def execute(command, cwd, environment, incoming, emit, bridge, stopped, observed, record, ledger, hello,
             configuration_directory, usage_store, delegation=None, borrowed=None):
     start = time.monotonic()
-    result, problem, interrupted, auth_error = None, None, False, None
+    result, problem, interrupted, auth_error, usage_error = None, None, False, None, None
+    # The CLI's rate_limit_event reports of this turn, newest last; a usage-limit stop takes
+    # its exact reset time from them.
+    limit_events = []
     record['dirty'] = True  # A runner crash after launch must never resume blindly.
     record.pop('auth_stop', None)
     ledger.save(record)
@@ -1305,7 +1424,7 @@ def execute(command, cwd, environment, incoming, emit, bridge, stopped, observed
     try:
         while True:
             result, problem, auth_error, relaunch, switch = None, None, None, False, False
-            refused_credential = None
+            refused_credential, usage_error, usage_seen, usage_text = None, None, False, ''
             prompt_seen, auth_seen, expired_reported, forced, tree = False, False, False, False, None
             # retry_noticed: the user was told this launch waits for a login; stopping: its wait
             # was ended because no usable token is coming.
@@ -1341,7 +1460,7 @@ def execute(command, cwd, environment, incoming, emit, bridge, stopped, observed
                         source, message = events.get(timeout=.2)
                     except queue.Empty:
                         if process.poll() is not None:
-                            if result is None and not auth_seen:
+                            if result is None and not auth_seen and not usage_seen:
                                 problem = ('cli_exit', 'Claude exited without a final result.')
                             break
                         continue
@@ -1367,7 +1486,7 @@ def execute(command, cwd, environment, incoming, emit, bridge, stopped, observed
                     if source != channel:
                         continue  # Remaining output of a stopped launch.
                     if message is None:
-                        if result is None and not auth_seen:
+                        if result is None and not auth_seen and not usage_seen:
                             problem = ('cli_exit', 'Claude exited without a final result.')
                         break
                     if message.get('type') == 'control_request':
@@ -1398,6 +1517,8 @@ def execute(command, cwd, environment, incoming, emit, bridge, stopped, observed
                         rotation.recover()  # The CLI polls for a rotated token before it gives up.
                     if settle_deadline is not None and message.get('type') in ('assistant', 'stream_event', 'user'):
                         settle_deadline = None  # A background report started the next turn.
+                    if message.get('type') == 'rate_limit_event' and isinstance(message.get('rate_limit_info'), dict):
+                        limit_events = (limit_events + [message['rate_limit_info']])[-16:]
                     # Remote (SSH) runs have no manager store; their usage is read on Windows.
                     if message.get('type') == 'rate_limit_event' and usage_store is not None:
                         from manager_core.claude_usage import record_event
@@ -1441,6 +1562,10 @@ def execute(command, cwd, environment, incoming, emit, bridge, stopped, observed
                             auth_seen = True
                             expired_reported = expired_reported or token_expired(message, detail)
                             normalized.append(dict(kind='notice', message='Claude could not authenticate its request.'))
+                        elif usage_limit_failed(message):
+                            # The CLI's own limit line is reported once, in the turn's error.
+                            usage_seen, usage_text = True, detail or usage_text
+                            normalized.append(dict(kind='notice', message='Claude reached its usage limit.'))
                         else:
                             normalized.append(dict(kind='notice', message='Claude API request failed'
                                                    + (': ' + bounded_text(detail, 1000) if detail else '.')))
@@ -1465,6 +1590,11 @@ def execute(command, cwd, environment, incoming, emit, bridge, stopped, observed
                             auth_seen = True
                             expired_reported = expired_reported or token_expired(message, message.get('result'))
                             break  # Nothing in this process can continue without a login.
+                        if message.get('is_error') is True and (usage_seen or usage_limit_failed(message)):
+                            usage_seen = True
+                            if usage_limit_failed(message) or not usage_text:
+                                usage_text = message.get('result') if isinstance(message.get('result'), str) else usage_text
+                            break  # Nothing in this process can continue until the limit resets.
                         if background:
                             if len(results) == launch_results + 1:
                                 emit(dict(type='event', kind='notice', message=(
@@ -1490,6 +1620,10 @@ def execute(command, cwd, environment, incoming, emit, bridge, stopped, observed
                     if relaunch and rotation.gave_up and not replacement_held(borrowed, credential, switch):
                         # The host was already asked while this CLI waited and had nothing usable.
                         relaunch = switch = False
+                elif usage_seen and not interrupted and not problem and (result is None or result.get('is_error')):
+                    kind, resets_at, reset_text = usage_limit_details(usage_text, limit_events)
+                    usage_error = (USAGE_LIMIT_CODE, usage_limit_message(kind, resets_at, reset_text),
+                                   dict(limit_kind=kind, resets_at=resets_at, reset_text=reset_text))
             finally:
                 rotation.stop()
                 if not relaunch:
@@ -1634,15 +1768,19 @@ def execute(command, cwd, environment, incoming, emit, bridge, stopped, observed
     turn_cost = total_cost - prior_cost if total_cost is not None and total_cost >= prior_cost else None
     if checkpoint and 'total_cost_usd' not in checkpoint.get('result', {}):
         turn_cost = None  # A failed maintenance call may have consumed unreported usage.
-    # The CLI stopped by itself on the borrowed login after writing its final result and
-    # recording this request. Its session stays dirty, but a host announcing auth_resume may
-    # continue it next turn when nothing it saw has changed.
-    if (auth_error and auth_error[0] in AUTH_STOP_CODES and not problem and not interrupted
+    # The CLI stopped by itself on the borrowed login or on the account's usage limit after
+    # writing its final result and recording this request. Its session stays dirty, but a host
+    # announcing auth_resume may continue it next turn when nothing it saw has changed. The
+    # marker's shape is the same for both reasons (the runtime checks only that shape); only
+    # the note of the next request differs.
+    if (((auth_error and auth_error[0] in AUTH_STOP_CODES) or usage_error) and not problem and not interrupted
             and result.get('is_error') and prompt_seen and not forced and hello.get('auth_resume') == 1):
         seen = {turn: value for turn, value in hello['snapshot'].get('turn_fingerprints', {}).items()
                 if turn != hello['turn_id']}
         if set(record.get('covered', [])).issubset(seen):
             record['auth_stop'] = dict(turn_id=hello['turn_id'], turn_fingerprints=seen)
+            if usage_error and not auth_error:
+                record['auth_stop']['reason'] = 'usage_limit'
             record['cost_total_usd'] = total_cost if total_cost is not None else prior_cost
     record['compactions'] = record.get('compactions', 0) + compactions
     ledger.save(record)
@@ -1655,9 +1793,12 @@ def execute(command, cwd, environment, incoming, emit, bridge, stopped, observed
                 turn_cost_usd=turn_cost, permission_denials=result.get('permission_denials', []),
                 duration_ms=int((time.monotonic() - start) * 1000), model_request_started=model_started)
     if not success and not interrupted:
-        code, message = problem or auth_error or (
+        code, message = problem or auth_error or (usage_error[:2] if usage_error else None) or (
             'claude_error', 'Claude did not complete this turn. Review the CLI account and permission status.')
         done['error'] = dict(code=code, message=message)
+        if not problem and not auth_error and usage_error:
+            # limit_kind, resets_at (epoch seconds or None) and the CLI's own reset phrase.
+            done['error'].update(usage_error[2])
         if not problem and auth_error and refused_credential is not None:
             # The refused saved token; the host records it even if it missed auth_rejected (C2).
             done['error'].update(credential_source=refused_credential[1], credential_id=refused_credential[2])
@@ -1810,8 +1951,10 @@ def serve(root, profile_id, incoming=None, outgoing=None, cli_path=None, plugin_
                 raise ClaudeError('session_changed', 'Claude needs a fresh session with the complete task history.')
             if resume and any(block.get('kind') == 'context' for block in request.get('blocks', []) if isinstance(block, dict)):
                 raise ClaudeError('duplicate_context', 'A resumed Claude session accepts only unseen history updates.')
-            hello['_prompt'] = prompt_message(request.get('blocks'),
-                                              AUTH_STOP_NOTE if resume and previous.get('auth_stop') else None)
+            stop = previous.get('auth_stop') if resume else None
+            hello['_prompt'] = prompt_message(request.get('blocks'), None if not stop else USAGE_STOP_NOTE
+                                              if isinstance(stop, dict) and stop.get('reason') == 'usage_limit'
+                                              else AUTH_STOP_NOTE)
             record = dict(previous) if resume else dict(id=str(uuid4()), covered=[], fingerprint=None,
                          turn_fingerprints={}, model=settings['model'], effort=settings['effort'],
                          dirty=False, compactions=0, cost_total_usd=0, settings=settings)

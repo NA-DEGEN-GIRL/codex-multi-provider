@@ -35,6 +35,49 @@
 
 ## 최근 수정
 
+### 수정 124 — Claude 사용 한도 안내·알림·재설정 후 자동 이어하기
+
+- 증상: 03:13 KST에 한 Claude 프로필의 SSH 작업 3개가 함께 멈췄다. CLI 기록은 합성 assistant 메시지(`error: "rate_limit"`, `isApiErrorMessage`,
+  "You've hit your session limit · resets 4:30am (Asia/Seoul)")로 끝났지만 앱에는 일반 오류 "Claude did not complete this turn…"만 보였다.
+  수정 121의 R1은 `authentication_failed`만 구분했다. 계정이 5시간 한도에 닿아도 알림이 없었다.
+- 러너(`claude_runner.py`):
+  - 감지: assistant `error == "rate_limit"`, 또는 is_error 결과의 CLI 한도 문장(`You've hit/reached your …`, `You're out of usage credits/extra usage`).
+    CLI 2.1.282 번들의 한도 이름은 session, weekly, Opus, Sonnet, Fable, usage credit, monthly spend limit, team's shared budget이다.
+  - 코드 `claude_usage_limit`. 영어 문장 끝에 고정 꼬리표 `[usage-limit: <kind>, resets <UTC ISO>]`를 붙이고, `done.error`에 `limit_kind`, `resets_at`(epoch), `reset_text`를 넣는다.
+  - 재설정 시각: 거부된 `rate_limit_event`의 `resetsAt`을 먼저 쓴다. 없으면 CLI 문장("4:30am (Asia/Seoul)", "Oct 12, 4am (…)")을 그 시간대로 계산한다.
+    시간대 DB가 없으면(Windows) 러너 기계의 시간대를 쓰고, 31일보다 먼 값은 버린다.
+  - CLI 문장은 commentary나 알림으로 남기지 않고 "Claude reached its usage limit." 알림만 보낸다.
+  - 이어 쓰기: R4의 `auth_stop` 표시를 그대로 쓰고 `reason: "usage_limit"`를 더한다. 다음 턴은 같은 세션을 이어 쓰며 한도 안내 문장(`USAGE_STOP_NOTE`)을 앞에 붙인다.
+    런타임 `context::resumable`은 표시의 모양(turn_id·turn_fingerprints)과 멈춘 turn의 마지막 항목이 Claude 출력인지만 보므로 Rust 변경이 없다.
+    도구 결과도 Claude 출력 메시지로 기록되므로 도구 뒤에 멈춘 turn도 이어진다. 출력 없이 첫 요청에서 멈추면 새 세션으로 시작한다.
+- 관리 측 감지: 로컬 런타임 프록시와 SSH 펌프의 `RuntimeObserver`가 `turn/completed`(failed)와 `error`(willRetry false)의 오류 문장에서 꼬리표만 읽는다.
+  thread·turn·종류·재설정 시각을 `work/control-center/usage-continuations/inbox/`에 파일 하나로 남기고, 문장 자체는 남기지 않는다.
+- 자동 이어하기(`usage_continuation.py`, 백엔드 스레드 15초 주기):
+  - 멈춘 turn마다 한 번, 재설정 + 60~120초에 예약한다. `state.json`에 저장해 관리자를 다시 시작해도 유지한다.
+    예약·전송·건너뜀은 모두 `log.jsonl`과 관리창 로그에 남긴다(메시지 내용은 남기지 않음).
+  - 보내기 직전 확인:
+    - 프로필이 있고 설정이 켜져 있는가.
+    - 작업이 로드되어 쉬는 중인가.
+    - 가장 최근 turn이 멈춘 turn이고 failed인가(아니면 새 메시지가 있는 것).
+    - 사용량 창이 아직 100%로 보이면 새 재설정으로 다시 예약한다(최대 3회).
+    - 프로필이 닫혀 있으면 15분 기다린 뒤 건너뛰고, 12시간 넘게 늦었으면 건너뛴다. 재설정 시각을 모르면(크레딧 등) 예약하지 않는다.
+  - 전송: 프로필의 인증된 런타임 관리 통로(admin)에 `turn/start`를 더했다. 고정 이어하기 문장 하나만 받는다.
+    최신 turn 확인용 `thread/turns/list`는 1개, id·상태만 돌려준다. 결과가 불확실한 전송은 다시 보내지 않는다.
+    보낸 이어하기가 10분 안에 다시 한도로 멈추면 같은 멈춤의 재시도로 센다.
+  - 설정: Claude 프로필 창의 "한도 재설정 후 자동으로 이어하기"(기본 켜짐). `claude_settings` 밖의 `claude_auto_continue`라서
+    런타임 설정이나 SSH 바인딩을 바꾸지 않고, 프로필을 다시 열 필요도 없다.
+- 알림(`usage_alerts.py`):
+  - 대상: 모든 계정(Codex·Claude)의 5시간·주간 창. 90%를 넘을 때, 100%이거나 Claude 작업이 한도로 멈췄을 때, 재설정 시각이 지났을 때("다시 사용 가능").
+  - Windows 알림과 카드 경고 칩("한도 93%", "한도 도달 · 자동 이어하기 04:31")으로 보인다. 로컬 작업의 멈춤 알림을 누르면 그 작업으로 이동한다.
+  - 창·재설정 주기마다 한 번만 알린다(`usage-alerts.json`). 첫 실행은 현재 상태를 기준으로만 기록하고, 새 네트워크 호출은 없다.
+- 적용:
+  - 러너·관리 측 모두 Python이라 런타임(Rust) 빌드가 필요 없다. 관리 서비스 명령 목록도 그대로다.
+  - 관리 앱을 빌드한 뒤 프로필을 다시 열어야 프록시와 관리 통로가 바뀐다. 이전 프록시에서는 자동 이어하기가 `runtime_outdated`로 건너뛴다.
+  - SSH 호스트의 러너는 준비할 때 올리는 helper 파일이다. SSH 연결을 다시 준비하기 전까지는(또는 다시 준비를 포함하는 SSH 업데이트 전까지는) 이전 러너가 돈다.
+    그동안 SSH 한도 멈춤은 일반 오류로 보이고 자동 이어하기도 동작하지 않는다. 90%·100% 알림은 그대로 동작한다.
+- 미확인: 관리 통로로 시작한 turn을 데스크톱 화면이 사용자 메시지로 그리는지는 실제 앱에서 확인하지 않았다(진행 알림은 같은 연결로 전달된다).
+  시험: 가짜 CLI의 한도 시나리오 5종, 관찰자·관리 통로 검증, 가짜 시계 예약기(건너뜀·재예약·재시작·연쇄), 알림 중복 방지, Shell 컴파일.
+
 ### 수정 123 — 작업 바로가기 반응 개선, 진행 표시, 마지막 클릭 우선
 
 - 근거: 10월 7–9일 작업 바로가기 클릭 67건을 측정했다. 앱이 이미 떠 있고 호스트가 연결된 경우는 약 1초(p90 4초)에 열렸지만,
@@ -463,3 +506,4 @@
 | 121 | [claude-login-renewal-121](design/claude-login-renewal-121.md), [llm-usage-removal-121](design/llm-usage-removal-121.md) | SSH Claude 로그인 자동 갱신·이어 쓰기·실행 중 토큰 교체, 계정별 장기 토큰과 토큰 전달 보호, llm-usage 연동 제거와 기존 프로필·SSH home 호환 |
 | 122 | (REVISIONS 본문) | SSH 이전 런타임 재실행 방지, SSH 자동 업데이트 기본 켜기와 대기 확인 간격 늘림, 완전 종료 대기를 앱 수에 맞추고 남은 정리 자동 진행 |
 | 123 | (REVISIONS 본문) | 작업 바로가기 클릭별 기록과 하루치 로그, 카드·상태 줄 진행 표시, 클릭한 프로필 우선 시작·메모리 부족 시 미리 열기 축소, 마지막 클릭 우선과 프로필별 처리, 앱 파이프 직접 이동·대기 단축, 대기 중 앱 종료 시 한 번 다시 시작 |
+| 124 | (REVISIONS 본문) | Claude 사용 한도 멈춤의 구체 오류(`claude_usage_limit`)와 같은 세션 이어 쓰기, 재설정 후 자동 이어하기(예약·확인·재예약·기록, admin 고정 `turn/start`), 모든 계정의 90%·한도·재설정 알림과 카드 강조 |

@@ -446,6 +446,10 @@ class RuntimeObserver:
         self.messages = 0
         self.diagnostics: list[dict] = []
         self.diagnostic_sequence = 0
+        # Claude turns that stopped on the account's usage limit (thread, turn, limit kind,
+        # reset time), drained by the proxy outside its protocol lock (revision 124).
+        self.usage_stops: list[dict] = []
+        self.usage_stop_keys: list[tuple[str, str]] = []
 
     def _diagnostic(self, method, state, error=None, result=None):
         # Never retain request/response bodies, arbitrary methods or raw errors.
@@ -544,6 +548,8 @@ class RuntimeObserver:
                     except (OSError, ValueError, KeyError, TypeError, AttributeError):
                         self._taint('catalog_membership_unavailable')
                 return
+            if method in ('turn/completed', 'error') and thread_id:
+                self._usage_stop(method, thread_id, params)
             if method in ('turn/started', 'turn/completed'):
                 turn = params.get('turn')
                 turn_id = identifier(turn.get('id')) if isinstance(turn, dict) else None
@@ -642,6 +648,30 @@ class RuntimeObserver:
                 turn_id = identifier(turn.get('id')) if isinstance(turn, dict) else None
                 if turn_id and turn.get('status') == 'inProgress':
                     self.active_turns.add((thread_id, turn_id))
+
+    def _usage_stop(self, method: str, thread_id: str, params: dict) -> None:
+        """Keep only ids, the limit kind and the reset time of a usage-limit stop; never the text."""
+        if method == 'turn/completed':
+            turn = params.get('turn')
+            if not isinstance(turn, dict) or turn.get('status') != 'failed':
+                return
+            turn_id, error = identifier(turn.get('id')), turn.get('error')
+        else:
+            if params.get('willRetry') is not False:
+                return
+            turn_id, error = identifier(params.get('turnId')), params.get('error')
+        from .usage_continuation import parse_stop
+        stop = parse_stop(error.get('message') if isinstance(error, dict) else None)
+        if stop is None or turn_id is None or (thread_id, turn_id) in self.usage_stop_keys:
+            return
+        self.usage_stop_keys = (self.usage_stop_keys + [(thread_id, turn_id)])[-64:]
+        self.usage_stops = (self.usage_stops + [dict(thread_id=thread_id, turn_id=turn_id, kind=stop['kind'],
+                                                     resets_at=stop['resets_at'], observed_at=time.time())])[-32:]
+
+    def drain_usage_stops(self) -> list[dict]:
+        with self.lock:
+            stops, self.usage_stops = self.usage_stops, []
+            return stops
 
     def _thread_status(self, thread_id: str, status: Any) -> None:
         kind = status.get('type') if isinstance(status, dict) else None

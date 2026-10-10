@@ -729,6 +729,15 @@ def _proxy_with_auth(executable: Path, arguments: list[str], environment: dict,
                 # Outside the protocol lock: the observer has its own lock and
                 # a slow file write never delays frames.
                 activity.publish(control.observer.thread_activity(), control.observer.opened())
+                # Claude turns stopped on a usage limit, for the manager's automatic continuation.
+                stops = control.observer.drain_usage_stops()
+                if stops:
+                    try:
+                        from manager_core.usage_continuation import record_stops
+                        record_stops(source_environment['CODEX_MANAGER_ROOT'], event['profile_id'],
+                                     'ssh:' + event['alias'], stops)
+                    except (OSError, ValueError):
+                        pass
 
     # A native bootstrap Job Object ensures forced Windows termination closes the
     # local transport tree. Ctrl+C already reaches the inherited console group.

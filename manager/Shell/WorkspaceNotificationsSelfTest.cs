@@ -47,6 +47,12 @@ internal static class WorkspaceNotificationsSelfTest
         Require(parsed.Root!.Attribute("activationType")!.Value == "protocol" && parsed.Root.Attribute("launch")!.Value == uri,
             "Question notification does not launch the workspace URI.");
         Require(parsed.Descendants("text").First().Value == "[02] " + notice.Title, "Profile label or XML escaping failed.");
+        // Revision 124: an account usage alert only brings the workspace forward.
+        Require(WorkspaceActivation.Ticket(directory, scheme + "://manager") == "" && WorkspaceActivation.Ticket(directory, scheme + "://manager/" + ticket) is null
+            && WorkspaceActivation.Ticket(directory, scheme + "://manager?run=anything") is null, "Usage alert activation accepted a payload.");
+        var alert = XDocument.Parse(WorkspaceNotifications.BuildAccountXml(scheme + "://manager", "02", "5시간 한도 <90%>", "04:30에 재설정됩니다."));
+        Require(alert.Descendants("text").First().Value == "[02] 5시간 한도 <90%>" && alert.Root!.Attribute("launch")!.Value == scheme + "://manager",
+            "Usage alert XML lost its label, escaping or activation.");
         checks.Add("Question routes persist the last profile per host+task, handle removal, and reject arbitrary URI/path arguments; XML safely labels profile 02.");
 
         // Toast work leaves the caller's thread. A busy worker (for example the

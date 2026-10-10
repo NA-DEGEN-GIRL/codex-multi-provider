@@ -497,8 +497,20 @@ def proxy(runtime: Path, arguments: list[str], observer_path: Path, profile_id: 
             except OSError:
                 pass
 
+    def record_usage_stops():
+        # Claude turns stopped on a usage limit, for the manager's automatic continuation.
+        # Outside protocol_lock: the observer has its own lock and the files are small.
+        stops = observer.drain_usage_stops()
+        if stops and source_environment.get('CODEX_MANAGER_ROOT'):
+            try:
+                from manager_core.usage_continuation import record_stops
+                record_stops(source_environment['CODEX_MANAGER_ROOT'], profile_id, 'local', stops)
+            except (OSError, ValueError):
+                pass
+
     def heartbeat():
         while not stop.wait(2):
+            record_usage_stops()
             try:
                 with protocol_lock:
                     outcome = auth.poll()
@@ -757,6 +769,7 @@ def proxy(runtime: Path, arguments: list[str], observer_path: Path, profile_id: 
         admin_server.close()
         admin_state = 'closed'
     ticker.join(timeout=3)
+    record_usage_stops()
     frontend_output.close()
     frontend_output.thread.join(timeout=5)
     observer.disconnected()

@@ -17,8 +17,10 @@ internal sealed class WorkspaceActivation : IDisposable
     internal static string? Ticket(string root, string? uri)
     {
         if (!Uri.TryCreate(uri, UriKind.Absolute, out var value) || value.Scheme != Scheme(root) ||
-            value.Host != "notification" || value.Query != "" || value.Fragment != "" || value.UserInfo != "" || !value.IsDefaultPort)
+            value.Host is not ("notification" or "manager") || value.Query != "" || value.Fragment != "" || value.UserInfo != "" || !value.IsDefaultPort)
             return null;
+        // An account usage alert (revision 124) only brings the workspace forward: no ticket.
+        if (value.Host == "manager") return value.AbsolutePath is "" or "/" ? "" : null;
         var ticket = value.AbsolutePath.TrimStart('/');
         return Guid.TryParseExact(ticket, "N", out _) ? ticket : null;
     }

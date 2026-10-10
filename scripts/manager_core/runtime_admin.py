@@ -44,9 +44,17 @@ _PREFIX = 'codex-manager-admin:'
 _PIPE_PREFIX = r'\\.\pipe\Codex.ControlCenter.Admin.'
 _LOCAL_METHODS = frozenset({'manager/maintenance/acquire', 'manager/maintenance/status', 'manager/maintenance/release'})
 _METHODS = frozenset({'thread/managedCloseIdle', 'thread/managedReloadBinding', 'thread/managedIdleStatus', 'thread/settings/update',
-                      'thread/loaded/list', 'thread/read', 'manager/executionPresets/status'}) | _LOCAL_METHODS
+                      'thread/loaded/list', 'thread/read', 'manager/executionPresets/status',
+                      'thread/turns/list', 'turn/start'}) | _LOCAL_METHODS
 _MUTATIONS = frozenset({'thread/managedCloseIdle', 'thread/managedReloadBinding', 'thread/settings/update',
-                        'manager/maintenance/acquire', 'manager/maintenance/release'})
+                        'manager/maintenance/acquire', 'manager/maintenance/release', 'turn/start'})
+# The only message the manager may start a turn with: the automatic continuation of a Claude
+# turn that stopped on the account's usage limit, once that limit has reset (revision 124).
+# Admin stays a lifecycle channel, never a way to send arbitrary prompts.
+CONTINUATION_TEXT = ('사용 한도가 재설정되어 이어서 진행합니다. 중단된 작업을 계속해 주세요. '
+                     '이미 끝난 작업은 반복하지 마세요.')
+_TURN_ID = re.compile(r'[A-Za-z0-9_-]{1,128}')
+_TURN_STATUSES = frozenset({'completed', 'interrupted', 'failed', 'inProgress'})
 _ERRORS = frozenset({'invalid_request', 'unavailable', 'stale_runtime', 'not_ready',
                      'busy', 'timeout', 'runtime_error', 'invalid_response', 'closed'})
 _CLOSE_LOCK = threading.Lock()
@@ -151,6 +159,16 @@ def validate_request(method, params):
         return {'threadId': _uuid(params['threadId']), 'hostId': host,
                 'sourceStoreId': source, 'ownerProfileId': _uuid(params['ownerProfileId']),
                 'ownershipEpoch': params['ownershipEpoch'], 'recordRevision': params['recordRevision']}
+    if method == 'thread/turns/list':
+        # The newest turn's id and status only, for the usage-limit continuation check.
+        if params != {'threadId': params.get('threadId'), 'limit': 1, 'sortDirection': 'desc', 'itemsView': 'notLoaded'}:
+            raise AdminError('invalid_request')
+        return {'threadId': _uuid(params['threadId']), 'limit': 1, 'sortDirection': 'desc', 'itemsView': 'notLoaded'}
+    if method == 'turn/start':
+        expected = [{'type': 'text', 'text': CONTINUATION_TEXT, 'text_elements': []}]
+        if set(params) != {'threadId', 'input'} or params['input'] != expected:
+            raise AdminError('invalid_request')
+        return {'threadId': _uuid(params['threadId']), 'input': expected}
     if method == 'thread/loaded/list':
         if set(params) - {'cursor', 'limit'}:
             raise AdminError('invalid_request')
@@ -276,6 +294,21 @@ def sanitize_result(method, params, value):
                     'writerReleaseVerified': True}
         if method == 'thread/loaded/list':
             return {'data': _id_list(value['data']), 'nextCursor': _cursor(value.get('nextCursor'))}
+        if method in ('thread/turns/list', 'turn/start'):
+            turns = value['data'] if method == 'thread/turns/list' else [value['turn']]
+            if not isinstance(turns, list) or len(turns) > 1:
+                raise ValueError()
+            clean = []
+            for turn in turns:
+                if (not isinstance(turn, dict) or not isinstance(turn.get('id'), str)
+                        or not _TURN_ID.fullmatch(turn['id']) or turn.get('status') not in _TURN_STATUSES):
+                    raise ValueError()
+                clean.append({'id': turn['id'], 'status': turn['status']})
+            if method == 'turn/start':
+                if not clean:
+                    raise ValueError()
+                return {'turn': clean[0]}
+            return {'data': clean}
         if method == 'thread/read':
             thread = value['thread']
             if not isinstance(thread, dict) or thread.get('id') != params['threadId']:

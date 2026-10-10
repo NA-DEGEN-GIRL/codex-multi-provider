@@ -905,6 +905,7 @@ public sealed partial class MainWindow : Window
             // each launch still kept in _shownProfiles.
             _state = state; _shownProfiles.Clear();
             Render();
+            DeliverUsageAlerts();
             var current = _viewingCatalog ? _viewerProfile : Profile();
             if (_host.IsAttached && _expectedWindowLaunch?.Matches(current) == true &&
                 _host.AttachedHandle == (nint)current.N("window_handle")) _expectedWindowLaunch = null;
@@ -974,6 +975,10 @@ public sealed partial class MainWindow : Window
                     if (prepared.S("state") is "checking" or "opening") { suffix = "\n백그라운드에서 여는 중"; (noticeTone, noticeShort) = ("transient", "여는 중"); }
                     else if (prepared.S("state") == "queued") { suffix = "\n미리 열기 대기"; (noticeTone, noticeShort) = ("transient", "열기 대기"); }
                 }
+                // An account at or near its usage limit (revision 124): 90% or more of a 5-hour or
+                // weekly window, a reached limit, or a stopped Claude task waiting for its reset.
+                if (suffix.Length == 0 && p.Get("usage_alert").S("short") is { Length: > 0 } usageShort)
+                { suffix = "\n" + p.Get("usage_alert").S("detail", usageShort); (noticeTone, noticeShort) = ("warning", usageShort); }
                 // Lowest priority: a long-lived Claude token that expires soon or stopped working.
                 if (suffix.Length == 0 && ClaudeProfilePresentation.LongLivedAttention(p) is { Length: > 0 } tokenNotice)
                 { suffix = "\n" + tokenNotice; (noticeTone, noticeShort) = ("warning", "토큰 확인"); }
@@ -2375,13 +2380,16 @@ public sealed partial class MainWindow : Window
             modelSettings = Dialogs.ExternalModelSettings(this, LocalModelPresentation.ForSettings(registry, model.Data));
             if (modelSettings is null) return;
         }
+        object? autoContinue = null;
         if (kind.Id == "claude_code")
         {
             modelSettings = Dialogs.ClaudeProfileSettings(this);
             if (modelSettings is null) return;
+            // Kept outside claude_settings, which accepts only the CLI settings.
+            if (modelSettings.Remove("auto_continue_after_limit", out var value)) autoContinue = value;
         }
         var alias = Dialogs.Prompt(this, "프로필 이름", "목록에 표시할 이름을 입력하세요."); if (alias is null) return;
-        var result = await Request("profile.add", new { alias, kind = kind.Id == "local" ? "external" : kind.Id, model_id = modelId, settings = modelSettings }); await RefreshAsync();
+        var result = await Request("profile.add", new { alias, kind = kind.Id == "local" ? "external" : kind.Id, model_id = modelId, settings = modelSettings, auto_continue_after_limit = autoContinue }); await RefreshAsync();
         if (kind.Id == "claude_code")
         {
             var login = await Request("claude.login", new { profile_id = result.S("id") });

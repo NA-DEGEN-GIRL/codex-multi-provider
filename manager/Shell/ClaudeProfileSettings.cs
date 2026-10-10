@@ -115,6 +115,11 @@ internal static partial class Dialogs
             if (request is not null) longLived = new ClaudeLongLivedTokenPanel(window, body, profile, request);
         }
         var fields = AddClaudeSettingsEditor(body, profile.Get("claude_settings"));
+        // Revision 124: a manager setting kept outside claude_settings (default on).
+        var autoContinue = new CheckBox { Content = "한도 재설정 후 자동으로 이어하기",
+            IsChecked = profile.Get("claude_auto_continue").ValueKind != JsonValueKind.False, Margin = new Thickness(0, 12, 0, 6) };
+        body.Children.Add(autoContinue);
+        body.Children.Add(Note("Claude 작업이 사용 한도로 멈추면 한도가 재설정되고 1~2분 뒤 같은 작업에 이어하기 메시지를 한 번 보냅니다. 그사이 새 메시지를 보냈거나 작업이 실행 중이거나 프로필이 닫혀 있으면 보내지 않습니다."));
         body.Children.Add(Note("같은 계정에서 Claude 모델·추론 강도를 바꿔도 기존 세션을 이어갑니다. 계정마다 세션은 분리되며, 다른 제공자로 전환할 때는 공유 기록과 요약을 전달합니다. 계정 사이의 서버 캐시는 공유되지 않습니다."));
         body.Children.Add(Note("압축 후 다른 계정·모델에 넘길 공통 요약을 만들 때 Claude 사용량이 추가될 수 있습니다."));
         Dictionary<string, object>? result = null;
@@ -122,7 +127,9 @@ internal static partial class Dialogs
         {
             if (longLived is not null && !longLived.ConfirmDiscard()) return;
             result = fields.Read();
-            if (result is not null) window.DialogResult = true;
+            if (result is null) return;
+            result["auto_continue_after_limit"] = autoContinue.IsChecked == true;
+            window.DialogResult = true;
         });
         Button(body, "닫기", () => { if (longLived is null || longLived.ConfirmDiscard()) window.Close(); });
         // The title bar close button gets the same unsaved-token check.
