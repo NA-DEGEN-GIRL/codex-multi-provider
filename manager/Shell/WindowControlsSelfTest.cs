@@ -118,11 +118,57 @@ internal static class WindowControlsSelfTest
             throw new InvalidOperationException("Post-close shortcut menu deleted the selected shortcut instead of the context target.");
         if (requests.Any(r => r.Args.S("profile_id") == "selected" || r.Args.S("shortcut_id") == "selected-link"))
             throw new InvalidOperationException("A context action reached the selected item.");
+        CheckProfileClose(window, profiles, context, requests, checks);
         var beforeClose = requests.Count;
         window.Close();
         if (requests.Skip(beforeClose).Any(r => r.Command is "profile.cleanup" or "supervisor.retire" or "supervisor.shutdown" or "manager.stop_warmup"))
             throw new InvalidOperationException("Normal UI close dispatched a work-stopping request.");
         checks.Add("Real post-close WPF menu Click routes move, login status, restart, remove, prepare and shortcut deletion to the right-clicked item using an isolated RPC recorder.");
+    }
+
+    // Revision 126: a profile's Codex 닫기 (and 닫고 제거) never stops anything
+    // without confirmation and a service that holds the profile's launches.
+    private static void CheckProfileClose(MainWindow window, ListBox profiles, FieldInfo context,
+        List<(string Command, JsonElement Args)> requests, List<string> checks)
+    {
+        void Click(string label)
+        {
+            context.SetValue(window, "target");
+            profiles.ContextMenu.RaiseEvent(new RoutedEventArgs(ContextMenu.OpenedEvent));
+            profiles.ContextMenu.RaiseEvent(new RoutedEventArgs(ContextMenu.ClosedEvent));
+            profiles.ContextMenu.Items.OfType<MenuItem>().Single(item => Equals(item.Header, label))
+                .RaiseEvent(new RoutedEventArgs(MenuItem.ClickEvent));
+        }
+        static bool Stops(string command) => command is "profile.close_begin" or "profile.close_end" or
+            "profile.cleanup" or "profile.remote_stop" or "profile.recover" or "manager.stop_warmup";
+        var before = requests.Count;
+        Click("Codex 닫기"); // The fixture target is not running.
+        if (requests.Skip(before).Any(r => Stops(r.Command)))
+            throw new InvalidOperationException("Codex 닫기 on a closed profile dispatched a stopping request.");
+        using var running = JsonDocument.Parse("""
+        {"profiles":[{"id":"selected","alias":"A"},{"id":"target","alias":"B","status":"running","generation":"g","process_id":1,
+          "thread_activity":{"t1":"working","t2":"waiting_input"},"remote_bindings":[{"alias":"fixture-host","prepared":true}]}],
+         "shortcuts":[]}
+        """);
+        var prompts = new List<string>();
+        window.ConfirmProfileClose = (message, _) => { prompts.Add(message); return true; };
+        window.UseFixture(running.RootElement);
+        typeof(MainWindow).GetField("_selectedProfile", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(window, "selected");
+        before = requests.Count;
+        Click("Codex 닫기");
+        Click("계정을 목록에서 제거");
+        // No service connection here (and no profile_close capability): both refuse before any prompt or stop.
+        if (prompts.Count != 0 || requests.Skip(before).Any(r => Stops(r.Command) || r.Command == "profile.remove"))
+            throw new InvalidOperationException("Closing a running profile proceeded without a service that holds its launches.");
+        var prompt = ProfileClosePresentation.Prompt(running.RootElement.GetProperty("profiles")[1], remove: true, remoteLifecycle: true);
+        if (!prompt.Contains("진행 중인 작업이 2개") || !prompt.Contains("작업 중 1개, 입력 대기 1개") ||
+            !prompt.Contains("목록에서 제거") || !prompt.Contains("SSH에서는"))
+            throw new InvalidOperationException("The close prompt does not warn about running tasks, removal and SSH: " + prompt);
+        var idle = ProfileClosePresentation.Prompt(running.RootElement.GetProperty("profiles")[0], remove: false, remoteLifecycle: true);
+        if (idle.Contains("주의") || !idle.Contains("목록에 남고"))
+            throw new InvalidOperationException("An idle profile's close prompt warned about running work: " + idle);
+        window.ConfirmProfileClose = null;
+        checks.Add("Codex 닫기 and 닫고 제거 stop nothing for a closed profile or without the service's launch hold, and the prompt counts running tasks, removal and SSH.");
     }
 
     private static IEnumerable<DependencyObject> LogicalChildren(DependencyObject root)

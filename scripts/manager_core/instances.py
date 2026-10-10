@@ -227,6 +227,10 @@ class Instances:
         self._launch_lock=threading.Lock()
         self._launch_count=0
         self._launch_stopping=False
+        # Revision 126: profile -> monotonic expiry of a per-profile close.
+        # No launch (warmup, task open, restart, reconnect) starts it until the
+        # shell releases it or it expires (a shell that died mid-close).
+        self._close_holds={}
         self._app_lock=threading.Lock()
         self._app_cache=None
         self._app_checked=0.0
@@ -608,6 +612,7 @@ class Instances:
         with self._launch_lock:
             if self._launch_stopping:
                 raise RuntimeError('관리창을 닫는 중이므로 새 프로필 실행을 중지했습니다.')
+            self._require_not_closing_locked(profile_id)
             self._launch_count+=1
         try:
             with self.metrics.phase(profile_id, 'show_total'):
@@ -631,12 +636,59 @@ class Instances:
         with self._launch_lock:
             self._launch_stopping=False
 
-    def _require_launch_open(self):
+    def _require_launch_open(self, profile_id=None):
         with self._launch_lock:
             if self._launch_stopping:
                 raise RuntimeError('관리창을 닫는 중이므로 새 프로필 실행을 중지했습니다.')
+            if profile_id is not None:
+                self._require_not_closing_locked(profile_id)
+
+    CLOSE_HOLD_SECONDS=15*60
+
+    def hold_launches(self, profile_id, seconds=None):
+        """Keep one profile closed while the shell closes (and maybe removes) it."""
+        profile_id=identifier(profile_id)
+        with self._launch_lock:
+            self._close_holds[profile_id]=time.monotonic()+(self.CLOSE_HOLD_SECONDS if seconds is None else seconds)
+
+    def release_launches(self, profile_id):
+        with self._launch_lock:
+            return self._close_holds.pop(identifier(profile_id),None) is not None
+
+    def launch_held(self, profile_id):
+        if not getattr(self,'_close_holds',None):
+            return False
+        with self._launch_lock:
+            return self._closing_locked(profile_id)
+
+    def require_not_closing(self, profile_id):
+        if not getattr(self,'_close_holds',None):
+            return  # Nothing held (the common case; also partially built test instances).
+        with self._launch_lock:
+            self._require_not_closing_locked(profile_id)
+
+    def _closing_locked(self, profile_id):
+        holds=getattr(self,'_close_holds',None) or {}
+        if not holds:
+            return False
+        try:profile_id=identifier(profile_id)
+        except ValueError:return False  # Never a held (validated) profile id.
+        expires=holds.get(profile_id)
+        if expires is not None and expires<=time.monotonic():
+            del holds[profile_id]
+            expires=None
+        return expires is not None
+
+    def _require_not_closing_locked(self, profile_id):
+        if self._closing_locked(profile_id):
+            error=RuntimeError('이 프로필의 Codex를 닫는 중이므로 다시 열지 않았습니다. 닫기가 끝난 뒤 다시 선택하세요.')
+            error.code='profile_closing'
+            raise error
 
     def _show(self, profile_id, *, reopen_existing=True):
+        # Under launch admission: a show that queued behind a profile close's
+        # admission sees its hold here, before any preparation or spawn.
+        self.require_not_closing(profile_id)
         profile=self.store.profile(profile_id)
         if profile.get('removed_at'):
             raise ValueError('목록에서 제거한 계정입니다. 계정 복원 후 열 수 있습니다.')
@@ -657,7 +709,7 @@ class Instances:
             # state. No deep link is sent, so its current conversation stays put.
             environment=self.environment(profile)
             try:
-                self._require_launch_open()
+                self._require_launch_open(profile['id'])
                 from . import rust_service
                 request=rust_service.launch(profile,active['executable_path'],environment,embed=self.embed_windows,reopen=True) if rust_service.enabled() else subprocess.Popen([active['executable_path'],f'--user-data-dir={profile["ui_home"]}'],
                     cwd=self.root,env=environment,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,
@@ -742,7 +794,7 @@ class Instances:
             # The combined desktop also offers ChatGPT/Work. Its native deep link
             # selects the Codex composer without creating or submitting a task.
             from . import rust_service
-            self._require_launch_open()
+            self._require_launch_open(profile['id'])
             brokered=rust_service.enabled()
             process=rust_service.launch(profile,app['executable'],env,embed=self.embed_windows) if brokered else subprocess.Popen([app['executable'],f'--user-data-dir={profile["ui_home"]}',
                                       'codex://threads/new?mode=codex'],cwd=self.root,

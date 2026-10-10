@@ -331,6 +331,10 @@ fn allowed(command: &str) -> bool {
         "manager.stop_warmup",
         "manager.resume_launches",
         "profile.cleanup",
+        // Revision 126: close one profile's Codex (and optionally remove it)
+        // while its launches are held.
+        "profile.close_begin",
+        "profile.close_end",
         "manager.recover_legacy",
         "state",
         "accounts.refresh",

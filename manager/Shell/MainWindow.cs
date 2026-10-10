@@ -209,7 +209,7 @@ public sealed partial class MainWindow : Window
         VirtualizingPanel.SetScrollUnit(_profiles, ScrollUnit.Pixel);
         var profileMenu = MenuButton("프로필 관리", ("모델 기본 설정 · 로컬 / API / Claude", EditExternalModelAsync), ("실행 프리셋", () => ManagePresetsAsync(_contextProfile ?? RequireProfile())), ("하위 에이전트 설정", ProfileProvidersAsync), ("로그인 · API 키 관리", LoginProfileAsync),
             ("현재 앱의 로그인 계정 연결", RegisterCurrentAsync), ("로그인 상태 새로 확인", RefreshLoginStatusAsync),
-            ("이 프로필 다시 열기", RecoverProfileAsync), ("작업 종료 후 설정 적용 예약", RestartProfileAsync), ("SSH 작업 종료 후 설정 적용", RestartRemoteProfileAsync),
+            ("이 프로필 다시 열기", RecoverProfileAsync), ("Codex 닫기", CloseProfileAppAsync), ("작업 종료 후 설정 적용 예약", RestartProfileAsync), ("SSH 작업 종료 후 설정 적용", RestartRemoteProfileAsync),
             ("원래 창으로 분리", DetachAsync), ("별칭 변경", RenameProfileAsync),
             ("계정을 목록에서 제거", RemoveProfileAsync), ("제거한 계정 복원", RestoreProfileAsync), ("프로필 준비", PrepareProfileAsync));
         profileMenu.ContextMenu.Opened += (_, _) => SetClaudeProfileMenu(profileMenu.ContextMenu, Profile());
@@ -233,7 +233,7 @@ public sealed partial class MainWindow : Window
             if (choice is not null) Log($"프로필 클릭 수신 · {choice.Data.S("alias")} · {choice.Id}");
         };
         _profiles.MouseLeftButtonUp += async (_, e) => { if (_profileAlreadySelected && ClickedChoice(e.OriginalSource) is { } choice) await Safe(() => ShowProfileAsync(choice.Id)); };
-        _profiles.ContextMenu = ProfileMenu(("위로 이동", id => _profileOrdering.MoveByAsync(id, -1)), ("아래로 이동", id => _profileOrdering.MoveByAsync(id, 1)), ("모델 기본 설정 · 로컬 / API / Claude", EditExternalModelAsync), ("실행 프리셋", id => ManagePresetsAsync(id)), ("하위 에이전트 설정", id => ShowProvidersAsync(id)), ("로그인 · API 키 관리", LoginProfileAsync), ("로그인 상태 새로 확인", RefreshLoginStatusAsync), ("이 프로필 다시 열기", RecoverProfileAsync), ("작업 종료 후 설정 적용 예약", RestartProfileAsync), ("SSH 작업 종료 후 설정 적용", RestartRemoteProfileAsync), ("별칭 변경", RenameProfileAsync), ("계정을 목록에서 제거", RemoveProfileAsync), ("제거한 계정 복원", _ => RestoreProfileAsync()), ("프로필 준비", PrepareProfileAsync));
+        _profiles.ContextMenu = ProfileMenu(("위로 이동", id => _profileOrdering.MoveByAsync(id, -1)), ("아래로 이동", id => _profileOrdering.MoveByAsync(id, 1)), ("모델 기본 설정 · 로컬 / API / Claude", EditExternalModelAsync), ("실행 프리셋", id => ManagePresetsAsync(id)), ("하위 에이전트 설정", id => ShowProvidersAsync(id)), ("로그인 · API 키 관리", LoginProfileAsync), ("로그인 상태 새로 확인", RefreshLoginStatusAsync), ("이 프로필 다시 열기", RecoverProfileAsync), ("Codex 닫기", CloseProfileAppAsync), ("작업 종료 후 설정 적용 예약", RestartProfileAsync), ("SSH 작업 종료 후 설정 적용", RestartRemoteProfileAsync), ("별칭 변경", RenameProfileAsync), ("계정을 목록에서 제거", RemoveProfileAsync), ("제거한 계정 복원", _ => RestoreProfileAsync()), ("프로필 준비", PrepareProfileAsync));
         _profiles.ContextMenu.Opened += (_, _) =>
         {
             // WPF closes the popup before dispatching MenuItem.Click. Keep the
@@ -865,6 +865,8 @@ public sealed partial class MainWindow : Window
         "profile.restart" => "설정 적용 · 정상 종료 후 다시 열기",
         "profile.remote_restart" => "프로필 SSH 설정 적용", "profile.remote_stop" => "프로필 SSH 종료",
         "profile.recover" => "선택한 관리용 Codex 종료",
+        "profile.close_begin" => "프로필 Codex 닫기 준비", "profile.close_end" => "프로필 Codex 닫기 마무리",
+        "profile.cleanup" => "남은 Codex 프로세스 정리", "profile.remove" => "계정을 목록에서 제거",
         "catalog.list" => "대화 목록 읽기", "catalog.show" => "원본 Codex 전체 기록 열기", "conversation.open" => "지정 계정에서 대화 열기", "policy.set" => "모델 조합 적용",
         "providers.verify" => "모델 API 연결 시험", "providers.key" => "API 키 저장", "providers.save" => "모델 연결 등록",
         "updates.check" => "공식 업데이트 확인", "updates.prepare" => "공식 패키지 다운로드·확인", "updates.apply" => "업데이트 준비·실행",
@@ -1539,10 +1541,28 @@ public sealed partial class MainWindow : Window
             Log("이전 서비스의 로컬 종료만 수행 · SSH 원격 실행 유지");
             return; // The confirmation dialog explicitly describes this legacy scope.
         }
+        var refused = await StopRemoteRuntimesAsync(_state.Arr("profiles").ToArray());
+        if (refused.Count > 0 && MessageBox.Show(this,
+                "다음 SSH 원격 실행은 자동으로 종료하지 못했습니다.\n\n" + string.Join("\n", refused) +
+                "\n\n원격 실행을 서버에 남겨 두고 완전 종료하려면 확인을 누르세요. 로컬 Codex는 모두 종료됐고, " +
+                "다음 실행 때 남은 원격 실행에 다시 연결합니다. 관리창을 유지하려면 취소를 누르세요.",
+                "SSH 원격 실행 남겨 두기", MessageBoxButton.OKCancel, MessageBoxImage.Warning, MessageBoxResult.OK) != MessageBoxResult.OK)
+            throw new InvalidOperationException("SSH 원격 실행을 종료하지 못해 관리창을 유지합니다.");
+        if (refused.Count > 0) Log("SSH 원격 실행을 서버에 남겨 두고 완전 종료");
+    }
+
+    // Requests a graceful SSH stop for each of these profiles' prepared remotes
+    // and waits for the service to confirm them. Returns "alias · reason" for
+    // every remote not confirmed stopped (refused, unanswered or timed out);
+    // the caller offers to leave those on the server. Used by 완전 종료 for all
+    // profiles and by a single profile's Codex 닫기 (revision 126).
+    private async Task<List<string>> StopRemoteRuntimesAsync(IReadOnlyCollection<JsonElement> profiles)
+    {
+        if (_client?.IsConnected != true) throw new InvalidOperationException("원격 종료를 확인할 관리 서비스가 연결되지 않았습니다.");
         var jobs = new Dictionary<string, string>();
         var refused = new List<string>();
         var maxHosts = 0;
-        foreach (var profile in _state.Arr("profiles"))
+        foreach (var profile in profiles)
         {
             if (profile.S("generation") == "" || !profile.Arr("remote_bindings").Any(b => b.B("prepared"))) continue;
             maxHosts = Math.Max(maxHosts, profile.Arr("remote_bindings").Count(b => b.B("prepared")));
@@ -1578,7 +1598,8 @@ public sealed partial class MainWindow : Window
         // A refused remote stop (an unaudited runtime, no shutdown proof) does
         // not resolve by waiting. Collect them and let the user leave those
         // listeners on the server, exactly like closing only the window.
-        var aliases = _state.Arr("profiles").ToDictionary(p => p.S("id"), p => p.S("alias", p.S("id")));
+        var aliases = profiles.Where(p => p.S("id") != "").GroupBy(p => p.S("id"))
+            .ToDictionary(g => g.Key, g => g.First().S("alias", g.Key));
         var waitStarted = DateTime.UtcNow;
         try
         {
@@ -1622,13 +1643,7 @@ public sealed partial class MainWindow : Window
                 Log($"프로필 원격 종료 확인 시간 초과 · {aliases.GetValueOrDefault(id, id)}");
             }
         }
-        if (refused.Count > 0 && MessageBox.Show(this,
-                "다음 SSH 원격 실행은 자동으로 종료하지 못했습니다.\n\n" + string.Join("\n", refused) +
-                "\n\n원격 실행을 서버에 남겨 두고 완전 종료하려면 확인을 누르세요. 로컬 Codex는 모두 종료됐고, " +
-                "다음 실행 때 남은 원격 실행에 다시 연결합니다. 관리창을 유지하려면 취소를 누르세요.",
-                "SSH 원격 실행 남겨 두기", MessageBoxButton.OKCancel, MessageBoxImage.Warning, MessageBoxResult.OK) != MessageBoxResult.OK)
-            throw new InvalidOperationException("SSH 원격 실행을 종료하지 못해 관리창을 유지합니다.");
-        if (refused.Count > 0) Log("SSH 원격 실행을 서버에 남겨 두고 완전 종료");
+        return refused;
     }
 
     private Task RecoverProfileAsync() => RecoverProfileAsync(RequireProfile());
@@ -1786,6 +1801,8 @@ public sealed partial class MainWindow : Window
         profile = Latest(profile);
         if (ProfileLoginPresentation.ShowRecovery(profile)) { ShowLoginRecovery(profile); return; }
         if (!_embedRequested || _host.IsTransitioning) return;
+        // A profile whose Codex this window is closing (revision 126) is never reattached.
+        if (_closingProfiles.Contains(profile.S("id"))) return;
         if (AutomaticProfileUpdate.IsClosing(profile))
         {
             _attachDeadline = DateTime.UtcNow.AddSeconds(25);
@@ -1878,7 +1895,7 @@ public sealed partial class MainWindow : Window
             var id = profile.S("id");
             if (id == "" || profile.S("status") != "running" || profile.N("window_handle") == 0
                 || (!_viewingCatalog && id == _selectedProfile) || (_viewingCatalog && id == _viewerProfile.S("id"))
-                || AutomaticProfileUpdate.IsClosing(profile)) continue;
+                || AutomaticProfileUpdate.IsClosing(profile) || _closingProfiles.Contains(id)) continue;
             if (_detachedProfiles.TryGetValue(id, out var detached) && detached.Matches(profile)) continue;
             var host = _hostDeck.Ensure(id);
             if (host.IsTransitioning) continue;
@@ -2029,6 +2046,8 @@ public sealed partial class MainWindow : Window
     private Task RequestWorkspaceExitAsync(bool restartAdministrator)
     {
         if (_shutdownInProgress || (_closing && !_serviceShutdown.DrainStarted && !_serviceShutdown.BackendResetting)) return Task.CompletedTask;
+        if (_closingProfiles.Count > 0)
+        { SetStatus("프로필의 Codex를 닫는 중입니다. 끝난 뒤 완전 종료를 다시 눌러 주세요.", true); return Task.CompletedTask; }
         var message = restartAdministrator
             ? "관리 중인 모든 Codex 프로필과 작업을 종료한 뒤 관리자 권한으로 다시 실행합니다.\n진행 중인 작업은 중단됩니다. 작업을 모두 마쳤을 때만 계속하세요.\n\n종료가 확인되면 Windows 권한 허용 창이 나타납니다."
             : "관리 중인 모든 Codex 프로필과 작업을 종료합니다.\n진행 중인 작업은 중단됩니다.\n\n창만 닫고 작업을 계속하려면 취소한 뒤 제목줄의 X를 누르세요.";
@@ -2485,13 +2504,7 @@ public sealed partial class MainWindow : Window
         CloseShortcutOverlay();
         await Safe(() => OpenShortcutAsync(choice.Id));
     }
-    private Task RemoveProfileAsync() => RemoveProfileAsync(RequireProfile());
-    private async Task RemoveProfileAsync(string id)
-    {
-        var result = await Request("profile.remove", new { profile_id = id });
-        if (_selectedProfile == id) _selectedProfile = null;
-        _loginStatuses.Remove(id); await RefreshAsync(); SetStatus(result.Message());
-    }
+    // RemoveProfileAsync (with 닫고 제거 for a running profile): MainWindow.ProfileClose.cs.
     private async Task RestoreProfileAsync()
     {
         var removed = _state.Arr("removed_profiles").Select(p => new Choice(p.S("id"), p.S("alias"), p)).ToArray();

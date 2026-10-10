@@ -33,7 +33,7 @@ OPEN_COMMANDS=('conversation.open','conversation.continue','conversation.navigat
 # task open still waiting for it is dropped (latest click wins, and it would
 # otherwise relaunch an app that exits).
 ENDS_WAITING_OPENS=('profile.show','profile.recover','profile.login','profile.remove','profile.restart',
-                    'profile.remote_restart','profile.remote_stop','profile.cleanup')
+                    'profile.remote_restart','profile.remote_stop','profile.cleanup','profile.close_begin')
 
 
 class ControlCenter:
@@ -105,7 +105,76 @@ class ControlCenter:
         self.profile_warmup=ProfileWarmup(self.store,self.instances,self._open_profile_locally,
                                           metrics=self.instances.metrics,free_commit=available_commit)
 
+    def _close_begin(self, profile_id, *, remove=False):
+        """Revision 126: hold one profile closed while the shell quits its app.
+
+        The shell then asks that app to quit (the full exit's request), reaps
+        its leftovers (profile.cleanup) and stops its SSH runtimes
+        (profile.remote_stop), and finally calls profile.close_end. Until then
+        no warmup, task open, login, restart or reconnect launches it again.
+        """
+        from manager_core.profile_restart import TERMINAL
+        from manager_core.updates import UpdateError
+        profile_id=identifier(profile_id)
+        profile=self.store.profile(profile_id)
+        if profile.get('view_only'):raise ValueError('전체 기록 보기 인스턴스는 프로필 메뉴에서 닫을 수 없습니다.')
+        if profile.get('removed_at'):raise ValueError('목록에서 제거한 계정입니다.')
+        # Refused before anything closes: a close-then-remove that could not
+        # remove would only have interrupted the work.
+        if remove:self.profile_lifecycle.check_removable(profile_id)
+        job=self.restarts.status().get(profile_id)
+        if job and job.get('phase') not in TERMINAL and not job.get('remote_background'):
+            raise UpdateError('profile_prepare_busy','이 프로필의 설정 적용이 진행 중이거나 예약되어 있습니다. '
+                              '적용이 끝난 뒤 다시 닫아 주세요.')
+        try:
+            # Waits for a launch of this profile already admitted (its identity
+            # is then in the snapshot below); any later one sees the hold.
+            with self.update_hooks.launch_admission(profile_id):
+                self.instances.hold_launches(profile_id)
+        except UpdateError as error:
+            if error.code=='update_maintenance':
+                raise UpdateError('update_maintenance','이 프로필의 설정 적용 또는 업데이트가 진행 중입니다. '
+                                  '끝난 뒤 다시 닫아 주세요.') from None
+            raise
+        try:
+            profile=self.store.profile(profile_id)
+            observed=self.instances.observe(profile)
+        except BaseException:
+            self.instances.release_launches(profile_id)
+            raise
+        return dict(profile_id=profile_id,held=True,hold_seconds=self.instances.CLOSE_HOLD_SECONDS,
+                    profile={**profile,**observed})
+
+    def _close_end(self, profile_id, *, remove=False):
+        """Release a profile_close hold; with remove, remove the closed profile first."""
+        from manager_core.profile_lifecycle import ProfileRunning
+        profile_id=identifier(profile_id)
+        try:
+            if remove:
+                try:
+                    with self.update_hooks.launch_admission(profile_id):
+                        result=self.profile_lifecycle.remove(profile_id)
+                except ProfileRunning:
+                    raise ProfileRunning('이 계정의 Codex 종료를 확인하지 못해 계정을 제거하지 않았습니다. '
+                                         '잠시 뒤 다시 시도하세요.') from None
+                return {**result,'closed':True}
+            profile=self.store.profile(profile_id)
+            observed=self.instances.observe(profile)
+            closed=observed.get('status')!='running'
+            return dict(id=profile_id,closed=closed,removed=False,profile={**profile,**observed},
+                        message=(f"{profile['alias']} 프로필의 Codex를 닫았습니다. 프로필은 목록에 남아 있으며 다시 선택하면 엽니다."
+                                 if closed else f"{profile['alias']} 프로필의 Codex가 아직 실행 중입니다."))
+        finally:
+            self.instances.release_launches(profile_id)
+
+    def _require_not_closing(self, profile_id):
+        # Instances doubles that predate revision 126 hold nothing.
+        check=getattr(self.instances,'require_not_closing',None)
+        if callable(check):check(profile_id)
+
     def _open_profile_locally(self, profile_id):
+        # A profile being closed (revision 126) is not shown or reattached.
+        self._require_not_closing(profile_id)
         profile=self.store.profile(profile_id)
         observed=self.instances.observe(profile)
         if observed.get('status') == 'running' and observed.get('executable_path'):
@@ -362,6 +431,7 @@ class ControlCenter:
             catalog_refresh.refresh(state['sources'],include_paginated=built.get('paginated_record_catalog',False))
         state['catalog_refresh']=catalog_refresh.status()
         state['capabilities']=dict(shutdown_restart_barrier=True,remote_profile_lifecycle=True,original_gui_hosting=True,exact_navigation='request_then_verify',
+                                   profile_close=True,
                                    native_catalog=built.get('native_record_catalog',False),
                                    shared_native_catalog=built.get('shared_record_catalog',False),
                                    paginated_catalog=built.get('paginated_record_catalog',False),
@@ -567,6 +637,8 @@ class ControlCenter:
             return register(self.store, args['alias'], Path.home()/'.codex')
         if command=='profile.remove':
             with self.update_hooks.launch_admission(args['profile_id']):return self.profile_lifecycle.remove(args['profile_id'])
+        if command=='profile.close_begin':return self._close_begin(args['profile_id'],remove=args.get('remove') is True)
+        if command=='profile.close_end':return self._close_end(args['profile_id'],remove=args.get('remove') is True)
         if command=='profile.restore':return self.profile_lifecycle.restore(args['profile_id'],args.get('alias'))
         if command=='profile.move':return self.store.move_profile(args['profile_id'],args['target_profile_id'],args['position'])
         if command=='profile.restart':return self.restarts.schedule(args['profile_id'])
@@ -613,6 +685,7 @@ class ControlCenter:
         if command=='profile.prepare':return self.instances.prepare(self.store.profile(args['profile_id']))
         if command=='profile.show':
             profile=self.store.profile(args['profile_id'])
+            self._require_not_closing(profile['id'])  # Revision 126: being closed.
             observed=self.instances.observe(profile)
             warmup=self.profile_warmup.status()
             pending=next((p for p in warmup['profiles'] if p['profile_id']==profile['id']),None)

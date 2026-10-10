@@ -1659,6 +1659,14 @@ async fn pipe_acl_and_broker_auth_and_protocol_guard() {
     );
 }
 
+#[test]
+fn per_profile_close_commands_reach_the_backend() {
+    for command in ["profile.close_begin", "profile.close_end", "profile.cleanup", "profile.remove"] {
+        assert!(allowed(command), "{command}");
+    }
+    assert!(!allowed("profile.close"));
+}
+
 #[tokio::test]
 async fn long_lived_claude_token_is_forwarded_but_never_logged_or_kept() {
     for command in [

@@ -12,20 +12,42 @@ def account_alias(value, profiles, *, excluding=None):
     return value
 
 
+class ProfileRunning(RuntimeError):
+    """Removal refused because the profile's Codex still runs (rev 126: the
+    shell offers to close it first instead of only showing this refusal)."""
+    code = 'profile_running'
+
+
+LINKED_TASKS = '연결된 작업을 다른 계정으로 옮기거나 바로가기를 삭제한 뒤 계정을 제거하세요.'
+
+
 class ProfileLifecycle:
     def __init__(self, store, instances):
         self.store, self.instances = store, instances
+
+    def check_removable(self, profile_id):
+        """Everything removal checks except the running app: a close-then-remove
+        refuses these before it closes anything."""
+        data = self.store.read()
+        profile = self.store.profile(profile_id, data)
+        if profile.get('view_only'):
+            raise ValueError('전체 기록 보기 인스턴스는 계정 목록에서 제거할 수 없습니다.')
+        if profile.get('removed_at'):
+            raise ValueError('이미 목록에서 제거한 계정입니다.')
+        if any(link['profile_id'] == profile['id'] for link in data['shortcuts']):
+            raise ValueError(LINKED_TASKS)
+        return profile
 
     def remove(self, profile_id):
         profile = self.store.profile(profile_id)
         if profile.get('view_only'):
             raise ValueError('전체 기록 보기 인스턴스는 계정 목록에서 제거할 수 없습니다.')
         if self.instances.observe(profile)['status'] == 'running':
-            raise RuntimeError('이 계정의 Codex 창을 닫은 뒤 제거하세요. 실행 중인 작업은 그대로 유지했습니다.')
+            raise ProfileRunning('이 계정의 Codex 창을 닫은 뒤 제거하세요. 실행 중인 작업은 그대로 유지했습니다.')
         def remove(data):
             current = self.store.profile(profile_id, data)
             if any(link['profile_id'] == profile_id for link in data['shortcuts']):
-                raise ValueError('연결된 작업을 다른 계정으로 옮기거나 바로가기를 삭제한 뒤 계정을 제거하세요.')
+                raise ValueError(LINKED_TASKS)
             current['removed_at'] = now()
             if data.get('representative_profile_id') == profile_id:
                 data['representative_profile_id'] = next((p['id'] for p in data['profiles']

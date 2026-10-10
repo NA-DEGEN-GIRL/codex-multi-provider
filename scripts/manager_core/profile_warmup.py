@@ -515,6 +515,11 @@ class ProfileWarmup:
                 or profile.get('runtime_channel') == 'packaged' else
                 'account_missing' if profile.get('account_missing')
                 and profile.get('auth_mode') != 'native' else None)
+        held = getattr(self.instances, 'launch_held', None)
+        if not code and callable(held) and held(profile_id) is True:
+            # Revision 126: the user is closing (or closing and removing) this
+            # profile's Codex; a startup pass never reopens it meanwhile.
+            code = 'closing'
         if code:
             self._update(profile_id, state='skipped', code=code)
             return
